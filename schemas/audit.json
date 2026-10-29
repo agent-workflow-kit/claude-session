@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "claude-session/audit",
+  "$id": "claude-session/audit.json",
   "title": "claude-session audit.jsonl record",
-  "description": "Audit record for claude-session. Whether this tool writes audit records is decided in its design session (architecture §14).",
+  "description": "Launch is not an external action; claude-session audits taint overrides, escalation overrides, sandbox lowering on third-party-reading runs (written at adoption), stop and forget (bulk forget writes one record per session).",
   "type": "object",
   "properties": {
     "ts": {
@@ -10,38 +10,132 @@
       "format": "date-time"
     },
     "actor": {
-      "type": "string"
+      "type": "string",
+      "description": "human:<user> or auto:<...>. An audited honor system, not authentication."
     },
     "decision_id": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Decision ids (from --decision-id and, for launch_escalation_override, pre-launch hook stdout); possibly empty."
+    },
+    "target": {
+      "type": "string",
+      "pattern": "^cs-[a-z2-7]{8}$",
+      "description": "csession_id"
+    },
+    "action": {
+      "enum": [
+        "resume_tainted",
+        "forget",
+        "stop",
+        "launch_escalation_override",
+        "sandbox_lowered"
+      ]
+    },
+    "inputs": {
       "oneOf": [
         {
-          "type": "string"
+          "type": "object",
+          "properties": {
+            "run_kind": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "forked_from": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "labels": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+                "description": "key=value; split at the first '='."
+              },
+              "description": "Multiset of key=value pairs, verbatim."
+            },
+            "tty": {
+              "type": "boolean"
+            },
+            "overridden_hooks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "sandbox_from": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "required",
+                "preferred",
+                "off",
+                null
+              ]
+            },
+            "sandbox_to": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "required",
+                "preferred",
+                "off",
+                null
+              ]
+            },
+            "grace": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [],
+          "additionalProperties": false
         },
         {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
+          "type": "null"
         }
       ]
     },
-    "target": {
-      "type": "string"
-    },
-    "action": {
-      "type": "string"
-    },
-    "inputs": {
-      "type": "object"
-    },
-    "result": {}
+    "result": {
+      "enum": [
+        "ok",
+        "refused",
+        "error"
+      ]
+    }
   },
   "required": [
     "ts",
     "actor",
+    "decision_id",
     "target",
     "action",
+    "inputs",
     "result"
   ],
-  "additionalProperties": true
+  "additionalProperties": false
 }

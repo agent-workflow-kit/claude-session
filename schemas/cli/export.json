@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/export.json",
+  "title": "claude-session export --json",
+  "description": "Audit records (design guide section 6), oldest first, filtered by --since and --action.",
+  "type": "array",
+  "items": {
+    "$ref": "../audit.json"
+  }
+}

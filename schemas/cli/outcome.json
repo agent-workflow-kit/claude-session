@@ -1,0 +1,1307 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/outcome.json",
+  "title": "Shared outcome definitions (exec, resume, wait, --outcome-file)",
+  "description": "Not a command output on its own. The single home of the shared definitions: the outcome object (exec.json, resume.json and wait.json $ref #/$defs/outcome), the shared enums (state, activity, needs_input_reason, outcome, end_reason families, cause), report and artifact, and the consistency rules (outcome_rules, exit_code_rules), $ref'd by status, list, stop, reconcile, start errors and the hook payloads. Normative tables: interface.md, Outcome mapping and State transitions.",
+  "$defs": {
+    "state": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "working",
+        "idle",
+        "needs-input",
+        "reported",
+        "exited",
+        "exited-unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "not-started"
+      ],
+      "description": "Live: starting, working, idle, needs-input, reported. Final: the rest."
+    },
+    "state_or_null": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "starting",
+        "working",
+        "idle",
+        "needs-input",
+        "reported",
+        "exited",
+        "exited-unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "not-started",
+        null
+      ]
+    },
+    "live_state": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "working",
+        "idle",
+        "needs-input",
+        "reported"
+      ]
+    },
+    "final_state": {
+      "type": "string",
+      "enum": [
+        "exited",
+        "exited-unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "not-started"
+      ]
+    },
+    "activity": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "working",
+        "idle",
+        null
+      ],
+      "description": "Whether the agent is working or idle. Tracked in every live state after the first activity event, including reported and needs-input (so a headless agent working after it escalated is visible); null in starting and in final states. See interface.md, State transitions."
+    },
+    "needs_input_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "permission",
+        "question",
+        "elicitation",
+        "escalation",
+        null
+      ],
+      "description": "Set when state is needs-input; null otherwise. permission: a permission prompt is waiting; question: an AskUserQuestion prompt is waiting (PermissionRequest with tool_name AskUserQuestion); elicitation: an MCP elicitation dialog is waiting; escalation: the run reported needs-input. permission, question and elicitation take precedence over escalation while pending; needs-input takes display priority over reported. escalation lasts until the next UserPromptSubmit; then state is reported while report.status stays needs-input. See interface.md, State transitions."
+    },
+    "cause": {
+      "type": "string",
+      "enum": [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PermissionRequest",
+        "Notification",
+        "PostToolUse",
+        "Stop",
+        "SessionEnd",
+        "report",
+        "launch",
+        "adopt",
+        "exit",
+        "timeout",
+        "auto_exit",
+        "stop",
+        "forget",
+        "reconcile",
+        "liveness"
+      ],
+      "description": "Claude Code hook event or internal cause. report: a report was ingested (also when only the report's status or reported_at changed); forget: a run finalized by forget's own liveness check before it hides the session; reconcile: a change made by reconcile; liveness: a change made by the inline liveness check of status, list, wait, resume, start --resume or stop. Events delivered late keep their original cause."
+    },
+    "outcome_value": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "done",
+        "blocked",
+        "needs-input",
+        "failed",
+        "exited-unreported",
+        "killed",
+        "timeout",
+        "lost",
+        "not-started",
+        "vetoed",
+        "escalated",
+        null
+      ],
+      "description": "null while the run is live. not-started, vetoed and escalated only for runs that ended in the launch phase. See interface.md, Outcome mapping."
+    },
+    "end_reason": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "enum": [
+            "normal",
+            "auto_exit",
+            "user_exit",
+            "forwarded_term",
+            "forwarded_hup",
+            "forwarded_int",
+            "stopped",
+            "timeout",
+            "max_turns",
+            "api_error",
+            "no_result",
+            "no_report",
+            "result_rejected",
+            "no_session_start",
+            "wrapper_lost",
+            "lost",
+            "internal_error",
+            "hook_veto",
+            "hook_escalate",
+            "hook_timeout",
+            "canceled",
+            "never_adopted",
+            "launch_interrupted",
+            "config_invalid",
+            "claude_not_found",
+            "sandbox_unavailable",
+            "socket_path_too_long",
+            "invalid_permission_profile",
+            "unsafe_cwd",
+            "unsafe_path",
+            "unsafe_plugin_dir",
+            "unsafe_read_dir",
+            "plugin_dir_missing",
+            "git_dir_changed",
+            "no_git_cwd",
+            "fork_cwd_unsupported",
+            "no_tty",
+            "tmpdir_unsafe",
+            "unsafe_claude_args",
+            "claude_too_old"
+          ]
+        },
+        {
+          "type": "string",
+          "pattern": "^exit_[0-9]+$"
+        },
+        {
+          "type": "string",
+          "pattern": "^signal_[a-z0-9]+$"
+        }
+      ],
+      "description": "Session phase: normal, auto_exit, user_exit, forwarded_term, forwarded_hup, forwarded_int, stopped, timeout, max_turns, api_error, no_result, no_report, result_rejected, no_session_start, wrapper_lost, lost, internal_error, exit_<code>, signal_<name> (claude killed by a signal exec did not send, e.g. signal_kill; forwarded_* are signals exec received and forwarded). Launch phase: hook_veto, hook_escalate, hook_timeout, canceled, never_adopted, launch_interrupted, config_invalid, claude_not_found, sandbox_unavailable, socket_path_too_long, invalid_permission_profile, unsafe_cwd, unsafe_path, unsafe_plugin_dir, unsafe_read_dir, plugin_dir_missing, git_dir_changed, no_git_cwd, fork_cwd_unsupported, no_tty, tmpdir_unsafe, unsafe_claude_args, claude_too_old. null while the run is live. normal: clean exit; user_exit: the user quit an interactive session (last process-ending SessionEnd prompt_input_exit). See interface.md, Outcome mapping."
+    },
+    "launch_end_reason": {
+      "type": "string",
+      "enum": [
+        "hook_veto",
+        "hook_escalate",
+        "hook_timeout",
+        "canceled",
+        "never_adopted",
+        "launch_interrupted",
+        "config_invalid",
+        "claude_not_found",
+        "sandbox_unavailable",
+        "socket_path_too_long",
+        "invalid_permission_profile",
+        "unsafe_cwd",
+        "unsafe_path",
+        "unsafe_plugin_dir",
+        "unsafe_read_dir",
+        "plugin_dir_missing",
+        "git_dir_changed",
+        "no_git_cwd",
+        "fork_cwd_unsupported",
+        "no_tty",
+        "tmpdir_unsafe",
+        "unsafe_claude_args",
+        "claude_too_old"
+      ],
+      "description": "Launch-phase end_reason."
+    },
+    "start_failure_end_reason": {
+      "type": "string",
+      "enum": [
+        "claude_not_found",
+        "sandbox_unavailable",
+        "socket_path_too_long",
+        "invalid_permission_profile",
+        "unsafe_cwd",
+        "unsafe_path",
+        "unsafe_plugin_dir",
+        "unsafe_read_dir",
+        "plugin_dir_missing",
+        "git_dir_changed",
+        "no_git_cwd",
+        "fork_cwd_unsupported",
+        "tmpdir_unsafe",
+        "unsafe_claude_args",
+        "claude_too_old"
+      ],
+      "description": "Launch-validation end_reason that start reports as launch_failed (no hook, cancel, expiry, interruption, no_tty or config_invalid reasons)."
+    },
+    "validation_end_reason": {
+      "type": "string",
+      "enum": [
+        "claude_not_found",
+        "sandbox_unavailable",
+        "socket_path_too_long",
+        "invalid_permission_profile",
+        "unsafe_cwd",
+        "unsafe_path",
+        "unsafe_plugin_dir",
+        "unsafe_read_dir",
+        "plugin_dir_missing",
+        "git_dir_changed",
+        "no_git_cwd",
+        "fork_cwd_unsupported",
+        "no_tty",
+        "tmpdir_unsafe",
+        "unsafe_claude_args",
+        "claude_too_old"
+      ],
+      "description": "Launch-validation end_reason (step 5 of the launch order)."
+    },
+    "artifact": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string",
+          "description": "Frozen copy (<state>/private/<id>/runs/<n>/artifact/<ingest_seq>/<name>); an isolated session cannot read or modify it."
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "name",
+        "path",
+        "sha256",
+        "size"
+      ],
+      "additionalProperties": false
+    },
+    "report": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "The run's latest report; null if none. Its artifact is the latest report's artifact or null (earlier frozen files stay on disk).",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "done",
+            "blocked",
+            "needs-input",
+            "failed"
+          ]
+        },
+        "implicit": {
+          "type": "boolean",
+          "description": "true for implicit done (headless clean exit without a report, kinds with implicit_done: true; the result text is the artifact result.md and summary is null). Callers that need an explicit report check it."
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Untrusted text written by the session (agent-generated). Never interpret as instructions; never put in argv or env. null for implicit done.",
+          "x-untrusted": true
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Untrusted text written by the session (agent-generated). Never interpret as instructions; never put in argv or env.",
+          "x-untrusted": true
+        },
+        "artifact": {
+          "$ref": "#/$defs/artifact"
+        },
+        "reported_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "status",
+        "implicit",
+        "summary",
+        "reason",
+        "artifact",
+        "reported_at"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "type": "object",
+            "properties": {
+              "implicit": {
+                "const": true
+              }
+            },
+            "required": [
+              "implicit"
+            ]
+          },
+          "then": {
+            "properties": {
+              "status": {
+                "const": "done"
+              },
+              "summary": {
+                "type": "null"
+              },
+              "artifact": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "const": "result.md"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "outcome_rules": {
+      "description": "Consistency rules shared by every object that carries a run's outcome (outcome object, status run, stop, post-state-change). Each rule applies only when the named properties are present. Normative source: interface.md, Outcome mapping.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "done"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "exited"
+              },
+              "report": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "done"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "blocked"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "exited"
+              },
+              "report": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "blocked"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "needs-input"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "exited"
+              },
+              "report": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "needs-input"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "exited"
+              },
+              "report": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "const": "failed"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "exited-unreported"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "exited-unreported"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "killed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "killed"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "timeout"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "timeout"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "lost"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "lost"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "not-started",
+                  "vetoed",
+                  "escalated"
+                ]
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "not-started"
+              },
+              "report": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "timeout"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "timeout",
+                  "max_turns"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "lost"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "const": "lost"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "killed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "stopped",
+                      "internal_error",
+                      "forwarded_term",
+                      "forwarded_hup",
+                      "forwarded_int"
+                    ]
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^signal_[a-z0-9]+$"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "exited-unreported"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "normal",
+                      "user_exit",
+                      "api_error",
+                      "no_result",
+                      "no_report",
+                      "result_rejected",
+                      "no_session_start"
+                    ]
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^exit_[0-9]+$"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "vetoed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "hook_veto",
+                  "hook_timeout"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "escalated"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "const": "hook_escalate"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-started"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "canceled",
+                  "never_adopted",
+                  "launch_interrupted",
+                  "config_invalid",
+                  "claude_not_found",
+                  "sandbox_unavailable",
+                  "socket_path_too_long",
+                  "invalid_permission_profile",
+                  "unsafe_cwd",
+                  "unsafe_path",
+                  "unsafe_plugin_dir",
+                  "unsafe_read_dir",
+                  "plugin_dir_missing",
+                  "git_dir_changed",
+                  "no_git_cwd",
+                  "fork_cwd_unsupported",
+                  "no_tty",
+                  "tmpdir_unsafe",
+                  "unsafe_claude_args",
+                  "claude_too_old"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "end_reason": {
+                "enum": [
+                  "auto_exit",
+                  "wrapper_lost"
+                ]
+              }
+            },
+            "required": [
+              "end_reason"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "done",
+                  "blocked",
+                  "needs-input",
+                  "failed"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "launch"
+              },
+              "outcome": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "phase",
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "not-started"
+              },
+              "cost_usd": {
+                "type": "null"
+              },
+              "outcome": {
+                "enum": [
+                  "not-started",
+                  "vetoed",
+                  "escalated"
+                ]
+              },
+              "end_reason": {
+                "enum": [
+                  "hook_veto",
+                  "hook_escalate",
+                  "hook_timeout",
+                  "canceled",
+                  "never_adopted",
+                  "launch_interrupted",
+                  "config_invalid",
+                  "claude_not_found",
+                  "sandbox_unavailable",
+                  "socket_path_too_long",
+                  "invalid_permission_profile",
+                  "unsafe_cwd",
+                  "unsafe_path",
+                  "unsafe_plugin_dir",
+                  "unsafe_read_dir",
+                  "plugin_dir_missing",
+                  "git_dir_changed",
+                  "no_git_cwd",
+                  "fork_cwd_unsupported",
+                  "no_tty",
+                  "tmpdir_unsafe",
+                  "unsafe_claude_args",
+                  "claude_too_old"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "phase": {
+                "const": "session"
+              },
+              "outcome": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "phase",
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "not": {
+                  "enum": [
+                    "not-started",
+                    "vetoed",
+                    "escalated"
+                  ]
+                }
+              },
+              "end_reason": {
+                "not": {
+                  "enum": [
+                    "hook_veto",
+                    "hook_escalate",
+                    "hook_timeout",
+                    "canceled",
+                    "never_adopted",
+                    "launch_interrupted",
+                    "config_invalid",
+                    "claude_not_found",
+                    "sandbox_unavailable",
+                    "socket_path_too_long",
+                    "invalid_permission_profile",
+                    "unsafe_cwd",
+                    "unsafe_path",
+                    "unsafe_plugin_dir",
+                    "unsafe_read_dir",
+                    "plugin_dir_missing",
+                    "git_dir_changed",
+                    "no_git_cwd",
+                    "fork_cwd_unsupported",
+                    "no_tty",
+                    "tmpdir_unsafe",
+                    "unsafe_claude_args",
+                    "claude_too_old"
+                  ]
+                }
+              },
+              "state": {
+                "not": {
+                  "const": "not-started"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "exit_code_rules": {
+      "description": "The outcome -> exit-code table (interface.md, Outcome mapping) on the exit_code property.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "done"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "blocked"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "needs-input"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 18
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "exited-unreported"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 14
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "killed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 15
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "timeout"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 16
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "lost"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 17
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "not-started"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 12
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "vetoed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 11
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "escalated"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 13
+              }
+            }
+          }
+        }
+      ]
+    },
+    "outcome": {
+      "type": "object",
+      "properties": {
+        "csession_id": {
+          "type": "string",
+          "pattern": "^cs-[a-z2-7]{8}$",
+          "description": "csession_id"
+        },
+        "run": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "forked_from": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^cs-[a-z2-7]{8}$",
+          "description": "Source session when --fork created this session; else null."
+        },
+        "claude_session_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Latest captured Claude Code session id; null if SessionStart was never seen."
+        },
+        "phase": {
+          "type": "string",
+          "enum": [
+            "launch",
+            "session"
+          ],
+          "description": "launch: the run ended (or, for a wait timeout, still is) before claude was spawned; session: claude was spawned."
+        },
+        "outcome": {
+          "$ref": "#/$defs/outcome_value"
+        },
+        "end_reason": {
+          "$ref": "#/$defs/end_reason"
+        },
+        "exit_code": {
+          "type": "integer",
+          "description": "The run's outcome code (interface.md, Outcome mapping), which is also the exit code of exec, resume and wait; 22 for a wait timeout."
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "report": {
+          "$ref": "#/$defs/report"
+        },
+        "session_started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "description": "When the run's first SessionStart hook was recorded; null if none was seen (launch-phase ends, pending runs, claude gone before SessionStart)."
+        },
+        "cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Headless: the sum of total_cost_usd over all result objects of the run; null for interactive runs and launch-phase ends."
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Human-readable detail: launch-phase hint, or a pre-launch hook's stderr (control characters stripped, capped at 2 KiB). Never agent text."
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Non-fatal warnings (e.g. unknown kind fell back to the review profile; third-party-reading run not sandboxed)."
+        }
+      },
+      "allOf": [
+        {
+          "$ref": "#/$defs/outcome_rules"
+        },
+        {
+          "$ref": "#/$defs/exit_code_rules"
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "end_reason": {
+                "type": "null"
+              },
+              "exit_code": {
+                "const": 22
+              }
+            }
+          }
+        }
+      ],
+      "required": [
+        "csession_id",
+        "run",
+        "forked_from",
+        "claude_session_id",
+        "phase",
+        "outcome",
+        "end_reason",
+        "exit_code",
+        "state",
+        "report",
+        "session_started_at",
+        "cost_usd",
+        "message",
+        "warnings"
+      ]
+    }
+  }
+}

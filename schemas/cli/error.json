@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/error.json",
+  "title": "Error envelope (any command with --json)",
+  "description": "Printed on stdout for exits 1, 2, 10, 20 and 21 (any command, including wait when the session is forgotten mid-wait), for exit 12 with code schema_newer or failed (any command), and by start for exit 12 with code launch_failed. Not printed by --dry-run, which prints the plan for exits 0, 12 and 20.",
+  "type": "object",
+  "properties": {
+    "error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "usage",
+            "not_found",
+            "ambiguous",
+            "refused",
+            "launch_failed",
+            "failed",
+            "schema_newer",
+            "internal"
+          ],
+          "description": "usage (exit 2; also an invalid config, with detail), not_found (10), ambiguous (21), refused (20), launch_failed (12; start, a launch-validation failure), failed (12; an operational failure outside a launch, e.g. cron install without crontab, transcript read errors; an outcome-file write failure is only a warning), schema_newer (12; the database schema is newer than this claude-session, checked first by every command), internal (1)."
+        },
+        "message": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "live",
+            "tainted",
+            "already_adopted",
+            "expired"
+          ],
+          "description": "Refusal reason; required when code is refused (exit 20)."
+        },
+        "matches": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^cs-[a-z2-7]{8}$",
+            "description": "csession_id"
+          },
+          "description": "Candidates for an ambiguous prefix (exit 21)."
+        },
+        "csession_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^cs-[a-z2-7]{8}$",
+          "description": "For launch_failed: the session whose run ended not-started (never null then)."
+        },
+        "run": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "For launch_failed: the run that ended not-started."
+        },
+        "end_reason": {
+          "$ref": "outcome.json#/$defs/start_failure_end_reason",
+          "description": "Launch-validation end_reason; required when code is launch_failed."
+        },
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "How to fix the cause (e.g. install command); required (nullable) when code is launch_failed."
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "For failed: what failed (e.g. the operation and errno); for usage: e.g. the config validation error. Never agent text."
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "refused"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "ambiguous"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "matches"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "launch_failed"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "end_reason",
+              "hint",
+              "csession_id",
+              "run"
+            ],
+            "properties": {
+              "csession_id": {
+                "type": "string",
+                "pattern": "^cs-[a-z2-7]{8}$",
+                "description": "csession_id"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "required": [
+    "error"
+  ],
+  "additionalProperties": false
+}

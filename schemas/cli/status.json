@@ -1,0 +1,657 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/status.json",
+  "title": "claude-session status --json",
+  "description": "status runs the inline liveness check and may finalize a run; it never runs hooks (the final event is delivered by the next delivering command or by reconcile).",
+  "type": "object",
+  "properties": {
+    "csession_id": {
+      "type": "string",
+      "pattern": "^cs-[a-z2-7]{8}$",
+      "description": "csession_id"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "launch_kind": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "run_kind": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "description": "Kind of the current run."
+    },
+    "state": {
+      "$ref": "outcome.json#/$defs/state"
+    },
+    "activity": {
+      "$ref": "outcome.json#/$defs/activity"
+    },
+    "needs_input_reason": {
+      "$ref": "outcome.json#/$defs/needs_input_reason"
+    },
+    "live": {
+      "type": "boolean"
+    },
+    "tainted": {
+      "type": "boolean"
+    },
+    "tainted_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "tainted_by_run": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "forked_from": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+        "description": "key=value; split at the first '='."
+      },
+      "description": "Multiset of key=value pairs, verbatim."
+    },
+    "repo": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Repo id host/<full project path> (no . or .. segments)."
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "interactive",
+        "headless"
+      ]
+    },
+    "current_run": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "start creates run 1 as a pending run; start --resume creates run n as a pending run. A pending run has no wrapper until exec --session-id adopts it."
+    },
+    "pending": {
+      "type": "boolean",
+      "description": "true while the current run is pending (created by start, not yet adopted)."
+    },
+    "expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "description": "For a pending current run: when it ends not-started (never_adopted) unless adopted; null otherwise."
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "sessions.updated_at: time of the last change to the session record (state, activity, report, run, labels, taint)."
+    },
+    "csession_dir": {
+      "type": "string"
+    },
+    "claude_session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Latest captured Claude Code session id."
+    },
+    "claude_session_ids": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "claude_session_id": {
+            "type": "string"
+          },
+          "run": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "startup",
+              "resume",
+              "fork",
+              "clear",
+              "compact",
+              "other"
+            ],
+            "description": "Claude Code SessionStart source."
+          },
+          "transcript_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "seen_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "claude_session_id",
+          "run",
+          "source",
+          "transcript_path",
+          "seen_at"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "run": {
+      "type": "object",
+      "properties": {
+        "run": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_kind": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        },
+        "reads_third_party": {
+          "type": "boolean"
+        },
+        "implicit_done": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "interactive",
+            "headless"
+          ]
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Resolved cwd of the run; a resume always reuses it; a fork reuses it unless given --cwd."
+        },
+        "repo": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Repo id host/<full project path> (no . or .. segments)."
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skill": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "has_prompt": {
+          "type": "boolean"
+        },
+        "sandbox": {
+          "type": "string",
+          "enum": [
+            "required",
+            "preferred",
+            "off"
+          ]
+        },
+        "sandbox_active": {
+          "type": "boolean",
+          "description": "Sandbox mode is not off AND its prerequisites were present at launch (Linux/WSL2: bwrap and socat resolved and user namespaces usable; macOS: sandbox-exec present) AND the socket path fits. false for a pending run."
+        },
+        "permission_profile": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^([A-Za-z0-9][A-Za-z0-9_-]{0,63}|file:[0-9a-f]{12,64})$",
+          "description": "Profile name from config, or file:<sha256 prefix> for a profile file (snapshotted at launch)."
+        },
+        "decision_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Decision ids from --decision-id and from pre-launch hook stdout."
+        },
+        "input_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Basenames of this run's input files ($CSESSION_DIR/inputs/<run>/), including inputs carried from a not-started previous run or copied from a fork source."
+        },
+        "pending": {
+          "type": "boolean",
+          "description": "true while the run is created by start and not yet adopted by exec --session-id (no wrapper)."
+        },
+        "expires_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "description": "For a pending run: when it ends not-started (never_adopted) if not adopted (lost_grace); null otherwise."
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "description": "When the adopting or launching exec started claude; null while pending or for a launch-phase end."
+        },
+        "session_started_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "description": "When the run's first SessionStart hook was recorded; null if none was seen (launch-phase ends, pending runs, claude gone before SessionStart)."
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "state": {
+          "$ref": "outcome.json#/$defs/state",
+          "description": "The run's own state: its final state once ended, else the session's current state."
+        },
+        "phase": {
+          "type": "string",
+          "enum": [
+            "launch",
+            "session"
+          ],
+          "description": "launch until claude is spawned (pending runs and launch-phase ends); session afterwards."
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Launch hint or pre-launch hook stderr (control characters stripped, capped at 2 KiB); never agent text."
+        },
+        "stop_requested_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "description": "When stop was requested for this run; null if never."
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Warnings recorded for this run (launch, adoption, supervision)."
+        },
+        "state_since": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "wrapper_pid": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "wrapper_alive": {
+          "type": "boolean"
+        },
+        "child_pid": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "child_alive": {
+          "type": "boolean"
+        },
+        "backstop_used": {
+          "type": "boolean"
+        },
+        "report": {
+          "$ref": "outcome.json#/$defs/report"
+        },
+        "outcome": {
+          "$ref": "outcome.json#/$defs/outcome_value"
+        },
+        "end_reason": {
+          "$ref": "outcome.json#/$defs/end_reason"
+        },
+        "session_end_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The reason field of Claude Code's SessionEnd hook, verbatim; null if none was seen."
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "The outcome exit code of this run (interface.md, Outcome mapping); null while live."
+        },
+        "result_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Headless stream-json output (private/<id>/runs/<n>/result.json, one JSON object per line); null for interactive runs."
+        },
+        "cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Headless: the sum of total_cost_usd over all result objects of the run; null for interactive runs and launch-phase ends."
+        },
+        "num_turns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Headless: the sum of num_turns over all result objects."
+        },
+        "is_error": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Headless: is_error of the final result object."
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "outcome.json#/$defs/outcome_rules"
+        },
+        {
+          "$ref": "outcome.json#/$defs/exit_code_rules"
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ended_at": {
+                "type": "null"
+              },
+              "exit_code": {
+                "type": "null"
+              },
+              "end_reason": {
+                "type": "null"
+              },
+              "state": {
+                "enum": [
+                  "starting",
+                  "working",
+                  "idle",
+                  "needs-input",
+                  "reported"
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "ended_at": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "pending": {
+                "const": true
+              }
+            },
+            "required": [
+              "pending"
+            ]
+          },
+          "then": {
+            "properties": {
+              "phase": {
+                "const": "launch"
+              },
+              "state": {
+                "const": "starting"
+              },
+              "expires_at": {
+                "type": "string"
+              },
+              "started_at": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "required": [
+        "run",
+        "run_kind",
+        "reads_third_party",
+        "implicit_done",
+        "mode",
+        "cwd",
+        "repo",
+        "model",
+        "skill",
+        "has_prompt",
+        "sandbox",
+        "sandbox_active",
+        "permission_profile",
+        "decision_ids",
+        "input_files",
+        "pending",
+        "expires_at",
+        "started_at",
+        "session_started_at",
+        "ended_at",
+        "state",
+        "phase",
+        "message",
+        "stop_requested_at",
+        "warnings",
+        "state_since",
+        "wrapper_pid",
+        "wrapper_alive",
+        "child_pid",
+        "child_alive",
+        "backstop_used",
+        "report",
+        "outcome",
+        "end_reason",
+        "session_end_reason",
+        "exit_code",
+        "result_path",
+        "cost_usd",
+        "num_turns",
+        "is_error"
+      ],
+      "description": "The current run (possibly pending), or the run selected with --run."
+    },
+    "runs": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "recent_events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "event_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "event_ts": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the state change happened."
+          },
+          "run": {
+            "type": "integer"
+          },
+          "from_state": {
+            "$ref": "outcome.json#/$defs/state_or_null"
+          },
+          "to_state": {
+            "$ref": "outcome.json#/$defs/state"
+          },
+          "from_activity": {
+            "$ref": "outcome.json#/$defs/activity"
+          },
+          "to_activity": {
+            "$ref": "outcome.json#/$defs/activity"
+          },
+          "needs_input_reason": {
+            "$ref": "outcome.json#/$defs/needs_input_reason"
+          },
+          "cause": {
+            "$ref": "outcome.json#/$defs/cause"
+          },
+          "final": {
+            "type": "boolean",
+            "description": "true for the run's final event (to_state is final)."
+          },
+          "delivered": {
+            "type": "boolean",
+            "description": "Whether post-state-change hooks have been run for this event (in order, at least once; when the run has no live wrapper, by the next delivering command or reconcile; status and list never deliver)."
+          }
+        },
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "final": {
+                  "const": true
+                }
+              },
+              "required": [
+                "final"
+              ]
+            },
+            "then": {
+              "properties": {
+                "to_state": {
+                  "enum": [
+                    "exited",
+                    "exited-unreported",
+                    "killed",
+                    "timeout",
+                    "lost",
+                    "not-started"
+                  ]
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "to_state": {
+                  "enum": [
+                    "starting",
+                    "working",
+                    "idle",
+                    "needs-input",
+                    "reported"
+                  ]
+                }
+              }
+            }
+          }
+        ],
+        "required": [
+          "event_id",
+          "event_ts",
+          "run",
+          "from_state",
+          "to_state",
+          "from_activity",
+          "to_activity",
+          "needs_input_reason",
+          "cause",
+          "final",
+          "delivered"
+        ]
+      },
+      "maxItems": 20
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Warnings found by this status call (e.g. a live run's recorded hook interpreter path no longer exists after an upgrade)."
+    }
+  },
+  "required": [
+    "csession_id",
+    "created_at",
+    "launch_kind",
+    "run_kind",
+    "state",
+    "activity",
+    "needs_input_reason",
+    "live",
+    "tainted",
+    "tainted_at",
+    "tainted_by_run",
+    "forked_from",
+    "labels",
+    "repo",
+    "mode",
+    "current_run",
+    "pending",
+    "expires_at",
+    "updated_at",
+    "csession_dir",
+    "claude_session_id",
+    "claude_session_ids",
+    "run",
+    "runs",
+    "recent_events",
+    "warnings"
+  ],
+  "additionalProperties": false
+}

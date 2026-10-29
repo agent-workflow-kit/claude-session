@@ -26,16 +26,15 @@ standalone: no harness, bus, shared library or shared contracts package is requi
 - Run `make verify` before every commit.
 - All subprocess and HTTP calls go through `src/claude_session/gateway.py` so tests can substitute fakes.
 - Never run destructive git commands (reset, checkout --, clean, restore, forced push) and never
-  kill processes by pattern; signal only exact, verified PIDs this tool started.
+  kill processes by pattern; signal only exact verified PIDs this tool started, plus the process
+  groups of hooks this tool spawned.
 - Minimize dependencies; justify each one in `docs/design.md`.
 
 ## Workflow
 
-1. Start with a design session that resolves the open topics in `docs/design.md`.
-2. Write `docs/interface.md` and `schemas/`.
-3. Implement test-first.
-
-The first task of the design session is the spike in architecture §8.6: empirically confirm each listed `claude` behavior and record the results in `docs/design.md` before designing the interface.
+1. The design session is done: `docs/design.md` (decisions, spike results), `docs/interface.md` and `schemas/` are the contract.
+2. Implement test-first, following `docs/plan.md` and the repo's GitHub issues.
+3. Claude Code behavior this tool relies on is covered by `live` tests (`make live`, never in CI); run them after every Claude Code upgrade.
 
 ## Repository workflow
 

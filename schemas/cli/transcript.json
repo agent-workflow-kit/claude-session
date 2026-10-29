@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/transcript.json",
+  "title": "claude-session transcript --paths --json",
+  "description": "Paths only; transcript content is never embedded in JSON output. Transcript files are untrusted.",
+  "type": "object",
+  "properties": {
+    "csession_id": {
+      "type": "string",
+      "pattern": "^cs-[a-z2-7]{8}$",
+      "description": "csession_id"
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "claude_session_id": {
+            "type": "string"
+          },
+          "run": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "startup",
+              "resume",
+              "fork",
+              "clear",
+              "compact",
+              "other"
+            ],
+            "description": "Claude Code SessionStart source."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exists": {
+            "type": "boolean"
+          },
+          "subagents": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "agent_id": {
+                  "type": "string"
+                },
+                "agent_type": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "description": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Written by the model; untrusted.",
+                  "x-untrusted": true
+                },
+                "tool_use_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "path": {
+                  "type": "string"
+                },
+                "exists": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "agent_id",
+                "agent_type",
+                "description",
+                "tool_use_id",
+                "path",
+                "exists"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "claude_session_id",
+          "run",
+          "source",
+          "path",
+          "exists",
+          "subagents"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "csession_id",
+    "files"
+  ],
+  "additionalProperties": false
+}

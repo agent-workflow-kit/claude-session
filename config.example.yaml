@@ -1,2 +1,356 @@
-# Example config for claude-session. Location: ~/.config/claude-session/config.yaml (drop-ins: config.d/*.yaml). Keys are defined in docs/interface.md once designed.
-hooks: {}
+# claude-session example config: every key with its built-in default.
+# Location: ~/.config/claude-session/config.yaml (drop-ins: config.d/*.yaml, merged after it).
+# Environment overrides: CSESSION_<KEY>, e.g. CSESSION_CLAUDE_BIN, CSESSION_RETENTION_DAYS. They apply
+# only to these top-level scalar keys: claude_bin, default_kind, min_claude_version,
+# summary_max_bytes, artifact_max_bytes, input_max_bytes, notes_context_timeout, notes_context_max_bytes,
+# retention_days, lost_grace, auto_exit_delay, kill_grace, poll_interval, session_start_timeout
+# (durations accept bare numbers of seconds, e.g. CSESSION_KILL_GRACE=15). Everything else (kinds,
+# permission_profiles, repos, hooks, secret_env, claude_auth_env, claude_args, notes_context_cmd,
+# notes_context_sources, me) cannot be set from the environment.
+# Precedence for top-level scalars: flags > environment > config > built-in defaults.
+# Precedence for kind settings: flags > previous run's stored flags > per-repo override > config kind
+# > built-in kind.
+# Merging: maps are deep-merged; lists are replaced, except hooks.* lists, which append.
+# Durations: seconds as a non-negative number, or <number><unit> with unit ms, s, m, h or d
+# ("90s", "10m", "0.5s"); null or "none" means no bound where allowed.
+# Quote "off" (YAML 1.1 parsers read a bare off as false).
+
+# The claude executable, resolved on the session's PATH (set an absolute path for cron).
+claude_bin: claude
+
+# Minimum Claude Code version (claude --version) a launch accepts; an older claude fails the launch
+# (exit 12, end_reason claude_too_old). Built-in: the version the spike verified.
+min_claude_version: "2.1.312"
+
+# Kind used when --kind is omitted. Kind names: ^[a-z0-9][a-z0-9_-]{0,63}$.
+default_kind: implement
+
+# Extra variable names always passed to sessions for Claude Code's own authentication
+# (added to the built-in list: ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL,
+# ANTHROPIC_MODEL, CLAUDE_CODE_USE_BEDROCK, CLAUDE_CODE_USE_VERTEX; AWS_* only when
+# CLAUDE_CODE_USE_BEDROCK is set; GOOGLE_*, CLOUD_ML_REGION and ANTHROPIC_VERTEX_PROJECT_ID
+# only when CLAUDE_CODE_USE_VERTEX is set). A report containing the value (8+ characters) of
+# any passed auth or secret_env variable is rejected (contains_secret).
+claude_auth_env: []
+
+# Variables stripped from every session unless a kind's env.allow in config names them exactly
+# (e.g. notification webhooks, ticket tokens). Per-call --env-allow cannot unlock them.
+secret_env: []
+
+# Session-start notes context (kinds with notes_context: true). argv list, no shell;
+# claude-session appends --repo=<repo-id> (one token) and one --label key=value per session label.
+# Exit 0 and 10 are success; other exits are logged at warn and the session starts without notes.
+notes_context_cmd: [memoctl, context]
+notes_context_timeout: 5s
+notes_context_max_bytes: 16384
+notes_context_sources: [startup]   # SessionStart sources: startup, resume, fork, clear, compact, other
+
+summary_max_bytes: 65536      # cap for a report summary and reason (UTF-8 bytes each)
+artifact_max_bytes: 10485760  # cap for a reported artifact (10 MiB)
+input_max_bytes: 10485760     # cap for each --prompt-file and --input-file (10 MiB); larger exits 2
+retention_days: 30            # after forget, before reconcile deletes the session
+lost_grace: 10m               # a pending run never adopted ends not-started (never_adopted)
+auto_exit_delay: 2s
+kill_grace: 10s               # SIGTERM, then SIGKILL; default stop --grace; hook timeout kill
+poll_interval: 0.5s
+session_start_timeout: 120s   # headless: warn when no SessionStart arrives (hooks suppressed?)
+
+# Hooks. Selectors (all optional, combined with AND): kinds, exclude_kinds,
+# labels (all must match), and for post-state-change only, states.
+# timeout defaults to 30s; on timeout the hook's process group gets SIGTERM, then SIGKILL
+# after kill_grace. A pre-launch timeout is a veto (end_reason hook_timeout).
+# Each cmd runs as sh -c <cmd> in its own process group, with the state root as its cwd, the
+# sanitized PATH, and CSESSION_HOOK, CSESSION_ID and CSESSION_OBJECT_TYPE set.
+# pre-launch: synchronous, in order, no async. Exit 0 continues; 13 escalates (later hooks still
+# run); other non-zero vetoes at once. Stdout may be {"decision_id": "..."} (or a list).
+# A pre-launch hook that launches sessions must give them a shorter --timeout than its own, and
+# its entry must exclude the kinds it launches (exclude_kinds) so it does not run for them.
+# post-state-change fires on every turn (working <-> idle), at least once per event (deduplicate on
+# event_id): filter with states. Late delivery uses the current config's entries.
+hooks:
+  pre-launch: []
+  #  - cmd: "gatectl check launch-session --timeout 540"
+  #    timeout: 600                  # gate hooks need an explicit longer timeout
+  #    exclude_kinds: [gate-check]   # gatectl launches gate-check sessions: prevents recursion
+  post-state-change: []
+  #  - cmd: "notice-route send --source claude-session --stdin-json"
+  #    async: true
+  #    states: [needs-input, exited, exited-unreported, killed, timeout, lost, not-started]
+
+me: {}
+#  name: your-name             # default actor human:<name> when stdin is a TTY (default: OS username)
+
+# Kind profiles. Entries here are merged over the built-in kinds shown below; every field of
+# every built-in kind is listed. A new kind name starts from the built-in review kind's fields. An
+# unknown --kind name gets the full review profile (with a warning).
+# implicit_done: a clean headless exit without a report counts as done (report.implicit: true);
+# false gives exited-unreported (end_reason no_report).
+kinds:
+  implement:
+    permission_profile: default
+    sandbox: "off"
+    reads_third_party: false
+    implicit_done: true
+    setting_sources: [user, project, local]
+    mcp: inherit
+    cwd: caller
+    env: {inherit: true, allow: [], set: {}, path_prepend: []}
+    read_dirs: []
+    write_dirs: []
+    timeout: 60m                # headless runs; interactive runs use interactive_timeout
+    interactive_timeout: null
+    max_turns: null
+    auto_exit: true
+    backstop: true
+    notes_context: true
+    model: null
+    claude_args: []             # trusted kinds: any claude flags; isolated runs: only --verbose, --debug
+  draft-ticket:
+    permission_profile: default
+    sandbox: "off"
+    reads_third_party: false
+    implicit_done: true
+    setting_sources: [user, project, local]
+    mcp: inherit
+    cwd: caller
+    env: {inherit: true, allow: [], set: {}, path_prepend: []}
+    read_dirs: []
+    write_dirs: []
+    timeout: 60m
+    interactive_timeout: null
+    max_turns: null
+    auto_exit: true
+    backstop: true
+    notes_context: true
+    model: null
+    claude_args: []
+  audit:
+    permission_profile: default
+    sandbox: "off"
+    reads_third_party: false
+    implicit_done: true
+    setting_sources: [user, project, local]
+    mcp: inherit
+    cwd: caller
+    env: {inherit: true, allow: [], set: {}, path_prepend: []}
+    read_dirs: []
+    write_dirs: []
+    timeout: 60m
+    interactive_timeout: null
+    max_turns: null
+    auto_exit: true
+    backstop: true
+    notes_context: false
+    model: null
+    claude_args: []
+  improve:
+    permission_profile: default
+    sandbox: "off"
+    reads_third_party: false
+    implicit_done: true
+    setting_sources: [user, project, local]
+    mcp: inherit
+    cwd: caller
+    env: {inherit: true, allow: [], set: {}, path_prepend: []}
+    read_dirs: []
+    write_dirs: []
+    timeout: 60m
+    interactive_timeout: null
+    max_turns: null
+    auto_exit: true
+    backstop: true
+    notes_context: false
+    model: null
+    claude_args: []
+  rank:
+    permission_profile: readonly
+    sandbox: preferred          # isolated when a sandbox is available; never fails for lack of one
+    reads_third_party: false
+    implicit_done: false        # a ranking must be reported explicitly
+    setting_sources: []
+    mcp: none
+    cwd: session-dir            # $CSESSION_DIR/work/
+    env: {inherit: false, allow: [], set: {}, path_prepend: []}
+    read_dirs: []
+    write_dirs: []
+    timeout: 15m
+    interactive_timeout: null
+    max_turns: null
+    auto_exit: true
+    backstop: true
+    notes_context: false
+    model: null
+    claude_args: []
+  review:
+    permission_profile: review
+    sandbox: required
+    reads_third_party: true
+    implicit_done: true
+    setting_sources: []
+    mcp: none
+    cwd: session-dir            # $CSESSION_DIR/work/
+    env: {inherit: false, allow: [], set: {}, path_prepend: []}
+    read_dirs: []
+    write_dirs: []
+    timeout: 120m
+    interactive_timeout: null
+    max_turns: null
+    auto_exit: true
+    backstop: true
+    notes_context: false
+    model: null
+    claude_args: []
+  gate-check:
+    permission_profile: review
+    sandbox: required
+    reads_third_party: true
+    implicit_done: false        # a gate verdict must be reported explicitly
+    setting_sources: []
+    mcp: none
+    cwd: session-dir            # $CSESSION_DIR/work/
+    env: {inherit: false, allow: [], set: {}, path_prepend: []}
+    read_dirs: []
+    write_dirs: []
+    timeout: 15m
+    interactive_timeout: null
+    max_turns: null
+    auto_exit: true
+    backstop: true
+    notes_context: false
+    model: null
+    claude_args: []
+  respond:
+    permission_profile: respond
+    sandbox: required
+    reads_third_party: true
+    implicit_done: true
+    setting_sources: []
+    mcp: none
+    cwd: caller                 # requires a git cwd (else end_reason no_git_cwd); the agent edits
+                                # but never commits: the git dir is read-only, the caller commits.
+                                # A caller may fork into another directory (--fork --cwd <dir>)
+    env:
+      inherit: false
+      allow: []
+      set:
+        GIT_CONFIG_GLOBAL: "${CSESSION_DIR}/empty-gitconfig"
+        GIT_CONFIG_NOSYSTEM: "1"
+      path_prepend: []
+    read_dirs: []                # add toolchains the repo's tests need, e.g. ~/.nvm/versions/node:
+                                 # isolated runs can read only /usr, /bin, /lib*, /etc and a
+                                 # generated list, so anything else (under $HOME, /opt or
+                                 # elsewhere) must be listed here
+    write_dirs: []               # prefer per-session caches via env.set (see repos below)
+    timeout: 60m
+    interactive_timeout: null
+    max_turns: null
+    auto_exit: true
+    backstop: true
+    notes_context: false
+    model: null
+    claude_args: []
+
+# Permission profiles: Claude Code settings fragments (permissions and sandbox only).
+# Names: ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$. Variables: ${CSESSION_DIR}, ${CWD}, ${HOME}, ${GIT_DIR}.
+# Absolute paths in rules use "//" ("/${CSESSION_DIR}" expands to "//abs/path").
+# Profiles carry only kind-specific rules. claude-session generates, for EVERY run: --add-dir
+# $CSESSION_DIR; allow Bash(claude-session report:*) and Bash(<absolute claude-session path> report:*);
+# Read of $CSESSION_DIR; Edit and Write allow rules for $CSESSION_DIR/artifacts, outbox and (when it
+# is the cwd) work; Edit and Write denies for the protected session files and the private directory;
+# an explicit permissions.defaultMode (dontAsk for isolated runs; for trusted runs the profile's
+# mode, else default when setting_sources excludes user).
+# For isolated (third-party-reading or sandboxed) runs it also generates, overriding profile
+# content: deny-root reads (sandbox denyRead ["/"] plus a generated allowRead list: the cwd,
+# $CSESSION_DIR, /usr, /bin, /sbin, /lib, /lib32, /lib64, /etc, the bwrap/socat/git/claude
+# directories, claude-session's install and Python, read_dirs, plugin dirs, env.path_prepend dirs
+# and the resolved git dir; generated entries pass the read_dirs refusal checks, else the launch
+# fails with unsafe_read_dir; the private TMPDIR is in allowWrite only), plugin directories via
+# --add-dir as read-only, Edit/Write denies for .claude/**, .mcp.json, CLAUDE.md and
+# CLAUDE.local.md (top-level and **/) under $CSESSION_DIR and every --add-dir, and
+# (third-party-reading runs)
+# - always: sandbox denyWrite and Edit/Write denies for the concrete ${CWD}/.git;
+# - when a git dir was resolved: ${GIT_DIR} and a linked worktree's gitdir are READ-ONLY (sandbox
+# allowRead plus denyWrite of the whole directory, and Edit/Write denies); GIT_OPTIONAL_LOCKS=0;
+# - when the cwd has no git dir (isolated runs): write denies for ${CWD}/.git and ${CWD}/.git/**;
+# - GIT_CONFIG_COUNT/KEY/VALUE in claude's environment neutralizing core.fsmonitor,
+# core.hooksPath, core.sshCommand, credential.helper, diff.external and core.pager;
+# - Claude project config: sandbox write denies for ${CWD}/.claude, .mcp.json, CLAUDE.md and
+# CLAUDE.local.md; Edit/Write denies for those and for //${CWD}/**/.claude/**,
+# //${CWD}/**/.mcp.json, //${CWD}/**/CLAUDE.md and //${CWD}/**/CLAUDE.local.md.
+# Isolated profiles may not set sandbox.enabled, sandbox.failIfUnavailable,
+# sandbox.allowUnsandboxedCommands, sandbox.excludedCommands or
+# permissions.additionalDirectories, sandbox.autoAllowBashIfSandboxed: true, and their defaultMode is ignored (always dontAsk). A profile
+# rule whose variable expands empty fails the launch. A path a profile makes writable is checked
+# against the unsafe write targets (docs/interface.md, Path rules).
+# Trusted (non-isolated) runs may set any permission mode, including bypassPermissions.
+permission_profiles:
+  default: {}
+  readonly:
+    permissions:
+      allow:
+        - "Agent"
+        - "Task"
+        - "Skill"
+      deny:
+        - "WebFetch"
+        - "WebSearch"
+        - "mcp__*"
+        - "Bash(gh:*)"
+        - "Bash(glab:*)"
+        - "Bash(agent-spawn:*)"
+        - "Bash(memoctl add:*)"
+  review:
+    permissions:
+      allow:
+        - "Agent"
+        - "Task"
+        - "Skill"
+      deny:
+        - "WebFetch"
+        - "WebSearch"
+        - "mcp__*"
+        - "Bash(gh:*)"
+        - "Bash(glab:*)"
+        - "Bash(agent-spawn:*)"
+        - "Bash(memoctl add:*)"
+    sandbox:
+      network: {allowedDomains: []}
+  respond:
+    permissions:
+      allow:
+        - "Bash"
+        - "Read"
+        - "Edit(/${CWD}/**)"
+        - "Write(/${CWD}/**)"
+        - "Agent"
+        - "Task"
+        - "Skill"
+      deny:
+        - "Bash(git push:*)"
+        - "Bash(git remote:*)"
+        - "Bash(git config:*)"
+        - "Bash(git credential:*)"
+        - "Bash(gh:*)"
+        - "Bash(glab:*)"
+        - "Bash(agent-spawn:*)"
+        - "Bash(memoctl add:*)"
+        - "WebFetch"
+        - "WebSearch"
+        - "mcp__*"
+    sandbox:
+      network: {allowedDomains: []}
+
+# Per-repo overrides, keyed by repo id: lowercase host, :port only for a non-default port, then
+# /-separated path segments (never . or ..). reads_third_party cannot be overridden here.
+# read_dirs/write_dirs may name paths in the session's own $CSESSION_DIR and private tmpdir;
+# write_dirs under $CSESSION_DIR must be inside outbox/, artifacts/ or work/ and are created
+# before launch; other write_dirs must exist (missing: warning, skipped).
+repos: {}
+#  github.com/example-org/example-repo:
+#    kinds:
+#      respond:
+#        read_dirs: ["~/.nvm/versions/node"]
+#        write_dirs: ["${CSESSION_DIR}/work/.npm-cache"]   # created before launch
+#        env:
+#          set:
+#            npm_config_cache: "${CSESSION_DIR}/work/.npm-cache"   # per-session, not shared ~/.npm

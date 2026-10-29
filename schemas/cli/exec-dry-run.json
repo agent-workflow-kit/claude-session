@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/exec-dry-run.json",
+  "title": "claude-session exec|resume|start --dry-run --json",
+  "description": "Printed for exit 0, 12 (would_fail set, would_refuse null) and 20 (would_refuse set; checked first). A dry run allocates nothing, runs no hooks and never finalizes a run. schema_newer and failed still print the error envelope.",
+  "type": "object",
+  "properties": {
+    "dry_run": {
+      "const": true
+    },
+    "csession_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^cs-[a-z2-7]{8}$",
+      "description": "The session the plan applies to: null when a real launch would allocate a new session (a new session or a fork); the existing id for resume, start --resume without --fork, or an inspected start record (exec --session-id)."
+    },
+    "run": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The run number a real launch would create or adopt (1 for a new session or fork)."
+    },
+    "fork": {
+      "type": "boolean"
+    },
+    "forked_from": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^cs-[a-z2-7]{8}$",
+      "description": "Source session for --fork; else null."
+    },
+    "launch_kind": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "run_kind": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+        "description": "key=value; split at the first '='."
+      },
+      "description": "Labels the session would have after the launch."
+    },
+    "taints": {
+      "type": "boolean",
+      "description": "Whether the launch would taint the session (third-party-reading run)."
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "interactive",
+        "headless"
+      ]
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "repo": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Repo id host/<full project path> (no . or .. segments)."
+    },
+    "skill": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "has_prompt": {
+      "type": "boolean",
+      "description": "Whether a prompt would be delivered (given now or carried from a not-started previous run)."
+    },
+    "input_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Basenames the run would get in $CSESSION_DIR/inputs/<run>/."
+    },
+    "implicit_done": {
+      "type": "boolean"
+    },
+    "permission_profile": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^([A-Za-z0-9][A-Za-z0-9_-]{0,63}|file:[0-9a-f]{12,64})$",
+      "description": "Profile name from config, or file:<sha256 prefix> for a profile file (snapshotted at launch)."
+    },
+    "timeout": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "description": "Effective wall-clock bound in seconds for the run's mode; null for none."
+    },
+    "max_turns": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "actor": {
+      "type": "string",
+      "description": "Effective actor."
+    },
+    "override_escalation": {
+      "type": "boolean"
+    },
+    "allow_tainted": {
+      "type": "boolean"
+    },
+    "sandbox_lowered": {
+      "type": "boolean",
+      "description": "true when the run is third-party-reading and its resolved sandbox mode is below required (whatever the origin); a real launch audits it at adoption and warns."
+    },
+    "config_hash_changed": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "exec --session-id --dry-run: whether the current config hash differs from the one start froze; null otherwise."
+    },
+    "profile": {
+      "$ref": "kinds.json#/$defs/profile",
+      "description": "Effective kind profile."
+    },
+    "origins": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "enum": [
+          "builtin",
+          "config",
+          "repo",
+          "previous_run",
+          "flag",
+          "flag-implied",
+          "derived"
+        ],
+        "description": "flag-implied: set by --reads-third-party (sandbox, setting_sources, mcp, env.inherit). derived: the repo id derived from the origin remote of the caller's cwd (or --cwd); never for kinds whose cwd is session-dir."
+      },
+      "description": "For every resolved setting, where its value came from."
+    },
+    "settings": {
+      "type": "object",
+      "description": "The generated Claude Code settings (hooks, permissions, sandbox)."
+    },
+    "claude_argv": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "argv for claude; session paths shown as they would be created."
+    },
+    "env_names": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Names of variables the session would receive. Values are never printed."
+    },
+    "sandbox": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "required",
+            "preferred",
+            "off"
+          ]
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "problems": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_read": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_write": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny_read": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny_write": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "mode",
+        "available",
+        "problems",
+        "allow_read",
+        "allow_write",
+        "deny_read",
+        "deny_write"
+      ],
+      "additionalProperties": false
+    },
+    "hooks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "hook": {
+            "enum": [
+              "pre-launch",
+              "post-state-change"
+            ]
+          },
+          "cmd": {
+            "type": "string"
+          },
+          "timeout": {
+            "type": "number",
+            "description": "Effective timeout in seconds."
+          },
+          "source": {
+            "enum": [
+              "config",
+              "flag"
+            ],
+            "description": "config: a configured entry; flag: a per-invocation --hook entry."
+          },
+          "selected": {
+            "type": "boolean",
+            "description": "Whether the entry's selectors match this run."
+          }
+        },
+        "required": [
+          "hook",
+          "cmd",
+          "timeout",
+          "source",
+          "selected"
+        ],
+        "additionalProperties": false
+      },
+      "description": "Configured and per-invocation hook entries; hooks are not run by a dry run."
+    },
+    "would_refuse": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "live",
+        "tainted",
+        "already_adopted",
+        "expired",
+        null
+      ],
+      "description": "Refusal a real launch would hit (exit 20), else null."
+    },
+    "would_fail": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "outcome.json#/$defs/validation_end_reason"
+        }
+      ],
+      "description": "Launch-validation end_reason a real launch would hit, else null. Reported also when would_refuse is set (the refusal decides the exit: 20). Never a hook end_reason (hooks are not run)."
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Non-fatal warnings (e.g. unknown kind fell back to the review profile; third-party-reading run not sandboxed)."
+    }
+  },
+  "required": [
+    "dry_run",
+    "csession_id",
+    "run",
+    "fork",
+    "forked_from",
+    "launch_kind",
+    "run_kind",
+    "labels",
+    "taints",
+    "mode",
+    "cwd",
+    "repo",
+    "skill",
+    "has_prompt",
+    "input_files",
+    "implicit_done",
+    "permission_profile",
+    "timeout",
+    "max_turns",
+    "actor",
+    "override_escalation",
+    "allow_tainted",
+    "sandbox_lowered",
+    "config_hash_changed",
+    "profile",
+    "origins",
+    "settings",
+    "claude_argv",
+    "env_names",
+    "sandbox",
+    "hooks",
+    "would_refuse",
+    "would_fail",
+    "warnings"
+  ],
+  "additionalProperties": false
+}

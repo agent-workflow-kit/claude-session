@@ -1,0 +1,437 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/list.json",
+  "title": "claude-session list --json",
+  "description": "Newest first; no default limit. list never runs hooks.",
+  "type": "object",
+  "properties": {
+    "sessions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "csession_id": {
+            "type": "string",
+            "pattern": "^cs-[a-z2-7]{8}$",
+            "description": "csession_id"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "launch_kind": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+          },
+          "run_kind": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "description": "Kind of the current run."
+          },
+          "state": {
+            "$ref": "outcome.json#/$defs/state"
+          },
+          "activity": {
+            "$ref": "outcome.json#/$defs/activity"
+          },
+          "needs_input_reason": {
+            "$ref": "outcome.json#/$defs/needs_input_reason"
+          },
+          "live": {
+            "type": "boolean"
+          },
+          "tainted": {
+            "type": "boolean"
+          },
+          "tainted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "tainted_by_run": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "forked_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+              "description": "key=value; split at the first '='."
+            },
+            "description": "Multiset of key=value pairs, verbatim."
+          },
+          "repo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Repo id host/<full project path> (no . or .. segments)."
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "interactive",
+              "headless"
+            ]
+          },
+          "current_run": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "start creates run 1 as a pending run; start --resume creates run n as a pending run. A pending run has no wrapper until exec --session-id adopts it."
+          },
+          "pending": {
+            "type": "boolean",
+            "description": "true while the current run is pending (created by start, not yet adopted)."
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "For a pending current run: when it ends not-started (never_adopted) unless adopted; null otherwise."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "sessions.updated_at: time of the last change to the session record (state, activity, report, run, labels, taint)."
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "launch",
+              "session"
+            ],
+            "description": "Phase of the current run."
+          },
+          "last_outcome": {
+            "$ref": "outcome.json#/$defs/outcome_value",
+            "description": "Outcome of the current run; null while it is live."
+          },
+          "last_end_reason": {
+            "$ref": "outcome.json#/$defs/end_reason",
+            "description": "end_reason of the current run; null while it is live."
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Outcome exit code of the current run; null while it is live."
+          },
+          "report_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "done",
+              "blocked",
+              "needs-input",
+              "failed",
+              null
+            ],
+            "description": "Status of the current run's latest report; null if none (list --report-status none)."
+          }
+        },
+        "required": [
+          "csession_id",
+          "created_at",
+          "launch_kind",
+          "run_kind",
+          "state",
+          "activity",
+          "needs_input_reason",
+          "live",
+          "tainted",
+          "tainted_at",
+          "tainted_by_run",
+          "forked_from",
+          "labels",
+          "repo",
+          "mode",
+          "current_run",
+          "pending",
+          "expires_at",
+          "updated_at",
+          "phase",
+          "last_outcome",
+          "last_end_reason",
+          "exit_code",
+          "report_status"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "const": "done"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "const": 0
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "const": "blocked"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "const": 13
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "const": "needs-input"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "const": 13
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "const": "failed"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "const": 18
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "const": "exited-unreported"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "const": 14
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "const": "killed"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "const": 15
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "const": "timeout"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "const": 16
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "const": "lost"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "const": 17
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "const": "not-started"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "const": 12
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "const": "vetoed"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "const": 11
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "const": "escalated"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "const": 13
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "last_outcome": {
+                  "type": "null"
+                }
+              },
+              "required": [
+                "last_outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "exit_code": {
+                  "type": "null"
+                },
+                "last_end_reason": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "pending": {
+                  "const": true
+                }
+              },
+              "required": [
+                "pending"
+              ]
+            },
+            "then": {
+              "properties": {
+                "phase": {
+                  "const": "launch"
+                },
+                "state": {
+                  "const": "starting"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "required": [
+    "sessions"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/reconcile.json",
+  "title": "claude-session reconcile --json",
+  "description": "reconcile never signals a process (an orphaned child is ended with stop).",
+  "type": "object",
+  "properties": {
+    "already_running": {
+      "type": "boolean"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "csession_id": {
+            "type": "string",
+            "pattern": "^cs-[a-z2-7]{8}$",
+            "description": "csession_id"
+          },
+          "run": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "action": {
+            "enum": [
+              "marked_lost",
+              "marked_exited_wrapper_lost",
+              "marked_not_started",
+              "finalized_from_result",
+              "finalized_from_cause",
+              "outbox_ingested",
+              "outbox_discarded",
+              "events_delivered",
+              "tmpdir_removed",
+              "deleted"
+            ],
+            "description": "finalized_from_cause: a wrapper-lost run with a recorded pending_cause finalized per the cause table."
+          },
+          "from_state": {
+            "$ref": "outcome.json#/$defs/state_or_null"
+          },
+          "to_state": {
+            "$ref": "outcome.json#/$defs/state_or_null"
+          },
+          "outcome": {
+            "$ref": "outcome.json#/$defs/outcome_value"
+          },
+          "end_reason": {
+            "$ref": "outcome.json#/$defs/end_reason"
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "csession_id",
+          "run",
+          "action",
+          "from_state",
+          "to_state",
+          "outcome",
+          "end_reason",
+          "detail"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "orphans": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "csession_id": {
+            "type": "string",
+            "pattern": "^cs-[a-z2-7]{8}$",
+            "description": "csession_id"
+          },
+          "run": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "child_pid": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "csession_id",
+          "run",
+          "child_pid"
+        ],
+        "additionalProperties": false
+      },
+      "description": "Runs whose wrapper is gone but whose child is alive: left live (stop ends them; reconcile never signals). Not a change."
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "e.g. a live run's recorded hook interpreter path no longer exists (claude-session was upgraded with live sessions)."
+    }
+  },
+  "required": [
+    "already_running",
+    "dry_run",
+    "changes",
+    "orphans",
+    "warnings"
+  ],
+  "additionalProperties": false
+}
