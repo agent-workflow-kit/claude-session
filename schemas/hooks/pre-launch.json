@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/hooks/pre-launch.json",
+  "title": "pre-launch hook payload (stdin)",
+  "description": "Hook outcome: exit 0 continues; exit 13 escalates (remaining hooks still run; the launch exits 13, phase launch); any other non-zero exit vetoes at once (exit 11); a timeout is a veto with end_reason hook_timeout. Stderr (control characters stripped, capped at 2 KiB) becomes the outcome message. Stdout: if a JSON object, its decision_id (string or list of strings) is recorded in the run's decision_ids, the launch log event and any launch_escalation_override audit record; other keys and non-JSON stdout are ignored (logged).",
+  "type": "object",
+  "properties": {
+    "tool": {
+      "const": "claude-session"
+    },
+    "hook": {
+      "const": "pre-launch"
+    },
+    "object_type": {
+      "const": "session"
+    },
+    "object_id": {
+      "type": "string",
+      "pattern": "^cs-[a-z2-7]{8}$",
+      "description": "csession_id"
+    },
+    "repo": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Repo id host/<full project path> (no . or .. segments)."
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+        "description": "key=value; split at the first '='."
+      },
+      "description": "Multiset of key=value pairs, verbatim."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this payload was delivered (delivery is at least once; see event_ts for post-state-change)."
+    },
+    "run": {
+      "type": "integer"
+    },
+    "pending": {
+      "type": "boolean",
+      "description": "true when the run was created by start (or start --resume) and is being adopted."
+    },
+    "launch_kind": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "run_kind": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "previous_run_kind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Kind of the previous run (resume) or of the source's last run (fork); null for a new session."
+    },
+    "reads_third_party": {
+      "type": "boolean"
+    },
+    "implicit_done": {
+      "type": "boolean"
+    },
+    "auto_exit": {
+      "type": "boolean"
+    },
+    "tainted": {
+      "type": "boolean"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "interactive",
+        "headless"
+      ]
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "sandbox": {
+      "type": "string",
+      "enum": [
+        "required",
+        "preferred",
+        "off"
+      ],
+      "description": "Intended sandbox mode; whether it actually ran is reported later as sandbox_active (post-state-change, status)."
+    },
+    "permission_profile": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^([A-Za-z0-9][A-Za-z0-9_-]{0,63}|file:[0-9a-f]{12,64})$",
+      "description": "Profile name from config, or file:<sha256 prefix> for a profile file (snapshotted at launch)."
+    },
+    "setting_sources": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "user",
+          "project",
+          "local"
+        ]
+      }
+    },
+    "mcp": {
+      "enum": [
+        "inherit",
+        "none"
+      ]
+    },
+    "env_inherit": {
+      "type": "boolean"
+    },
+    "env_names": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Names (never values) of the variables the session will get."
+    },
+    "plugin_dirs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "input_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Basenames copied to $CSESSION_DIR/inputs/."
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resume": {
+      "type": "boolean"
+    },
+    "fork": {
+      "type": "boolean"
+    },
+    "forked_from": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "skill": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "has_prompt": {
+      "type": "boolean",
+      "description": "Whether a prompt file is delivered. The prompt text is never in the payload."
+    },
+    "allow_tainted": {
+      "type": "boolean"
+    },
+    "override_escalation": {
+      "type": "boolean",
+      "description": "true on a resume (or start --resume) given --override-escalation after a run that ended escalated; exactly the hook entries recorded as escalating on that run are overridden (their exit 13 counts as continue); other hooks still escalate, vetoes still veto."
+    },
+    "actor": {
+      "type": "string",
+      "description": "Effective actor: --actor, else human:<me.name> when stdin is a TTY, else auto:unknown (honor system, not authentication)."
+    },
+    "decision_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Caller-supplied --decision-id values."
+    }
+  },
+  "required": [
+    "tool",
+    "hook",
+    "object_type",
+    "object_id",
+    "repo",
+    "labels",
+    "ts",
+    "run",
+    "pending",
+    "launch_kind",
+    "run_kind",
+    "previous_run_kind",
+    "reads_third_party",
+    "implicit_done",
+    "auto_exit",
+    "tainted",
+    "mode",
+    "cwd",
+    "sandbox",
+    "permission_profile",
+    "setting_sources",
+    "mcp",
+    "env_inherit",
+    "env_names",
+    "plugin_dirs",
+    "input_files",
+    "model",
+    "resume",
+    "fork",
+    "forked_from",
+    "skill",
+    "has_prompt",
+    "allow_tainted",
+    "override_escalation",
+    "actor",
+    "decision_ids"
+  ],
+  "additionalProperties": false
+}

@@ -1,13 +1,648 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "claude-session/config",
+  "$id": "claude-session/config.json",
   "title": "claude-session config",
+  "description": "Maps are deep-merged across config.yaml and config.d/*.yaml; lists are replaced, except hooks.* lists, which append. Environment overrides (CSESSION_<KEY>) apply only to these top-level scalar keys: claude_bin, default_kind, min_claude_version, summary_max_bytes, artifact_max_bytes, input_max_bytes, notes_context_timeout, notes_context_max_bytes, retention_days, lost_grace, auto_exit_delay, kill_grace, poll_interval, session_start_timeout (durations accept bare numbers of seconds).",
   "type": "object",
   "properties": {
+    "claude_bin": {
+      "type": "string",
+      "default": "claude"
+    },
+    "min_claude_version": {
+      "type": "string",
+      "default": "2.1.312",
+      "pattern": "^[0-9]+(\\.[0-9]+)*$",
+      "description": "Minimum Claude Code version (claude --version) a launch accepts; older fails the launch with end_reason claude_too_old. Built-in: the version the spike verified."
+    },
+    "default_kind": {
+      "type": "string",
+      "default": "implement"
+    },
+    "kinds": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "permission_profile": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+            "description": "Name of a permission profile from config."
+          },
+          "sandbox": {
+            "type": "string",
+            "enum": [
+              "required",
+              "preferred",
+              "off"
+            ]
+          },
+          "reads_third_party": {
+            "type": "boolean"
+          },
+          "implicit_done": {
+            "type": "boolean",
+            "description": "Whether a clean headless exit without a report counts as done (report.implicit). false: exited-unreported with end_reason no_report. Built-in: false for gate-check and rank, true otherwise."
+          },
+          "setting_sources": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "user",
+                "project",
+                "local"
+              ]
+            },
+            "uniqueItems": true
+          },
+          "mcp": {
+            "enum": [
+              "inherit",
+              "none"
+            ]
+          },
+          "cwd": {
+            "enum": [
+              "session-dir",
+              "caller"
+            ]
+          },
+          "env": {
+            "type": "object",
+            "properties": {
+              "inherit": {
+                "type": "boolean"
+              },
+              "allow": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Names or PREFIX_* globs. Only a kind's config env.allow naming a secret_env variable exactly passes it; per-call --env-allow cannot."
+              },
+              "set": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "propertyNames": {
+                  "not": {
+                    "enum": [
+                      "CSESSION_ID",
+                      "CSESSION_DIR",
+                      "CSESSION_KIND",
+                      "CSESSION_HOOK",
+                      "CSESSION_OBJECT_TYPE"
+                    ]
+                  }
+                },
+                "description": "Literal non-secret values; ${CSESSION_DIR} ${CWD} ${HOME} ${GIT_DIR} expanded. Reserved CSESSION_* names are not allowed."
+              },
+              "path_prepend": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "read_dirs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "write_dirs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "timeout": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "string",
+                "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+              },
+              {
+                "type": "null"
+              },
+              {
+                "const": "none"
+              }
+            ],
+            "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused. null or 'none': no bound."
+          },
+          "interactive_timeout": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "string",
+                "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+              },
+              {
+                "type": "null"
+              },
+              {
+                "const": "none"
+              }
+            ],
+            "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused. null or 'none': no bound."
+          },
+          "max_turns": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "auto_exit": {
+            "type": "boolean"
+          },
+          "backstop": {
+            "type": "boolean"
+          },
+          "notes_context": {
+            "type": "boolean"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "claude_args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Config files and drop-ins only; never from environment overrides or flags. Isolated runs accept only --verbose and --debug; anything else fails the launch (unsafe_claude_args). Trusted runs: anything."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "propertyNames": {
+        "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+      },
+      "description": "Deep-merged over the built-in kinds (lists replace). A new kind starts from the built-in review kind's fields. Names: ^[a-z0-9][a-z0-9_-]{0,63}$."
+    },
+    "permission_profiles": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "permissions": {
+            "type": "object",
+            "description": "Claude Code permissions settings (allow, deny, ask, defaultMode, ...). additionalDirectories is refused for isolated runs, and defaultMode is ignored there (isolated runs always get dontAsk). Trusted runs: a profile defaultMode is used; without one the generated settings set default when setting_sources excludes user."
+          },
+          "sandbox": {
+            "type": "object",
+            "description": "Claude Code sandbox settings (network, filesystem). enabled, failIfUnavailable, allowUnsandboxedCommands, excludedCommands and autoAllowBashIfSandboxed: true are refused for third-party-reading or sandboxed runs (the generated autoAllowBashIfSandboxed is false); generated isolation keys always override profile content."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+      },
+      "description": "Names: ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ (so never ending in .json/.yaml/.yml)."
+    },
+    "claude_auth_env": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "Added to the built-in list (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, CLAUDE_CODE_USE_BEDROCK, CLAUDE_CODE_USE_VERTEX; AWS_* only with CLAUDE_CODE_USE_BEDROCK; GOOGLE_*, CLOUD_ML_REGION, ANTHROPIC_VERTEX_PROJECT_ID only with CLAUDE_CODE_USE_VERTEX)."
+    },
+    "secret_env": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "notes_context_cmd": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "default": [
+        "memoctl",
+        "context"
+      ]
+    },
+    "notes_context_timeout": {
+      "anyOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+        }
+      ],
+      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused."
+    },
+    "notes_context_max_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 16384
+    },
+    "notes_context_sources": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "startup",
+          "resume",
+          "fork",
+          "clear",
+          "compact",
+          "other"
+        ],
+        "description": "Claude Code SessionStart source."
+      },
+      "default": [
+        "startup"
+      ]
+    },
+    "summary_max_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 65536
+    },
+    "artifact_max_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 10485760
+    },
+    "input_max_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 10485760,
+      "description": "Cap for each --prompt-file and --input-file (bytes); larger exits 2."
+    },
+    "retention_days": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 30
+    },
+    "lost_grace": {
+      "anyOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+        }
+      ],
+      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused."
+    },
+    "auto_exit_delay": {
+      "anyOf": [
+        {
+          "type": "number",
+          "minimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+        }
+      ],
+      "description": "Seconds as a non-negative number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s')."
+    },
+    "kill_grace": {
+      "anyOf": [
+        {
+          "type": "number",
+          "minimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+        }
+      ],
+      "description": "Seconds as a non-negative number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s')."
+    },
+    "poll_interval": {
+      "anyOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+        }
+      ],
+      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused."
+    },
+    "session_start_timeout": {
+      "anyOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+        }
+      ],
+      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused. Headless runs: when no SessionStart arrives within it, exec logs a warning and adds it to warnings (injected hooks may be suppressed by disableAllHooks or managed-only hooks).",
+      "default": "120s"
+    },
     "hooks": {
       "type": "object",
-      "description": "Hook name to list of hook entries."
+      "properties": {
+        "pre-launch": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "cmd": {
+                "type": "string"
+              },
+              "timeout": {
+                "anyOf": [
+                  {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+                  }
+                ],
+                "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused. Default 30s. On timeout the hook's process group gets SIGTERM, then SIGKILL after kill_grace. Gate hooks need an explicit longer timeout.",
+                "default": "30s"
+              },
+              "kinds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+                },
+                "description": "Run only for these run kinds."
+              },
+              "exclude_kinds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+                },
+                "description": "Never run for these run kinds."
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+                  "description": "key=value; split at the first '='."
+                },
+                "description": "Run only when the session has all these labels (AND)."
+              }
+            },
+            "required": [
+              "cmd"
+            ],
+            "additionalProperties": false
+          },
+          "description": "Run synchronously in order; no async."
+        },
+        "post-state-change": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "cmd": {
+                "type": "string"
+              },
+              "timeout": {
+                "anyOf": [
+                  {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+                  }
+                ],
+                "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused. Default 30s. On timeout the hook's process group gets SIGTERM, then SIGKILL after kill_grace. Gate hooks need an explicit longer timeout.",
+                "default": "30s"
+              },
+              "async": {
+                "type": "boolean"
+              },
+              "kinds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+                },
+                "description": "Run only for these run kinds."
+              },
+              "exclude_kinds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+                },
+                "description": "Never run for these run kinds."
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+                  "description": "key=value; split at the first '='."
+                },
+                "description": "Run only when the session has all these labels (AND)."
+              },
+              "states": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "starting",
+                    "working",
+                    "idle",
+                    "needs-input",
+                    "reported",
+                    "exited",
+                    "exited-unreported",
+                    "killed",
+                    "timeout",
+                    "lost",
+                    "not-started"
+                  ],
+                  "description": "Live: starting, working, idle, needs-input, reported. Final: the rest."
+                },
+                "description": "Run only when the new state is one of these."
+              }
+            },
+            "required": [
+              "cmd"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "repos": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "kinds": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "permission_profile": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+                  "description": "Name of a permission profile from config."
+                },
+                "sandbox": {
+                  "type": "string",
+                  "enum": [
+                    "required",
+                    "preferred",
+                    "off"
+                  ]
+                },
+                "env": {
+                  "type": "object",
+                  "properties": {
+                    "inherit": {
+                      "type": "boolean"
+                    },
+                    "allow": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Names or PREFIX_* globs. Only a kind's config env.allow naming a secret_env variable exactly passes it; per-call --env-allow cannot."
+                    },
+                    "set": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "propertyNames": {
+                        "not": {
+                          "enum": [
+                            "CSESSION_ID",
+                            "CSESSION_DIR",
+                            "CSESSION_KIND",
+                            "CSESSION_HOOK",
+                            "CSESSION_OBJECT_TYPE"
+                          ]
+                        }
+                      },
+                      "description": "Literal non-secret values; ${CSESSION_DIR} ${CWD} ${HOME} ${GIT_DIR} expanded. Reserved CSESSION_* names are not allowed."
+                    },
+                    "path_prepend": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": [],
+                  "additionalProperties": false
+                },
+                "read_dirs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "write_dirs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "timeout": {
+                  "anyOf": [
+                    {
+                      "type": "number",
+                      "exclusiveMinimum": 0
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)\\d+(\\.\\d+)?(ms|s|m|h|d)$"
+                    },
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "const": "none"
+                    }
+                  ],
+                  "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused. null or 'none': no bound."
+                },
+                "max_turns": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1
+                },
+                "model": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [],
+              "additionalProperties": false
+            },
+            "propertyNames": {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+            }
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "propertyNames": {
+        "pattern": "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/(?!\\.\\.?(/|$))[A-Za-z0-9._-]+)+$"
+      },
+      "description": "Keyed by repo id: lowercase host, optional :port only for a non-default port, then /-separated path segments [A-Za-z0-9._-]+."
+    },
+    "me": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "additionalProperties": true
     }
   },
-  "additionalProperties": true
+  "required": [],
+  "additionalProperties": false
 }

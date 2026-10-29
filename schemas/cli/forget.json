@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/forget.json",
+  "title": "claude-session forget --json",
+  "type": "object",
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "forgotten": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "csession_id": {
+            "type": "string",
+            "pattern": "^cs-[a-z2-7]{8}$",
+            "description": "csession_id"
+          },
+          "forgotten_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "delete_after": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "csession_id",
+          "forgotten_at",
+          "delete_after"
+        ],
+        "additionalProperties": false
+      },
+      "description": "One entry for forget <id>; every match for bulk mode (--older-than)."
+    },
+    "skipped": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "csession_id": {
+            "type": "string",
+            "pattern": "^cs-[a-z2-7]{8}$",
+            "description": "csession_id"
+          },
+          "reason": {
+            "enum": [
+              "live"
+            ]
+          }
+        },
+        "required": [
+          "csession_id",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "description": "Bulk mode: matching sessions left alone because they are live (including a pending new-session record; cancel it with stop first)."
+    }
+  },
+  "required": [
+    "dry_run",
+    "forgotten",
+    "skipped"
+  ],
+  "additionalProperties": false
+}

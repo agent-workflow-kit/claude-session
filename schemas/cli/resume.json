@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/resume.json",
+  "title": "claude-session resume --json (outcome on exit)",
+  "description": "The shared outcome object (outcome.json). Printed for exit 0, 11, 12, 13-18; also written atomically to the run's --outcome-file by whichever process finalizes the run.",
+  "$ref": "outcome.json#/$defs/outcome",
+  "properties": {
+    "outcome": {
+      "type": "string"
+    },
+    "end_reason": {
+      "type": "string"
+    },
+    "exit_code": {
+      "not": {
+        "const": 22
+      }
+    }
+  },
+  "unevaluatedProperties": false
+}

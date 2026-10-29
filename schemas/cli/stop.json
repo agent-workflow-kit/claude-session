@@ -1,0 +1,424 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/stop.json",
+  "title": "claude-session stop --json",
+  "description": "Exit 0 when the run ended (or was already final or canceled); exit 12 with ended false when it is still live. The process exit code is not the run's outcome code (that is run_exit_code).",
+  "type": "object",
+  "properties": {
+    "csession_id": {
+      "type": "string",
+      "pattern": "^cs-[a-z2-7]{8}$",
+      "description": "csession_id"
+    },
+    "run": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "already_final": {
+      "type": "boolean",
+      "description": "true when the run was already final; nothing was signaled."
+    },
+    "canceled": {
+      "type": "boolean",
+      "description": "true when stop won the cancel compare-and-set on a run with no wrapper that was not final (a pending run): no signals; the run ended not-started with end_reason canceled. If adoption won, stop used the signal path instead. A stop during the adopting exec's launch window (pre-launch hooks, before spawn) also ends the run canceled (canceled false: the wrapper was signaled)."
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "ended": {
+      "type": "boolean",
+      "description": "Whether the run is final when stop returns. false: still live after grace + kill_grace + 5 s (exit 12)."
+    },
+    "run_exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "The run's outcome code (interface.md, Outcome mapping); null when ended is false."
+    },
+    "signals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "pid": {
+            "type": "integer"
+          },
+          "role": {
+            "enum": [
+              "wrapper",
+              "child"
+            ]
+          },
+          "signal": {
+            "enum": [
+              "SIGTERM",
+              "SIGKILL"
+            ]
+          }
+        },
+        "required": [
+          "pid",
+          "role",
+          "signal"
+        ],
+        "additionalProperties": false
+      },
+      "description": "Signals sent, in order, to exact verified PIDs (with --dry-run: the first signal that would be sent)."
+    },
+    "state": {
+      "$ref": "outcome.json#/$defs/state"
+    },
+    "outcome": {
+      "$ref": "outcome.json#/$defs/outcome_value"
+    },
+    "end_reason": {
+      "$ref": "outcome.json#/$defs/end_reason"
+    },
+    "recorded_by_stop": {
+      "type": "boolean",
+      "description": "true when the wrapper was gone and stop recorded the final state itself (also after stop SIGKILLed a wrapper: stop then finalizes the run via the liveness path)."
+    }
+  },
+  "required": [
+    "csession_id",
+    "run",
+    "already_final",
+    "canceled",
+    "dry_run",
+    "ended",
+    "run_exit_code",
+    "signals",
+    "state",
+    "outcome",
+    "end_reason",
+    "recorded_by_stop"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "$ref": "outcome.json#/$defs/outcome_rules"
+    },
+    {
+      "if": {
+        "properties": {
+          "ended": {
+            "const": false
+          }
+        },
+        "required": [
+          "ended"
+        ]
+      },
+      "then": {
+        "properties": {
+          "run_exit_code": {
+            "type": "null"
+          },
+          "outcome": {
+            "type": "null"
+          },
+          "end_reason": {
+            "type": "null"
+          },
+          "state": {
+            "enum": [
+              "starting",
+              "working",
+              "idle",
+              "needs-input",
+              "reported"
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "run_exit_code": {
+            "type": "integer"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "end_reason": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "exited",
+              "exited-unreported",
+              "killed",
+              "timeout",
+              "lost",
+              "not-started"
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "done"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 0
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "blocked"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 13
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "needs-input"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 13
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "failed"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 18
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "exited-unreported"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 14
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "killed"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 15
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "timeout"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 16
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "lost"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 17
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "not-started"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 12
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "vetoed"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 11
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "escalated"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 13
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "canceled": {
+            "const": true
+          }
+        },
+        "required": [
+          "canceled"
+        ]
+      },
+      "then": {
+        "properties": {
+          "state": {
+            "const": "not-started"
+          },
+          "outcome": {
+            "const": "not-started"
+          },
+          "end_reason": {
+            "const": "canceled"
+          },
+          "signals": {
+            "maxItems": 0
+          },
+          "ended": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "already_final": {
+            "const": true
+          }
+        },
+        "required": [
+          "already_final"
+        ]
+      },
+      "then": {
+        "properties": {
+          "signals": {
+            "maxItems": 0
+          },
+          "ended": {
+            "const": true
+          }
+        }
+      }
+    }
+  ]
+}

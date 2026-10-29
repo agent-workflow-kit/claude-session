@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/start.json",
+  "title": "claude-session start --json",
+  "type": "object",
+  "properties": {
+    "csession_id": {
+      "type": "string",
+      "pattern": "^cs-[a-z2-7]{8}$",
+      "description": "csession_id"
+    },
+    "csession_dir": {
+      "type": "string"
+    },
+    "argv": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 4,
+      "description": "[<absolute claude-session path>, 'exec', '--session-id', <id>]; place it in a terminal or process."
+    },
+    "run": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The pending run start created, which the argv adopts (1 for a new session or fork; the next run for start --resume)."
+    },
+    "forked_from": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Source session for start --resume <id> --fork."
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "The pending run ends not-started (never_adopted) unless adopted before this time (lost_grace after start)."
+    },
+    "required_env_names": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Names (never values) the adopting process should have: the claude_auth_env names in use, the kind's env.allow names and the env.set names. PATH must contain claude (claude-session is run by the absolute argv[0])."
+    },
+    "env_inherit": {
+      "type": "boolean",
+      "description": "Whether the session inherits the adopting process's environment beyond required_env_names (kind env.inherit after flags)."
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Non-fatal warnings (e.g. unknown kind fell back to the review profile; third-party-reading run not sandboxed)."
+    }
+  },
+  "required": [
+    "csession_id",
+    "csession_dir",
+    "argv",
+    "run",
+    "forked_from",
+    "expires_at",
+    "required_env_names",
+    "env_inherit",
+    "warnings"
+  ],
+  "additionalProperties": false
+}

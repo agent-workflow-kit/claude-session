@@ -1,0 +1,278 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/kinds.json",
+  "title": "claude-session kinds --json",
+  "type": "object",
+  "properties": {
+    "default_kind": {
+      "type": "string"
+    },
+    "repo": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Repo id host/<full project path> (no . or .. segments)."
+    },
+    "claude_bin_resolved": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Absolute path of claude_bin on the session PATH; null if not found."
+    },
+    "claude_version": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Output of claude --version; null if it could not be run."
+    },
+    "claude_version_ok": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "Whether claude_version is at least min_claude_version; null when the version could not be determined."
+    },
+    "state_dir_warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "e.g. state directory under /mnt/ on WSL."
+    },
+    "min_claude_version": {
+      "type": "string",
+      "description": "Minimum Claude Code version a launch accepts (config min_claude_version); older fails with claude_too_old."
+    },
+    "kinds": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/profile"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Non-fatal warnings (e.g. unknown kind fell back to the review profile; third-party-reading run not sandboxed)."
+    }
+  },
+  "required": [
+    "default_kind",
+    "repo",
+    "claude_bin_resolved",
+    "claude_version",
+    "claude_version_ok",
+    "state_dir_warnings",
+    "min_claude_version",
+    "kinds",
+    "warnings"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "profile": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        },
+        "builtin": {
+          "type": "boolean"
+        },
+        "fallback": {
+          "type": "boolean",
+          "description": "true when the name is not a configured kind and the review profile is used."
+        },
+        "permission_profile": {
+          "type": "string"
+        },
+        "sandbox": {
+          "type": "string",
+          "enum": [
+            "required",
+            "preferred",
+            "off"
+          ]
+        },
+        "sandbox_available": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "null when sandbox is off."
+        },
+        "sandbox_problems": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reads_third_party": {
+          "type": "boolean"
+        },
+        "implicit_done": {
+          "type": "boolean"
+        },
+        "setting_sources": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "user",
+              "project",
+              "local"
+            ]
+          }
+        },
+        "mcp": {
+          "enum": [
+            "inherit",
+            "none"
+          ]
+        },
+        "cwd": {
+          "enum": [
+            "session-dir",
+            "caller"
+          ]
+        },
+        "env": {
+          "type": "object",
+          "properties": {
+            "inherit": {
+              "type": "boolean"
+            },
+            "allow": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "set_names": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "path_prepend": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "inherit",
+            "allow",
+            "set_names",
+            "path_prepend"
+          ],
+          "additionalProperties": false
+        },
+        "required_env_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names (never values) an adopting process should have for this profile: claude_auth_env names in use, env.allow names and env.set names (as start --json required_env_names)."
+        },
+        "path": {
+          "type": "string",
+          "description": "Effective PATH the session would get."
+        },
+        "read_dirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Effective, resolved, including automatic entries."
+        },
+        "write_dirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "timeout": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Seconds; headless default."
+        },
+        "interactive_timeout": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_turns": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "auto_exit": {
+          "type": "boolean"
+        },
+        "backstop": {
+          "type": "boolean"
+        },
+        "notes_context": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "claude_args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Non-fatal warnings (e.g. unknown kind fell back to the review profile; third-party-reading run not sandboxed)."
+        }
+      },
+      "required": [
+        "name",
+        "builtin",
+        "fallback",
+        "permission_profile",
+        "sandbox",
+        "sandbox_available",
+        "sandbox_problems",
+        "reads_third_party",
+        "implicit_done",
+        "setting_sources",
+        "mcp",
+        "cwd",
+        "env",
+        "required_env_names",
+        "path",
+        "read_dirs",
+        "write_dirs",
+        "timeout",
+        "interactive_timeout",
+        "max_turns",
+        "auto_exit",
+        "backstop",
+        "notes_context",
+        "model",
+        "claude_args",
+        "warnings"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

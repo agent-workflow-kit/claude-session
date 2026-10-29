@@ -1,0 +1,336 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/wait.json",
+  "title": "claude-session wait --json",
+  "description": "The shared outcome object (outcome.json) plus timed_out, run_exit_code and pending. wait binds to the current run at invocation unless --run is given. Printed for exit 0, 11, 12, 13-18 and 22; also written atomically to --outcome-file when given.",
+  "allOf": [
+    {
+      "$ref": "outcome.json#/$defs/outcome"
+    },
+    {
+      "if": {
+        "properties": {
+          "timed_out": {
+            "const": true
+          }
+        },
+        "required": [
+          "timed_out"
+        ]
+      },
+      "then": {
+        "properties": {
+          "exit_code": {
+            "const": 22
+          },
+          "run_exit_code": {
+            "type": "null"
+          },
+          "outcome": {
+            "type": "null"
+          },
+          "end_reason": {
+            "type": "null"
+          },
+          "state": {
+            "enum": [
+              "starting",
+              "working",
+              "idle",
+              "needs-input",
+              "reported"
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "outcome": {
+            "type": "string"
+          },
+          "run_exit_code": {
+            "type": "integer"
+          },
+          "exit_code": {
+            "not": {
+              "const": 22
+            }
+          },
+          "pending": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "pending": {
+            "const": true
+          }
+        },
+        "required": [
+          "pending"
+        ]
+      },
+      "then": {
+        "properties": {
+          "phase": {
+            "const": "launch"
+          },
+          "state": {
+            "const": "starting"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "timed_out": {
+            "const": false
+          }
+        },
+        "required": [
+          "timed_out"
+        ]
+      },
+      "then": {
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "done"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 0
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "blocked"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 13
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "needs-input"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 13
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "failed"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 18
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "exited-unreported"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 14
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "killed"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 15
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "timeout"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 16
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "lost"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 17
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "not-started"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 12
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "vetoed"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 11
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "escalated"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "run_exit_code": {
+                  "const": 13
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "timed_out": {
+      "type": "boolean",
+      "description": "true when --timeout expired (exit 22); outcome, end_reason and run_exit_code are then null and state is live. phase is launch while the run is pending, session after adoption."
+    },
+    "run_exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "The run's outcome code; null when timed_out (exit_code is then 22)."
+    },
+    "pending": {
+      "type": "boolean",
+      "description": "true when the run was still pending (not adopted) at the timeout."
+    }
+  },
+  "required": [
+    "timed_out",
+    "run_exit_code",
+    "pending"
+  ],
+  "unevaluatedProperties": false
+}

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/report.json",
+  "title": "claude-session report --json",
+  "description": "Printed when the request is queued. Ingestion happens later in the session's hooks; a rejection is reported to the agent through the PostToolUse hook.",
+  "type": "object",
+  "properties": {
+    "queued": {
+      "const": true
+    },
+    "request_id": {
+      "type": "string",
+      "description": "The request file's uuid name in outbox/."
+    },
+    "status": {
+      "enum": [
+        "done",
+        "blocked",
+        "failed",
+        "needs-input"
+      ]
+    },
+    "artifact": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Artifact name (single path segment in artifacts/)."
+    }
+  },
+  "required": [
+    "queued",
+    "request_id",
+    "status",
+    "artifact"
+  ],
+  "additionalProperties": false
+}

@@ -1,7 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "claude-session/log",
+  "$id": "claude-session/log.json",
   "title": "claude-session log.jsonl record",
+  "description": "Never contains secrets, summaries, reasons written by the agent, or prompt text.",
   "type": "object",
   "properties": {
     "ts": {
@@ -9,7 +10,6 @@
       "format": "date-time"
     },
     "level": {
-      "type": "string",
       "enum": [
         "debug",
         "info",
@@ -18,10 +18,112 @@
       ]
     },
     "event": {
-      "type": "string"
+      "enum": [
+        "launch",
+        "adopt",
+        "state_change",
+        "report_ingested",
+        "report_rejected",
+        "outbox_discarded",
+        "hook_failed",
+        "hook_timeout",
+        "hook_veto",
+        "hook_escalate",
+        "hook_output_ignored",
+        "hook_event_failed",
+        "notes_failed",
+        "signal_sent",
+        "reconcile_change",
+        "config_warning",
+        "session_start_missing",
+        "migration",
+        "sandbox_lowered",
+        "launch_interrupted",
+        "outcome_file_failed",
+        "hook_delivered"
+      ]
+    },
+    "csession_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^cs-[a-z2-7]{8}$"
+    },
+    "run": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "pid": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Exact PID for signal_sent."
+    },
+    "signal": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "decision_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "For launch events: the run's decision ids."
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "bad_secret",
+        "not_live",
+        "stale_run",
+        "artifact_changed",
+        "artifact_missing",
+        "outside_dir",
+        "not_regular_file",
+        "too_large",
+        "contains_secret",
+        "malformed",
+        "hook_veto",
+        "hook_escalate",
+        "hook_timeout",
+        "canceled",
+        "never_adopted",
+        "launch_interrupted",
+        "config_invalid",
+        "claude_not_found",
+        "sandbox_unavailable",
+        "socket_path_too_long",
+        "invalid_permission_profile",
+        "unsafe_cwd",
+        "unsafe_path",
+        "unsafe_plugin_dir",
+        "unsafe_read_dir",
+        "plugin_dir_missing",
+        "git_dir_changed",
+        "no_git_cwd",
+        "fork_cwd_unsupported",
+        "no_tty",
+        "tmpdir_unsafe",
+        "unsafe_claude_args",
+        "claude_too_old",
+        null
+      ],
+      "description": "Machine reason: a report rejection reason (report_rejected) or a launch-phase end_reason (launch failures, hook_veto, hook_escalate, hook_timeout, launch_interrupted). Never agent text."
     },
     "message": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
@@ -29,5 +131,5 @@
     "level",
     "event"
   ],
-  "additionalProperties": true
+  "additionalProperties": false
 }

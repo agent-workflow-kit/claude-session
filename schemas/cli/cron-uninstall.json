@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/cron-uninstall.json",
+  "title": "claude-session cron uninstall --json",
+  "type": "object",
+  "properties": {
+    "action": {
+      "enum": [
+        "removed",
+        "unchanged"
+      ]
+    },
+    "block": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "removed: the block that was removed (or would be, with --dry-run); unchanged: null (no managed block was present)."
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "action",
+    "block",
+    "dry_run"
+  ],
+  "additionalProperties": false
+}

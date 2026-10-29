@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/cron-install.json",
+  "title": "claude-session cron install --json",
+  "type": "object",
+  "properties": {
+    "action": {
+      "enum": [
+        "installed",
+        "updated",
+        "unchanged"
+      ]
+    },
+    "block": {
+      "type": "string",
+      "description": "The managed block as it is in the crontab after the command (installed, updated, unchanged), or would be with --dry-run. Never null for install."
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "interval_minutes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 59
+    },
+    "env_file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Absolute path; must be owned by the user and not group- or world-writable (else exit 2)."
+    }
+  },
+  "required": [
+    "action",
+    "block",
+    "dry_run",
+    "interval_minutes",
+    "env_file"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/cli/label-add.json",
+  "title": "claude-session label add --json",
+  "type": "object",
+  "properties": {
+    "csession_id": {
+      "type": "string",
+      "pattern": "^cs-[a-z2-7]{8}$",
+      "description": "csession_id"
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+        "description": "key=value; split at the first '='."
+      },
+      "description": "Resulting labels (with --dry-run: what they would be)."
+    },
+    "added": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+        "description": "key=value; split at the first '='."
+      },
+      "description": "Pairs actually added (empty for label remove)."
+    },
+    "removed": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+        "description": "key=value; split at the first '='."
+      },
+      "description": "Pairs actually removed (empty for label add)."
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "csession_id",
+    "labels",
+    "added",
+    "removed",
+    "dry_run"
+  ],
+  "additionalProperties": false
+}

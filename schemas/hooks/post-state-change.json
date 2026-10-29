@@ -1,0 +1,310 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/hooks/post-state-change.json",
+  "title": "post-state-change hook payload (stdin)",
+  "description": "Fired on every real state or activity change of a run (and when the report's status or reported_at changes, cause report), in order, at least once (deduplicate on event_id). Delivered by exec while its wrapper runs; for a run with no live wrapper, synchronously by the command that changes it (start, stop, forget, wait, resume, reconcile) or by the next delivering command; status and list never run hooks. A per-session delivery lease prevents concurrent double delivery. Exactly one final: true per run. Fires every turn; filter with the states selector. Cannot veto.",
+  "type": "object",
+  "properties": {
+    "tool": {
+      "const": "claude-session"
+    },
+    "hook": {
+      "const": "post-state-change"
+    },
+    "object_type": {
+      "const": "session"
+    },
+    "object_id": {
+      "type": "string",
+      "pattern": "^cs-[a-z2-7]{8}$",
+      "description": "csession_id"
+    },
+    "repo": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Repo id host/<full project path> (no . or .. segments)."
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}$",
+        "description": "key=value; split at the first '='."
+      },
+      "description": "Multiset of key=value pairs, verbatim."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this payload was delivered (delivery is at least once; see event_ts for post-state-change)."
+    },
+    "event_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The state event's id (events.id). Delivery is at least once: deduplicate on (object_id, event_id)."
+    },
+    "event_ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the state change happened (ts is the delivery time)."
+    },
+    "run": {
+      "type": "integer"
+    },
+    "pending": {
+      "type": "boolean",
+      "description": "true while the run is pending (created by start, not yet adopted)."
+    },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "launch",
+        "session"
+      ],
+      "description": "launch for a pending run and launch-phase ends; session once claude was spawned."
+    },
+    "forked_from": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^cs-[a-z2-7]{8}$"
+    },
+    "launch_kind": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "run_kind": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "reads_third_party": {
+      "type": "boolean",
+      "description": "When true, notification templates exclude report.summary and report.reason by default."
+    },
+    "tainted": {
+      "type": "boolean"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "interactive",
+        "headless"
+      ]
+    },
+    "sandbox_active": {
+      "type": "boolean"
+    },
+    "decision_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Decision ids from --decision-id and from pre-launch hook stdout."
+    },
+    "state": {
+      "$ref": "../cli/outcome.json#/$defs/state"
+    },
+    "activity": {
+      "$ref": "../cli/outcome.json#/$defs/activity"
+    },
+    "needs_input_reason": {
+      "$ref": "../cli/outcome.json#/$defs/needs_input_reason"
+    },
+    "previous_state": {
+      "$ref": "../cli/outcome.json#/$defs/state_or_null"
+    },
+    "previous_activity": {
+      "$ref": "../cli/outcome.json#/$defs/activity"
+    },
+    "live": {
+      "type": "boolean"
+    },
+    "final": {
+      "type": "boolean",
+      "description": "true for the run's last change: outcome, end_reason and exit_code are then non-null and state is final. Exactly one per run, including runs that ended in the launch phase (state not-started)."
+    },
+    "report": {
+      "$ref": "../cli/outcome.json#/$defs/report"
+    },
+    "outcome": {
+      "$ref": "../cli/outcome.json#/$defs/outcome_value"
+    },
+    "end_reason": {
+      "$ref": "../cli/outcome.json#/$defs/end_reason"
+    },
+    "exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "The run's outcome code when final; else null."
+    },
+    "cost_usd": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "claude_session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session_started_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "description": "When the run's first SessionStart hook was recorded; null if none was seen (launch-phase ends, pending runs, claude gone before SessionStart)."
+    },
+    "session_end_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The reason of Claude Code's last SessionEnd hook for this run, verbatim; null if none was seen."
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Launch hint or pre-launch hook stderr (control characters stripped, capped at 2 KiB); never agent text."
+    },
+    "cause": {
+      "$ref": "../cli/outcome.json#/$defs/cause"
+    }
+  },
+  "required": [
+    "tool",
+    "hook",
+    "object_type",
+    "object_id",
+    "repo",
+    "labels",
+    "ts",
+    "event_id",
+    "event_ts",
+    "run",
+    "pending",
+    "phase",
+    "forked_from",
+    "launch_kind",
+    "run_kind",
+    "reads_third_party",
+    "tainted",
+    "mode",
+    "sandbox_active",
+    "decision_ids",
+    "state",
+    "activity",
+    "needs_input_reason",
+    "previous_state",
+    "previous_activity",
+    "live",
+    "final",
+    "report",
+    "outcome",
+    "end_reason",
+    "exit_code",
+    "cost_usd",
+    "claude_session_id",
+    "session_started_at",
+    "session_end_reason",
+    "message",
+    "cause"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "$ref": "../cli/outcome.json#/$defs/outcome_rules"
+    },
+    {
+      "$ref": "../cli/outcome.json#/$defs/exit_code_rules"
+    },
+    {
+      "if": {
+        "properties": {
+          "final": {
+            "const": true
+          }
+        },
+        "required": [
+          "final"
+        ]
+      },
+      "then": {
+        "properties": {
+          "outcome": {
+            "type": "string"
+          },
+          "end_reason": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "exited",
+              "exited-unreported",
+              "killed",
+              "timeout",
+              "lost",
+              "not-started"
+            ]
+          },
+          "live": {
+            "const": false
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "outcome": {
+            "type": "null"
+          },
+          "end_reason": {
+            "type": "null"
+          },
+          "exit_code": {
+            "type": "null"
+          },
+          "state": {
+            "enum": [
+              "starting",
+              "working",
+              "idle",
+              "needs-input",
+              "reported"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "pending": {
+            "const": true
+          }
+        },
+        "required": [
+          "pending"
+        ]
+      },
+      "then": {
+        "properties": {
+          "phase": {
+            "const": "launch"
+          }
+        }
+      }
+    }
+  ]
+}
