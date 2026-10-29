@@ -1,0 +1,31 @@
+name: ci
+
+# Thin caller for agent-workflow-kit/awkit-ci. Required status check: `ci / ci-ok`.
+# Source: https://github.com/agent-workflow-kit/awkit-ci/tree/main/templates
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    uses: agent-workflow-kit/awkit-ci/.github/workflows/python-ci.yml@v0.1.0
+
+  release:
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # The release pushes with the release GitHub App token, so GITHUB_TOKEN stays read-only.
+    permissions:
+      contents: read
+    uses: agent-workflow-kit/awkit-ci/.github/workflows/release.yml@v0.1.0
+    secrets:
+      app-id: ${{ secrets.RELEASE_APP_ID }}
+      app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}

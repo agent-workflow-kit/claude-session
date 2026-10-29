@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/audit",
+  "title": "claude-session audit.jsonl record",
+  "description": "Audit record for claude-session. Whether this tool writes audit records is decided in its design session (architecture §14).",
+  "type": "object",
+  "properties": {
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "actor": {
+      "type": "string"
+    },
+    "decision_id": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "target": {
+      "type": "string"
+    },
+    "action": {
+      "type": "string"
+    },
+    "inputs": {
+      "type": "object"
+    },
+    "result": {}
+  },
+  "required": [
+    "ts",
+    "actor",
+    "target",
+    "action",
+    "result"
+  ],
+  "additionalProperties": true
+}

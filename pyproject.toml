@@ -1,0 +1,76 @@
+[project]
+name = "claude-session"
+version = "0.0.0"
+description = "Runs and supervises Claude Code sessions"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = []
+
+[project.scripts]
+claude-session = "claude_session.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_session"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6", "pyright>=1.1.380", "pymarkdownlnt>=0.9.41"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: needs real models/hosts/credentials; never run in CI"]
+addopts = "-m 'not live'"
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+commit_parser = "conventional"
+allow_zero_version = true
+major_on_zero = false
+tag_format = "v{version}"
+commit_message = "chore(release): v{version}"
+# Refresh the package's own entry in uv.lock, stage it with the release commit, build.
+build_command = "uv lock --upgrade-package \"$PACKAGE_NAME\" && git add uv.lock && uv build"
+
+[tool.semantic_release.commit_parser_options]
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf", "chore", "refactor", "build"]
+other_allowed_tags = ["docs", "test", "ci", "style"]
+# Only the squash commit's title (the PR title) decides the bump and the changelog line.
+parse_squash_commits = false
+
+[tool.semantic_release.changelog]
+mode = "update"
+insertion_flag = "<!-- version list -->"
+# Shared template from awkit-ci: one line per commit (its title), lint-clean markdown.
+template_dir = ".psr-templates"
+exclude_commit_patterns = ['''^chore\(release\):''']
+
+[tool.semantic_release.changelog.default_templates]
+changelog_file = "CHANGELOG.md"
+output_format = "md"
+
+[tool.semantic_release.branches.main]
+match = "main"
+prerelease = false
+
+[tool.semantic_release.remote]
+type = "github"
+
+[tool.semantic_release.publish]
+dist_glob_patterns = ["dist/*"]
+upload_to_vcs_release = true

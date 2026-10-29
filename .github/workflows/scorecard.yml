@@ -1,0 +1,21 @@
+name: scorecard
+
+# Thin caller for agent-workflow-kit/awkit-ci (OpenSSF Scorecard).
+# Source: https://github.com/agent-workflow-kit/awkit-ci/tree/main/templates
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  scorecard:
+    permissions:
+      contents: read # check out the repository
+      actions: read # read workflow runs (Scorecard checks)
+      security-events: write # upload SARIF to code scanning
+      id-token: write # sign results published to the Scorecard API
+    uses: agent-workflow-kit/awkit-ci/.github/workflows/scorecard.yml@v0.1.0

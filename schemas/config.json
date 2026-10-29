@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "claude-session/config",
+  "title": "claude-session config",
+  "type": "object",
+  "properties": {
+    "hooks": {
+      "type": "object",
+      "description": "Hook name to list of hook entries."
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,17 @@
+name: pr-title
+
+# Thin caller for agent-workflow-kit/awkit-ci. Required status check: `pr-title / pr-title`.
+# Source: https://github.com/agent-workflow-kit/awkit-ci/tree/main/templates
+
+on:
+  # Needed so the check also runs for PRs from forks. The called workflow only reads
+  # the PR title through the API; it never checks out or executes PR code.
+  pull_request_target: # zizmor: ignore[dangerous-triggers] title lint only, no checkout
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: read # read the PR title
+
+jobs:
+  pr-title:
+    uses: agent-workflow-kit/awkit-ci/.github/workflows/pr-title.yml@v0.1.0

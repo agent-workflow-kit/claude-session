@@ -1,0 +1,34 @@
+# Dependabot version updates (weekly, one grouped PR per ecosystem).
+# uv runtime bumps use `chore(deps)` (patch release) and dev-only bumps use
+# `test(deps-dev)` (no release); action bumps, including the awkit-ci
+# reusable-workflow tags, use `ci(deps)` (no release).
+# Source: https://github.com/agent-workflow-kit/awkit-ci/tree/main/templates
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "test(deps-dev)"
+    groups:
+      runtime:
+        dependency-type: production
+        patterns: ["*"]
+      dev:
+        dependency-type: development
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci(deps)
+    groups:
+      all:
+        patterns: ["*"]

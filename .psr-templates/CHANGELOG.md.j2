@@ -1,0 +1,47 @@
+{#
+  Changelog template for python-semantic-release (update mode).
+
+  Inserts the newest release directly below the insertion flag as:
+
+    ## vX.Y.Z (YYYY-MM-DD)
+
+    - <commit title>        one line per commit, newest first
+
+  The commit title is the first line of the squash commit, i.e. the PR title (read
+  from git, so the line is the title exactly as merged).
+  Excluded commits (chore(release)) never reach the template. Output keeps
+  exactly one blank line between blocks so it passes pymarkdown (MD012/MD022).
+#}
+{%- set flag = ctx.changelog_insertion_flag | trim -%}
+{%- set prev = ctx.prev_changelog_file | read_file | safe -%}
+{%- set parts = prev.split(flag, maxsplit=1) -%}
+{%- set releases = ctx.history.released.values() | list -%}
+{%- if parts | length < 2 -%}
+{{ prev }}
+{%- else -%}
+{%- set top = parts[0] | trim -%}
+{%- set bottom = parts[1] | trim -%}
+{%- if top %}{{ top }}
+
+{% endif %}{{ flag }}
+{%- if releases | length > 0 %}
+{%- set release = releases[0] %}
+{%- set tag = release.version.as_semver_tag() %}
+{%- if ("## " ~ tag ~ " ") not in bottom %}
+{%- set ns = namespace(items=[]) %}
+{%- for _type, commits in release["elements"] | dictsort %}
+{%- set ns.items = ns.items + (commits | list) %}
+{%- endfor %}
+
+## {{ tag }} ({{ release.tagged_date.strftime("%Y-%m-%d") }})
+{% for item in ns.items | unique(attribute="commit.hexsha") | sort(attribute="commit.committed_date", reverse=true) %}
+- {{ item.commit.repo.commit(item.commit.hexsha).summary }}
+{%- endfor %}
+{%- endif %}
+{%- endif %}
+{%- if bottom %}
+
+{{ bottom }}
+{%- endif %}
+{{ "" }}
+{%- endif -%}

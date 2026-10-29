@@ -1,0 +1,2 @@
+# Example config for claude-session. Location: ~/.config/claude-session/config.yaml (drop-ins: config.d/*.yaml). Keys are defined in docs/interface.md once designed.
+hooks: {}
