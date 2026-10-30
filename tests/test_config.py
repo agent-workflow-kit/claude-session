@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import shutil
+import subprocess
+import sys
 import textwrap
 import time
 from pathlib import Path
@@ -307,14 +310,14 @@ def test_scalar_precedence_flags_env_config_builtin(cfg_dir: Path) -> None:
     env = {"CSESSION_KILL_GRACE": "30"}
     cfg = load(cfg_dir, env)
     assert cfg.kill_grace == 30.0  # environment > config
-    assert cfg.with_flags(kill_grace="40s").kill_grace == 40.0  # flags > environment
-    assert cfg.with_flags(kill_grace=None).kill_grace == 30.0  # flag not given
+    # No flag sets a top-level key (stop --grace is separate from kill_grace).
+    assert cfg.with_flags() == cfg
 
 
 def test_flags_are_validated(cfg_dir: Path) -> None:
     with pytest.raises(UsageError) as info:
-        load(cfg_dir).with_flags(kill_grace="soon")
-    assert "kill_grace" in str(info.value.detail)
+        config.with_flags(load(cfg_dir).kinds["implement"], timeout="soon")
+    assert "timeout" in str(info.value.detail)
 
 
 def test_kind_precedence_flags_repo_config_builtin(cfg_dir: Path) -> None:
@@ -412,6 +415,7 @@ INVALID: list[tuple[str, str]] = [
     ("default_kind: ''\n", "default_kind"),
     ("claude_bin: ''\n", "claude_bin"),
     ('claude_bin: "a\\x01b"\n', "claude_bin"),
+    ('claude_bin: "a\\x85b"\n', "claude_bin"),
     ("retention_days: 3.5\n", "retention_days"),
     ("kinds: {implement: {max_turns: 1.5}}\n", "kinds.implement.max_turns"),
     ("summary_max_bytes: true\n", "summary_max_bytes"),
@@ -532,7 +536,7 @@ def test_null_is_refused_where_the_schema_refuses_it(cfg_dir: Path, text: str) -
         schemas.validate(yaml.safe_load(text), CONFIG_SCHEMA)
 
 
-@pytest.mark.parametrize("value", ["claude\\n", "\\tclaude", "clau\\x7fde"])
+@pytest.mark.parametrize("value", ["claude\\n", "\\tclaude", "clau\\x7fde", "a\\x85b", "a\\x9fb"])
 def test_claude_bin_refuses_control_characters(cfg_dir: Path, value: str) -> None:
     # (Python's re lets the schema's "$" match before a trailing newline; ECMA-262 does not.)
     write(cfg_dir / "config.yaml", f'claude_bin: "{value}"\n')
@@ -675,6 +679,36 @@ def test_very_deep_nesting_is_a_usage_error(cfg_dir: Path) -> None:
     assert "config.yaml" in str(invalid(cfg_dir).detail)
 
 
+def test_extreme_nesting_is_refused_before_composing(tmp_path: Path) -> None:
+    # libyaml's composer recurses without limit: run in a child so a regression crashes only it.
+    levels = 50_000
+    path = tmp_path / "deep.yaml"
+    path.write_text("me: {x: " + "[" * levels + "]" * levels + "}\n", encoding="utf-8")
+    code = textwrap.dedent(
+        """
+        import sys
+        from claude_session import config
+        from claude_session.errors import UsageError
+        try:
+            config.load(sys.argv[1])
+        except UsageError as exc:
+            print(exc.detail)
+            sys.exit(0)
+        sys.exit(3)
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "nested more than" in proc.stdout
+    assert str(path) in proc.stdout
+
+
 def test_recursive_alias_is_refused(cfg_dir: Path) -> None:
     write(cfg_dir / "config.yaml", "me: {x: &a [*a]}\n")
     assert "config.yaml" in str(invalid(cfg_dir).detail)
@@ -706,6 +740,42 @@ def test_nested_duplicate_keys_are_refused(cfg_dir: Path) -> None:
 def test_sexagesimal_numbers_stay_strings(cfg_dir: Path, value: str) -> None:
     write(cfg_dir / "config.yaml", f"kill_grace: {value}\n")
     assert "kill_grace" in str(invalid(cfg_dir).detail)
+
+
+@pytest.mark.parametrize("value", ["!!int 1:30", "!!float 1:30.5", "!!int 1:30:00"])
+def test_tagged_base60_numbers_are_invalid(cfg_dir: Path, value: str) -> None:
+    write(cfg_dir / "config.yaml", f"kill_grace: {value}\n")
+    detail = str(invalid(cfg_dir).detail)
+    assert "base-60" in detail
+    assert "line 1" in detail
+
+
+def test_tagged_ordinary_numbers_still_load(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "retention_days: !!int 12\nkill_grace: !!float 1.5\n")
+    cfg = load(cfg_dir)
+    assert (cfg.retention_days, cfg.kill_grace) == (12, 1.5)
+
+
+def test_two_merge_keys_are_refused(cfg_dir: Path) -> None:
+    write(
+        cfg_dir / "config.yaml",
+        "me:\n  a: &a {x: 1}\n  b: &b {y: 2}\n  c: {<<: *a, <<: *b}\n",
+    )
+    detail = str(invalid(cfg_dir).detail)
+    assert "duplicate merge key" in detail
+    assert "line 4" in detail
+
+
+def test_one_merge_key_with_several_sources_loads(cfg_dir: Path) -> None:
+    write(
+        cfg_dir / "config.yaml",
+        "me:\n  a: &a {x: 1}\n  b: &b {y: 2}\n  c: {<<: [*a, *b], z: 3}\n",
+    )
+    assert load(cfg_dir).me.model_extra == {
+        "a": {"x": 1},
+        "b": {"y": 2},
+        "c": {"x": 1, "y": 2, "z": 3},
+    }
 
 
 def test_ordinary_yaml_numbers_still_load(cfg_dir: Path) -> None:
@@ -769,6 +839,56 @@ def test_config_values_are_not_echoed(cfg_dir: Path, text: str) -> None:
     assert "config.yaml" in str(error.detail)
 
 
+# YAML errors carry a fixed phrase and a position only (S4, S5)
+
+YAML_PROBLEMS = {
+    "invalid character",
+    "invalid YAML syntax",
+    "invalid alias or document structure",
+    "unsupported or invalid tagged value",
+    "invalid value",
+    "duplicate key",
+    "duplicate merge key",
+    "base-60 numbers are not supported",
+    "invalid YAML",
+}
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("me: !!binary SECRET\u00e9\n", "unsupported or invalid tagged value"),
+        ("me: !!binary 'can''t SECRET'\n", "unsupported or invalid tagged value"),
+        (f"claude_bin: !{SECRET} x\n", "unsupported or invalid tagged value"),
+        (f"me: !!python/name:{SECRET} x\n", "unsupported or invalid tagged value"),
+        (f"me: *{SECRET}\n", "invalid alias or document structure"),
+        (f"me: {{a: '{SECRET}\n", "invalid YAML syntax"),
+        (f"me: [{SECRET}\n", "invalid YAML syntax"),
+        ("me: {d: 2001-13-45}\n", "invalid value"),
+        ("retention_days: " + "1" * 5000 + "\n", "invalid value"),
+        ("a: 1\nb: 2\na: 3\n", "duplicate key"),
+    ],
+)
+def test_yaml_errors_use_a_fixed_phrase(cfg_dir: Path, text: str, problem: str) -> None:
+    path = write(cfg_dir / "config.yaml", text)
+    detail = str(invalid(cfg_dir).detail)
+    assert "SECRET" not in detail
+    assert "\u00e9" not in detail
+    assert "\\xe9" not in detail
+    location, _, phrase = detail.removeprefix(str(path)).partition(": ")
+    assert phrase == problem
+    assert phrase in YAML_PROBLEMS
+    assert re.fullmatch(r" at line [0-9]+, column [0-9]+", location)
+
+
+def test_invalid_timestamp_is_an_invalid_value_with_its_position(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "me:\n  d: 2001-13-45\n")
+    detail = str(invalid(cfg_dir).detail)
+    assert detail.endswith(": invalid value")
+    assert "line 2, column 6" in detail
+    assert "too long" not in detail
+
+
 # Environment edge cases (R13, R14, R24)
 
 
@@ -821,14 +941,21 @@ def test_builtin_defaults_are_not_mutated_by_loading(cfg_dir: Path) -> None:
 # Flags (R4, R18)
 
 
-def test_flag_durations_are_capped(cfg_dir: Path) -> None:
+@pytest.mark.parametrize("value", ["36501d", 10**400, 3153600001])
+def test_flag_durations_are_capped(cfg_dir: Path, value: object) -> None:
+    kind = load(cfg_dir).kinds["implement"]
     with pytest.raises(UsageError):
-        load(cfg_dir).with_flags(kill_grace="36501d")
-    with pytest.raises(UsageError):
-        load(cfg_dir).with_flags(kill_grace=10**400)
+        config.with_flags(kind, timeout=value)
 
 
-@pytest.mark.parametrize("key", ["secret_env", "hooks", "kinds", "claude_bin", "repos", "me"])
+def test_flag_duration_at_the_cap_is_accepted(cfg_dir: Path) -> None:
+    kind = load(cfg_dir).kinds["implement"]
+    assert config.with_flags(kind, timeout="36500d").timeout == 3153600000
+
+
+@pytest.mark.parametrize(
+    "key", ["kill_grace", "secret_env", "hooks", "kinds", "claude_bin", "repos", "me"]
+)
 def test_config_flags_are_allowlisted(cfg_dir: Path, key: str) -> None:
     with pytest.raises(TypeError):
         load(cfg_dir).with_flags(**{key: []})

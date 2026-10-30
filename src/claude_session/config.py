@@ -32,6 +32,10 @@ from pydantic import (
     ValidationError,
     ValidationInfo,
 )
+from yaml.composer import ComposerError
+from yaml.parser import ParserError
+from yaml.reader import ReaderError
+from yaml.scanner import ScannerError
 
 from . import defaults, durations
 from .errors import UsageError
@@ -123,7 +127,8 @@ def _integral(value: Any) -> Any:
 
 
 def _executable(value: str) -> str:
-    if not value or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+    # C0, DEL and C1 control characters
+    if not value or any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
         raise ValueError("must be non-empty and contain no control characters")
     return value
 
@@ -313,9 +318,10 @@ class Config(_Model):
         return with_flags(self, **flags)
 
 
-# Keys a flag may set (interface.md, Launch flags; ``stop --grace`` for ``kill_grace``). Anything
-# else passed to ``with_flags`` is a programming error.
-CONFIG_FLAG_KEYS = frozenset({"kill_grace"})
+# Keys a flag may set (interface.md, Launch flags). No flag sets a top-level config key
+# (``stop --grace`` is its own value; ``kill_grace`` is only its default). Anything else passed to
+# ``with_flags`` is a programming error.
+CONFIG_FLAG_KEYS: frozenset[str] = frozenset()
 KIND_FLAG_KEYS = frozenset(
     {
         "timeout",  # --timeout (headless)
@@ -431,15 +437,39 @@ except ImportError:  # PyYAML built without libyaml
     from yaml import SafeLoader as _BaseLoader
 
 
+class _Refused(yaml.constructor.ConstructorError):
+    """A constructor error whose ``problem`` is one of our fixed phrases (no file content)."""
+
+    def __init__(self, problem: str, mark: Any) -> None:
+        super().__init__(None, None, problem, mark)
+
+
+_INT, _FLOAT = "tag:yaml.org,2002:int", "tag:yaml.org,2002:float"
+_MERGE = "tag:yaml.org,2002:merge"
+
+
 class _Loader(_BaseLoader):  # pyright: ignore[reportGeneralTypeIssues]
-    """Safe YAML loading that refuses duplicate mapping keys and reads YAML 1.1 base-60 numbers
-    (``1:30``) as strings."""
+    """Safe YAML loading that refuses duplicate mapping keys (and a second ``<<``), reads YAML 1.1
+    base-60 numbers (``1:30``) as strings and refuses them when tagged ``!!int``/``!!float``.
+    Constructor ``ValueError``s become ``_Refused("invalid value")`` at the node's position."""
+
+    def construct_object(self, node: yaml.Node, deep: bool = False) -> Any:
+        try:
+            return super().construct_object(node, deep=deep)
+        except ValueError:  # e.g. timestamp 2001-13-45, an integer over 4300 digits
+            raise _Refused("invalid value", node.start_mark) from None
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        merges = [key for key, _ in node.value if key.tag == _MERGE]
+        if len(merges) > 1:  # several sources are written <<: [*a, *b]
+            raise _Refused("duplicate merge key", merges[1].start_mark)
+        super().flatten_mapping(node)
 
     def construct_mapping(self, node: yaml.Node, deep: bool = False) -> dict[Any, Any]:
         if isinstance(node, yaml.MappingNode):
             seen: set[tuple[type, Any]] = set()
             for key_node, _ in node.value:
-                if key_node.tag == "tag:yaml.org,2002:merge":
+                if key_node.tag == _MERGE:
                     continue
                 key = self.construct_object(key_node, deep=deep)
                 try:
@@ -448,14 +478,20 @@ class _Loader(_BaseLoader):  # pyright: ignore[reportGeneralTypeIssues]
                 except TypeError:  # unhashable key: the base constructor reports it
                     continue
                 if duplicate:
-                    raise yaml.constructor.ConstructorError(
-                        None, None, "duplicate mapping key", key_node.start_mark
-                    )
+                    raise _Refused("duplicate key", key_node.start_mark)
                 seen.add(marker)
         return super().construct_mapping(node, deep=deep)
 
+    def construct_number(self, node: yaml.Node) -> Any:
+        if ":" in self.construct_scalar(node):  # pyright: ignore[reportArgumentType]
+            raise _Refused("base-60 numbers are not supported", node.start_mark)
+        if node.tag == _INT:
+            return self.construct_yaml_int(node)
+        return self.construct_yaml_float(node)
 
-_INT, _FLOAT = "tag:yaml.org,2002:int", "tag:yaml.org,2002:float"
+
+_Loader.add_constructor(_INT, _Loader.construct_number)
+_Loader.add_constructor(_FLOAT, _Loader.construct_number)
 _Loader.yaml_implicit_resolvers = {
     first: [(tag, regexp) for tag, regexp in resolvers if tag not in (_INT, _FLOAT)]
     for first, resolvers in _Loader.yaml_implicit_resolvers.items()
@@ -494,19 +530,15 @@ def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
     except UnicodeDecodeError as exc:
         raise UsageError("invalid config", detail=f"{path}: not UTF-8 ({exc.reason})") from None
     try:
+        _check_nesting(text, path)
         data = yaml.load(text, Loader=_Loader)  # noqa: S506 (a safe loader)
     except yaml.YAMLError as exc:
         where = ""
         mark = getattr(exc, "problem_mark", None)
         if mark is not None:
             where = f" at line {mark.line + 1}, column {mark.column + 1}"
-        problem = getattr(exc, "problem", None) or "invalid YAML"
-        # Quoted parts (tags, anchors, characters) may come from the file: never echo them.
-        problem = re.sub(r"'[^']*'|\"[^\"]*\"", "<redacted>", problem)
-        raise UsageError("invalid config", detail=f"{path}{where}: {problem}") from None
-    except (ValueError, RecursionError):  # e.g. an integer with too many digits
-        detail = f"{path}: a value cannot be loaded (too long or too deeply nested)"
-        raise UsageError("invalid config", detail=detail) from None
+        # Parser and constructor messages may quote the file: report a fixed phrase only.
+        raise UsageError("invalid config", detail=f"{path}{where}: {_problem(exc)}") from None
     if data is None:
         return {}
     if not isinstance(data, dict):
@@ -515,6 +547,38 @@ def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
         raise UsageError("invalid config", detail=detail)
     _check_tree(data, path)
     return data
+
+
+def _problem(exc: yaml.YAMLError) -> str:
+    if isinstance(exc, _Refused):
+        return str(exc.problem)
+    if isinstance(exc, ReaderError):
+        return "invalid character"
+    if isinstance(exc, (ScannerError, ParserError)):
+        return "invalid YAML syntax"
+    if isinstance(exc, ComposerError):
+        return "invalid alias or document structure"
+    if isinstance(exc, yaml.constructor.ConstructorError):
+        return "unsupported or invalid tagged value"
+    return "invalid YAML"
+
+
+def _check_nesting(text: str, path: Path) -> None:
+    """Refuse nesting deeper than ``_check_tree`` allows from the event stream, before composing:
+    libyaml's composer recurses once per level without limit. The parser is not recursive, and
+    scanning stops at the first event that is too deep."""
+    depth = 0
+    for event in yaml.parse(text, Loader=_Loader):
+        if isinstance(event, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
+            depth += 1
+            # A collection at tree depth d is the (d + 1)-th open one (top level: depth 0).
+            if depth > MAX_DEPTH + 1:
+                mark = event.start_mark
+                where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+                detail = f"{path}{where}: nested more than {MAX_DEPTH} levels deep"
+                raise UsageError("invalid config", detail=detail)
+        elif isinstance(event, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+            depth -= 1
 
 
 def _read_bytes(path: Path, *, required: bool) -> bytes | None:

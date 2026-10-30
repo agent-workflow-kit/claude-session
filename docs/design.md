@@ -610,7 +610,7 @@ What is carried, reset and refused on resume and fork is normative in [interface
 - Label key `^[a-z0-9][a-z0-9_.-]{0,63}$`; value 0 to 256 characters from `[A-Za-z0-9._:/#@+=,-]`, split at the first `=`; empty values allowed; enforced at every entry point (exit 2).
 - `--skill` matches `^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$`.
 - Kind names match `^[a-z0-9][a-z0-9_-]{0,63}$` (`--kind`, config `kinds` keys, repo-override kind keys); permission-profile names match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` and may not end in `.json`, `.yaml` or `.yml`; repo ids follow the grammar in section [Git calls](#git-calls).
-- Duration: a non-negative number of seconds (fractions allowed) or `^\d+(\.\d+)?(ms|s|m|h|d)$`; `none` (or null in config) means no bound where allowed.
+- Duration: a non-negative number of seconds (fractions allowed) or `^[0-9]+(\.[0-9]+)?(ms|s|m|h|d)$` (full grammar and cap: interface.md, Identifiers); `none` (or null in config) means no bound where allowed.
 
 ### Transcripts
 
