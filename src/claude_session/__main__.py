@@ -54,25 +54,43 @@ def _divert_output() -> list[int | None]:
     return saved
 
 
+def _close_quietly(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
 def _restore_output(saved: list[int | None]) -> None:
-    """Point fds 1 and 2 back at the descriptors ``_divert_output`` saved, and close those."""
-    for fd, copy in zip((1, 2), saved, strict=True):
+    """Point fds 1 and 2 back at the descriptors ``_divert_output`` saved, and close those
+    (their entries become None, so they are never closed twice). Raises ``OSError`` if a
+    descriptor cannot be restored (fds 1 and 2 may then be half restored)."""
+    for index, (fd, copy) in enumerate(zip((1, 2), saved, strict=True)):
         if copy is None:
             continue
+        saved[index] = None
         try:
             os.dup2(copy, fd)
-        except OSError:
-            pass
         finally:
-            os.close(copy)
+            _close_quietly(copy)
 
 
 def _silence_output(saved: list[int | None]) -> None:
     """Leave fds 1 and 2 at /dev/null for the rest of the process and close the saved ones."""
     for copy in saved:
         if copy is not None:
-            os.close(copy)
+            _close_quietly(copy)
     _redirect_to_devnull(1, 2)
+
+
+def _drop_stray_output(*streams: object) -> None:
+    """Flush ``streams`` (and the interpreter's original stdout and stderr) while fds 1 and 2
+    still point at /dev/null, so text the handler wrote to them directly is dropped."""
+    for stream in {id(s): s for s in (*streams, sys.__stdout__, sys.__stderr__)}.values():
+        try:
+            stream.flush()  # type: ignore[union-attr]
+        except BaseException:
+            pass
 
 
 def _hook_event(argv: list[str]) -> int:
@@ -81,8 +99,10 @@ def _hook_event(argv: list[str]) -> int:
 
     While it runs, ``sys.stdout``/``sys.stderr`` are captured and fds 1 and 2 point at
     /dev/null. Only after it returns normally are the fds restored and the captured stdout
-    written; raw fd writes and the captured stderr are dropped, so a failure can never leak
-    partial output to Claude Code.
+    written; raw fd writes, text written to ``sys.__stdout__``/``sys.__stderr__`` (flushed to
+    /dev/null before the restore) and the captured stderr are dropped, so a failure can never
+    leak partial output to Claude Code. A failure to restore or write leaves fds 1 and 2 at
+    /dev/null and still exits 0.
     """
     saved = _divert_output()
     real_stdout, real_stderr = sys.stdout, sys.stderr
@@ -101,14 +121,15 @@ def _hook_event(argv: list[str]) -> int:
     if failed:
         _silence_output(saved)
         return 0
-    _restore_output(saved)
     # captured_stderr is dropped. TODO(#13): decide whether hook-event's own stderr reaches the
     # log; schemas/log.json has no event for it and the text may carry payload data.
     try:
+        _drop_stray_output(real_stdout, real_stderr)
+        _restore_output(saved)
         real_stdout.write(captured_stdout.getvalue())
         real_stdout.flush()
-    except BaseException:
-        _redirect_to_devnull(1, 2)
+    except BaseException:  # containment: nothing reaches Claude Code, and the exit is still 0
+        _silence_output(saved)
     return 0
 
 

@@ -15,6 +15,7 @@ from datetime import datetime
 from .logs import (
     JSONValue,
     append_record,
+    first_secret_index,
     is_csession_id,
     is_int,
     leaks_secret,
@@ -92,20 +93,24 @@ def _check_inputs(inputs: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         if level is not None and level not in SANDBOX_LEVELS:
             raise ValueError(f"audit input {key} must be one of {sorted(SANDBOX_LEVELS)}")
     grace = checked.get("grace")
-    if grace is not None and (
-        isinstance(grace, bool) or not isinstance(grace, int | float) or not math.isfinite(grace)
-    ):
-        raise ValueError("audit input grace must be a finite number or null")
+    # An int is always finite (math.isfinite raises OverflowError on a huge one); only a float
+    # can be NaN or infinite.
+    if grace is not None and not is_int(grace):
+        if not isinstance(grace, float) or not math.isfinite(grace):
+            raise ValueError("audit input grace must be a finite number or null")
     return checked
 
 
 def _redact_label(label: str, secrets: Collection[str]) -> str | None:
-    """A label as written: unchanged, ``<key>=redacted`` when it contains a secret (so it still
-    matches the label grammar), or None (dropped) when its key contains one."""
+    """A label as written: unchanged without a secret; ``<key>=redacted`` (so it still matches
+    the label grammar) when every secret occurrence lies wholly inside the value; None
+    (dropped) when an occurrence starts in the key or at the ``=``, or when
+    ``<key>=redacted`` would still contain a secret."""
     if not leaks_secret(label, secrets):
         return label
     key = label.partition("=")[0]
-    if leaks_secret(key, secrets):
+    first = first_secret_index(label, secrets)
+    if first == -1 or first <= len(key):
         return None
     redacted = f"{key}={LABEL_REDACTED_VALUE}"
     return None if leaks_secret(redacted, secrets) else redacted
@@ -141,8 +146,10 @@ def append(
     ``logs.MIN_SECRET_CHARS`` are ignored) are redacted from the text fields: ``actor``,
     ``decision_id`` and the ``overridden_hooks`` and ``labels`` inputs. ``run_kind`` and
     ``kind`` are kind names: validated, never redacted.
-    A label containing a secret is written as ``<key>=redacted``, and dropped if its key
-    contains one.
+    A label containing a secret is written as ``<key>=redacted`` when every occurrence lies
+    wholly inside its value; it is dropped when an occurrence starts in its key or at the
+    ``=`` (it would reveal part of the secret), or when ``<key>=redacted`` would still contain
+    one.
 
     Raises ``ValueError`` for a value the schema does not allow and ``OSError`` when the file
     cannot be written. Never swallow either: the audited action must not be taken without its

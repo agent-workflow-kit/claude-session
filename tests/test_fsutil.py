@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import stat
-import time
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -252,22 +252,38 @@ def test_append_requires_an_absolute_path() -> None:
         fsutil.append_private_line("relative/log.jsonl", b"x\n")
 
 
-def test_append_gives_up_on_a_held_lock_within_the_deadline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+# Run in a fresh interpreter with a subprocess timeout: a blocking lock regression fails the
+# test instead of hanging the suite.
+HELD_LOCK = """
+import fcntl, os, sys, time
+from claude_session import fsutil
+
+target = sys.argv[1]
+fsutil.LOCK_TIMEOUT = 0.2
+# flock locks belong to the open file description: a second open conflicts in-process.
+holder = os.open(target, os.O_RDONLY)
+fcntl.flock(holder, fcntl.LOCK_EX)
+started = time.monotonic()
+try:
+    fsutil.append_private_line(target, b"two\\n")
+except OSError as exc:
+    assert "lock" in str(exc), exc
+    assert time.monotonic() - started < 5
+    print("refused")
+"""
+
+
+def test_append_gives_up_on_a_held_lock_within_the_deadline(tmp_path: Path) -> None:
     target = tmp_path / "log.jsonl"
     fsutil.append_private_line(str(target), b"one\n")
-    monkeypatch.setattr(fsutil, "LOCK_TIMEOUT", 0.2)
-    # flock locks belong to the open file description: a second open conflicts in-process.
-    holder = os.open(target, os.O_RDONLY)
-    try:
-        fcntl.flock(holder, fcntl.LOCK_EX)
-        started = time.monotonic()
-        with pytest.raises(OSError, match="lock"):
-            fsutil.append_private_line(str(target), b"two\n")
-        assert time.monotonic() - started < 5
-    finally:
-        os.close(holder)
+    proc = subprocess.run(
+        [sys.executable, "-c", HELD_LOCK, str(target)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "refused\n", "")
     assert target.read_bytes() == b"one\n"
 
 
@@ -275,22 +291,36 @@ def test_lock_deadline_is_short() -> None:
     assert 0 < fsutil.LOCK_TIMEOUT <= 2
 
 
-def test_append_waits_for_a_lock_released_before_the_deadline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+RELEASED_LOCK = """
+import fcntl, os, sys, time
+from claude_session import fsutil
+
+target = sys.argv[1]
+holder = os.open(target, os.O_RDONLY)
+fcntl.flock(holder, fcntl.LOCK_EX)
+real_sleep = time.sleep
+
+def release_then_sleep(seconds):
+    os.close(holder)  # the first retry finds the lock free
+    fsutil.time.sleep = real_sleep
+    real_sleep(seconds)
+
+fsutil.time.sleep = release_then_sleep
+fsutil.append_private_line(target, b"two\\n")
+"""
+
+
+def test_append_waits_for_a_lock_released_before_the_deadline(tmp_path: Path) -> None:
     target = tmp_path / "log.jsonl"
     fsutil.append_private_line(str(target), b"one\n")
-    holder = os.open(target, os.O_RDONLY)
-    fcntl.flock(holder, fcntl.LOCK_EX)
-    real_sleep = time.sleep
-
-    def release_then_sleep(seconds: float) -> None:
-        os.close(holder)  # the first retry finds the lock free
-        monkeypatch.setattr(fsutil.time, "sleep", real_sleep)
-        real_sleep(seconds)
-
-    monkeypatch.setattr(fsutil.time, "sleep", release_then_sleep)
-    fsutil.append_private_line(str(target), b"two\n")
+    proc = subprocess.run(
+        [sys.executable, "-c", RELEASED_LOCK, str(target)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert (proc.returncode, proc.stderr) == (0, "")
     assert target.read_bytes() == b"one\ntwo\n"
 
 
@@ -313,3 +343,72 @@ def test_append_to_a_write_only_hard_linked_file_is_refused_untouched(tmp_path: 
     with pytest.raises(OSError, match="links"):
         fsutil.append_private_line(str(target), b"two\n")
     assert stat.S_IMODE(target.stat().st_mode) == 0o200
+
+
+def _rename_away_before_the_check(
+    monkeypatch: pytest.MonkeyPatch, target: Path, replacement: Path
+) -> None:
+    """Between the open and the checks, replace the name ``target`` (a hard link) with
+    ``replacement``: the opened file then has one link left, its other name."""
+    real = fsutil._check_and_tighten
+    raced: list[bool] = []
+
+    def racing(*args: object) -> None:
+        if not raced:
+            raced.append(True)
+            os.rename(replacement, target)
+        real(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fsutil, "_check_and_tighten", racing)
+
+
+def test_append_refuses_a_hard_link_renamed_away_after_the_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"victim\n")
+    victim.chmod(0o644)
+    target = tmp_path / "log.jsonl"
+    os.link(victim, target)
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"")
+    replacement.chmod(0o600)
+    _rename_away_before_the_check(monkeypatch, target, replacement)
+    with pytest.raises(OSError):
+        fsutil.append_private_line(str(target), b"two\n")
+    assert victim.read_bytes() == b"victim\n"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert target.read_bytes() == b""
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can open a mode-0200 file for reading")
+def test_append_refuses_a_write_only_hard_link_renamed_away_after_the_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"victim\n")
+    victim.chmod(0o200)
+    target = tmp_path / "log.jsonl"
+    os.link(victim, target)
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"")
+    replacement.chmod(0o600)
+    _rename_away_before_the_check(monkeypatch, target, replacement)
+    with pytest.raises(OSError):
+        fsutil.append_private_line(str(target), b"two\n")
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o200
+    victim.chmod(0o600)
+    assert victim.read_bytes() == b"victim\n"
+    assert target.read_bytes() == b""
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can create files in a read-only directory")
+def test_append_in_a_read_only_directory_keeps_the_permission_error(tmp_path: Path) -> None:
+    directory = tmp_path / "ro"
+    directory.mkdir()
+    directory.chmod(0o500)
+    try:
+        with pytest.raises(PermissionError):
+            fsutil.append_private_line(str(directory / "log.jsonl"), b"x\n")
+    finally:
+        directory.chmod(0o700)

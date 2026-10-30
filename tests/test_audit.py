@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import audit
+from claude_session import audit, logs
 
 from .schemas import registry, validate
 
@@ -87,6 +87,16 @@ def test_full_record_validates(audit_path: Path) -> None:
 def test_every_action_and_result_validates(action: str, result: str, audit_path: Path) -> None:
     write(audit_path, action=action, result=result)
     validate(records(audit_path)[0], AUDIT_SCHEMA)
+
+
+def test_patterns_match_the_schema() -> None:
+    schema = registry().contents(AUDIT_SCHEMA)
+    inputs = schema["properties"]["inputs"]["oneOf"][0]["properties"]
+    assert inputs["kind"]["pattern"] == f"^{audit.KIND_NAME.pattern}$"
+    assert inputs["run_kind"]["pattern"] == f"^{audit.KIND_NAME.pattern}$"
+    assert inputs["labels"]["items"]["pattern"] == f"^{audit.LABEL.pattern}$"
+    assert inputs["forked_from"]["pattern"] == logs.CSESSION_ID_PATTERN
+    assert schema["properties"]["target"]["pattern"] == logs.CSESSION_ID_PATTERN
 
 
 def test_enums_match_the_schema() -> None:
@@ -264,3 +274,39 @@ def test_rejection_messages_never_echo_the_value(kwargs: dict[str, Any], audit_p
     with pytest.raises(ValueError) as info:
         write(audit_path, **kwargs)
     assert LEAK not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("label", "secret"),
+    [
+        ("k0123456789abcdefghij=xyz", "k0123456789abcdefghij=x"),
+        ("k0123456789abcdefghij=xyz", "0123456789abcdefghij="),
+        ("keykeykeykey=abcdefgh", "keykeykeykey"),
+    ],
+)
+def test_label_with_a_secret_starting_before_the_value_is_dropped(
+    label: str, secret: str, audit_path: Path
+) -> None:
+    write(audit_path, inputs={"labels": [label, "plain=1"]}, secrets=[secret])
+    [record] = records(audit_path)
+    validate(record, AUDIT_SCHEMA)
+    assert record["inputs"]["labels"] == ["plain=1"]
+
+
+def test_label_with_a_secret_wholly_inside_the_value_keeps_its_key(audit_path: Path) -> None:
+    write(audit_path, inputs={"labels": ["k0123=xyzabcdefgh"]}, secrets=["xyzabcdefgh"])
+    assert records(audit_path)[0]["inputs"]["labels"] == ["k0123=redacted"]
+
+
+@pytest.mark.parametrize("grace", [10**400, 0, 2.5], ids=["huge-int", "zero", "float"])
+def test_finite_grace_is_written(grace: int | float, audit_path: Path) -> None:
+    write(audit_path, inputs={"grace": grace})
+    [record] = records(audit_path)
+    validate(record, AUDIT_SCHEMA)
+    assert record["inputs"]["grace"] == grace
+
+
+def test_grace_too_large_to_write_raises_value_error(audit_path: Path) -> None:
+    with pytest.raises(ValueError):
+        write(audit_path, inputs={"grace": 10**5000})
+    assert not audit_path.exists()

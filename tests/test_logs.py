@@ -7,7 +7,6 @@ import os
 import stat
 import subprocess
 import sys
-import time
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -329,12 +328,86 @@ def test_full_secret_before_a_pre_cut_secret_prefix_stays_redacted(log_path: Pat
     assert text.endswith(logs.TRUNCATED)
 
 
+def run_bounded(code: str, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run ``code`` in a fresh interpreter with a subprocess timeout, so a performance
+    regression fails the test instead of hanging the suite."""
+    return subprocess.run(
+        [sys.executable, "-c", code, *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+MANY_OVERLAPPING = """
+import sys
+from claude_session import logs
+secrets = ["a" * n for n in range(8, 200)]
+logs.EventLog(sys.argv[1], secrets=secrets).write("adopt", message="a" * 2_000_000)
+"""
+
+
 def test_many_overlapping_secrets_in_a_large_message_finish_quickly(log_path: Path) -> None:
-    secrets = ["a" * n for n in range(8, 200)]
-    started = time.monotonic()
-    logs.EventLog(str(log_path), secrets=secrets).write("adopt", message="a" * 2_000_000)
-    assert time.monotonic() - started < 10
+    proc = run_bounded(MANY_OVERLAPPING, str(log_path))
+    assert (proc.returncode, proc.stderr) == (0, "")
     assert records(log_path)[0]["message"] == logs.REDACTED + logs.TRUNCATED
+
+
+LONG_OVERLAPPING = """
+import sys
+from claude_session import logs
+log = logs.EventLog(sys.argv[1], secrets=["a" * 50_000])
+log.write("signal_sent", signal="a" * 1_000_000)
+"""
+
+
+def test_long_overlapping_secret_in_a_long_text_field_finishes_quickly(log_path: Path) -> None:
+    # Overlapping occurrences of one long secret in a field without a pre-cut (signal).
+    proc = run_bounded(LONG_OVERLAPPING, str(log_path))
+    assert (proc.returncode, proc.stderr) == (0, "")
+    assert records(log_path)[0]["signal"] == logs.REDACTED
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("aaaaaaaaaaaa", "aaaaaaaa"),
+        ("xabababababababy", "abababab"),
+        ("abcabcabXabcabcab", "abcabcab"),
+        ("zzabcdefghzzabcdefgh", "abcdefgh"),
+        ("abaabaabaabaab", "abaabaab"),
+    ],
+)
+def test_overlapping_occurrences_redact_their_union(text: str, secret: str) -> None:
+    covered = bytearray(len(text))
+    for start in range(len(text)):
+        if text.startswith(secret, start):
+            covered[start : start + len(secret)] = b"\x01" * len(secret)
+    assert logs._secret_mask(text, [secret]) == covered
+
+
+def test_whole_field_replaced_after_the_pre_cut_has_no_truncation_marker(log_path: Path) -> None:
+    secrets = ["AAAAAAAA", "ted]BBBBBB"]
+    limit = 2 * logs.MESSAGE_MAX_CHARS + max(map(len, secrets))
+    message = "xAAAAAAAABBBBBBy" + "z" * limit
+    logs.EventLog(str(log_path), secrets=secrets).write("adopt", message=message)
+    assert records(log_path)[0]["message"] == logs.REDACTED
+
+
+def test_csession_id_pattern_matches_the_schemas() -> None:
+    log_schema = registry().contents(LOG_SCHEMA)
+    assert log_schema["properties"]["csession_id"]["pattern"] == logs.CSESSION_ID_PATTERN
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["cs-abcd2345", "cs-ABCD2345", "cs-abcd1345", "cs-abcd234", "cs-abcd23456", "xs-abcd2345"],
+)
+def test_is_csession_id_agrees_with_the_pattern(value: str) -> None:
+    import re
+
+    assert logs.is_csession_id(value) == bool(re.fullmatch(logs.CSESSION_ID_PATTERN, value))
 
 
 def test_truncation_never_splits_a_marker(log_path: Path) -> None:

@@ -354,3 +354,23 @@ def test_hook_event_with_a_locked_log_exits_0_quickly(tmp_path: Path) -> None:
     assert time.monotonic() - started < 30
     assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
     assert (tmp_path / "log.jsonl").read_bytes() == b""
+
+
+def test_hook_event_whose_saved_fds_are_closed_exits_0_silently() -> None:
+    code = HOOK_OUTPUT_THEN.format(
+        output="import os; print('{}'); os.closerange(3, 64)", after="return 0"
+    )
+    proc = run_python(code)
+    assert (proc.returncode, proc.stderr) == (0, "")
+
+
+def test_hook_event_writes_to_the_real_streams_never_escape() -> None:
+    code = HOOK_OUTPUT_THEN.format(
+        output=(
+            "print('{\"ok\": true}'); sys.__stdout__.write('stray out'); "
+            "sys.__stderr__.write('stray err')"
+        ),
+        after="return 0",
+    )
+    proc = run_python(code)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, '{"ok": true}\n', "")

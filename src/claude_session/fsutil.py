@@ -90,13 +90,17 @@ def append_private_line(path: str, line: bytes) -> None:
     resolved and walked as in ``write_private_file``; the file itself is opened with
     ``O_NOFOLLOW`` (a symlink fails) and ``O_NONBLOCK`` (a FIFO fails instead of blocking), and
     anything but a regular file with exactly one link, owned by the current user, is refused
-    before anything is written or chmodded. Under an exclusive ``flock`` (held by every
+    before anything is written or chmodded. The checks run after the descriptor is locked, and
+    the name must still refer to the opened file (same device and inode), so a hard link
+    renamed away after the open is refused too. Under an exclusive ``flock`` (held by every
     writer, so a concurrent write in progress is never mistaken for a torn line), if the file
     does not end in a newline (an earlier short write left a torn line), the line is prefixed
     with one, so it stays a line of its own. The lock is waited for at most ``LOCK_TIMEOUT``
-    seconds. An existing file the user cannot read (such as mode 0200) is checked, tightened
-    to 0600 and reopened. The parent directory is never created. Raises ``OSError`` on
-    failure, including a short write and a lock still held at the deadline.
+    seconds. An existing file the user cannot read (such as mode 0200) is checked the same way
+    (without the lock), tightened to 0600 and reopened; a missing file in a directory the user
+    cannot write raises the ``PermissionError`` of the create. The parent directory is never
+    created. Raises ``OSError`` on failure, including a short write and a lock still held at
+    the deadline.
     """
     if not os.path.isabs(path):
         raise ValueError(f"path must be absolute: {path!r}")
@@ -108,19 +112,19 @@ def append_private_line(path: str, line: bytes) -> None:
     dir_fd = open_dir_nofollow(os.path.realpath(parent))
     try:
         fd = _open_for_append(name, dir_fd, path)
+        try:
+            _lock(fd, path)  # released when fd is closed
+            _check_and_tighten(fd, name, dir_fd, path)
+            size = os.fstat(fd).st_size
+            if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
+                line = b"\n" + line
+            written = os.write(fd, line)
+            if written != len(line):
+                raise OSError(f"short write to {path}: {written} of {len(line)} bytes")
+        finally:
+            os.close(fd)
     finally:
         os.close(dir_fd)
-    try:
-        _check_and_tighten(fd, path)
-        _lock(fd, path)  # released when fd is closed
-        size = os.fstat(fd).st_size
-        if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
-            line = b"\n" + line
-        written = os.write(fd, line)
-        if written != len(line):
-            raise OSError(f"short write to {path}: {written} of {len(line)} bytes")
-    finally:
-        os.close(fd)
 
 
 # O_RDWR, not O_WRONLY: the last byte is read back to detect a torn line.
@@ -130,20 +134,29 @@ _APPEND_FLAGS = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_C
 def _open_for_append(name: str, dir_fd: int, path: str) -> int:
     try:
         return os.open(name, _APPEND_FLAGS | os.O_CREAT, 0o600, dir_fd=dir_fd)
-    except PermissionError:
+    except PermissionError as denied:
         # An existing file without read permission: check it through a write-only descriptor,
-        # tighten it to 0600, then open it once more for reading and appending.
+        # tighten it to 0600, then open it once more for reading and appending. A missing file
+        # (a directory the user cannot write) keeps the original permission error.
         flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-        fd = os.open(name, flags, dir_fd=dir_fd)
         try:
-            _check_and_tighten(fd, path)
+            fd = os.open(name, flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            raise denied from None
+        try:
+            _check_and_tighten(fd, name, dir_fd, path)
         finally:
             os.close(fd)
         return os.open(name, _APPEND_FLAGS, dir_fd=dir_fd)
 
 
-def _check_and_tighten(fd: int, path: str) -> None:
-    """Refuse anything but a regular file with one link owned by the user; set mode 0600."""
+def _check_and_tighten(fd: int, name: str, dir_fd: int, path: str) -> None:
+    """Refuse anything but a regular file with one link owned by the user that ``name`` (in
+    ``dir_fd``) still names; set mode 0600.
+
+    The name is checked after the descriptor: a hard link renamed away after the open leaves
+    the opened file with one link, but ``name`` then no longer names it.
+    """
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         raise OSError(f"not a regular file: {path}")
@@ -151,6 +164,9 @@ def _check_and_tighten(fd: int, path: str) -> None:
         raise OSError(f"file has {st.st_nlink} links: {path}")
     if st.st_uid != os.getuid():
         raise OSError(f"file is owned by another user: {path}")
+    named = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if (named.st_dev, named.st_ino) != (st.st_dev, st.st_ino):
+        raise OSError(f"file was replaced while it was opened: {path}")
     if stat.S_IMODE(st.st_mode) != 0o600:
         os.fchmod(fd, 0o600)
 

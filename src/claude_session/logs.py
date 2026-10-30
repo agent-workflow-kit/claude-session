@@ -10,7 +10,7 @@ instead. Records are appended with one ``os.write`` each.
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 
 from . import fsutil
@@ -88,6 +88,9 @@ MESSAGE_MAX_CHARS = 4096
 # report), so a short value cannot rewrite unrelated text.
 MIN_SECRET_CHARS = 8
 
+# interface.md, Identifiers; schemas/log.json and schemas/audit.json use the same pattern.
+# A plain string: is_csession_id checks it without ``re``.
+CSESSION_ID_PATTERN = "^cs-[a-z2-7]{8}$"
 _CSESSION_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz234567")
 
 type JSONValue = (
@@ -134,21 +137,68 @@ def usable_secrets(secrets: Iterable[str]) -> frozenset[str]:
     return frozenset(s for s in secrets if len(s) >= MIN_SECRET_CHARS)
 
 
+def _failure(secret: str) -> list[int]:
+    """The KMP prefix function of ``secret``: entry ``i`` is the length of the longest strict
+    prefix of ``secret[: i + 1]`` that is also its suffix."""
+    failure = [0] * len(secret)
+    k = 0
+    for i in range(1, len(secret)):
+        while k and secret[i] != secret[k]:
+            k = failure[k - 1]
+        if secret[i] == secret[k]:
+            k += 1
+        failure[i] = k
+    return failure
+
+
+def _occurrences(text: str, secret: str) -> Iterator[int]:
+    """The start of every occurrence of ``secret`` in ``text``, overlapping ones included, in
+    increasing order, in time linear in ``len(text) + len(secret)``.
+
+    KMP, except that while no partial match is in progress the next occurrence is found with
+    ``str.find`` (an occurrence never starts before the current position then); the
+    character-by-character scan runs only inside a match of a secret that overlaps itself."""
+    size = len(secret)
+    failure = _failure(secret)
+    border = failure[-1]  # how much of a match the next overlapping occurrence can reuse
+    pos, matched = 0, 0
+    while pos < len(text):
+        if not matched:
+            start = text.find(secret, pos)
+            if start == -1:
+                return
+            yield start
+            pos, matched = start + size, border
+            continue
+        char = text[pos]
+        while matched and char != secret[matched]:
+            matched = failure[matched - 1]
+        if char == secret[matched]:
+            matched += 1
+        pos += 1
+        if matched == size:
+            yield pos - size
+            matched = border
+
+
 def _secret_mask(text: str, secrets: Collection[str]) -> bytearray:
-    """One byte per character of ``text``: 1 where a secret occurs. Overlapping occurrences of
-    one secret mark each character once, so the work stays linear in ``len(text)`` per
-    secret."""
+    """One byte per character of ``text``: 1 where a secret occurs. Occurrences (overlapping
+    ones included) are found in linear time, and each character is marked at most once per
+    secret, so the work is ``O(len(text) + len(secret))`` per secret."""
     mask = bytearray(len(text))
     for secret in secrets:
         covered = 0  # characters before this index are already marked for this secret
-        start = text.find(secret)
-        while start != -1:
+        for start in _occurrences(text, secret):
             end = start + len(secret)
             begin = max(start, covered)
             mask[begin:end] = b"\x01" * (end - begin)
             covered = end
-            start = text.find(secret, start + 1)
     return mask
+
+
+def first_secret_index(text: str, secrets: Collection[str]) -> int:
+    """The index where the first secret occurrence in ``text`` starts, or -1."""
+    return _secret_mask(text, secrets).find(1)
 
 
 def _apply_mask(text: str, mask: bytearray, end: int) -> str:
@@ -205,14 +255,7 @@ def redact_text(text: str, secrets: Collection[str]) -> str:
 def _prefix_at_end(text: str, secret: str) -> int:
     """The length of the longest strict prefix of ``secret`` that ``text`` ends with (KMP,
     linear in ``len(secret)``)."""
-    failure = [0] * len(secret)
-    k = 0
-    for i in range(1, len(secret)):
-        while k and secret[i] != secret[k]:
-            k = failure[k - 1]
-        if secret[i] == secret[k]:
-            k += 1
-        failure[i] = k
+    failure = _failure(secret)
     matched = 0
     for char in text[-(len(secret) - 1) :] if len(secret) > 1 else "":
         while matched and char != secret[matched]:
@@ -236,8 +279,9 @@ def redact_message(message: str, secrets: Collection[str]) -> str:
     The message is first cut to ``2 * MESSAGE_MAX_CHARS`` plus the longest secret, and any
     tail of that cut which is the start of a secret is dropped, so no part of a secret
     survives the cut even when earlier redactions shorten the text. Redaction happens before
-    the final cut, which never splits a ``REDACTED`` marker; a secret completed by the
-    ``TRUNCATED`` marker makes the whole message ``REDACTED``. ``secrets`` must already be
+    the final cut, which never splits a ``REDACTED`` marker. When the whole message is
+    replaced (a secret formed across a marker, or completed by the ``TRUNCATED`` marker) the
+    result is exactly ``REDACTED``, without ``TRUNCATED``. ``secrets`` must already be
     filtered with ``usable_secrets``.
     """
     limit = 2 * MESSAGE_MAX_CHARS + max(map(len, secrets), default=0)
@@ -246,7 +290,7 @@ def redact_message(message: str, secrets: Collection[str]) -> str:
         text = message[:limit]
         result = _replace_secrets(text, secrets, _end_before_secret_prefix(text, secrets))
         if leaks_secret(result, secrets):
-            result = REDACTED
+            return REDACTED  # the whole field is replaced: nothing was kept to truncate
     else:
         result = redact_text(message, secrets)
     result = _truncate(result, force=precut)
