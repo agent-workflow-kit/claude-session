@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import os
 import signal
@@ -76,12 +77,34 @@ def test_env_and_extra_env_are_exclusive() -> None:
         ("/usr/bin::/bin", "/usr/bin:/bin"),
         (":/usr/bin:", "/usr/bin"),
         ("bin:./x:/usr/bin:../y", "/usr/bin"),
-        ("", ""),
         ("/a:/b:/a", "/a:/b:/a"),
     ],
 )
 def test_sanitize_path_drops_empty_and_relative_entries(path: str, expected: str) -> None:
     assert sanitize_path(path) == expected
+
+
+@pytest.mark.parametrize("path", ["", ":", "rel:foo", "./bin::."])
+def test_sanitize_path_with_no_absolute_entry_falls_back_to_a_fixed_default(path: str) -> None:
+    # An empty PATH would make some programs search the current directory.
+    assert sanitize_path(path) == "/usr/bin:/bin"
+
+
+@pytest.mark.parametrize("path", ["rel:foo", ""])
+def test_inherited_path_with_no_absolute_entry_becomes_the_fixed_default(
+    gw: SystemGateway, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    monkeypatch.setenv("PATH", path)
+    proc = gw.run(py("import os; print(os.environ['PATH'])"))
+    assert proc.stdout.strip() == "/usr/bin:/bin"
+
+
+def test_extra_env_path_with_no_absolute_entry_becomes_the_fixed_default(
+    gw: SystemGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin")
+    proc = gw.run(py("import os; print(os.environ['PATH'])"), extra_env={"PATH": "rel"})
+    assert proc.stdout.strip() == "/usr/bin:/bin"
 
 
 def test_default_environment_is_inherited_with_a_sanitized_path(
@@ -269,6 +292,12 @@ def test_spawn_inherit_shares_our_stdin(
     assert out.read_bytes() == b"PAYLOAD"
 
 
+def test_spawn_refuses_stdin_none(gw: SystemGateway) -> None:
+    # None would silently inherit our stdin (the hook payload); INHERIT says so explicitly.
+    with pytest.raises(TypeError):
+        gw.spawn(["/bin/true"], stdin=None)  # type: ignore[arg-type]
+
+
 def test_spawn_wait_times_out_with_none_and_signal_ends_the_child(gw: SystemGateway) -> None:
     child = gw.spawn(py("import time; time.sleep(60)"), stdin=DEVNULL)
     try:
@@ -396,7 +425,30 @@ def test_timeout_without_a_process_group_kills_only_the_direct_child(
 
 
 @linux_only
-def test_timeout_kill_grace_lets_the_group_exit_on_sigterm(
+def test_timeout_kill_grace_outlasts_the_group_leader(gw: SystemGateway, tmp_path: Path) -> None:
+    # The leader (sh) dies on SIGTERM at once; the worker it waits for needs ~0.5 s to clean
+    # up. The grace belongs to the whole group, not to the leader.
+    marker = tmp_path / "cleaned"
+    worker = tmp_path / "worker.sh"
+    worker.write_text(
+        f"trap '/bin/sleep 0.5; echo cleaned > {marker}; exit 0' TERM\n"
+        "while :; do /bin/sleep 0.1; done\n"
+    )
+    start = time.monotonic()
+    with pytest.raises(GatewayTimeout):
+        gw.run(
+            ["/bin/sh", "-c", f"/bin/sh {worker}; echo after"],
+            new_process_group=True,
+            timeout=1,
+            kill_grace=3,
+        )
+    elapsed = time.monotonic() - start
+    assert marker.read_text() == "cleaned\n"
+    assert elapsed < 1 + 3  # returned once the group was empty, before the grace ran out
+
+
+@linux_only
+def test_timeout_kill_grace_ends_early_once_the_group_is_empty(
     gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
 ) -> None:
     marker = tmp_path / "term"
@@ -408,6 +460,65 @@ def test_timeout_kill_grace_lets_the_group_exit_on_sigterm(
     assert time.monotonic() - start < 10  # did not sit out the whole grace
     assert marker.read_text() == "term\n"
     assert _wait_dead(_read_pid(pidfile, grandchildren), 5)
+
+
+@linux_only
+def test_timeout_sigkills_a_group_that_ignores_sigterm_after_the_grace(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    pidfile = tmp_path / "pid"
+    # The ignored SIGTERM is inherited by every sleep, so nothing in the group ends on it.
+    script = f"echo $$ > {pidfile}; trap '' TERM; while :; do /bin/sleep 0.1; done"
+    start = time.monotonic()
+    with pytest.raises(GatewayTimeout):
+        gw.run(["/bin/sh", "-c", script], new_process_group=True, timeout=0.5, kill_grace=0.5)
+    elapsed = time.monotonic() - start
+    assert 0.9 <= elapsed < 0.5 + 0.5 + 3
+    assert _wait_dead(_read_pid(pidfile, grandchildren), 5)
+
+
+@linux_only
+def test_interrupted_grouped_run_gives_the_group_its_grace(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    # An exception escaping communicate (here a signal handler raising) ends the group the
+    # same way a timeout does: SIGTERM, grace, SIGKILL. Then the exception propagates.
+    class Interrupted(Exception):
+        pass
+
+    def on_alarm(signum: int, frame: object) -> None:
+        del signum, frame
+        raise Interrupted
+
+    marker = tmp_path / "term"
+    script = f"trap 'echo term > {marker}; exit 0' TERM; /bin/sleep 30 & wait"
+    previous = signal.signal(signal.SIGALRM, on_alarm)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0.5)
+        with pytest.raises(Interrupted):
+            gw.run(["/bin/sh", "-c", script], new_process_group=True, timeout=30, kill_grace=5)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    assert marker.read_text() == "term\n"
+
+
+@linux_only
+def test_leader_reaped_elsewhere_stops_all_group_signals(
+    gw: SystemGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # If the leader was reaped by someone else, its PID (the group ID) may be reused: the
+    # group must not be signaled any more.
+    def reaped_elsewhere(*args: object) -> object:
+        del args
+        raise ChildProcessError
+
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "waitid", reaped_elsewhere)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+    with pytest.raises(GatewayTimeout):
+        gw.run(["/bin/sleep", "1"], new_process_group=True, timeout=0.3, kill_grace=5)
+    assert sent == []
 
 
 @linux_only
@@ -496,6 +607,82 @@ def test_child_whose_parent_already_died_exits_without_exec(
     child = gw.spawn(py(f"open({str(marker)!r}, 'w').close()"), die_with_parent=True)
     assert child.wait(timeout=30) == PARENT_GONE_EXIT
     assert not marker.exists()
+
+
+def _sigmask() -> set[int]:
+    return set(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+
+
+@pytest.fixture
+def usr1_blocked() -> Iterator[None]:
+    """SIGUSR1 blocked in this thread for the test; the mask is restored afterwards."""
+    saved = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, saved)
+
+
+@linux_only
+def test_die_with_parent_restores_the_callers_signal_mask(
+    gw: SystemGateway, tmp_path: Path, usr1_blocked: None
+) -> None:
+    before = _sigmask()
+    child = gw.spawn(["/bin/true"], die_with_parent=True)
+    assert _sigmask() == before
+    assert child.wait(timeout=30) == 0
+    with pytest.raises(FileNotFoundError):
+        gw.spawn([str(tmp_path / "missing")], die_with_parent=True)
+    assert _sigmask() == before
+
+
+@linux_only
+def test_die_with_parent_child_keeps_our_mask_except_sigterm(
+    gw: SystemGateway, tmp_path: Path, usr1_blocked: None
+) -> None:
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})  # restored by the fixture
+    out = tmp_path / "status"
+    with open(out, "wb") as fh:
+        child = gw.spawn(
+            ["/bin/cat", "/proc/self/status"], stdout=fh.fileno(), die_with_parent=True
+        )
+        assert child.wait(timeout=30) == 0
+    (line,) = (x for x in out.read_text().splitlines() if x.startswith("SigBlk:"))
+    blocked = int(line.split()[1], 16)
+    assert blocked & (1 << (signal.SIGUSR1 - 1))
+    assert not blocked & (1 << (signal.SIGTERM - 1))
+
+
+@linux_only
+def test_signal_between_fork_and_exec_never_runs_our_python_handler(
+    gw: SystemGateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SIGHUP reaches the child while preexec_fn runs (sent by the child to itself, as the
+    # first libc call there). Our Python SIGHUP handler must not run in the child: the child
+    # gets the default action instead (dies of SIGHUP) and never execs.
+    handled = tmp_path / "handled"
+    ran = tmp_path / "ran"
+    real_libc = gateway._libc  # pyright: ignore[reportPrivateUsage]
+
+    def libc_sending_sighup() -> object:
+        libc = real_libc()
+
+        def signal_after_sighup(*args: object) -> object:
+            os.kill(os.getpid(), signal.SIGHUP)  # os.getpid() is the forked child here
+            return libc.signal(*args)
+
+        return dataclasses.replace(libc, signal=signal_after_sighup)
+
+    monkeypatch.setattr(gateway, "_libc", libc_sending_sighup)
+    previous = signal.signal(signal.SIGHUP, lambda *_: handled.touch())
+    try:
+        child = gw.spawn(py(f"open({str(ran)!r}, 'w').close()"), die_with_parent=True)
+        code = child.wait(timeout=30)
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+    assert not handled.exists()
+    assert code == -signal.SIGHUP
+    assert not ran.exists()
 
 
 @linux_only

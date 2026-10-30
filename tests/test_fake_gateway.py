@@ -153,3 +153,43 @@ def test_waiting_on_a_running_child_advances_the_fake_clock() -> None:
     child.exit(0)
     assert child.wait(timeout=5) == 0
     assert clock.monotonic() - start == 5  # an exited child returns at once
+
+
+def test_waiting_forever_on_a_running_child_fails_loudly() -> None:
+    # The real wait(None) on a child that never exits would block forever.
+    fake = FakeGateway()
+    fake.on(["/opt/claude"], timeout=True)
+    child = fake.spawn(["/opt/claude"])
+    with pytest.raises(AssertionError):
+        child.wait()
+    assert isinstance(child, FakeChild)
+    child.exit(0)
+    assert child.wait() == 0
+
+
+def test_a_scripted_run_timeout_advances_the_fake_clock() -> None:
+    clock = FakeClock()
+    fake = FakeGateway(clock=clock)
+    fake.on(["/bin/sh"], timeout=True)
+    start = clock.monotonic()
+    with pytest.raises(GatewayTimeout):
+        fake.run(["/bin/sh", "-c", "hook"], timeout=30, new_process_group=True, kill_grace=10)
+    assert clock.monotonic() - start == 40
+    with pytest.raises(GatewayTimeout):
+        fake.run(["/bin/sh", "-c", "notes"], timeout=5, new_process_group=True)
+    assert clock.monotonic() - start == 45
+
+
+def test_signals_to_an_exited_child_are_not_recorded() -> None:
+    fake = FakeGateway()
+    fake.on(["/opt/claude"])
+    child = fake.spawn(["/opt/claude"])
+    child.send_signal(signal.SIGTERM)
+    assert isinstance(child, FakeChild) and child.signals == []
+
+
+def test_spawn_refuses_stdin_none_like_the_real_gateway() -> None:
+    fake = FakeGateway()
+    fake.on(["/opt/claude"])
+    with pytest.raises(TypeError):
+        fake.spawn(["/opt/claude"], stdin=None)  # type: ignore[arg-type]

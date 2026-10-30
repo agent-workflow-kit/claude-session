@@ -9,7 +9,8 @@ fails loudly. ``run`` is always answered from ``on()`` rules (it never starts a 
 
 A rule holds one response, or a list consumed one per matching call (the last one repeats), so
 a polling test can script, say, "alive, alive, gone". With ``clock``, a scripted child's
-``wait(timeout)`` on a still-running child advances that clock by ``timeout``.
+``wait(timeout)`` on a still-running child advances that clock by ``timeout``, and a scripted
+``run`` timeout advances it by ``timeout`` plus ``kill_grace`` (the longest a real one takes).
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from claude_session.gateway import (
     Result,
     check_argv,
     check_kill_grace,
+    check_spawn_stdin,
 )
 
 from .fake_clock import FakeClock
@@ -79,8 +81,10 @@ class _Rule:
 @dataclass
 class FakeChild:
     """A scripted child: ``poll``/``wait`` report ``returncode`` once ``exit()`` was called (or
-    at once when built with one); signals are recorded, never sent. With a ``clock``, waiting
-    on a running child advances it by the timeout, as a real wait would take that long."""
+    at once when built with one); signals to a running child are recorded, never sent, and
+    signals after it exited are dropped (the real child ignores them once reaped). With a
+    ``clock``, waiting on a running child advances it by the timeout, as a real wait would take
+    that long; ``wait()`` with no timeout on a running child fails (it would never return)."""
 
     pid: int
     returncode: int | None = None
@@ -94,12 +98,19 @@ class FakeChild:
         return self.returncode
 
     def wait(self, timeout: float | None = None) -> int | None:
-        if self.returncode is None and self.clock is not None and timeout is not None:
-            self.clock.advance(timeout)
+        if self.returncode is None:
+            if timeout is None:
+                raise AssertionError(
+                    f"FakeChild {self.pid}: wait() with no timeout on a running child would "
+                    "block forever; call exit() first"
+                )
+            if self.clock is not None:
+                self.clock.advance(timeout)
         return self.returncode
 
     def send_signal(self, sig: int) -> None:
-        self.signals.append(sig)
+        if self.returncode is None:
+            self.signals.append(sig)
 
 
 class FakeGateway:
@@ -175,6 +186,8 @@ class FakeGateway:
         if response.error is not None:
             raise response.error
         if response.timeout:
+            if self._clock is not None:
+                self._clock.advance((timeout or 0) + (kill_grace or 0))
             raise GatewayTimeout(args, timeout)
         return Result(args, response.returncode, response.stdout, response.stderr)
 
@@ -192,6 +205,7 @@ class FakeGateway:
         die_with_parent: bool = False,
     ) -> Child:
         check_argv(argv, env=env, extra_env=extra_env)
+        check_spawn_stdin(stdin)
         args = tuple(argv)
         self.calls.append(
             Call(

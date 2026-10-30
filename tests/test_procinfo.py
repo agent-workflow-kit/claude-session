@@ -211,9 +211,9 @@ def test_real_process_is_alive_and_stable() -> None:
 @linux_only
 def test_real_process_with_a_non_utf8_name(tmp_path: Path) -> None:
     link = os.fsencode(tmp_path) + b"/\xff\xfe"
-    os.symlink(b"/bin/sleep", link)
+    os.symlink(os.fsencode(sys.executable), link)  # comm is the name the program ran under
     gw = SystemGateway()
-    child = gw.spawn([os.fsdecode(link), "60"])
+    child = gw.spawn([os.fsdecode(link), "-I", "-c", "import time; time.sleep(60)"])
     try:
         deadline = time.monotonic() + 10
         while Path(f"/proc/{child.pid}/comm").read_bytes() != b"\xff\xfe\n":
