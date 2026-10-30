@@ -8,8 +8,9 @@ that exact process still runs and is not a zombie ("wrapper dead" means gone or 
   (clock ticks since boot) and ``boot_id`` comes from ``/proc/sys/kernel/random/boot_id``, so a
   PID and tick count recorded before a reboot never match a process after it. Ticks are used
   rather than a wall-clock conversion because ``btime`` can shift by a second between reads.
-- macOS: the ``lstart`` column of ``/bin/ps -o stat= -o lstart= -p <pid>`` with ``LC_ALL=C``
-  and ``TZ=UTC`` (stable across callers' locales and zones), whitespace-normalized. Its
+- macOS: the ``lstart`` column of ``/bin/ps -o stat= -o lstart= -p <pid>``, whitespace-normalized,
+  run with only ``LC_ALL=C``, ``TZ=UTC`` (stable across callers' locales and zones) and the
+  sanitized ``PATH`` in its environment. Its
   resolution is one second; macOS allocates PIDs sequentially, so reuse within the same second
   is not a practical concern.
 
@@ -21,7 +22,7 @@ from __future__ import annotations
 import os
 import sys
 
-from .gateway import Gateway
+from .gateway import Gateway, sanitize_path
 
 PS = "/bin/ps"
 PS_TIMEOUT = 10.0
@@ -48,6 +49,12 @@ def parse_proc_stat(data: bytes) -> tuple[str, int]:
         return fields[0], int(fields[_STARTTIME_INDEX])
     except ValueError:  # UnicodeDecodeError included
         raise ProcInfoError(f"unparsable /proc stat line: {data[:200]!r}") from None
+
+
+def _ps_env() -> dict[str, str]:
+    """``ps``'s whole environment: a fixed locale and zone and the sanitized ``PATH``. Nothing
+    else is inherited (secrets and ``CSESSION_*`` included)."""
+    return {"LC_ALL": "C", "TZ": "UTC", "PATH": sanitize_path(os.environ.get("PATH", ""))}
 
 
 def _check_pid(pid: int) -> None:
@@ -99,6 +106,7 @@ class ProcInfo:
             with open(path, "rb") as fh:
                 data = fh.read()
         except FileNotFoundError:
+            self._boot_id_cache = ""
             return ""
         except OSError as exc:
             raise ProcInfoError(f"cannot read {path}: {exc}") from exc
@@ -108,7 +116,7 @@ class ProcInfo:
     def _ps_start(self, pid: int) -> str | None:
         proc = self._gateway.run(
             [PS, "-o", "stat=", "-o", "lstart=", "-p", str(pid)],
-            extra_env={"LC_ALL": "C", "TZ": "UTC"},
+            env=_ps_env(),
             timeout=PS_TIMEOUT,
         )
         out = proc.stdout.split()

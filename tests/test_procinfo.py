@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_session.gateway import DEVNULL, SystemGateway
+from claude_session.gateway import DEFAULT_PATH, DEVNULL, SystemGateway
 from claude_session.procinfo import ProcInfo, ProcInfoError, parse_proc_stat
 
 from .fake_gateway import FakeGateway
@@ -141,6 +141,16 @@ def test_linux_without_boot_id_still_uses_ticks(tmp_path: Path) -> None:
     assert info.start_time(42) == ":7"
 
 
+def test_linux_missing_boot_id_is_read_once_too(tmp_path: Path) -> None:
+    (tmp_path / "42").mkdir()
+    (tmp_path / "42/stat").write_bytes(stat_line(42, "x", starttime=7))
+    info = ProcInfo(FakeGateway(), platform="linux", proc_root=str(tmp_path))
+    assert info.start_time(42) == ":7"
+    (tmp_path / "sys/kernel/random").mkdir(parents=True)
+    (tmp_path / "sys/kernel/random/boot_id").write_text(BOOT_ID + "\n")  # not reread
+    assert info.start_time(42) == ":7"
+
+
 def test_linux_unreadable_boot_id_is_an_error_not_a_different_token(tmp_path: Path) -> None:
     # A transient read failure must not change the token (a live wrapper would look dead).
     (tmp_path / "42").mkdir()
@@ -252,14 +262,35 @@ def mac(fake: FakeGateway) -> ProcInfo:
     return ProcInfo(fake, platform="darwin")
 
 
-def test_macos_reads_lstart_through_ps_with_a_fixed_locale_and_zone() -> None:
+def test_macos_reads_lstart_through_ps_with_a_minimal_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only a fixed locale and zone, plus the sanitized PATH: nothing else is inherited.
+    monkeypatch.setenv("PATH", "relative:/opt/bin::/usr/bin")
+    monkeypatch.setenv("SECRET_TOKEN", "x")
     fake = FakeGateway()
     fake.on([*PS, "42"], stdout="Ss   Thu Oct 30 17:08:12 2026\n")
     assert mac(fake).start_time(42) == "Thu Oct 30 17:08:12 2026"
     (call,) = fake.calls
     assert call.argv == (*PS, "42")
-    assert call.extra_env == {"LC_ALL": "C", "TZ": "UTC"}
+    assert call.env == {"LC_ALL": "C", "TZ": "UTC", "PATH": "/opt/bin:/usr/bin"}
+    assert call.extra_env is None
     assert call.timeout is not None
+
+
+@pytest.mark.parametrize("path", [None, "", "relative::bin"])
+def test_macos_ps_path_falls_back_to_the_fixed_default(
+    monkeypatch: pytest.MonkeyPatch, path: str | None
+) -> None:
+    if path is None:
+        monkeypatch.delenv("PATH", raising=False)
+    else:
+        monkeypatch.setenv("PATH", path)
+    fake = FakeGateway()
+    fake.on([*PS, "42"], stdout="S    Thu Oct 30 17:08:12 2026\n")
+    mac(fake).start_time(42)
+    (call,) = fake.calls
+    assert call.env is not None and call.env["PATH"] == DEFAULT_PATH
 
 
 def test_macos_normalizes_lstart_padding() -> None:

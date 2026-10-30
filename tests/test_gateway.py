@@ -583,6 +583,48 @@ def test_second_exception_during_the_grace_of_an_interrupted_run_still_sigkills(
 
 
 @linux_only
+def test_exception_before_the_sigkill_is_sent_still_ends_the_group(
+    gw: SystemGateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A signal handler raising inside the SIGKILL step, before killpg, must not leave the
+    # cleanup waiting forever for a leader that ignores SIGTERM. (Should it hang anyway, the
+    # conftest watchdog kills the group and this test fails on the elapsed time.)
+    real = gateway._signal_group  # pyright: ignore[reportPrivateUsage]
+    raised: list[int] = []
+
+    def interrupted_once(popen: subprocess.Popen[bytes], sig: int) -> bool:
+        if sig == signal.SIGKILL and not raised:
+            raised.append(popen.pid)
+            raise Interrupted
+        return real(popen, sig)
+
+    monkeypatch.setattr(gateway, "_signal_group", interrupted_once)
+    script = "trap '' TERM; while :; do /bin/sleep 0.1; done"
+    start = time.monotonic()
+    with pytest.raises(Interrupted):
+        gw.run(["/bin/sh", "-c", script], new_process_group=True, timeout=0.3, kill_grace=0.2)
+    assert time.monotonic() - start < 10
+    (leader,) = raised
+    assert not _alive(leader)
+
+
+@linux_only
+def test_leftover_guard_kills_a_term_ignoring_group_by_its_recorded_leader(
+    gw: SystemGateway, tmp_path: Path, no_leftover_processes: list[Any]
+) -> None:
+    # The conftest guard that every test relies on: what it recorded at launch, it ends.
+    pidfile = tmp_path / "pid"
+    script = f"trap '' TERM; /bin/sleep 30 & echo $! > {pidfile}; while :; do /bin/sleep 0.1; done"
+    child = gw.spawn(["/bin/sh", "-c", script], new_process_group=True)
+    member = _read_pid(pidfile, [])
+    (recorded,) = no_leftover_processes
+    assert recorded.popen.pid == child.pid
+    recorded.kill()
+    assert child.wait(timeout=10) == -signal.SIGKILL
+    assert _wait_dead(member, 5)
+
+
+@linux_only
 def test_keyboard_interrupt_ends_the_group_of_a_leader_that_already_exited(
     gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
 ) -> None:

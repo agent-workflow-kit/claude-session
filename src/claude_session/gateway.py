@@ -42,8 +42,10 @@ harmless to the child. Residual: signals to the forking thread wait until the ch
 (or failed to).
 
 ``run`` reads the child's output with its own loop rather than ``Popen.communicate``, which
-reaps the child when a ``KeyboardInterrupt`` interrupts it: the child stays unreaped until it
-has exited, so its process group can still be ended safely when an exception escapes.
+reaps the child when a ``KeyboardInterrupt`` interrupts it: on Linux the child stays unreaped
+until it has exited, so its process group can still be ended safely when an exception escapes.
+Best effort without ``os.waitid`` (macOS): the final wait is ``Popen.wait``, which can reap the
+leader when interrupted, after which its group is no longer signaled.
 """
 
 from __future__ import annotations
@@ -108,9 +110,11 @@ class GatewayTimeout(Exception):
       direct child: processes it started may keep running.
     - with ``new_process_group``: the child's process group got SIGTERM, then SIGKILL once
       ``kill_grace`` seconds passed or no live process was left in the group (with
-      ``kill_grace=None``, SIGKILL straight away), and the leader was reaped. The leader stays
-      unreaped until then, so the group ID cannot have been reused, and the group is not
-      signaled at all once the leader was reaped elsewhere. "Empty group" is detected through
+      ``kill_grace=None``, SIGKILL straight away), and the leader was reaped. On Linux the
+      leader stays unreaped until then, so the group ID cannot have been reused, and the group
+      is not signaled at all once the leader was reaped elsewhere (best effort without
+      ``os.waitid``, on macOS: an interrupted wait can reap the leader early, and the group is
+      then not signaled). "Empty group" is detected through
       ``/proc`` on Linux (two scans in a row finding no live member); elsewhere the full grace
       is waited. A descendant that left the group (``setsid``/``setpgid``) is not signaled.
     """
@@ -161,8 +165,9 @@ class Gateway(Protocol):
         its own process group, which a timeout ends as a whole; ``kill_grace`` (only with a
         group) is the longest SIGTERM-to-SIGKILL delay (see ``GatewayTimeout``). An exception
         while waiting (a signal handler raising, ``KeyboardInterrupt`` included) ends the child
-        the same way, then propagates; one raised during the grace still gets the group
-        SIGKILL and the leader reaped first. Raises ``GatewayTimeout``, and ``OSError`` when the
+        the same way, then propagates (on Linux; best effort without ``os.waitid``, see
+        ``GatewayTimeout``); one raised during the grace still gets the group SIGKILL and the
+        leader reaped first. Raises ``GatewayTimeout``, and ``OSError`` when the
         program cannot be started."""
         ...
 
@@ -409,7 +414,16 @@ def _end(popen: subprocess.Popen[bytes], *, group: bool, kill_grace: float | Non
             if group:
                 _signal_group(popen, signal.SIGKILL)
         finally:
-            popen.wait()
+            try:
+                # Again (both are idempotent): an exception may have interrupted the step above
+                # before the kill was sent, and waiting for a leader that ignores SIGTERM would
+                # then block forever.
+                if group:
+                    _signal_group(popen, signal.SIGKILL)
+                else:
+                    popen.kill()
+            finally:
+                popen.wait()
 
 
 def _remaining(deadline: float | None) -> float | None:

@@ -15,8 +15,9 @@ PACKAGE_NAME = "claude_session"
 GATEWAY_MODULE = f"{PACKAGE_NAME}.gateway"
 
 # Modules whose import alone means starting processes (or, for ctypes, calling libc directly;
-# pydoc, imaplib, http.server, socketserver, ensurepip, venv and _osx_support start processes
-# internally, and asyncio.base_subprocess holds the event loop's process transports).
+# pydoc, imaplib, http.server, socketserver, ensurepip, venv, _osx_support, pipes and mailcap
+# start processes internally, and asyncio.base_subprocess holds the event loop's process
+# transports).
 FORBIDDEN_MODULES = {
     "subprocess",
     "multiprocessing",
@@ -35,6 +36,8 @@ FORBIDDEN_MODULES = {
     "ensurepip",
     "venv",
     "_osx_support",
+    "pipes",
+    "mailcap",
 }
 # Process-starting functions reachable without those imports, by full name.
 FORBIDDEN_NAMES = {
@@ -60,6 +63,8 @@ FORBIDDEN_NAMES = {
     "uuid.getnode",
     "uuid.uuid1",
 }
+# Modules whose private names (``uuid._unix_getnode``, ``platform._syscmd_file``) start processes.
+PRIVATE_STARTERS = {"uuid", "platform"}
 # Attributes that start processes whatever object they are read from (event loops).
 FORBIDDEN_ATTRS = {"subprocess_exec", "subprocess_shell", "_make_subprocess_transport"}
 IMPORT_FUNCS = {
@@ -69,10 +74,11 @@ IMPORT_FUNCS = {
     "importlib.import_module",
     "import_module",
 }
-# Top-level modules a reference to which reaches a process starter. Read as an attribute of
-# anything (``shutil.os``, ``posixpath.os``) or imported from another module
-# (``from shutil import os``), one of these is a re-export. ``platform``, ``uuid`` and
-# ``http`` are left out (common attribute names); their starters are caught by full name.
+# Top-level modules a reference to which reaches a process starter. Read as an attribute of an
+# imported module (``shutil.os``, ``posixpath.os``) or imported from another module
+# (``from shutil import os``), one of these is a re-export; on any other object
+# (``args.pty``, ``self._os``) it is just an attribute name. ``platform``, ``uuid`` and ``http``
+# are left out (common attribute names); their starters are caught by full name.
 REEXPORT_ROOTS = {
     "os",
     "posix",
@@ -93,6 +99,8 @@ REEXPORT_ROOTS = {
     "ensurepip",
     "venv",
     "_osx_support",
+    "pipes",
+    "mailcap",
 }
 
 
@@ -122,12 +130,23 @@ def _canonical(name: str) -> str:
     return name
 
 
+def _bad_function(name: str) -> bool:
+    """Whether ``name`` (``a.b``, possibly read off any object) is a process-starting function
+    by its full name, or a private name of a module in ``PRIVATE_STARTERS``."""
+    if any(name == f or name.startswith(f + ".") for f in FORBIDDEN_NAMES):
+        return True
+    module, _, attr = name.partition(".")
+    attr = attr.split(".")[0]
+    dunder = attr.startswith("__") and attr.endswith("__")
+    return module in PRIVATE_STARTERS and attr.startswith("_") and not dunder
+
+
 def _bad(name: str) -> bool:
     """Whether the fully qualified ``name`` reaches a process starter."""
     name = _canonical(name)
     if any(name == m or name.startswith(m + ".") for m in FORBIDDEN_MODULES):
         return True
-    if any(name == f or name.startswith(f + ".") for f in FORBIDDEN_NAMES):
+    if _bad_function(name):
         return True
     if name.startswith(GATEWAY_MODULE + "."):
         attr = name[len(GATEWAY_MODULE) + 1 :].split(".")[0]
@@ -182,6 +201,8 @@ def _arg(node: ast.Call, index: int, keyword: str) -> ast.expr | None:
 def _constant(node: ast.expr | None, kind: type) -> object:
     if node is None:
         return None
+    if isinstance(node, ast.Name) and node.id == "__package__" and kind is str:
+        return PACKAGE_NAME  # every module of the flat package is in claude_session
     if not isinstance(node, ast.Constant) or not isinstance(node.value, kind):
         raise Dynamic
     return node.value
@@ -244,6 +265,17 @@ def _dotted(node: ast.expr, aliases: dict[str, str]) -> str | None:
     return ".".join(reversed(parts))
 
 
+def _module_base(node: ast.Attribute, aliases: dict[str, str]) -> bool:
+    """Whether the base of the chain ``node`` is a name bound by an import or an import call
+    (so its attributes are a module's), rather than some other object."""
+    base: ast.expr = node
+    while isinstance(base, ast.Attribute):
+        base = base.value
+    if isinstance(base, ast.Name):
+        return base.id in aliases
+    return _imported(base, aliases) is not None
+
+
 def _attrs(node: ast.Attribute) -> list[str]:
     """The attribute names of a chain, base excluded: ``f().a.b`` gives ``['a', 'b']``."""
     attrs: list[str] = []
@@ -302,16 +334,20 @@ def violations(source: str) -> list[str]:
             call = _import_call(node, aliases)
             name = None if isinstance(node, ast.Call) else _dotted(node, aliases)
             module = _imported(node, aliases) if call is not None else None
+            of_module = isinstance(node, ast.Attribute) and _module_base(node, aliases)
         except Dynamic:
             found.append(f"dynamic import: {ast.unparse(node)}")
             continue
         if isinstance(node, ast.Attribute):
             attrs = _attrs(node) if not read_as_attribute(node) else []
+            # Off a module, any name reaching a starter; off another object, only a starter
+            # function's full name (``sys.modules['x'].platform.uname``).
+            reaches = _bad if of_module else _bad_function
             if node.attr in FORBIDDEN_ATTRS:
                 found.append(f"<object>.{node.attr}")
-            elif _reexport_root(node.attr):
+            elif of_module and _reexport_root(node.attr):
                 found.append(f"re-export: {ast.unparse(node)}")
-            elif any(_bad(".".join(attrs[i:])) for i in range(len(attrs))):
+            elif any(reaches(".".join(attrs[i:])) for i in range(len(attrs))):
                 found.append(f"re-export: {ast.unparse(node)}")
         if call is not None:
             assert module is not None
@@ -483,6 +519,21 @@ def test_gateway_is_the_module_that_does() -> None:
         "import uuid\nuuid.uuid1()",
         "from uuid import uuid1",
         "loop._make_subprocess_transport(proto, ['/bin/x'], False, None, None, None, 0)",
+        # pipes and mailcap run shell commands; uuid and platform hold private starters
+        "import pipes",
+        "from pipes import Template",
+        "import mailcap",
+        "from mailcap import findmatch",
+        "import shlex\nshlex.pipes",
+        "import uuid\nuuid._unix_getnode()",
+        "import uuid\nuuid._ifconfig_getnode()",
+        "from uuid import _get_command_stdout",
+        "import platform\nplatform._syscmd_file('/bin/x', '')",
+        "from platform import _syscmd_ver",
+        "import json\njson.decoder.uuid._unix_getnode()",
+        # relative import calls through __package__ (claude_session)
+        "import importlib\nimportlib.import_module('.gateway', __package__)._prctl()",
+        "from importlib import import_module\nimport_module('.gateway', package=__package__).os",
     ],
 )
 def test_checker_catches(source: str) -> None:
@@ -515,6 +566,16 @@ def test_checker_catches(source: str) -> None:
         "import importlib\nimportlib.import_module('.clock', 'claude_session').monotonic",
         "self.gateway.run(['/bin/x'])",
         "from . import clock\nclock.SystemClock()",
+        # attribute names that only match a module name, on objects that are not modules
+        "args.pty",
+        "session.pty.fd",
+        "self._os",
+        "cfg.venv",
+        "opts.concurrent",
+        "def f(args):\n    return args.subprocess",
+        "import importlib\nimportlib.import_module('.clock', __package__).SystemClock()",
+        "from importlib import import_module\nimport_module('.clock', package=__package__).x",
+        "import uuid\nuuid.__name__",
     ],
 )
 def test_checker_allows(source: str) -> None:
