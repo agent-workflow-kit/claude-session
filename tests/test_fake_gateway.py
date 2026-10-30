@@ -193,3 +193,11 @@ def test_spawn_refuses_stdin_none_like_the_real_gateway() -> None:
     fake.on(["/opt/claude"])
     with pytest.raises(TypeError):
         fake.spawn(["/opt/claude"], stdin=None)  # type: ignore[arg-type]
+
+
+def test_a_scripted_timeout_without_a_timeout_fails() -> None:
+    # The real gateway cannot time out a run that has no timeout.
+    fake = FakeGateway()
+    fake.on(["/bin/sh"], timeout=True)
+    with pytest.raises(AssertionError):
+        fake.run(["/bin/sh", "-c", "hook"], new_process_group=True)

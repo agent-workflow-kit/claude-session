@@ -56,8 +56,9 @@ class Call:
 
 @dataclass(frozen=True)
 class Response:
-    """One scripted answer. ``timeout``: ``run`` raises ``GatewayTimeout``, a spawned child
-    keeps running. ``error``: the call raises it."""
+    """One scripted answer. ``timeout``: ``run`` raises ``GatewayTimeout`` (only for a call
+    given a ``timeout``: otherwise the fake fails, as the real call could not time out), a
+    spawned child keeps running. ``error``: the call raises it."""
 
     returncode: int = 0
     stdout: str = ""
@@ -186,8 +187,13 @@ class FakeGateway:
         if response.error is not None:
             raise response.error
         if response.timeout:
+            if timeout is None:
+                raise AssertionError(
+                    f"FakeGateway: scripted timeout for {args[0]} run without a timeout (the real "
+                    "gateway cannot time out then)"
+                )
             if self._clock is not None:
-                self._clock.advance((timeout or 0) + (kill_grace or 0))
+                self._clock.advance(timeout + (kill_grace or 0))
             raise GatewayTimeout(args, timeout)
         return Result(args, response.returncode, response.stdout, response.stderr)
 

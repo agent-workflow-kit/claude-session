@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import os
 import signal
+import subprocess
 import sys
 import textwrap
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -96,6 +99,14 @@ def test_inherited_path_with_no_absolute_entry_becomes_the_fixed_default(
 ) -> None:
     monkeypatch.setenv("PATH", path)
     proc = gw.run(py("import os; print(os.environ['PATH'])"))
+    assert proc.stdout.strip() == "/usr/bin:/bin"
+
+
+def test_unset_path_becomes_the_fixed_default(
+    gw: SystemGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PATH", raising=False)
+    proc = gw.run(py("import os; print(os.environ.get('PATH'))"))
     assert proc.stdout.strip() == "/usr/bin:/bin"
 
 
@@ -503,6 +514,188 @@ def test_interrupted_grouped_run_gives_the_group_its_grace(
     assert marker.read_text() == "term\n"
 
 
+class Interrupted(Exception):
+    """Raised by a test's signal handler."""
+
+
+@contextlib.contextmanager
+def _raising_alarms(
+    first: float, interval: float = 0.0, exc: type[BaseException] = Interrupted
+) -> Iterator[None]:
+    """SIGALRM after ``first`` seconds (then every ``interval``), its handler raising ``exc``.
+    The timer and the previous handler are restored even if an alarm lands while restoring."""
+
+    def on_alarm(signum: int, frame: object) -> None:
+        del signum, frame
+        raise exc
+
+    previous = signal.signal(signal.SIGALRM, on_alarm)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, first, interval)
+        yield
+    finally:
+        for _ in range(100):
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+                break
+            except exc:
+                continue
+
+
+@linux_only
+def test_exception_during_the_kill_grace_still_sigkills_and_reaps(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    # Timeout at 0.3 s; the alarm at 0.8 s lands in the 5 s grace of a group that ignores
+    # SIGTERM. The group still gets SIGKILL and the leader is reaped before it propagates.
+    pidfile, leaderfile = tmp_path / "pid", tmp_path / "leader"
+    script = (
+        f"echo $$ > {leaderfile}; trap '' TERM; /bin/sleep 30 & echo $! > {pidfile}; "
+        "while :; do /bin/sleep 0.1; done"
+    )
+    start = time.monotonic()
+    with pytest.raises(Interrupted), _raising_alarms(0.8, 1.0):
+        gw.run(["/bin/sh", "-c", script], new_process_group=True, timeout=0.3, kill_grace=5)
+    leader = _read_pid(leaderfile, grandchildren)  # recorded for cleanup should this fail
+    assert time.monotonic() - start < 3
+    assert _wait_dead(_read_pid(pidfile, grandchildren), 5)
+    assert not _alive(leader)
+
+
+@linux_only
+def test_second_exception_during_the_grace_of_an_interrupted_run_still_sigkills(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    # The first alarm interrupts the run; the second lands in the grace that follows.
+    pidfile, leaderfile = tmp_path / "pid", tmp_path / "leader"
+    script = (
+        f"echo $$ > {leaderfile}; trap '' TERM; /bin/sleep 30 & echo $! > {pidfile}; "
+        "while :; do /bin/sleep 0.1; done"
+    )
+    start = time.monotonic()
+    with pytest.raises(Interrupted), _raising_alarms(0.5, 0.5):
+        gw.run(["/bin/sh", "-c", script], new_process_group=True, timeout=30, kill_grace=5)
+    leader = _read_pid(leaderfile, grandchildren)  # recorded for cleanup should this fail
+    assert time.monotonic() - start < 3
+    assert _wait_dead(_read_pid(pidfile, grandchildren), 5)
+    assert not _alive(leader)
+
+
+@linux_only
+def test_keyboard_interrupt_ends_the_group_of_a_leader_that_already_exited(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    # The leader exits at once; a background member keeps stdout open. On KeyboardInterrupt
+    # the leader must still be unreaped, so its group can be ended safely.
+    pidfile = tmp_path / "pid"
+    script = f"/bin/sleep 30 & echo $! > {pidfile}; exit 0"
+    with pytest.raises(KeyboardInterrupt), _raising_alarms(0.5, exc=KeyboardInterrupt):
+        gw.run(["/bin/sh", "-c", script], new_process_group=True, timeout=30, kill_grace=5)
+    assert _wait_dead(_read_pid(pidfile, grandchildren), 5)
+
+
+@linux_only
+def test_run_waits_for_the_leader_after_its_output_closes(gw: SystemGateway) -> None:
+    proc = gw.run(
+        ["/bin/sh", "-c", "exec >&- 2>&-; /bin/sleep 0.3; exit 5"],
+        new_process_group=True,
+        timeout=30,
+    )
+    assert (proc.returncode, proc.stdout, proc.stderr) == (5, "", "")
+
+
+def test_run_timeout_counts_the_wait_after_output_closes(gw: SystemGateway) -> None:
+    start = time.monotonic()
+    with pytest.raises(GatewayTimeout):
+        gw.run(["/bin/sh", "-c", "exec >&- 2>&-; exec /bin/sleep 30"], timeout=0.5)
+    assert time.monotonic() - start < 10
+
+
+def test_run_translates_newlines_like_text_mode(gw: SystemGateway) -> None:
+    proc = gw.run(py("import sys; sys.stdout.buffer.write(b'a\\r\\nb\\rc\\n')"))
+    assert proc.stdout == "a\nb\nc\n"
+
+
+def test_run_with_empty_stdin_text_gives_eof(gw: SystemGateway) -> None:
+    proc = gw.run(py("import sys; print(repr(sys.stdin.read()))"), stdin="")
+    assert proc.stdout == "''\n"
+
+
+def test_run_survives_a_child_that_does_not_read_its_stdin(gw: SystemGateway) -> None:
+    proc = gw.run(["/bin/true"], stdin="x" * (1024 * 1024), timeout=30)
+    assert proc.returncode == 0
+
+
+# --- group scan and grace polling --------------------------------------------------------
+
+
+def _stat(state: bytes, pgrp: int, threads: int) -> bytes:
+    after = [state, b"1", str(pgrp).encode(), *([b"0"] * 14), str(threads).encode(), b"0", b"9"]
+    return b"42 (a) b) " + b" ".join(after) + b"\n"
+
+
+@pytest.mark.parametrize(
+    ("stat", "live"),
+    [
+        (_stat(b"S", 77, 1), True),
+        (_stat(b"R", 77, 3), True),
+        (_stat(b"Z", 77, 3), True),  # main thread exited, other threads still run
+        (_stat(b"Z", 77, 1), False),
+        (_stat(b"X", 77, 1), False),
+        (_stat(b"S", 78, 1), False),  # another group
+        (b"42 (a) S", False),  # truncated
+    ],
+)
+def test_group_member_classification(stat: bytes, live: bool) -> None:
+    assert gateway._live_in_group(stat, 77) is live  # pyright: ignore[reportPrivateUsage]
+
+
+class _FakeTime:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _wait_with_scans(
+    monkeypatch: pytest.MonkeyPatch, scans: list[bool], seconds: float
+) -> tuple[bool, _FakeTime, list[bool]]:
+    remaining = list(scans)
+    monkeypatch.setattr(gateway, "_reaped_elsewhere", lambda pid: False)
+    monkeypatch.setattr(
+        gateway, "_group_has_live_member", lambda pgid: remaining.pop(0) if remaining else True
+    )
+    clock = _FakeTime()
+    empty = gateway._wait_group_empty(  # pyright: ignore[reportPrivateUsage]
+        123, seconds, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+    return empty, clock, remaining
+
+
+def test_group_counts_as_empty_only_after_two_empty_scans_in_a_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A process forked after a scan listed /proc may be missed once, not twice.
+    empty, clock, left = _wait_with_scans(monkeypatch, [False, True, False, False, True], 10)
+    assert empty
+    assert left == [True]  # stopped after the second empty scan in a row
+    assert clock.sleeps == [0.05]
+
+
+def test_grace_poll_backs_off_and_stops_at_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    empty, clock, _ = _wait_with_scans(monkeypatch, [], 2.0)
+    assert empty
+    assert clock.sleeps == pytest.approx([0.05, 0.1, 0.2, 0.4, 0.5, 0.5, 0.25])
+    assert clock.now == pytest.approx(2.0)
+
+
 @linux_only
 def test_leader_reaped_elsewhere_stops_all_group_signals(
     gw: SystemGateway, monkeypatch: pytest.MonkeyPatch
@@ -651,6 +844,65 @@ def test_die_with_parent_child_keeps_our_mask_except_sigterm(
     blocked = int(line.split()[1], 16)
     assert blocked & (1 << (signal.SIGUSR1 - 1))
     assert not blocked & (1 << (signal.SIGTERM - 1))
+
+
+@linux_only
+def test_die_with_parent_restores_the_mask_when_blocking_raises(
+    gw: SystemGateway, monkeypatch: pytest.MonkeyPatch, usr1_blocked: None
+) -> None:
+    # A pending handler can raise from the very call that blocked every signal.
+    before = _sigmask()
+    real = signal.pthread_sigmask
+
+    def raising_after_blocking_all(how: int, mask: object) -> object:
+        old = real(how, mask)  # type: ignore[arg-type]
+        if how == signal.SIG_BLOCK and signal.SIGTERM in set(mask):  # type: ignore[arg-type]
+            raise Interrupted
+        return old
+
+    monkeypatch.setattr(signal, "pthread_sigmask", raising_after_blocking_all)
+    with pytest.raises(Interrupted):
+        gw.spawn(["/bin/true"], die_with_parent=True)
+    monkeypatch.undo()
+    assert _sigmask() == before
+
+
+@linux_only
+def test_die_with_parent_kills_and_reaps_the_child_when_restoring_the_mask_raises(
+    gw: SystemGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SIGUSR1 arrives while spawn blocks every signal; its handler raises once the mask is
+    # restored. The child already started must not be left behind.
+    started: list[subprocess.Popen[Any]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        popen: subprocess.Popen[Any] = real_popen(*args, **kwargs)
+        started.append(popen)
+        os.kill(os.getpid(), signal.SIGUSR1)  # pending until spawn restores the mask
+        return popen
+
+    def on_usr1(signum: int, frame: object) -> None:
+        del signum, frame
+        raise Interrupted
+
+    before = _sigmask()
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    previous = signal.signal(signal.SIGUSR1, on_usr1)
+    try:
+        with pytest.raises(Interrupted):
+            gw.spawn(["/bin/sleep", "30"], die_with_parent=True)
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+        monkeypatch.undo()
+        leftover = [p for p in started if p.returncode is None]
+        for p in leftover:  # the exact child this test started
+            p.kill()
+            p.wait()
+    assert len(started) == 1
+    assert leftover == []
+    assert started[0].returncode == -signal.SIGKILL
+    assert _sigmask() == before
 
 
 @linux_only
