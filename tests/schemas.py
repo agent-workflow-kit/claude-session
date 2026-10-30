@@ -26,6 +26,10 @@ def registry() -> Registry[Any]:
 
 
 def validate(instance: object, schema_id: str) -> None:
-    """Raise ``jsonschema.ValidationError`` unless ``instance`` matches ``schema_id``."""
+    """Raise ``jsonschema.ValidationError`` unless ``instance`` matches ``schema_id``, formats
+    (such as ``date-time``) included."""
     schema = registry().contents(schema_id)
-    Draft202012Validator(schema, registry=registry()).validate(instance)
+    validator = Draft202012Validator(
+        schema, registry=registry(), format_checker=Draft202012Validator.FORMAT_CHECKER
+    )
+    validator.validate(instance)

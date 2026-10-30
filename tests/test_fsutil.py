@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
@@ -160,6 +161,53 @@ def test_append_short_write_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(fsutil.os, "write", lambda fd, data: real_write(fd, data[:1]))
     with pytest.raises(OSError, match="short write"):
         fsutil.append_private_line(str(tmp_path / "log.jsonl"), b"abc\n")
+
+
+def test_append_after_a_torn_line_starts_a_new_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "log.jsonl"
+    fsutil.append_private_line(str(target), b'{"a":1}\n')
+    real_write = os.write
+    with monkeypatch.context() as patch:
+        patch.setattr(fsutil.os, "write", lambda fd, data: real_write(fd, data[:4]))
+        with pytest.raises(OSError, match="short write"):
+            fsutil.append_private_line(str(target), b'{"b":2}\n')
+    fsutil.append_private_line(str(target), b'{"c":3}\n')
+    assert target.read_bytes() == b'{"a":1}\n{"b"\n{"c":3}\n'
+    assert json.loads(target.read_text(encoding="utf-8").splitlines()[-1]) == {"c": 3}
+
+
+def test_append_to_a_file_ending_in_a_newline_adds_no_blank_line(tmp_path: Path) -> None:
+    target = tmp_path / "log.jsonl"
+    target.write_bytes(b"one\n")
+    target.chmod(0o600)
+    fsutil.append_private_line(str(target), b"two\n")
+    assert target.read_bytes() == b"one\ntwo\n"
+
+
+def test_append_refuses_a_hard_linked_file(tmp_path: Path) -> None:
+    target = tmp_path / "log.jsonl"
+    target.write_bytes(b"one\n")
+    target.chmod(0o644)
+    os.link(target, tmp_path / "other")
+    with pytest.raises(OSError, match="links"):
+        fsutil.append_private_line(str(target), b"two\n")
+    assert target.read_bytes() == b"one\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+def test_append_refuses_a_file_owned_by_another_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "log.jsonl"
+    target.write_bytes(b"one\n")
+    target.chmod(0o644)
+    monkeypatch.setattr(fsutil.os, "getuid", lambda: os.stat(target).st_uid + 1)
+    with pytest.raises(OSError, match="another user"):
+        fsutil.append_private_line(str(target), b"two\n")
+    assert target.read_bytes() == b"one\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
 
 
 def test_append_refuses_a_symlink(tmp_path: Path) -> None:

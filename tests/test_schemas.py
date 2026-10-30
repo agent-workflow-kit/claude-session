@@ -12,12 +12,12 @@ import yaml
 from jsonschema import Draft202012Validator, ValidationError
 from referencing.exceptions import Unresolvable
 
-from .golden import GOLDEN_ROOT, assert_golden, schema_id_for
+from .golden import GOLDEN_ROOT, assert_golden, golden_name, schema_id_for
 from .schemas import SCHEMA_ROOT, registry, validate
 
 ROOT = SCHEMA_ROOT.parent
 SCHEMA_FILES = sorted(SCHEMA_ROOT.rglob("*.json"))
-GOLDEN_FILES = sorted(GOLDEN_ROOT.glob("*.json"))
+GOLDEN_FILES = sorted(GOLDEN_ROOT.rglob("*.json"))
 
 
 def load(path: Path) -> Any:
@@ -95,9 +95,9 @@ def test_golden_files_exist() -> None:
     assert GOLDEN_FILES
 
 
-@pytest.mark.parametrize("path", GOLDEN_FILES, ids=lambda p: p.name)
+@pytest.mark.parametrize("path", GOLDEN_FILES, ids=golden_name)
 def test_golden_file_validates_against_its_schema(path: Path) -> None:
-    validate(load(path), schema_id_for(path.stem))
+    validate(load(path), schema_id_for(golden_name(path)))
 
 
 @pytest.mark.parametrize(
@@ -108,15 +108,18 @@ def test_golden_file_validates_against_its_schema(path: Path) -> None:
         ("exec-dry-run-review", "claude-session/cli/exec-dry-run.json"),
         ("exec-done", "claude-session/cli/exec.json"),
         ("list", "claude-session/cli/list.json"),
+        ("hooks/pre-launch-resume", "claude-session/hooks/pre-launch.json"),
+        ("hooks/post-state-change", "claude-session/hooks/post-state-change.json"),
     ],
 )
 def test_golden_name_picks_the_longest_schema(name: str, schema_id: str) -> None:
     assert schema_id_for(name) == schema_id
 
 
-def test_golden_name_without_a_schema_is_an_error() -> None:
+@pytest.mark.parametrize("name", ["nonsense-case", "hooks/label-add-x", "nodir/error-x"])
+def test_golden_name_without_a_schema_is_an_error(name: str) -> None:
     with pytest.raises(LookupError):
-        schema_id_for("nonsense-case")
+        schema_id_for(name)
 
 
 def test_assert_golden_validates_before_comparing() -> None:
@@ -126,3 +129,49 @@ def test_assert_golden_validates_before_comparing() -> None:
         assert_golden({"error": {"code": "usage"}}, "error-usage")
     with pytest.raises(AssertionError):
         assert_golden({"error": {"code": "usage", "message": "other"}}, "error-usage")
+
+
+ERROR = {"error": {"code": "usage", "message": "bad", "detail": None}}
+
+
+def test_assert_golden_normalizes_before_validating_and_comparing(tmp_path: Path) -> None:
+    (tmp_path / "error-norm.json").write_text(json.dumps(ERROR), encoding="utf-8")
+    volatile = {"error": {"code": "usage", "message": "bad /tmp/x123", "detail": None}}
+
+    def normalize(value: Any) -> Any:
+        value["error"]["message"] = value["error"]["message"].split(" ")[0]
+        return value
+
+    assert_golden(volatile, "error-norm", normalize=normalize, root=tmp_path)
+    with pytest.raises(AssertionError):
+        assert_golden(
+            {"error": {"code": "usage", "message": "bad /tmp/x123", "detail": None}},
+            "error-norm",
+            root=tmp_path,
+        )
+
+
+def test_update_golden_writes_indented_sorted_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UPDATE_GOLDEN", "1")
+    assert_golden(ERROR, "error-new", root=tmp_path)
+    text = (tmp_path / "error-new.json").read_text(encoding="utf-8")
+    assert text == json.dumps(ERROR, indent=2, sort_keys=True) + "\n"
+    assert text.index('"code"') < text.index('"detail"') < text.index('"message"')
+
+
+def test_assert_golden_uses_a_hooks_schema_for_a_hooks_golden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UPDATE_GOLDEN", "1")
+    with pytest.raises(ValidationError):  # an error envelope is not a pre-launch payload
+        assert_golden(ERROR, "hooks/pre-launch-case", root=tmp_path)
+    assert not (tmp_path / "hooks").exists()
+
+
+def test_validate_checks_formats() -> None:
+    record = {"ts": "not-a-time", "level": "info", "event": "launch"}
+    with pytest.raises(ValidationError, match="date-time"):
+        validate(record, "claude-session/log.json")
+    validate({**record, "ts": "2026-10-30T12:00:00.123Z"}, "claude-session/log.json")

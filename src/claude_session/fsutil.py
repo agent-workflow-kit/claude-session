@@ -1,11 +1,13 @@
 """File writes that never follow a planted symlink. Standard library only.
 
-Used for ``--outcome-file`` (interface.md, Outcome file), the ``log.jsonl`` and ``audit.jsonl``
-appends, and reusable for the session-directory writes (design.md, File handling).
+``write_private_file`` is used for ``--outcome-file`` (interface.md, Outcome file) and
+``append_private_line`` for the ``log.jsonl`` and ``audit.jsonl`` appends; both are reusable
+for the session-directory writes (design.md, File handling).
 """
 
 from __future__ import annotations
 
+import fcntl
 import os
 import secrets
 import stat
@@ -81,7 +83,11 @@ def append_private_line(path: str, line: bytes) -> None:
     looser), so lines from concurrent writers never interleave. The parent directory is
     resolved and walked as in ``write_private_file``; the file itself is opened with
     ``O_NOFOLLOW`` (a symlink fails) and ``O_NONBLOCK`` (a FIFO fails instead of blocking), and
-    anything but a regular file is refused. The parent directory is never created. Raises
+    anything but a regular file with exactly one link, owned by the current user, is refused
+    before anything is written or chmodded. Under an exclusive ``flock`` (held by every
+    writer, so a concurrent write in progress is never mistaken for a torn line), if the file
+    does not end in a newline (an earlier short write left a torn line), the line is prefixed
+    with one, so it stays a line of its own. The parent directory is never created. Raises
     ``OSError`` on failure, including a short write.
     """
     if not os.path.isabs(path):
@@ -93,7 +99,8 @@ def append_private_line(path: str, line: bytes) -> None:
         raise IsADirectoryError(path)
     dir_fd = open_dir_nofollow(os.path.realpath(parent))
     try:
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+        # O_RDWR, not O_WRONLY: the last byte is read back to detect a torn line.
+        flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
         fd = os.open(name, flags | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
     finally:
         os.close(dir_fd)
@@ -101,8 +108,16 @@ def append_private_line(path: str, line: bytes) -> None:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise OSError(f"not a regular file: {path}")
+        if st.st_nlink != 1:
+            raise OSError(f"file has {st.st_nlink} links: {path}")
+        if st.st_uid != os.getuid():
+            raise OSError(f"file is owned by another user: {path}")
         if stat.S_IMODE(st.st_mode) != 0o600:
             os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # released when fd is closed
+        size = os.fstat(fd).st_size
+        if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
+            line = b"\n" + line
         written = os.write(fd, line)
         if written != len(line):
             raise OSError(f"short write to {path}: {written} of {len(line)} bytes")

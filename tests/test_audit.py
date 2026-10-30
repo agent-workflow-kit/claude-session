@@ -103,6 +103,32 @@ def test_enums_match_the_schema() -> None:
         {"action": "launch"},
         {"result": "maybe"},
         {"inputs": {"unknown": 1}},
+        {"target": "cs-ABCD2345"},
+        {"target": "abcd2345"},
+        {"actor": 3},
+        {"decision_ids": "d1"},
+        {"decision_ids": [1]},
+        {"inputs": ["run"]},
+        {"inputs": {"sandbox_from": "maybe"}},
+        {"inputs": {"sandbox_to": "on"}},
+        {"inputs": {"labels": ["Bad Label"]}},
+        {"inputs": {"labels": ["a=b c"]}},
+        {"inputs": {"labels": {"a": "b"}}},
+        {"inputs": {"labels": "a=b"}},
+        {"inputs": {"labels": [1]}},
+        {"inputs": {"run": "1"}},
+        {"inputs": {"run": True}},
+        {"inputs": {"kind": 3}},
+        {"inputs": {"run_kind": ["review"]}},
+        {"inputs": {"forked_from": "parent"}},
+        {"inputs": {"tty": 1}},
+        {"inputs": {"overridden_hooks": "h1"}},
+        {"inputs": {"overridden_hooks": [1]}},
+        {"inputs": {"grace": "10"}},
+        {"inputs": {"grace": True}},
+        {"inputs": {"grace": float("nan")}},
+        {"inputs": {"grace": float("inf")}},
+        {"now": datetime(2026, 10, 30, 1, 2, 3)},
     ],
 )
 def test_invalid_records_are_rejected(kwargs: dict[str, Any], audit_path: Path) -> None:
@@ -122,18 +148,82 @@ def test_file_mode_is_0600(audit_path: Path) -> None:
     assert stat.S_IMODE(audit_path.stat().st_mode) == 0o600
 
 
+def test_write_failure_raises(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        write(tmp_path / "missing" / "audit.jsonl")
+    (tmp_path / "audit.jsonl").mkdir()
+    with pytest.raises(OSError):
+        write(tmp_path / "audit.jsonl")
+
+
 def test_secrets_never_appear_in_records(audit_path: Path) -> None:
     write(
         audit_path,
         actor=f"auto:{SECRET}",
         decision_ids=[SECRET],
-        inputs={"kind": f"k-{SECRET}", "labels": [f"token={SECRET}"]},
-        secrets=[SECRET],
+        inputs={
+            "kind": f"k-{SECRET}",
+            "run_kind": SECRET,
+            "overridden_hooks": [f"h{SECRET}"],
+            "labels": [f"token={SECRET}", "plain=1", f"{SECRET.lower()}=v"],
+        },
+        secrets=[SECRET, SECRET.lower()],
     )
-    assert SECRET not in audit_path.read_text(encoding="utf-8")
+    text = audit_path.read_text(encoding="utf-8")
+    assert SECRET not in text
+    assert SECRET.lower() not in text
     [record] = records(audit_path)
-    assert record["inputs"]["labels"] == ["token=[redacted]"]
+    validate(record, AUDIT_SCHEMA)
+    assert record["inputs"]["labels"] == ["token=redacted", "plain=1"]
     assert record["decision_id"] == ["[redacted]"]
+    assert record["inputs"]["overridden_hooks"] == ["h[redacted]"]
+
+
+@pytest.mark.parametrize("secret", ["stop", "ok", "human", "cs-abcd", "a", "2026"])
+def test_short_secrets_are_ignored(secret: str, audit_path: Path) -> None:
+    write(audit_path, secrets=[secret], inputs={"labels": [f"k={secret}"]})
+    [record] = records(audit_path)
+    validate(record, AUDIT_SCHEMA)
+    assert record["action"] == "stop"
+    assert record["result"] == "ok"
+    assert record["actor"] == "human:tester"
+    assert record["inputs"]["labels"] == [f"k={secret}"]
+
+
+@pytest.mark.parametrize(
+    "secret", ["launch_escalation_override", SID, "cs-zzzz2222", "required", "2026-10-30"]
+)
+def test_constrained_fields_are_never_redacted(secret: str, audit_path: Path) -> None:
+    now = datetime(2026, 10, 30, 1, 2, 3, tzinfo=UTC)
+    inputs = {"forked_from": "cs-zzzz2222", "sandbox_from": "required", "sandbox_to": "off"}
+    write(
+        audit_path,
+        action="launch_escalation_override",
+        inputs=inputs,
+        actor=f"auto:{secret}",
+        secrets=[secret],
+        now=now,
+    )
+    [record] = records(audit_path)
+    validate(record, AUDIT_SCHEMA)
+    assert record["action"] == "launch_escalation_override"
+    assert record["target"] == SID
+    assert record["ts"] == "2026-10-30T01:02:03.000Z"
+    assert record["inputs"] == inputs
+    assert record["actor"] == "auto:[redacted]"
+
+
+def test_label_whose_redacted_form_would_leak_is_dropped(audit_path: Path) -> None:
+    write(audit_path, inputs={"labels": ["key=abcdefgh"]}, secrets=["abcdefgh", "y=redacted"])
+    [record] = records(audit_path)
+    validate(record, AUDIT_SCHEMA)
+    assert record["inputs"]["labels"] == []
+
+
+def test_secret_formed_across_a_marker_is_not_written(audit_path: Path) -> None:
+    write(audit_path, actor="auto:AAAAAAAABBBBBB", secrets=["AAAAAAAA", "ted]BBBBBB"])
+    assert "ted]BBBBBB" not in audit_path.read_text(encoding="utf-8")
+    assert records(audit_path)[0]["actor"] == "[redacted]"
 
 
 def test_returned_record_is_the_redacted_one(audit_path: Path) -> None:

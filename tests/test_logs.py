@@ -7,7 +7,7 @@ import os
 import stat
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,7 @@ def log_path(tmp_path: Path) -> Path:
 
 
 def test_minimal_record_validates(log_path: Path) -> None:
-    assert logs.EventLog(str(log_path)).write("adopt")
+    logs.EventLog(str(log_path)).write("adopt")
     [record] = records(log_path)
     validate(record, LOG_SCHEMA)
     assert record["event"] == "adopt"
@@ -40,7 +40,7 @@ def test_minimal_record_validates(log_path: Path) -> None:
 
 
 def test_full_record_validates(log_path: Path) -> None:
-    log = logs.EventLog(str(log_path), min_level="debug")
+    log = logs.EventLog(str(log_path))
     log.write(
         "signal_sent",
         level="debug",
@@ -80,16 +80,35 @@ def test_every_event_validates(event: str, log_path: Path) -> None:
     validate(records(log_path)[0], LOG_SCHEMA)
 
 
-def test_events_and_levels_match_the_schema() -> None:
+def test_events_levels_and_reasons_match_the_schema() -> None:
     schema = registry().contents(LOG_SCHEMA)
     assert set(logs.EVENTS) == set(schema["properties"]["event"]["enum"])
     assert list(logs.LEVELS) == schema["properties"]["level"]["enum"]
+    assert set(logs.REASONS) | {None} == set(schema["properties"]["reason"]["enum"])
+
+
+@pytest.mark.parametrize("reason", sorted(logs.REASONS))
+def test_every_reason_validates(reason: str, log_path: Path) -> None:
+    logs.EventLog(str(log_path)).write("report_rejected", reason=reason)
+    validate(records(log_path)[0], LOG_SCHEMA)
 
 
 def test_timestamp_is_utc_iso_8601(log_path: Path) -> None:
     now = datetime(2026, 10, 30, 12, 0, 0, 123456, tzinfo=UTC)
     logs.EventLog(str(log_path)).write("adopt", now=now)
     assert records(log_path)[0]["ts"] == "2026-10-30T12:00:00.123Z"
+
+
+def test_naive_timestamp_is_rejected(log_path: Path) -> None:
+    with pytest.raises(ValueError):
+        logs.EventLog(str(log_path)).write("adopt", now=datetime(2026, 10, 30, 12, 0, 0))
+    assert not log_path.exists()
+
+
+def test_aware_non_utc_timestamp_is_converted(log_path: Path) -> None:
+    now = datetime(2026, 10, 30, 14, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+    logs.EventLog(str(log_path)).write("adopt", now=now)
+    assert records(log_path)[0]["ts"] == "2026-10-30T12:00:00.000Z"
 
 
 def test_default_timestamp_is_now(log_path: Path) -> None:
@@ -99,42 +118,36 @@ def test_default_timestamp_is_now(log_path: Path) -> None:
     assert abs((datetime.now(UTC) - ts).total_seconds()) < 60
 
 
-@pytest.mark.parametrize(
-    ("min_level", "written"),
-    [
-        ("debug", ["debug", "info", "warn", "error"]),
-        ("info", ["info", "warn", "error"]),
-        ("warn", ["warn", "error"]),
-        ("error", ["error"]),
-    ],
-)
-def test_records_below_the_level_are_skipped(
-    min_level: str, written: list[str], log_path: Path
-) -> None:
-    log = logs.EventLog(str(log_path), min_level=min_level)
-    results = [log.write("adopt", level=level) for level in logs.LEVELS]
-    assert [r["level"] for r in records(log_path)] == written
-    assert results == [level in written for level in logs.LEVELS]
-
-
-def test_nothing_is_created_when_every_record_is_skipped(log_path: Path) -> None:
-    logs.EventLog(str(log_path), min_level="error").write("adopt")
-    assert not log_path.exists()
+def test_every_level_is_written(log_path: Path) -> None:
+    log = logs.EventLog(str(log_path))
+    for level in logs.LEVELS:
+        log.write("adopt", level=level)
+    assert [r["level"] for r in records(log_path)] == list(logs.LEVELS)
 
 
 @pytest.mark.parametrize(
     "kwargs",
-    [{"event": "no_such_event"}, {"event": "adopt", "level": "loud"}],
+    [
+        {"event": "no_such_event"},
+        {"event": "adopt", "level": "loud"},
+        {"event": "report_rejected", "reason": "the agent said so"},
+        {"event": "adopt", "csession_id": "cs-ABCD2345"},
+        {"event": "adopt", "csession_id": "abcd2345"},
+        {"event": "adopt", "csession_id": "cs-abcd23451"},
+        {"event": "adopt", "run": True},
+        {"event": "adopt", "run": "1"},
+        {"event": "adopt", "pid": 1.5},
+        {"event": "adopt", "pid": False},
+        {"event": "adopt", "signal": 15},
+        {"event": "adopt", "message": 3},
+        {"event": "launch", "decision_ids": "d1"},
+        {"event": "launch", "decision_ids": [1]},
+    ],
 )
-def test_unknown_event_or_level_is_rejected(kwargs: dict[str, Any], log_path: Path) -> None:
+def test_values_the_schema_rejects_are_rejected(kwargs: dict[str, Any], log_path: Path) -> None:
     with pytest.raises(ValueError):
         logs.EventLog(str(log_path)).write(**kwargs)
     assert not log_path.exists()
-
-
-def test_unknown_min_level_is_rejected(log_path: Path) -> None:
-    with pytest.raises(ValueError):
-        logs.EventLog(str(log_path), min_level="loud")
 
 
 def test_records_append_one_line_each(log_path: Path) -> None:
@@ -185,7 +198,7 @@ def test_secret_in_message_is_redacted(log_path: Path) -> None:
     assert record["message"] == f"token={logs.REDACTED} rejected"
 
 
-def test_secret_in_every_string_field_is_redacted(log_path: Path) -> None:
+def test_secret_in_every_text_field_is_redacted(log_path: Path) -> None:
     log = logs.EventLog(str(log_path), secrets=[SECRET])
     log.write(
         "launch",
@@ -194,29 +207,95 @@ def test_secret_in_every_string_field_is_redacted(log_path: Path) -> None:
         message=SECRET,
     )
     assert SECRET not in raw(log_path)
-    assert records(log_path)[0]["decision_ids"] == ["ok", f"pre-{logs.REDACTED}-post"]
+    [record] = records(log_path)
+    validate(record, LOG_SCHEMA)
+    assert record["decision_ids"] == ["ok", f"pre-{logs.REDACTED}-post"]
+    assert record["signal"] == logs.REDACTED
 
 
-def test_secret_in_exception_text_is_redacted(log_path: Path) -> None:
-    log = logs.EventLog(str(log_path), secrets=[SECRET])
-    try:
-        raise RuntimeError(f"could not parse {{'token': '{SECRET}'}}")
-    except RuntimeError as exc:
-        log.write("hook_event_failed", level="error", message=logs.describe_exception(exc))
-    assert SECRET not in raw(log_path)
-    assert records(log_path)[0]["message"].startswith("RuntimeError: could not parse")
+@pytest.mark.parametrize(
+    "secret", ["launch", "info", "stop", "a", "o", "2026", "cs-", "abcd", "stale_r"]
+)
+def test_short_secrets_are_ignored(secret: str, log_path: Path) -> None:
+    logs.EventLog(str(log_path), secrets=[secret]).write(
+        "launch",
+        level="info",
+        csession_id=SID,
+        run=2026,
+        reason="stale_run",
+        signal="stop",
+        message=f"plain {secret} text",
+    )
+    [record] = records(log_path)
+    validate(record, LOG_SCHEMA)
+    assert record["message"] == f"plain {secret} text"
+    assert record["csession_id"] == SID
+
+
+def test_seven_characters_are_ignored_and_eight_redacted(log_path: Path) -> None:
+    log = logs.EventLog(str(log_path), secrets=["abcdefg", "12345678"])
+    log.write("adopt", message="abcdefg 12345678")
+    assert records(log_path)[0]["message"] == f"abcdefg {logs.REDACTED}"
+
+
+@pytest.mark.parametrize("secret", ["stale_run", "hook_event_failed", SID, "2026-10-30"])
+def test_constrained_fields_are_never_redacted(secret: str, log_path: Path) -> None:
+    now = datetime(2026, 10, 30, 12, 0, 0, tzinfo=UTC)
+    logs.EventLog(str(log_path), secrets=[secret]).write(
+        "hook_event_failed",
+        level="error",
+        csession_id=SID,
+        reason="stale_run",
+        message=f"x {secret} y",
+        now=now,
+    )
+    [record] = records(log_path)
+    validate(record, LOG_SCHEMA)
+    assert record["event"] == "hook_event_failed"
+    assert record["reason"] == "stale_run"
+    assert record["csession_id"] == SID
+    assert record["ts"] == "2026-10-30T12:00:00.000Z"
+    assert record["message"] == f"x {logs.REDACTED} y"
 
 
 def test_secret_spanning_the_truncation_point_is_redacted_first(log_path: Path) -> None:
-    padding = "x" * (logs.MESSAGE_MAX_CHARS - 5)
+    # The secret starts 5 characters before the cut: truncating first would keep SECRET[:5].
+    padding = "x" * (logs.MESSAGE_MAX_CHARS - len(logs.TRUNCATED) - 5)
     logs.EventLog(str(log_path), secrets=[SECRET]).write("adopt", message=padding + SECRET)
-    assert SECRET[:8] not in raw(log_path)
+    assert SECRET[:5] not in raw(log_path)
 
 
 def test_overlapping_secrets_are_both_redacted(log_path: Path) -> None:
     secrets = ["abcdefgh", "efghijkl"]
     logs.EventLog(str(log_path), secrets=secrets).write("adopt", message="xxabcdefghijklyy")
     assert records(log_path)[0]["message"] == f"xx{logs.REDACTED}yy"
+
+
+def test_adjacent_secrets_collapse_into_one_marker(log_path: Path) -> None:
+    secrets = ["abcdefgh", "ijklmnop"]
+    logs.EventLog(str(log_path), secrets=secrets).write("adopt", message="xxabcdefghijklmnopyy")
+    assert records(log_path)[0]["message"] == f"xx{logs.REDACTED}yy"
+
+
+def test_secret_formed_across_a_marker_redacts_the_whole_field(log_path: Path) -> None:
+    secrets = ["AAAAAAAA", "ted]BBBBBB"]
+    logs.EventLog(str(log_path), secrets=secrets).write("adopt", message="xAAAAAAAABBBBBBy")
+    assert records(log_path)[0]["message"] == logs.REDACTED
+    assert "ted]BBBBBB" not in raw(log_path)
+
+
+def test_secret_formed_with_the_truncation_marker_is_redacted(log_path: Path) -> None:
+    secret = "zz[truncated]"
+    message = "x" * (logs.MESSAGE_MAX_CHARS - len(logs.TRUNCATED) - 2) + "z" * 20
+    logs.EventLog(str(log_path), secrets=[secret]).write("adopt", message=message)
+    assert records(log_path)[0]["message"] == logs.REDACTED
+
+
+@pytest.mark.parametrize("text", ["redacted", "[redacted]", "a redacted b redacted", "xredactedy"])
+def test_secret_equal_to_the_marker_text_terminates(text: str) -> None:
+    out = logs.redact_text(text, ["redacted"])
+    assert not logs.leaks_secret(out, ["redacted"])
+    assert "redacted" not in out.replace(logs.REDACTED, "")
 
 
 def test_secret_needing_json_escapes_is_redacted(log_path: Path) -> None:
@@ -239,10 +318,44 @@ def test_redact_walks_nested_values() -> None:
     }
 
 
+def test_redact_redacts_dictionary_keys() -> None:
+    assert logs.redact({f"k-{SECRET}": 1}, [SECRET]) == {f"k-{logs.REDACTED}": 1}
+
+
+def test_redact_ignores_short_secrets() -> None:
+    assert logs.redact({"info": "info"}, ["info"]) == {"info": "info"}
+
+
 def test_secret_values_from_env() -> None:
-    environ = {"API_TOKEN": SECRET, "EMPTY": "", "OTHER": "visible"}
-    names = ["API_TOKEN", "EMPTY", "MISSING"]
-    assert logs.secret_values(names, environ) == frozenset({SECRET})
+    environ = {"API_TOKEN": SECRET, "EMPTY": "", "SHORT": "1234567", "OTHER": "visible"}
+    names = ["API_TOKEN", "EMPTY", "SHORT", "MISSING"]
+    assert logs.secret_values(environ, secret_env=names) == frozenset({SECRET})
+
+
+def test_secret_values_include_claude_auth_env_and_the_run_secret() -> None:
+    environ = {"ANTHROPIC_API_KEY": "sk-auth-value-123", "API_TOKEN": SECRET}
+    run_secret = "0" * 64
+    values = logs.secret_values(
+        environ,
+        secret_env=["API_TOKEN"],
+        claude_auth_env=["ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"],
+        run_secret=run_secret,
+    )
+    assert values == frozenset({SECRET, "sk-auth-value-123", run_secret})
+
+
+def test_claude_auth_env_value_is_redacted(log_path: Path) -> None:
+    secrets = logs.secret_values(
+        {"ANTHROPIC_API_KEY": "sk-auth-value-123"}, claude_auth_env=["ANTHROPIC_API_KEY"]
+    )
+    logs.EventLog(str(log_path), secrets=secrets).write("adopt", message="k=sk-auth-value-123")
+    assert "sk-auth-value-123" not in raw(log_path)
+
+
+def test_nan_is_rejected(log_path: Path) -> None:
+    with pytest.raises(ValueError):
+        logs.append_record(str(log_path), {"ts": "x", "n": float("nan")})
+    assert not log_path.exists()
 
 
 # Concurrency

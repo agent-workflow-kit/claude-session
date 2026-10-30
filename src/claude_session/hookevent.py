@@ -1,8 +1,8 @@
 """The injected-hook fast path (``hook-event``); see design.md, Hook-event fast path.
 
 ``__main__`` dispatches here before importing ``cli``, so this module and everything it
-imports must stay standard library only (plus ``logs``, ``fsutil`` and, once they exist,
-``store``, ``outbox`` and ``gateway``): never ``config``, Pydantic or YAML.
+imports must stay standard library only (plus ``store``, ``outbox`` and ``gateway`` once they
+exist): never ``config``, Pydantic or YAML. Contained errors are logged by ``__main__``.
 """
 
 from __future__ import annotations

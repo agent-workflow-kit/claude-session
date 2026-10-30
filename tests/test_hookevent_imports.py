@@ -7,6 +7,8 @@ import subprocess
 import sys
 from typing import Any
 
+import pytest
+
 # Modules hook-event must never import, whether or not they are installed.
 FORBIDDEN = ("pydantic", "yaml", "argparse", "claude_session.cli", "claude_session.config")
 # claude_session modules hook-event may load (design.md: stdlib, store, outbox's ingestion
@@ -125,3 +127,25 @@ def test_failing_hook_event_logs_without_heavy_imports() -> None:
     assert result["code"] == 0
     assert "claude_session.logs" in result["package"]
     assert violations(result) == []
+
+
+def test_entry_module_does_not_import_re() -> None:
+    """``__main__`` runs for every hook; ``re`` is loaded only when a failure is logged."""
+    script = (
+        "import sys\n"  # not json: it imports re
+        "preloaded = 're' in sys.modules\n"
+        "import claude_session.__main__\n"
+        "print(int(preloaded), int('re' in sys.modules))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    preloaded, loaded = proc.stdout.split()
+    if preloaded == "1":
+        pytest.skip("the interpreter loads re at startup")
+    assert loaded == "0"

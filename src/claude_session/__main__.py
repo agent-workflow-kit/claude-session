@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import io
 import os
-import re
 import sys
 from collections.abc import Sequence
 
@@ -25,9 +24,6 @@ HOOK_EVENTS = frozenset(
         "SessionEnd",
     }
 )
-# The csession_id grammar (interface.md, Identifiers). TODO(#5): share it with the ids module
-# if that module stays importable from the hook path.
-_CSESSION_ID = re.compile(r"cs-[a-z2-7]{8}")
 
 
 def _redirect_to_devnull(*fds: int) -> None:
@@ -116,7 +112,7 @@ def _log_hook_event_failure(argv: list[str], exc: BaseException) -> None:
         logs.EventLog(os.path.join(state_dir, "log.jsonl")).write(
             "hook_event_failed",
             level="error",
-            csession_id=session if _CSESSION_ID.fullmatch(session) else None,
+            csession_id=session if logs.is_csession_id(session) else None,
             message=f"{event}: {name}" if event else name,
         )
     except BaseException:  # logging is best effort; hook-event still exits 0 silently
