@@ -349,7 +349,8 @@ def _flag(dest: str) -> str:
 
 
 def _is_nonpositive_duration(text: str) -> bool:
-    """True for durations such as ``0``, ``0s`` or ``-5m``. Full grammar: ids (#5)."""
+    """True for durations such as ``0``, ``0s`` or ``-5m``."""
+    # TODO(#3): validate with durations.parse once feat/config is merged.
     match = NUMBER_WITH_UNIT.match(text)
     return match is not None and float(match.group(1)) <= 0
 

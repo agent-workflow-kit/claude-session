@@ -104,6 +104,7 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     (["status", "abc"], "session id 'abc' is too short"),
     (["status", "cs-abc", "--json"], "session id 'cs-abc' is too short"),
     (["resume", "cs-"], "session id 'cs-' is too short"),
+    (["status", "CS-AB"], "session id 'CS-AB' is too short"),
     (["stop", "ab"], "at least 4 characters"),
     (["wait", "abc"], "at least 4 characters"),
     (["label", "add", "abc", "a=b"], "at least 4 characters"),
@@ -202,6 +203,7 @@ ALLOWED: list[list[str]] = [
     ["export", "--action", "resume_tainted", "--action", "sandbox_lowered"],
     ["status", "abcd"],
     ["status", "cs-abcd"],
+    ["status", "CS-ABCD"],
     ["status", "zzzzzzzzzz"],  # malformed but long enough: unknown (exit 10) at lookup
     ["resume", "abcd", "--kind", "review-respond", "--skill", "plan:make"],
     ["exec", "--session-id", "abcd"],

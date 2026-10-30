@@ -28,16 +28,20 @@ SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}")
 ARTIFACT_NAME = re.compile(r"[A-Za-z0-9._-]{1,128}")
 LABEL_KEY = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 LABEL_VALUE = re.compile(r"[A-Za-z0-9._:/#@+=,-]{0,256}")
-_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+# Prefix input after `cs-`: what any id prefix of at least MIN_PREFIX_LENGTH can look like.
+ID_PREFIX_BODY = re.compile(r"[a-z2-7]{4,8}")
+# Identical to schemas/config.json `repos` propertyNames (tests check the two are equal).
 REPO_ID = re.compile(
-    rf"(?P<host>{_HOST_LABEL}(?:\.{_HOST_LABEL})*)"
-    r"(?::(?P<port>[1-9][0-9]{0,4}))?"
-    r"(?P<path>(?:/[A-Za-z0-9._-]+)+)"
+    r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/(?!\.\.?(/|$))[A-Za-z0-9._-]+)+$"
 )
 # Default ports dropped when deriving a repo id from an origin URL.
 DEFAULT_PORTS = {"http": 80, "https": 443, "ssh": 22, "git+ssh": 22, "ssh+git": 22, "git": 9418}
 # scp-like `[user@]host:path`: no slash before the colon.
-_SCP_ORIGIN = re.compile(r"(?:[^@/:]+@)?(?P<host>[^@/:]+):(?P<path>.*)", re.DOTALL)
+# The userinfo (which may hold credentials) is dropped.
+_SCP_ORIGIN = re.compile(r"(?:[^@/]*@)?(?P<host>[^@/:]+):(?P<path>.*)")
+# Space, C0 controls and DEL: never part of an origin (the caller trims git's newline).
+_ORIGIN_UNSAFE = re.compile(r"[\x00-\x20\x7f]")
+_GIT_SUFFIX = re.compile(r"\.git$", re.IGNORECASE)
 
 
 # Allocation
@@ -55,6 +59,8 @@ def new_session_id(
     for _ in range(max_attempts):
         body = base64.b32encode(random_bytes(5)).decode("ascii").lower()
         candidate = ID_PREFIX + body
+        if not is_session_id(candidate):
+            raise InternalError(f"random source gave a malformed session id: {candidate!r}")
         if not is_used(candidate):
             return candidate
     raise InternalError(f"could not allocate a session id after {max_attempts} attempts")
@@ -76,9 +82,10 @@ class IdCandidate(NamedTuple):
 
 
 def session_id_prefix(text: str, flag: str | None = None) -> str:
-    """Normalize session id input to a ``cs-`` prefix; fewer than 4 characters after ``cs-``
-    is a usage error (exit 2). Malformed input is not rejected here: it matches nothing."""
-    body = text.removeprefix(ID_PREFIX)
+    """Normalize session id input (case-insensitive) to a lowercase ``cs-`` prefix; fewer than
+    4 characters after ``cs-`` is a usage error (exit 2). Malformed input is not rejected here:
+    ``resolve_session_id`` reports it as unknown."""
+    body = text.lower().removeprefix(ID_PREFIX)
     if len(body) < MIN_PREFIX_LENGTH:
         where = f"{flag}: " if flag else ""
         raise UsageError(
@@ -97,6 +104,8 @@ def resolve_session_id(text: str, candidates: Iterable[IdCandidate]) -> str:
     """
     # TODO(#4): the store passes the sessions matching the prefix (or all of them).
     prefix = session_id_prefix(text)
+    if ID_PREFIX_BODY.fullmatch(prefix.removeprefix(ID_PREFIX)) is None:
+        raise NotFoundError(f"unknown session: {text}")  # can match no id; no lookup
     matches = sorted(
         {c.csession_id for c in candidates if not c.forgotten and c.csession_id.startswith(prefix)}
     )
@@ -115,6 +124,7 @@ def is_kind_name(name: str) -> bool:
 
 
 def is_permission_profile_name(name: str) -> bool:
+    # TODO(#22): enforce on --permission-profile names.
     return PERMISSION_PROFILE_NAME.fullmatch(name) is not None
 
 
@@ -140,20 +150,16 @@ def parse_label(text: str) -> tuple[str, str]:
 
 
 def is_repo_id(text: str) -> bool:
-    """``host[:port]/path``: lowercase host, port 1-65535, segments never ``.`` or ``..``."""
-    match = REPO_ID.fullmatch(text)
-    if match is None:
-        return False
-    port = match.group("port")
-    if port is not None and int(port) > 65535:
-        return False
-    return all(segment not in (".", "..") for segment in match.group("path").split("/")[1:])
+    """``host[:port]/path`` exactly as schemas/config.json defines a repo id."""
+    return REPO_ID.fullmatch(text) is not None
 
 
 def repo_id_from_origin(origin: str) -> str | None:
     """Normalize an ``origin`` URL to a repo id, or None when it does not yield a valid one
     (local paths, ``file://``, unknown schemes, no path)."""
     # TODO(#9): call from the --repo derivation (git calls go through the gateway).
+    if _ORIGIN_UNSAFE.search(origin):
+        return None
     if "://" in origin:
         try:
             parts = urlsplit(origin)
@@ -173,6 +179,6 @@ def repo_id_from_origin(origin: str) -> str | None:
             return None
         host = match.group("host")
         path = match.group("path")
-    path = path.strip("/").removesuffix(".git")
+    path = _GIT_SUFFIX.sub("", path.strip("/"))
     repo = f"{host.lower()}/{path}"
     return repo if is_repo_id(repo) else None
