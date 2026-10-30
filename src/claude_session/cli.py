@@ -16,7 +16,7 @@ import traceback
 from collections.abc import Callable, Sequence
 from typing import Any, NoReturn
 
-from . import fsutil
+from . import fsutil, ids
 from .errors import CliError, InternalError, RefusedError, UsageError
 
 PROG = "claude-session"
@@ -64,8 +64,15 @@ RESETTABLE = {
 # The only flags `exec --session-id` accepts (interface.md, Exit codes, exit 2).
 ADOPTION_FLAGS = {"json", "dry_run", "outcome_file", "verbose", "quiet", "yes"}
 OUTCOME_FILE_COMMANDS = ("exec", "start", "resume", "wait")
-# TODO(#5): move to ids.py with the other identifier grammars.
-ARTIFACT_NAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# Session id arguments (dest -> flag; None for the positional id). verify-secret is not
+# listed: it requires the full id and answers a mismatch with exit 11, never a usage error.
+SESSION_ID_ARGS: dict[str, str | None] = {
+    "id": None,
+    "session_id": "--session-id",
+    "resume": "--resume",
+    "forked_from": "--forked-from",
+}
+KIND_ARGS = ("kind", "launch_kind", "run_kind")
 # argparse takes a token like this as an option value, not as an option.
 NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
 NUMBER_WITH_UNIT = re.compile(r"^(-?\d+(?:\.\d+)?)(ms|s|m|h|d)?$")
@@ -375,8 +382,9 @@ def _check_launch_flags(args: argparse.Namespace) -> None:
         if path == "-":
             raise UsageError("--input-file - is not supported; pass a file")
         name = os.path.basename(path)
-        if name in (".", "..") or not ARTIFACT_NAME.match(name):
-            raise UsageError(f"--input-file name {name!r} must match {ARTIFACT_NAME.pattern}")
+        if not ids.is_artifact_name(name):
+            pattern = ids.ARTIFACT_NAME.pattern
+            raise UsageError(f"--input-file name {name!r} must match ^{pattern}$, not . or ..")
         if name in basenames:
             raise UsageError(f"duplicate --input-file name {name!r}")
         basenames.add(name)
@@ -481,10 +489,43 @@ FLAG_RULES: dict[str, Callable[[argparse.Namespace], None]] = {
 }
 
 
+def _check_label(text: str, where: str) -> None:
+    try:
+        ids.parse_label(text)
+    except ValueError as exc:
+        raise UsageError(f"{where}invalid label {text!r}: {exc}") from None
+
+
+def _check_identifiers(args: argparse.Namespace) -> None:
+    """Session id prefixes and the name grammars (interface.md, Identifiers)."""
+    if args.handler != "verify-secret":
+        for dest, flag in SESSION_ID_ARGS.items():
+            value = getattr(args, dest, None)
+            if value is not None:
+                ids.session_id_prefix(value, flag)
+    for dest in KIND_ARGS:
+        value = getattr(args, dest, None)
+        if value is not None and not ids.is_kind_name(value):
+            raise UsageError(
+                f"{_flag(dest)}: invalid kind name {value!r} (^{ids.KIND_NAME.pattern}$)"
+            )
+    skill = getattr(args, "skill", None)
+    if skill is not None and not ids.is_skill_name(skill):
+        raise UsageError(f"--skill: invalid skill name {skill!r} (^{ids.SKILL_NAME.pattern}$)")
+    repo = getattr(args, "repo", None)
+    if repo is not None and not ids.is_repo_id(repo):
+        raise UsageError(f"--repo: invalid repo id {repo!r} (expected host[:port]/path)")
+    for text in getattr(args, "label", None) or []:
+        _check_label(text, "--label: ")
+    for text in getattr(args, "pairs", None) or []:
+        _check_label(text, "")
+
+
 def check_flag_rules(args: argparse.Namespace) -> None:
     """Raise ``UsageError`` for any rule that can be decided from argv alone."""
     if args.verbose and args.quiet:
         raise UsageError("--verbose and --quiet are mutually exclusive")
+    _check_identifiers(args)
     rule = FLAG_RULES.get(args.handler)
     if rule is not None:
         rule(args)

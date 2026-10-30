@@ -10,7 +10,7 @@ Normative sections: [Launch order](#launch-order), [Flags at start and adoption]
 
 ## Concepts
 
-- **Session**: one Claude Code conversation that claude-session started, identified by a `csession_id`: `cs-` followed by 8 lowercase base32 characters (`a-z`, `2-7`), e.g. `cs-k3v9q2xa`. See [Identifiers](#identifiers) for accepted input forms.
+- **Session**: one Claude Code conversation that claude-session started, identified by a `csession_id`: `cs-` followed by 8 lowercase base32 characters (`a-z`, `2-7`), e.g. `cs-k3v7q2xa`. See [Identifiers](#identifiers) for accepted input forms.
 - **Run**: one execution of a session (run 1, then one per resume), numbered from 1. Reports, outcomes, bounds, the resolved cwd and the permission-profile snapshot are per run. A run that ended in the launch phase keeps its number.
 - **Phase**: a run is in the `launch` phase until `claude` is spawned (including while it is pending) and in the `session` phase afterwards.
 - **Pending run**: a run created by `start` (run 1 of a new session or fork) or `start --resume` (run n) whose wrapper is not yet set. `exec --session-id` adopts it (see [Launch order](#launch-order)).
