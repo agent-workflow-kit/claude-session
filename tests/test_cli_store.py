@@ -159,6 +159,21 @@ def test_an_unsafe_store_is_failed(_private_state_dir: Path, tmp_path: Path) -> 
     assert not outcome.exists()  # the schema check precedes parsing
 
 
+def test_an_invalid_schema_version_is_failed(capsys: pytest.CaptureFixture[str]) -> None:
+    store.open_state().close()
+    conn = sqlite3.connect(db())
+    try:
+        conn.execute("UPDATE meta SET value = 'one' WHERE key = 'schema_version'")
+        conn.commit()
+    finally:
+        conn.close()
+    assert main(["list", "--json"]) == 12
+    envelope = json.loads(capsys.readouterr().out)
+    validate(envelope, ERROR_SCHEMA)
+    assert envelope["error"]["code"] == "failed"
+    assert envelope["error"]["detail"] == f"{db()}: invalid schema_version 'one'"
+
+
 def test_report_never_opens_the_store(
     _private_state_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -190,10 +205,12 @@ def test_no_or_unknown_command_is_a_usage_error_without_the_store(
 
 
 def test_help_after_double_dash_does_not_skip_the_check(
-    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     make_newer()
+    seen = capture_errors(monkeypatch)
     assert main(["label", "add", "cs-abcd2345", "--", "--help"]) == 12
+    assert [error.code for error in seen] == ["schema_newer"]
 
 
 def test_an_older_store_is_migrated_by_a_command(

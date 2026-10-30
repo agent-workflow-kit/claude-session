@@ -9,18 +9,22 @@ the hook path may import it (design.md, Hook-event fast path), but never migrate
   applied in order at open, under the lease ``migrate``; each one commits together with the
   version it brings the database to, so an interrupted migration resumes where it stopped.
 - A database whose schema is newer than this code is refused with ``schema_newer`` (exit 12)
-  before anything is written (interface.md, Launch order and Upgrades).
+  before claude-session writes anything (interface.md, Launch order and Upgrades).
 - Leases (``migrate``, ``reconcile``, ``delivery:<id>``) record the holder's PID, process
   start time and a per-``Store`` token, and expire ``LEASE_TTL`` after their last renewal; a
   dead holder's lease may be taken over at once.
 - Open refuses, with ``FailedError`` (exit 12), a state directory or ``state.db`` that is
-  unsafe (a symlink, not ours, hard-linked), unusable or not a claude-session database
-  (``PRAGMA application_id``); nothing is written to such a database.
+  unsafe (a symlink, not ours, hard-linked, not a regular file), unusable or not a
+  claude-session database (``PRAGMA application_id``); claude-session writes nothing to such
+  a database (SQLite's own hot-journal recovery may still run).
+- Open never opens a file descriptor of its own on an existing ``state.db``: closing it
+  would drop every POSIX lock this process holds on the file, SQLite's included. Paths are
+  checked with ``lstat``; only a missing file is created (``O_EXCL``), and closed before
+  SQLite connects. Only ``migrate`` opens tighten modes; the hook path only checks.
 """
 
 from __future__ import annotations
 
-import errno
 import os
 import re
 import sqlite3
@@ -108,39 +112,70 @@ def _make_private_dirs(path: str) -> None:
         os.chmod(directory, 0o700)
 
 
-def _check_private_dir(path: str) -> None:
-    """``path`` must be a real directory (not a symlink) owned by us; it is made 0700."""
+def _check_private_dir(path: str, *, tighten: bool) -> None:
+    """``path`` must be a real directory (not a symlink) owned by us; with ``tighten`` it
+    is made 0700."""
     info = os.lstat(path)
     if not stat.S_ISDIR(info.st_mode):
         raise _unsafe(path, "not a directory (or a symbolic link)")
     if info.st_uid != os.geteuid():
         raise _unsafe(path, f"owned by uid {info.st_uid}")
-    if stat.S_IMODE(info.st_mode) & 0o077:
+    if tighten and stat.S_IMODE(info.st_mode) & 0o077:
         os.chmod(path, 0o700)
 
 
-def _open_db_file(path: str, *, create: bool) -> int:
-    """Open (with ``create``, creating it) ``path`` without following a symlink; it must be
-    a regular file owned by us with a single link. Returns the file descriptor."""
-    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+def _check_db_file(path: str, info: os.stat_result) -> None:
+    """``info`` (from ``lstat``) must be a regular file owned by us with a single link."""
+    if stat.S_ISLNK(info.st_mode):
+        raise _unsafe(path, "a symbolic link")
+    if not stat.S_ISREG(info.st_mode):
+        raise _unsafe(path, "not a regular file")
+    if info.st_uid != os.geteuid():
+        raise _unsafe(path, f"owned by uid {info.st_uid}")
+    if info.st_nlink != 1:
+        raise _unsafe(path, f"has {info.st_nlink} hard links")
+
+
+def _prepare_db_file(path: str, *, migrate: bool) -> None:
+    """Check ``path`` without opening it; with ``migrate``, create it when missing and
+    tighten it (and an existing ``-wal``/``-shm``) to 0600.
+
+    No descriptor is ever held on an existing database: POSIX ``close`` drops all of this
+    process's ``fcntl`` locks on the file, including those of live SQLite connections. A
+    file this call creates is closed before anything connects to it."""
     try:
-        fd = os.open(path, flags | (os.O_CREAT if create else 0), 0o600)
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise _unsafe(path, "a symbolic link") from exc
-        raise
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise _unsafe(path, "not a regular file")
-        if info.st_uid != os.geteuid():
-            raise _unsafe(path, f"owned by uid {info.st_uid}")
-        if info.st_nlink != 1:
-            raise _unsafe(path, f"has {info.st_nlink} hard links")
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
+        info = os.lstat(path)
+    except FileNotFoundError:
+        if not migrate:
+            raise
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:  # created concurrently: check it like any other
+            info = os.lstat(path)
+        else:
+            try:
+                os.fchmod(fd, 0o600)  # whatever the umask
+            finally:
+                os.close(fd)
+            return
+    _check_db_file(path, info)
+    if not migrate:
+        return
+    if stat.S_IMODE(info.st_mode) != 0o600:
+        os.chmod(path, 0o600)
+    for sidecar in (path + "-wal", path + "-shm"):
+        try:
+            side = os.lstat(sidecar)
+        except FileNotFoundError:
+            continue
+        # Anything else is skipped: SQLite refuses a symlinked -wal/-shm itself.
+        if (
+            stat.S_ISREG(side.st_mode)
+            and side.st_uid == os.geteuid()
+            and stat.S_IMODE(side.st_mode) != 0o600
+        ):
+            os.chmod(sidecar, 0o600)
 
 
 def _unsafe(path: str, cause: str) -> FailedError:
@@ -153,11 +188,18 @@ def _open_failed(path: str, exc: OSError | sqlite3.Error) -> FailedError:
     return FailedError("cannot open the state database", detail=f"{where}: {cause}")
 
 
+def _db_uri(path: str) -> str:
+    """A ``file:`` URI for ``path`` (``mode=rw``). The absolute path starts with exactly one
+    slash, so it can never be read as a URI authority (``//host``)."""
+    absolute = "/" + os.path.abspath(path).lstrip("/")
+    return f"file:{urllib.parse.quote(absolute)}?mode=rw"
+
+
 def _connect(path: str, busy_timeout: float) -> sqlite3.Connection:
     """Connect to an existing file (``mode=rw``: SQLite never creates it). isolation_level
     None: no implicit transactions; writes use BEGIN IMMEDIATE."""
     return sqlite3.connect(
-        f"file:{urllib.parse.quote(path)}?mode=rw",
+        _db_uri(path),
         timeout=busy_timeout,
         isolation_level=None,
         uri=True,
@@ -388,8 +430,9 @@ def format_version(version: Version) -> str:
 
 
 def parse_version(text: str) -> Version:
+    """``<major>.<minor>``; ``ValueError`` for anything else."""
     if not re.fullmatch(r"[0-9]+\.[0-9]+", text):
-        raise InternalError(f"state.db has an invalid schema_version {text!r}")
+        raise ValueError(f"invalid schema_version {text!r}")
     major, _, minor = text.partition(".")
     return int(major), int(minor)
 
@@ -408,7 +451,7 @@ def _schema_newer(found: Version, code: Version) -> SchemaNewerError:
 
 
 def _check_identity(conn: sqlite3.Connection, path: str, *, allow_new: bool) -> None:
-    """Refuse a database that is not ours, before anything is written to it. With
+    """Refuse a database that is not ours, before claude-session writes anything. With
     ``allow_new``, an empty database (application_id 0, no schema) is accepted."""
     # One statement, one snapshot: a concurrent first open may bootstrap in between.
     app_id, objects = conn.execute(
@@ -450,11 +493,13 @@ class Store:
         self,
         conn: sqlite3.Connection,
         *,
+        path: str,
         holder: Holder,
         liveness: Liveness,
         clock: Clock,
     ) -> None:
         self.conn = conn
+        self.path = path
         self.holder = Holder(pid=holder.pid, start=holder.start or "")
         # Lease ownership is (pid, start, token): two stores of one process never share one.
         self.token = uuid.uuid4().hex
@@ -490,28 +535,27 @@ class Store:
         try:
             if migrate:
                 _make_private_dirs(root)
-            _check_private_dir(root)
-            fd = _open_db_file(path, create=migrate)
+            _check_private_dir(root, tighten=migrate)
+            _prepare_db_file(path, migrate=migrate)
         except OSError as exc:
             raise _open_failed(path, exc) from exc
         try:
             conn = _connect(path, busy_timeout)
-            try:
-                _check_identity(conn, path, allow_new=migrate)
-                if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
-                    os.fchmod(fd, 0o600)
-                if migrate:
-                    _enable_wal(conn, busy_timeout)
-            except sqlite3.DatabaseError as exc:
-                conn.close()
-                raise _open_failed(path, exc) from exc
-            except BaseException:
-                conn.close()
-                raise
-        finally:
-            os.close(fd)
+        except sqlite3.DatabaseError as exc:
+            raise _open_failed(path, exc) from exc
+        try:
+            _check_identity(conn, path, allow_new=migrate)
+            if migrate:
+                _enable_wal(conn, busy_timeout)
+        except sqlite3.DatabaseError as exc:
+            conn.close()
+            raise _open_failed(path, exc) from exc
+        except BaseException:
+            conn.close()
+            raise
         store = cls(
             conn,
+            path=path,
             holder=holder or current_holder(),
             # TODO(#6): wire procinfo liveness (PID + start time) as the default.
             liveness=liveness or pid_alive,
@@ -564,7 +608,14 @@ class Store:
         if row is None:
             return (0, 0)
         row = self.conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        return (0, 0) if row is None else parse_version(row[0])
+        if row is None:
+            return (0, 0)
+        try:
+            return parse_version(row[0])
+        except ValueError as exc:
+            raise FailedError(
+                "cannot open the state database", detail=f"{self.path}: {exc}"
+            ) from exc
 
     def _check_hook_schema(self, code: Version, path: str) -> None:
         """The hook path uses a database of the code's major version as it is (a newer
@@ -599,20 +650,27 @@ class Store:
         """Bootstrap and take the ``migrate`` lease, retrying while another process holds
         it or the database is busy (e.g. inside a migration step), for up to ``wait``."""
         deadline = time.monotonic() + wait
-        while True:
-            try:
-                self._bootstrap()
-                if self.take_lease(MIGRATE_LEASE):
-                    return
-            except sqlite3.OperationalError as exc:
-                if not _is_busy(exc):
-                    raise
-            if time.monotonic() >= deadline:
-                raise FailedError(
-                    "timed out waiting for another process to migrate state.db",
-                    detail=f"{path}: migrate lease not obtained within {wait:g} s",
-                )
-            time.sleep(MIGRATE_POLL)
+        (configured,) = self.conn.execute("PRAGMA busy_timeout").fetchone()
+        try:
+            while True:
+                # Never wait for the lock past the deadline.
+                remaining = max(0, int((deadline - time.monotonic()) * 1000))
+                self.conn.execute(f"PRAGMA busy_timeout = {min(configured, remaining)}")
+                try:
+                    self._bootstrap()
+                    if self.take_lease(MIGRATE_LEASE):
+                        return
+                except sqlite3.OperationalError as exc:
+                    if not _is_busy(exc):
+                        raise
+                if time.monotonic() >= deadline:
+                    raise FailedError(
+                        "timed out waiting for another process to migrate state.db",
+                        detail=f"{path}: migrate lease not obtained within {wait:g} s",
+                    )
+                time.sleep(MIGRATE_POLL)
+        finally:
+            self.conn.execute(f"PRAGMA busy_timeout = {int(configured)}")
 
     def _migrate(self, migrations: Sequence[Migration], wait: float, path: str) -> None:
         code = code_version(migrations)
@@ -643,19 +701,30 @@ class Store:
                     raise FailedError(
                         "lost the migrate lease while migrating state.db", detail=path
                     )
+        except sqlite3.OperationalError as exc:
+            if not _is_busy(exc):
+                raise
+            raise FailedError(
+                "state.db stayed locked while migrating", detail=f"{path}: {exc}"
+            ) from exc
         finally:
-            self.release_lease(MIGRATE_LEASE)
+            # Must not mask the error above; a dead process's lease is taken over at once.
+            with suppress(sqlite3.Error):
+                self.release_lease(MIGRATE_LEASE)
 
     # Leases
 
     def take_lease(self, name: str) -> bool:
         """Take lease ``name`` for this store. Succeeds when the lease is free, expired
-        (including an expiry more than ``LEASE_TTL`` ahead: clock skew), held by a dead
+        (including an expiry more than ``2 * LEASE_TTL`` ahead: clock skew), held by a dead
         process or already held by this store (then it is renewed). Returns whether this
-        store now holds it."""
-        now = self.clock()
+        store now holds it.
+
+        The clock is read inside the transaction: read before waiting for the lock, a
+        renewal committed meanwhile would look like an expiry far in the future."""
         me = self.holder
         with self.transaction() as conn:
+            now = self.clock()
             row = conn.execute(
                 "SELECT holder_pid, holder_start, holder_token, expires_at "
                 "FROM leases WHERE name = ?",
@@ -665,7 +734,7 @@ class Store:
                 pid, start, token, expires_at = row
                 mine = (pid, start, token) == (me.pid, me.start, self.token)
                 expiry = parse_ts(expires_at)
-                expired = expiry <= now or expiry > now + LEASE_TTL
+                expired = expiry <= now or expiry > now + 2 * LEASE_TTL
                 if not mine and not expired and self._holder_alive(pid, start):
                     return False
             conn.execute(
@@ -684,8 +753,8 @@ class Store:
     def renew_lease(self, name: str) -> bool:
         """Extend lease ``name`` by ``LEASE_TTL`` from now. Returns False if this store no
         longer holds it (it was taken over or released)."""
-        expires_at = format_ts(self.clock() + LEASE_TTL)
         with self.transaction() as conn:
+            expires_at = format_ts(self.clock() + LEASE_TTL)
             cursor = conn.execute(
                 "UPDATE leases SET expires_at = ? WHERE name = ? AND holder_pid = ? "
                 "AND holder_start = ? AND holder_token = ?",
