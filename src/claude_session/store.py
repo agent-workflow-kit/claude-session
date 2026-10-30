@@ -20,7 +20,8 @@ the hook path may import it (design.md, Hook-event fast path), but never migrate
 - Open never opens a file descriptor of its own on an existing ``state.db``: closing it
   would drop every POSIX lock this process holds on the file, SQLite's included. Paths are
   checked with ``lstat``; only a missing file is created (``O_EXCL``), and closed before
-  SQLite connects. Only ``migrate`` opens tighten modes; the hook path only checks.
+  any thread of the process connects. Only ``migrate`` opens tighten modes; the hook path
+  only checks.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import os
 import re
 import sqlite3
 import stat
+import threading
 import time
 import urllib.parse
 import uuid
@@ -50,6 +52,9 @@ MIGRATE_WAIT = 2 * LEASE_TTL.total_seconds()
 MIGRATE_POLL = 0.05  # seconds
 # ``PRAGMA application_id`` of a claude-session database ("CSes"; design.md, Data model).
 APPLICATION_ID = 0x43536573
+# Held from creating state.db to the end of connection setup: closing the create descriptor
+# drops this process's POSIX locks, so no other thread may connect before that close.
+_OPEN_LOCK = threading.Lock()
 
 Version = tuple[int, int]
 Clock = Callable[[], datetime]
@@ -483,6 +488,34 @@ def _enable_wal(conn: sqlite3.Connection, busy_timeout: float) -> None:
         raise InternalError(f"state.db could not be switched to WAL mode (got {mode!r})")
 
 
+def _open_connection(path: str, *, migrate: bool, busy_timeout: float) -> sqlite3.Connection:
+    """Check (with ``migrate``: create) ``path`` and connect to it; with ``migrate`` the
+    database is switched to WAL. Unsafe, unusable or foreign files raise ``FailedError``."""
+    root = os.path.dirname(os.path.abspath(path))
+    try:
+        if migrate:
+            _make_private_dirs(root)
+        _check_private_dir(root, tighten=migrate)
+        _prepare_db_file(path, migrate=migrate)
+    except OSError as exc:
+        raise _open_failed(path, exc) from exc
+    try:
+        conn = _connect(path, busy_timeout)
+    except sqlite3.DatabaseError as exc:
+        raise _open_failed(path, exc) from exc
+    try:
+        _check_identity(conn, path, allow_new=migrate)
+        if migrate:
+            _enable_wal(conn, busy_timeout)
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        raise _open_failed(path, exc) from exc
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 # Store
 
 
@@ -531,28 +564,8 @@ class Store:
         """
         migrations = MIGRATIONS if migrations is None else migrations
         _check_migrations(migrations)
-        root = os.path.dirname(os.path.abspath(path))
-        try:
-            if migrate:
-                _make_private_dirs(root)
-            _check_private_dir(root, tighten=migrate)
-            _prepare_db_file(path, migrate=migrate)
-        except OSError as exc:
-            raise _open_failed(path, exc) from exc
-        try:
-            conn = _connect(path, busy_timeout)
-        except sqlite3.DatabaseError as exc:
-            raise _open_failed(path, exc) from exc
-        try:
-            _check_identity(conn, path, allow_new=migrate)
-            if migrate:
-                _enable_wal(conn, busy_timeout)
-        except sqlite3.DatabaseError as exc:
-            conn.close()
-            raise _open_failed(path, exc) from exc
-        except BaseException:
-            conn.close()
-            raise
+        with _OPEN_LOCK:
+            conn = _open_connection(path, migrate=migrate, busy_timeout=busy_timeout)
         store = cls(
             conn,
             path=path,
@@ -651,13 +664,18 @@ class Store:
         it or the database is busy (e.g. inside a migration step), for up to ``wait``."""
         deadline = time.monotonic() + wait
         (configured,) = self.conn.execute("PRAGMA busy_timeout").fetchone()
+
+        def bound_busy_timeout() -> None:
+            # Before each blocking step: never wait for the lock past the deadline.
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            self.conn.execute(f"PRAGMA busy_timeout = {min(configured, remaining)}")
+
         try:
             while True:
-                # Never wait for the lock past the deadline.
-                remaining = max(0, int((deadline - time.monotonic()) * 1000))
-                self.conn.execute(f"PRAGMA busy_timeout = {min(configured, remaining)}")
                 try:
+                    bound_busy_timeout()
                     self._bootstrap()
+                    bound_busy_timeout()
                     if self.take_lease(MIGRATE_LEASE):
                         return
                 except sqlite3.OperationalError as exc:

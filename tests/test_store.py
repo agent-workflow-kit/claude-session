@@ -298,6 +298,16 @@ def test_a_state_root_with_two_leading_slashes_opens(tmp_path: Path) -> None:
         assert s.schema_version() == store.code_version()
 
 
+@pytest.mark.parametrize("name", ["a?mode=ro", "c%41%2F", "b#frag"])
+def test_a_state_root_with_uri_special_characters_opens(tmp_path: Path, name: str) -> None:
+    path = str(tmp_path / name / "state.db")
+    open_as(path, ME).close()
+    with open_as(path, ME, migrate=False) as s:
+        assert s.schema_version() == store.code_version()
+    assert os.listdir(tmp_path) == [name]  # no file created under a misread path
+    assert os.path.isfile(path)
+
+
 OPEN_AND_CLOSE = """
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
@@ -344,11 +354,65 @@ def test_opening_again_keeps_the_sqlite_locks_of_live_connections(db: str) -> No
         conn.close()
 
 
+def test_a_thread_cannot_connect_while_another_holds_the_create_descriptor(
+    db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing the descriptor that created state.db drops every POSIX lock this process
+    holds on it; no other thread may connect to the new database before that close."""
+    created, go, second_done = threading.Event(), threading.Event(), threading.Event()
+    errors: list[BaseException] = []
+    fchmod = os.fchmod
+
+    def paused_fchmod(fd: int, mode: int) -> None:
+        if threading.current_thread().name == "creator":
+            created.set()
+            go.wait(10)
+        fchmod(fd, mode)
+
+    def run(done: threading.Event | None) -> None:
+        try:
+            open_as(db, ME).close()
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+        finally:
+            if done is not None:
+                done.set()
+
+    monkeypatch.setattr(os, "fchmod", paused_fchmod)
+    creator = threading.Thread(target=run, args=(None,), name="creator")
+    second = threading.Thread(target=run, args=(second_done,), name="second")
+    creator.start()
+    try:
+        assert created.wait(10)
+        second.start()
+        connected_early = second_done.wait(0.5)
+    finally:
+        go.set()
+        creator.join(10)
+        if second.ident is not None:
+            second.join(10)
+    assert not connected_early, "opened while the create descriptor was open"
+    assert not creator.is_alive() and not second.is_alive()
+    assert errors == []
+
+
 def test_a_db_that_cannot_be_opened_is_failed(db: str) -> None:
     os.makedirs(db)  # a directory where state.db should be
     with pytest.raises(FailedError) as exc:
         open_as(db, ME)
     assert db in (exc.value.detail or "")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode 0 file")
+def test_an_unreadable_db_is_failed_on_the_hook_path(db: str) -> None:
+    open_as(db, ME).close()
+    os.chmod(db, 0)
+    try:
+        with pytest.raises(FailedError) as exc:
+            open_as(db, ME, migrate=False)
+        assert db in (exc.value.detail or "")
+    finally:
+        os.chmod(db, 0o600)
 
 
 def test_a_corrupt_db_is_failed(db: str) -> None:
@@ -706,6 +770,40 @@ def test_the_migration_wait_does_not_overshoot_by_a_busy_timeout(db: str) -> Non
         lock.close()
 
 
+def test_the_lease_step_of_the_migration_wait_gets_only_the_time_left(
+    db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bootstrap uses up most of the wait; taking the lease must not wait a full
+    ``migrate_wait`` again."""
+    open_as(db, ME, migrations=make_migrations([], [(1, 0)])).close()
+    locks: list[sqlite3.Connection] = []
+    bootstrap = Store._bootstrap
+
+    def slow_bootstrap(self: Store) -> None:
+        if not locks:
+            time.sleep(0.9)  # e.g. waiting for another writer
+            bootstrap(self)
+            locks.append(grab_write_lock(db))  # the next writer holds the lock throughout
+        else:
+            bootstrap(self)
+
+    monkeypatch.setattr(Store, "_bootstrap", slow_bootstrap)
+    try:
+        started = time.monotonic()
+        with pytest.raises(FailedError, match="timed out waiting"):
+            open_as(
+                db,
+                ME,
+                migrations=make_migrations([], [(1, 0), (1, 1)]),
+                busy_timeout=5,
+                migrate_wait=1.0,
+            )
+        assert time.monotonic() - started < 1.5
+    finally:
+        for lock in locks:
+            lock.close()
+
+
 def test_the_busy_timeout_is_restored_after_the_migration_wait(db: str) -> None:
     open_as(db, ME, migrations=make_migrations([], [(1, 0)])).close()
     with open_as(
@@ -875,50 +973,6 @@ def test_a_lease_less_than_two_ttls_ahead_is_not_far_in_the_future(db: str) -> N
     with open_as(db, OTHER, clock=ahead) as other, open_as(db, ME) as me:
         assert other.take_lease("reconcile")
         assert not me.take_lease("reconcile")
-
-
-def test_a_lease_renewed_while_a_taker_waits_for_the_lock_is_kept(db: str) -> None:
-    """Real clocks: the taker must read the time inside its transaction, or a renewal that
-    commits while it waits looks like an expiry far in the future."""
-    open_as(db, ME).close()
-    alive = FakeProcesses(ME, OTHER)
-    ready, stop = threading.Event(), threading.Event()
-    lost: list[int] = []
-
-    errors: list[BaseException] = []
-
-    def hold() -> None:
-        try:
-            with Store.open(db, holder=OTHER, liveness=alive) as holder:
-                assert holder.take_lease("reconcile")
-                ready.set()
-                while not stop.wait(0.0005):  # leave the taker room to get the lock
-                    if not holder.renew_lease("reconcile"):
-                        lost.append(1)
-                        holder.take_lease("reconcile")
-        except BaseException as exc:  # noqa: BLE001 - reported below
-            errors.append(exc)
-            ready.set()
-
-    thread = threading.Thread(target=hold)
-    thread.start()
-    wins = tries = 0
-    try:
-        assert ready.wait(10)
-        with Store.open(db, holder=ME, liveness=alive) as taker:
-            end = time.monotonic() + 1.0
-            while time.monotonic() < end:
-                tries += 1
-                time.sleep(0.0005)
-                if taker.take_lease("reconcile"):
-                    wins += 1
-                    taker.release_lease("reconcile")
-    finally:
-        stop.set()
-        thread.join(10)
-    assert errors == []
-    assert tries > 10
-    assert (wins, len(lost)) == (0, 0)
 
 
 def test_take_lease_reads_the_clock_after_getting_the_lock(db: str) -> None:
