@@ -9,14 +9,15 @@ the hook path may import it (design.md, Hook-event fast path), but never migrate
   applied in order at open, under the lease ``migrate``; each one commits together with the
   version it brings the database to, so an interrupted migration resumes where it stopped.
 - A database whose schema is newer than this code is refused with ``schema_newer`` (exit 12)
-  before claude-session writes anything (interface.md, Launch order and Upgrades).
+  before claude-session writes any data to it (interface.md, Launch order and Upgrades).
 - Leases (``migrate``, ``reconcile``, ``delivery:<id>``) record the holder's PID, process
   start time and a per-``Store`` token, and expire ``LEASE_TTL`` after their last renewal; a
   dead holder's lease may be taken over at once.
 - Open refuses, with ``FailedError`` (exit 12), a state directory or ``state.db`` that is
   unsafe (a symlink, not ours, hard-linked, not a regular file), unusable or not a
-  claude-session database (``PRAGMA application_id``); claude-session writes nothing to such
-  a database (SQLite's own hot-journal recovery may still run).
+  claude-session database (``PRAGMA application_id``); claude-session writes no data to such
+  a database (it may only tighten the modes of the state directory and ``state.db``, which it
+  already checked are the user's own; SQLite's own hot-journal recovery may still run).
 - Open never opens a file descriptor of its own on an existing ``state.db``: closing it
   would drop every POSIX lock this process holds on the file, SQLite's included. Paths are
   checked with ``lstat``; only a missing file is created (``O_EXCL``), and closed before
@@ -52,9 +53,21 @@ MIGRATE_WAIT = 2 * LEASE_TTL.total_seconds()
 MIGRATE_POLL = 0.05  # seconds
 # ``PRAGMA application_id`` of a claude-session database ("CSes"; design.md, Data model).
 APPLICATION_ID = 0x43536573
-# Held from creating state.db to the end of connection setup: closing the create descriptor
-# drops this process's POSIX locks, so no other thread may connect before that close.
+# Held while state.db is checked and, when missing, created: closing the create descriptor
+# drops this process's POSIX locks, so no other thread may connect before that close. Any
+# thread that takes it after the creator finds the file and closed descriptor; it is never
+# held across a database wait.
 _OPEN_LOCK = threading.Lock()
+
+
+def _reset_open_lock() -> None:
+    """In a forked child, replace the lock: another thread may have held it at the fork."""
+    global _OPEN_LOCK
+    _OPEN_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_open_lock)
 
 Version = tuple[int, int]
 Clock = Callable[[], datetime]
@@ -456,7 +469,7 @@ def _schema_newer(found: Version, code: Version) -> SchemaNewerError:
 
 
 def _check_identity(conn: sqlite3.Connection, path: str, *, allow_new: bool) -> None:
-    """Refuse a database that is not ours, before claude-session writes anything. With
+    """Refuse a database that is not ours, before claude-session writes any data. With
     ``allow_new``, an empty database (application_id 0, no schema) is accepted."""
     # One statement, one snapshot: a concurrent first open may bootstrap in between.
     app_id, objects = conn.execute(
@@ -496,7 +509,8 @@ def _open_connection(path: str, *, migrate: bool, busy_timeout: float) -> sqlite
         if migrate:
             _make_private_dirs(root)
         _check_private_dir(root, tighten=migrate)
-        _prepare_db_file(path, migrate=migrate)
+        with _OPEN_LOCK:
+            _prepare_db_file(path, migrate=migrate)
     except OSError as exc:
         raise _open_failed(path, exc) from exc
     try:
@@ -564,8 +578,7 @@ class Store:
         """
         migrations = MIGRATIONS if migrations is None else migrations
         _check_migrations(migrations)
-        with _OPEN_LOCK:
-            conn = _open_connection(path, migrate=migrate, busy_timeout=busy_timeout)
+        conn = _open_connection(path, migrate=migrate, busy_timeout=busy_timeout)
         store = cls(
             conn,
             path=path,
@@ -717,7 +730,8 @@ class Store:
                 # TODO(#7): log a `migration` event.
                 if not self.renew_lease(MIGRATE_LEASE):
                     raise FailedError(
-                        "lost the migrate lease while migrating state.db", detail=path
+                        "lost the migrate lease while migrating state.db",
+                        detail=f"{path}: migrate lease taken over",
                     )
         except sqlite3.OperationalError as exc:
             if not _is_busy(exc):

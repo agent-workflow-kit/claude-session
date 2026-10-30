@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+import signal
 import sqlite3
 import stat
 import subprocess
 import sys
 import threading
 import time
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -396,6 +398,71 @@ def test_a_thread_cannot_connect_while_another_holds_the_create_descriptor(
     assert errors == []
 
 
+def test_a_slow_open_of_one_database_does_not_stall_an_open_of_another(tmp_path: Path) -> None:
+    """The process-wide open lock covers only creating the file, not the database waits."""
+    slow_db, other_db = str(tmp_path / "a" / "state.db"), str(tmp_path / "b" / "state.db")
+    open_as(slow_db, ME).close()
+    open_as(other_db, ME).close()
+    setup = sqlite3.connect(slow_db, isolation_level=None)
+    setup.execute("PRAGMA journal_mode=DELETE")  # an exclusive lock then blocks readers
+    setup.close()
+    locker = sqlite3.connect(slow_db, isolation_level=None, check_same_thread=False)
+    locker.execute("BEGIN EXCLUSIVE")
+    waiting = threading.Event()
+
+    def slow_open() -> None:
+        waiting.set()
+        with suppress(FailedError):
+            open_as(slow_db, ME, busy_timeout=2.0).close()
+
+    thread = threading.Thread(target=slow_open)
+    try:
+        thread.start()
+        assert waiting.wait(10)
+        time.sleep(0.2)  # let it reach the busy wait on the slow database
+        started = time.monotonic()
+        open_as(other_db, ME, busy_timeout=2.0).close()
+        elapsed = time.monotonic() - started
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+        thread.join(10)
+    assert not thread.is_alive()
+    assert elapsed < 1.0, f"the unrelated open took {elapsed:.2f} s"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_a_child_forked_while_the_open_lock_is_held_can_open(tmp_path: Path) -> None:
+    """A fork while another thread holds the open lock must not leave the child's copy
+    locked forever."""
+    child_db = str(tmp_path / "child" / "state.db")
+    store._OPEN_LOCK.acquire()  # pyright: ignore[reportPrivateUsage]
+    try:
+        pid = os.fork()
+        if pid == 0:  # child: never return into pytest
+            status = 1
+            try:
+                signal.alarm(5)  # a hang ends the child by SIGALRM
+                Store.open(child_db).close()
+                status = 0
+            finally:
+                os._exit(status)
+    finally:
+        store._OPEN_LOCK.release()  # pyright: ignore[reportPrivateUsage]
+    deadline = time.monotonic() + 15
+    while True:
+        done, wait_status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)  # the child forked above, still unreaped
+            os.waitpid(pid, 0)
+            pytest.fail("the forked child did not finish")
+        time.sleep(0.05)
+    assert not os.WIFSIGNALED(wait_status), "the child hung on the open lock"
+    assert os.WEXITSTATUS(wait_status) == 0
+
+
 def test_a_db_that_cannot_be_opened_is_failed(db: str) -> None:
     os.makedirs(db)  # a directory where state.db should be
     with pytest.raises(FailedError) as exc:
@@ -697,8 +764,9 @@ def test_a_migrator_that_loses_its_lease_stops_before_the_next_step(db: str) -> 
         )
 
     migrations = [Migration((1, 0), stolen), Migration((1, 1), lambda c: log.append("1.1"))]
-    with pytest.raises(FailedError, match="lost the migrate lease"):
+    with pytest.raises(FailedError, match="lost the migrate lease") as exc:
         open_as(db, ME, migrations=migrations)
+    assert exc.value.detail == f"{db}: migrate lease taken over"
     assert log == ["1.0"]
 
 

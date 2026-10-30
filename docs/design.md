@@ -315,7 +315,7 @@ meta        key PK, value            (schema_version)
 - Migrations are numbered functions applied at open under the lease `migrate`, forward only, and additive within a schema major version (`meta.schema_version` is `<major>.<minor>`). `hook-event` never migrates: with older code and a newer additive schema it keeps working, and it only reads and writes the columns it knows. Every other command checks the schema version first, before any allocation, and refuses a newer one with the error envelope `code: schema_newer`, exit 12 (dry runs too); it is never a run end reason.
 - Concurrency: every write is one `BEGIN IMMEDIATE` transaction with a busy timeout of 5 s; the per-session lock of the architecture is that transaction. `reconcile`, `migrate` and per-session delivery take a lease (holder PID + start time + `expires_at`): a lease expires 60 s after its last renewal, the holder renews it every 20 s while it works (hook delivery renews during long hooks), and a dead holder's lease may be taken over immediately.
 - Timestamps are UTC ISO 8601; durations inside `exec` use the monotonic clock.
-- `PRAGMA application_id` is `0x43536573` ("CSes"); a database with another id, or id 0 and a non-empty schema, is refused before claude-session writes anything. `holder_token` is random per open store, so two stores of one process never share a lease.
+- `PRAGMA application_id` is `0x43536573` ("CSes"); a database with another id, or id 0 and a non-empty schema, is refused before claude-session writes any data to it (it may only tighten the modes of the state directory and `state.db`, which it already checked are the user's own). `holder_token` is random per open store, so two stores of one process never share a lease.
 
 ### Generated settings
 
