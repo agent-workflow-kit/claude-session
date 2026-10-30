@@ -172,7 +172,7 @@ Each of these exits 2 before anything is allocated:
 - `--input-file -`, duplicate input basenames, or names outside the artifact-name grammar; a prompt or input file larger than `input_max_bytes`;
 - `--override-escalation` with `--fork`, or when the previous run did not end `escalated`; `--allow-tainted` or `--override-escalation` without a TTY or an explicit `--actor human:*` (human-only flags; exit 2 rather than 13 because they are flags on an otherwise automatable command);
 - a headless new session with neither skill nor prompt;
-- outside launches: `transcript --raw --json` and `transcript --raw --paths`; `label add`/`label remove` without any `key=value` pair; `forget <id>` with a bulk-only flag (`--older-than`, `--state`, `--kind`, `--label`).
+- outside launches: `transcript --raw --json` and `transcript --raw --paths`; `label add`/`label remove` without any `key=value` pair; `forget <id>` with a bulk-only flag (`--older-than`, `--state`, `--kind`, `--label`); `forget` without an id or `--older-than`.
 
 Untrusted or agent-generated text is never accepted *only* as a flag value: prompts come through `--prompt-file`, inputs through `--input-file`, report text through `--summary-file`/`--reason-file`. `report --summary <text>` exists for one-line summaries.
 
@@ -259,7 +259,7 @@ claude-session exec [launch flags] [--json] [--outcome-file <path>]
 claude-session exec --session-id <id> [--dry-run] [--json] [--outcome-file <path>]
 ```
 
-Runs a session in the foreground and exits with its outcome code. Without `--session-id`, performs every step of the [launch order](#launch-order) for a new session. With `--session-id`, adopts the pending run created by `start` (a new session, a fork or a pending resume); it accepts only `--json`, `--dry-run` and `--outcome-file` (anything else exits 2).
+Runs a session in the foreground and exits with its outcome code. Without `--session-id`, performs every step of the [launch order](#launch-order) for a new session. With `--session-id`, adopts the pending run created by `start` (a new session, a fork or a pending resume); it accepts only `--json`, `--dry-run`, `--outcome-file` and the global `--verbose`, `--quiet` and `--yes` (anything else exits 2).
 
 Headless runs: if no `SessionStart` arrives within `session_start_timeout` (default 120 s), `exec` logs a warning and adds it to `warnings` (injected hooks may be suppressed; see [Residual risks](#residual-risks)). Interactive runs are exempt (they may wait at the trust dialog).
 
@@ -342,7 +342,7 @@ claude-session report done|blocked|failed|needs-input
 
 Run by the agent inside its session. Requires `CSESSION_ID` and `CSESSION_DIR` (else exit 2). It never opens `state.db` (so it is exempt from the schema check). It reads the protected `run.json` for the state root, the run number, the limits and the device and inode of `outbox/` and `artifacts/`, and requires `realpath(CSESSION_DIR)` to equal `<state_root>/sessions/<CSESSION_ID>` (else exit 2).
 
-- `done` requires a summary; `blocked`, `failed` and `needs-input` require a reason (a summary is optional for them). A `--summary` text that begins with `-` must be given as `--summary=<text>`.
+- `done` requires a non-empty summary; `blocked`, `failed` and `needs-input` require a reason (a summary is optional for them). A `--summary` text that begins with `-` must be given as `--summary=<text>`.
 - **Command forms.** Only a bare `claude-session report …` command matches the generated `Bash(claude-session report:*)` rule; the generated rules also allow `Bash(<absolute claude-session path> report:*)` (the install path is per machine, so the instructions may name it). A command prefixed with `cd … &&` or containing `$(…)` is denied (live test). The standard instructions show exactly these forms:
   - write the text with the Write tool to `$CSESSION_DIR/artifacts/summary.md` (or `reason.md`), then `claude-session report done --summary-file <path>`;
   - `claude-session report done --summary "<one line>"`;
@@ -629,7 +629,7 @@ Per outcome (encoded in [schemas/cli/outcome.json](../schemas/cli/outcome.json) 
 |---|---|
 | 0 | success; for waiting commands: reported done (including implicit done) |
 | 1 | internal error |
-| 2 | usage error: bad flags or values (labels, kind or skill names, durations, short id prefix, input-file names, `--input-file -`, `--timeout 0`, `wait --timeout 0`, `--interval` outside 1–59, prompt or input files over `input_max_bytes`), an invalid config (`detail` names the error), the [flag rules](#flag-rules), `report` outside a session or with invalid input or a `CSESSION_DIR` that does not match `CSESSION_ID`, `start` without `--json`, flags other than `--json`/`--dry-run`/`--outcome-file`/`--verbose`/`--quiet`/`--yes` with `--session-id`, `--cwd` on a resume (not a fork) that differs from the stored cwd, `--prompt-file -` in interactive mode with a TTY stdin (also `start`), plain `exec`/`resume` in interactive mode without a TTY, an isolated run's `--outcome-file` under a [session-writable path](#session-writable-paths) (at adoption: the run stays pending), `transcript --raw --json` or `--raw --paths`, `label add`/`remove` without pairs, `forget <id>` with bulk-only flags, an unsafe `cron --env-file` |
+| 2 | usage error: bad flags or values (labels, kind or skill names, durations, short id prefix, input-file names, `--input-file -`, `--timeout 0`, `wait --timeout 0`, `--interval` outside 1–59, prompt or input files over `input_max_bytes`), an invalid config (`detail` names the error), the [flag rules](#flag-rules), `report` outside a session or with invalid input or a `CSESSION_DIR` that does not match `CSESSION_ID`, `start` without `--json`, flags other than `--json`/`--dry-run`/`--outcome-file`/`--verbose`/`--quiet`/`--yes` with `--session-id`, `--cwd` on a resume (not a fork) that differs from the stored cwd, `--prompt-file -` in interactive mode with a TTY stdin (also `start`), plain `exec`/`resume` in interactive mode without a TTY, an isolated run's `--outcome-file` under a [session-writable path](#session-writable-paths) (at adoption: the run stays pending), `transcript --raw --json` or `--raw --paths`, `label add`/`remove` without pairs, `forget <id>` with bulk-only flags, `forget` with neither an id nor `--older-than`, `--verbose` with `--quiet`, `--max-turns` < 1, `list --limit` < 1, an unknown `export --action`, an unsafe `cron --env-file` |
 | 10 | unknown or forgotten session (also when forgotten during `wait`, and on adoption); `--run` out of range |
 | 11 | `pre-launch` hook veto or hook timeout (`phase: launch`); `verify-secret` mismatch |
 | 12 | `claude` never started (`phase: launch`: launch failed, `no_tty` or `config_invalid` at adoption, canceled, never adopted, launch interrupted); `stop` when the run is still live after its wait; error codes `schema_newer` and `failed` (any command) |

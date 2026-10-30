@@ -515,3 +515,22 @@ def test_outcome_file_write_failure_is_a_warning(
     assert json.loads(captured.out)["error"]["code"] == "usage"
     assert "warning: could not write --outcome-file" in captured.err
     assert not os.path.exists(out)
+
+
+def test_outcome_file_prescan_ignores_a_flag_as_its_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert main(["exec", "--outcome-file", "--json"]) == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("extra", [[], ["--bogus"]], ids=["parsed", "parse-failed"])
+def test_repeated_outcome_file_writes_the_last_path(
+    extra: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first, last = tmp_path / "first.json", tmp_path / "last.json"
+    argv = ["exec", "--timeout", "0", "--outcome-file", str(first), "--outcome-file", str(last)]
+    assert main([*argv, *extra]) == 2
+    assert read_envelope(last)["error"]["code"] == "usage"
+    assert not first.exists()

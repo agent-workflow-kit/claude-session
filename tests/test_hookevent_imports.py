@@ -41,10 +41,8 @@ class Recorder:
 already = [m for m in FORBIDDEN if m in sys.modules]
 sys.meta_path.insert(0, Recorder())
 {extra}
-sys.argv = ["claude_session", "hook-event", "--state-dir", "/nonexistent", "SessionStart"]
 try:
-    runpy.run_module("claude_session", run_name="__main__", alter_sys=True)
-    code = None
+{runner}
 except SystemExit as exc:
     code = exc.code
 package = sorted(m for m in sys.modules if m == "claude_session" or m.startswith("claude_session."))
@@ -52,9 +50,24 @@ print(json.dumps({{"code": code, "already": already, "attempted": attempted, "pa
 """
 
 
-def run_probe(extra: str = "") -> dict[str, Any]:
+HOOK_ARGV = ["hook-event", "--state-dir", "/nonexistent", "SessionStart"]
+# `python -I -m claude_session hook-event ...`, as the injected hooks run it.
+RUN_MODULE = f"""
+    sys.argv = ["claude_session", *{HOOK_ARGV!r}]
+    runpy.run_module("claude_session", run_name="__main__", alter_sys=True)
+    code = None
+"""
+# The `claude-session` console script: it imports the entry function and calls it.
+CONSOLE_SCRIPT = f"""
+    from claude_session.__main__ import main
+    code = main({HOOK_ARGV!r})
+"""
+
+
+def run_probe(extra: str = "", runner: str = RUN_MODULE) -> dict[str, Any]:
+    script = PROBE.format(forbidden=FORBIDDEN, extra=extra, runner=runner)
     proc = subprocess.run(
-        [sys.executable, "-I", "-c", PROBE.format(forbidden=FORBIDDEN, extra=extra)],
+        [sys.executable, "-I", "-c", script],
         input="{}",
         capture_output=True,
         text=True,
@@ -76,6 +89,12 @@ def violations(result: dict[str, Any]) -> list[str]:
 
 def test_hook_event_imports_nothing_heavy() -> None:
     result = run_probe()
+    assert result["code"] == 0
+    assert violations(result) == []
+
+
+def test_console_script_hook_event_imports_nothing_heavy() -> None:
+    result = run_probe(runner=CONSOLE_SCRIPT)
     assert result["code"] == 0
     assert violations(result) == []
 

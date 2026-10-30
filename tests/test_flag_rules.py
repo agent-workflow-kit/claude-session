@@ -25,13 +25,19 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     # exec --session-id
     (["exec", "--session-id", SID, "--kind", "review"], "--kind cannot be used with --session-id"),
     (["exec", "--session-id", SID, "--config", "c"], "--config cannot be used with --session-id"),
-    (["exec", "--session-id", SID, "--no-auto-exit"], "--auto-exit cannot be used with"),
+    (
+        ["exec", "--session-id", SID, "--no-auto-exit"],
+        "--[no-]auto-exit cannot be used with --session-id",
+    ),
     (["exec", "--session-id", SID, "--label", "a=b"], "--label cannot be used with"),
     # exec new session
     (["exec", "--mode", "headless"], "a headless new session needs --skill or --prompt-file"),
     # --reset with the flag it resets
     (["resume", SID, "--reset", "model", "--model", "m"], "--reset model cannot be combined"),
-    (["resume", SID, "--reset", "auto-exit", "--auto-exit"], "--reset auto-exit cannot be"),
+    (
+        ["resume", SID, "--reset", "auto-exit", "--auto-exit"],
+        "--reset auto-exit cannot be combined with --[no-]auto-exit",
+    ),
     (["resume", SID, "--reset", "plugin-dir", "--plugin-dir", "/p"], "--reset plugin-dir"),
     (
         ["start", "--json", "--resume", SID, "--reset", "timeout", "--timeout", "5m"],
@@ -75,7 +81,9 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     # setting sources
     (["exec", "--setting-sources", "user,global"], "unknown source 'global'"),
     # report
-    (["report", "done"], "report done requires --summary-file or --summary"),
+    (["report", "done"], "report done requires a non-empty --summary or --summary-file"),
+    (["report", "done", "--summary", ""], "requires a non-empty --summary"),
+    (["report", "done", "--summary", " \t "], "requires a non-empty --summary"),
     (["report", "blocked", "--summary", "x"], "report blocked requires --reason-file"),
     (["report", "failed"], "report failed requires --reason-file"),
     (["report", "needs-input"], "report needs-input requires --reason-file"),

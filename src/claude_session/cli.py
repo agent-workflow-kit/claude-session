@@ -334,6 +334,8 @@ def parse(parser: _Parser, argv: Sequence[str]) -> argparse.Namespace:
 
 
 def _flag(dest: str) -> str:
+    if dest == "auto_exit":
+        return "--[no-]auto-exit"
     return "--" + dest.replace("_", "-")
 
 
@@ -385,7 +387,8 @@ def _check_launch_flags(args: argparse.Namespace) -> None:
                 )
     for setting in getattr(args, "reset", None) or []:
         if getattr(args, RESETTABLE[setting]) is not None:
-            raise UsageError(f"--reset {setting} cannot be combined with --{setting}")
+            flag = _flag(RESETTABLE[setting])
+            raise UsageError(f"--reset {setting} cannot be combined with {flag}")
     if getattr(args, "fork", False) and getattr(args, "override_escalation", False):
         raise UsageError("--override-escalation cannot be combined with --fork")
 
@@ -425,8 +428,9 @@ def _check_wait(args: argparse.Namespace) -> None:
 
 def _check_report(args: argparse.Namespace) -> None:
     if args.status == "done":
-        if args.summary is None and args.summary_file is None:
-            raise UsageError("report done requires --summary-file or --summary")
+        summary_given = args.summary is not None and args.summary.strip() != ""
+        if not summary_given and args.summary_file is None:
+            raise UsageError("report done requires a non-empty --summary or --summary-file")
     elif args.reason_file is None:
         raise UsageError(f"report {args.status} requires --reason-file")
 
@@ -509,16 +513,20 @@ def _given(argv: Sequence[str], flag: str) -> bool:
 
 
 def _outcome_file_from_argv(argv: Sequence[str]) -> str | None:
+    """The last ``--outcome-file`` value in ``argv`` (as argparse would take it)."""
     if not argv or argv[0] not in OUTCOME_FILE_COMMANDS:
         return None
+    found: str | None = None
     for index, token in enumerate(argv):
         if token == "--":
-            return None
+            break
         if token == "--outcome-file" and index + 1 < len(argv):
-            return argv[index + 1]
-        if token.startswith("--outcome-file="):
-            return token.partition("=")[2]
-    return None
+            value = argv[index + 1]
+            if not value.startswith("-"):
+                found = value
+        elif token.startswith("--outcome-file="):
+            found = token.partition("=")[2]
+    return found
 
 
 def _write_outcome_file(path: str, error: CliError) -> None:
