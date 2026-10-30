@@ -170,7 +170,8 @@
               "integer",
               "null"
             ],
-            "minimum": 1
+            "minimum": 1,
+            "maximum": 9007199254740991
           },
           "auto_exit": {
             "type": "boolean"
@@ -185,7 +186,10 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "minLength": 1,
+            "pattern": "^[^\u0000-\u001f\u007f-\u009f]+$",
+            "description": "When set: non-empty, no control characters (C0, DEL or C1)."
           },
           "claude_args": {
             "type": "array",
@@ -268,6 +272,7 @@
     "notes_context_max_bytes": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 9007199254740991,
       "default": 16384
     },
     "notes_context_sources": {
@@ -291,22 +296,26 @@
     "summary_max_bytes": {
       "type": "integer",
       "minimum": 1,
+      "maximum": 9007199254740991,
       "default": 65536
     },
     "artifact_max_bytes": {
       "type": "integer",
       "minimum": 1,
+      "maximum": 9007199254740991,
       "default": 10485760
     },
     "input_max_bytes": {
       "type": "integer",
       "minimum": 1,
+      "maximum": 9007199254740991,
       "default": 10485760,
       "description": "Cap for each --prompt-file and --input-file (bytes); larger exits 2."
     },
     "retention_days": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 36500,
       "default": 30
     },
     "lost_grace": {
@@ -623,13 +632,17 @@
                     "integer",
                     "null"
                   ],
-                  "minimum": 1
+                  "minimum": 1,
+                  "maximum": 9007199254740991
                 },
                 "model": {
                   "type": [
                     "string",
                     "null"
-                  ]
+                  ],
+                  "minLength": 1,
+                  "pattern": "^[^\u0000-\u001f\u007f-\u009f]+$",
+                  "description": "When set: non-empty, no control characters (C0, DEL or C1)."
                 }
               },
               "required": [],

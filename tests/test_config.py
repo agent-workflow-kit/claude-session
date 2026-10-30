@@ -419,6 +419,21 @@ INVALID: list[tuple[str, str]] = [
     ("retention_days: 3.5\n", "retention_days"),
     ("kinds: {implement: {max_turns: 1.5}}\n", "kinds.implement.max_turns"),
     ("summary_max_bytes: true\n", "summary_max_bytes"),
+    ("retention_days: 36501\n", "retention_days"),
+    ("summary_max_bytes: 9007199254740992\n", "summary_max_bytes"),
+    ("artifact_max_bytes: 9007199254740992\n", "artifact_max_bytes"),
+    ("input_max_bytes: 9007199254740992\n", "input_max_bytes"),
+    ("notes_context_max_bytes: 9007199254740992\n", "notes_context_max_bytes"),
+    ("kinds: {implement: {max_turns: 9007199254740992}}\n", "kinds.implement.max_turns"),
+    (
+        "repos: {example.com/x: {kinds: {respond: {max_turns: 9007199254740992}}}}\n",
+        "max_turns",
+    ),
+    ("kinds: {implement: {model: ''}}\n", "kinds.implement.model"),
+    ('kinds: {implement: {model: "a\\x01b"}}\n', "kinds.implement.model"),
+    ('kinds: {implement: {model: "a\\x7f"}}\n', "kinds.implement.model"),
+    ('kinds: {implement: {model: "a\\x85b"}}\n', "kinds.implement.model"),
+    ('repos: {example.com/x: {kinds: {respond: {model: "\\tm"}}}}\n', "model"),
     ("- a list\n", "top level"),
 ]
 
@@ -453,6 +468,14 @@ VALID = [
     "kinds: {implement: {model: null, max_turns: null, interactive_timeout: null}}\n",
     "repos: {example.com/x: {kinds: {respond: {timeout: null, max_turns: null, model: null}}}}\n",
     "default_kind: x_1-y\nkill_grace: 36500d\n",
+    # integer bounds (2^53 - 1; retention_days 36500)
+    "retention_days: 36500\nsummary_max_bytes: 9007199254740991\n",
+    "artifact_max_bytes: 9007199254740991\ninput_max_bytes: 9007199254740991\n",
+    "notes_context_max_bytes: 9007199254740991\n",
+    "kinds: {implement: {max_turns: 9007199254740991, model: claude-x.1}}\n",
+    "repos: {example.com/x: {kinds: {respond: {max_turns: 9007199254740991, model: m}}}}\n",
+    # a quoted merge key is an ordinary key
+    "me: {'<<': x}\n",
 ]
 
 
@@ -756,28 +779,6 @@ def test_tagged_ordinary_numbers_still_load(cfg_dir: Path) -> None:
     assert (cfg.retention_days, cfg.kill_grace) == (12, 1.5)
 
 
-def test_two_merge_keys_are_refused(cfg_dir: Path) -> None:
-    write(
-        cfg_dir / "config.yaml",
-        "me:\n  a: &a {x: 1}\n  b: &b {y: 2}\n  c: {<<: *a, <<: *b}\n",
-    )
-    detail = str(invalid(cfg_dir).detail)
-    assert "duplicate merge key" in detail
-    assert "line 4" in detail
-
-
-def test_one_merge_key_with_several_sources_loads(cfg_dir: Path) -> None:
-    write(
-        cfg_dir / "config.yaml",
-        "me:\n  a: &a {x: 1}\n  b: &b {y: 2}\n  c: {<<: [*a, *b], z: 3}\n",
-    )
-    assert load(cfg_dir).me.model_extra == {
-        "a": {"x": 1},
-        "b": {"y": 2},
-        "c": {"x": 1, "y": 2, "z": 3},
-    }
-
-
 def test_ordinary_yaml_numbers_still_load(cfg_dir: Path) -> None:
     write(cfg_dir / "config.yaml", "retention_days: 12\nkill_grace: 1.5\nlost_grace: 0x10\n")
     cfg = load(cfg_dir)
@@ -848,7 +849,7 @@ YAML_PROBLEMS = {
     "unsupported or invalid tagged value",
     "invalid value",
     "duplicate key",
-    "duplicate merge key",
+    "merge keys are not supported",
     "base-60 numbers are not supported",
     "invalid YAML",
 }
@@ -857,14 +858,17 @@ YAML_PROBLEMS = {
 @pytest.mark.parametrize(
     ("text", "problem"),
     [
-        ("me: !!binary SECRET\u00e9\n", "unsupported or invalid tagged value"),
-        ("me: !!binary 'can''t SECRET'\n", "unsupported or invalid tagged value"),
+        ("me: {x: !a%22b'SECRETTAIL v}\n", "unsupported or invalid tagged value"),
+        ("me: !!bool SECRET\n", "invalid value"),
+        ("me: !!int ''\n", "invalid value"),
+        ("me: !!bool ''\n", "invalid value"),
+        ("me: !!float SECRET\n", "invalid value"),
+        ("me: {a: &a {x: 1}, b: {<<: *a}}\n", "merge keys are not supported"),
         (f"claude_bin: !{SECRET} x\n", "unsupported or invalid tagged value"),
         (f"me: !!python/name:{SECRET} x\n", "unsupported or invalid tagged value"),
         (f"me: *{SECRET}\n", "invalid alias or document structure"),
         (f"me: {{a: '{SECRET}\n", "invalid YAML syntax"),
         (f"me: [{SECRET}\n", "invalid YAML syntax"),
-        ("me: {d: 2001-13-45}\n", "invalid value"),
         ("retention_days: " + "1" * 5000 + "\n", "invalid value"),
         ("a: 1\nb: 2\na: 3\n", "duplicate key"),
     ],
@@ -881,10 +885,10 @@ def test_yaml_errors_use_a_fixed_phrase(cfg_dir: Path, text: str, problem: str) 
     assert re.fullmatch(r" at line [0-9]+, column [0-9]+", location)
 
 
-def test_invalid_timestamp_is_an_invalid_value_with_its_position(cfg_dir: Path) -> None:
+def test_invalid_timestamp_is_an_unsupported_value_with_its_position(cfg_dir: Path) -> None:
     write(cfg_dir / "config.yaml", "me:\n  d: 2001-13-45\n")
     detail = str(invalid(cfg_dir).detail)
-    assert detail.endswith(": invalid value")
+    assert detail.startswith("me.d: unsupported value type (timestamp)")
     assert "line 2, column 6" in detail
     assert "too long" not in detail
 
@@ -985,3 +989,258 @@ def test_kind_flag_keys_are_settable(cfg_dir: Path) -> None:
     )
     assert flagged.sandbox == "required"
     assert flagged.env.allow == ["A"]
+
+
+# Merge keys (T1)
+
+
+def test_single_merge_key_is_refused(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "me:\n  a: &a {x: 1}\n  b:\n    <<: *a\n")
+    detail = str(invalid(cfg_dir).detail)
+    assert detail.endswith("merge keys are not supported")
+    assert "line 4, column 5" in detail
+
+
+def test_merge_key_with_several_sources_is_refused(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "me:\n  a: &a {x: 1}\n  b: &b {y: 2}\n  c: {<<: [*a, *b]}\n")
+    assert "merge keys are not supported" in str(invalid(cfg_dir).detail)
+
+
+def test_explicitly_tagged_merge_key_is_refused(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "me: {a: &a {x: 1}, b: {!!merge m: *a}}\n")
+    assert "merge keys are not supported" in str(invalid(cfg_dir).detail)
+
+
+def _merge_list_of_refs(count: int) -> str:
+    return "me:\n  a: &a {x: 1, y: 2}\n  b: {<<: [" + ", ".join(["*a"] * count) + "]}\n"
+
+
+def _merge_chain(links: int) -> str:
+    lines = ["me:", "  m0: &m0 {k0: 0}"]
+    lines += [f"  m{i}: &m{i} {{<<: *m{i - 1}, k{i}: {i}}}" for i in range(1, links)]
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize("text", [_merge_list_of_refs(20_000), _merge_chain(3_000)])
+def test_merge_key_blowups_are_refused_quickly(cfg_dir: Path, text: str) -> None:
+    write(cfg_dir / "config.yaml", text)
+    started = time.monotonic()
+    detail = str(invalid(cfg_dir).detail)
+    assert time.monotonic() - started < 1
+    assert "merge keys are not supported" in detail
+
+
+def test_example_config_uses_no_merge_keys() -> None:
+    assert "<<" not in EXAMPLE.read_text(encoding="utf-8")
+
+
+# Only JSON value types (T2)
+
+
+@pytest.mark.parametrize(
+    ("text", "key", "kind"),
+    [
+        ("me: {d: 2001-01-01}\n", "me.d", "timestamp"),
+        ("me: {d: 2001-12-14t21:59:43.10-05:00}\n", "me.d", "timestamp"),
+        ("me: {d: 2001-13-45}\n", "me.d", "timestamp"),
+        ("me: {d: !!timestamp 2001-01-01}\n", "me.d", "timestamp"),
+        ("me: {b: !!binary aGVsbG8=}\n", "me.b", "binary"),
+        ("me: {s: !!set {a: null}}\n", "me.s", "set"),
+        ("me: {o: !!omap [{a: 1}]}\n", "me.o", "omap"),
+        ("me: {p: !!pairs [{a: 1}, {a: 2}]}\n", "me.p", "pairs"),
+        ("me: {l: [1, !!binary aGVsbG8=]}\n", "me.l.1", "binary"),
+        ("kinds: {implement: {model: 2001-01-01}}\n", "kinds.implement.model", "timestamp"),
+    ],
+)
+def test_non_json_yaml_types_are_refused(cfg_dir: Path, text: str, key: str, kind: str) -> None:
+    path = write(cfg_dir / "config.yaml", text)
+    detail = str(invalid(cfg_dir).detail)
+    assert detail.startswith(f"{key}: unsupported value type ({kind})")
+    assert str(path) in detail
+    assert "line 1, column" in detail
+
+
+def test_unquoted_date_gets_a_hint(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "me: {d: 2001-01-01}\n")
+    assert "quote" in str(invalid(cfg_dir).detail)
+
+
+def test_non_json_top_level_is_refused(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "!!set {a: null}\n")
+    assert "unsupported value type" in str(invalid(cfg_dir).detail)
+
+
+def test_quoted_date_is_a_string(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "me: {d: '2001-01-01'}\n")
+    assert load(cfg_dir).me.model_extra == {"d": "2001-01-01"}
+
+
+def test_unsupported_values_are_not_echoed(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", f"me: {{b: !!binary {SECRET}}}\n")
+    assert SECRET not in str(invalid(cfg_dir).detail)
+
+
+def _run_child(text: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """Load ``text`` in a child, so a regression that crashes the interpreter crashes only it."""
+    path = tmp_path / "config.yaml"
+    path.write_text(text, encoding="utf-8")
+    code = textwrap.dedent(
+        """
+        import sys
+        from claude_session import config
+        from claude_session.errors import UsageError
+        try:
+            config.load(sys.argv[1])
+        except UsageError as exc:
+            print(exc.detail)
+            sys.exit(0)
+        sys.exit(3)
+        """
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code, str(path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def test_pairs_alias_bomb_is_refused_without_crashing(tmp_path: Path) -> None:
+    # The anchors live inside the !!pairs value: only constructing it could expand them.
+    lines = ["  - a0: &a0 [x, x, x, x, x, x, x, x, x, x]"]
+    for level in range(1, 8):
+        refs = ", ".join([f"*a{level - 1}"] * 10)
+        lines.append(f"  - a{level}: &a{level} [{refs}]")
+    text = "me:\n p: !!pairs\n" + "\n".join(lines) + "\n"
+    proc = _run_child(text, tmp_path)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "unsupported value type (pairs)" in proc.stdout
+
+
+def test_deep_pairs_are_refused_without_crashing(tmp_path: Path) -> None:
+    levels = 2_000
+    text = "me: {x: " + "!!pairs [{a: " * levels + "1" + "}]" * levels + "}\n"
+    proc = _run_child(text, tmp_path)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "config.yaml" in proc.stdout
+
+
+# Explicit scalar tags never escape as internal errors (T3)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "me: !!bool SECRET\n",
+        "me: !!timestamp ''\n",
+        "me: !!int ''\n",
+        "me: !!bool ''\n",
+        "me: !!float SECRET\n",
+        "me: !!null SECRET\n",
+        "me: {x: !!int SECRET}\n",
+    ],
+)
+def test_bad_scalar_tags_are_usage_errors(cfg_dir: Path, text: str) -> None:
+    write(cfg_dir / "config.yaml", text)
+    error = invalid(cfg_dir)
+    assert "SECRET" not in str(error.detail)
+    assert "config.yaml" in str(error.detail)
+    assert error.__cause__ is None
+
+
+# Integer bounds (T4)
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [
+        ("CSESSION_RETENTION_DAYS", "36501"),
+        ("CSESSION_SUMMARY_MAX_BYTES", "9007199254740992"),
+        ("CSESSION_ARTIFACT_MAX_BYTES", "9007199254740992"),
+        ("CSESSION_INPUT_MAX_BYTES", "9007199254740992"),
+        ("CSESSION_NOTES_CONTEXT_MAX_BYTES", "9" * 4000),
+    ],
+)
+def test_env_integers_are_bounded(cfg_dir: Path, var: str, value: str) -> None:
+    assert var in str(invalid(cfg_dir, {var: value}).detail)
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [("CSESSION_RETENTION_DAYS", "36500"), ("CSESSION_SUMMARY_MAX_BYTES", "9007199254740991")],
+)
+def test_env_integers_at_the_bound_are_accepted(cfg_dir: Path, var: str, value: str) -> None:
+    load(cfg_dir, {var: value})
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "kinds: {implement: {max_turns: 0x" + "f" * 200_000 + "}}\n",
+        "retention_days: 1e300\n",
+        "retention_days: 1.0e+300\n",
+    ],
+)
+def test_huge_integers_are_refused(cfg_dir: Path, text: str) -> None:
+    write(cfg_dir / "config.yaml", text)
+    detail = str(invalid(cfg_dir).detail)
+    assert "config.yaml" in detail
+
+
+@pytest.mark.parametrize("value", [9007199254740992, 1 << 800_000], ids=["2^53", "2^800000"])
+def test_flag_max_turns_is_bounded(cfg_dir: Path, value: int) -> None:
+    kind = load(cfg_dir).kinds["implement"]
+    with pytest.raises(UsageError) as info:
+        config.with_flags(kind, max_turns=value)
+    assert "max_turns" in str(info.value.detail)
+
+
+def test_flag_max_turns_at_the_bound_is_accepted(cfg_dir: Path) -> None:
+    kind = load(cfg_dir).kinds["implement"]
+    assert config.with_flags(kind, max_turns=9007199254740991).max_turns == 9007199254740991
+
+
+# config.d that is not a directory (T5)
+
+
+def _confd_file(path: Path) -> None:
+    path.write_text("kill_grace: 1s\n", encoding="utf-8")
+
+
+def _confd_fifo(path: Path) -> None:
+    os.mkfifo(path)
+
+
+def _confd_dangling(path: Path) -> None:
+    path.symlink_to(path.parent / "missing")
+
+
+@pytest.mark.parametrize("make", [_confd_file, _confd_fifo, _confd_dangling])
+def test_config_d_that_is_not_a_directory_is_an_error(cfg_dir: Path, make: Any) -> None:
+    cfg_dir.mkdir(parents=True)
+    make(cfg_dir / "config.d")
+    assert str(cfg_dir / "config.d") in str(invalid(cfg_dir).detail)
+
+
+def test_config_d_symlink_to_a_directory_is_read(cfg_dir: Path, tmp_path: Path) -> None:
+    write(tmp_path / "elsewhere" / "x.yaml", "kill_grace: 3s\n")
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.d").symlink_to(tmp_path / "elsewhere")
+    assert load(cfg_dir).kill_grace == 3.0
+
+
+# model (T6)
+
+
+@pytest.mark.parametrize("value", ["", "m\n", "m\x00", "\x7fm", "m\x9f"])
+def test_flag_model_refuses_control_characters(cfg_dir: Path, value: str) -> None:
+    kind = load(cfg_dir).kinds["implement"]
+    with pytest.raises(UsageError) as info:
+        config.with_flags(kind, model=value)
+    assert "model" in str(info.value.detail)
+
+
+def test_model_null_is_still_accepted(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "kinds: {implement: {model: null}}\n")
+    assert load(cfg_dir).kinds["implement"].model is None

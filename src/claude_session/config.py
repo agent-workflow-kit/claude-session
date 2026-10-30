@@ -48,6 +48,8 @@ DROPIN_SUFFIX = ".yaml"
 MAX_FILE_BYTES = 1 << 20
 MAX_NODES = 100_000  # with aliases expanded
 MAX_DEPTH = 64
+MAX_INTEGER = (1 << 53) - 1  # every integer key (JSON's exact-integer range)
+MAX_RETENTION_DAYS = 36500
 
 # Grammars (interface.md, Identifiers). TODO(#5): use the ids grammars.
 KIND_NAME = r"[a-z0-9][a-z0-9_-]{0,63}"
@@ -126,8 +128,8 @@ def _integral(value: Any) -> Any:
     return value
 
 
-def _executable(value: str) -> str:
-    # C0, DEL and C1 control characters
+def _no_controls(value: str) -> str:
+    """Non-empty, no C0, DEL or C1 control characters (``claude_bin``, ``model``)."""
     if not value or any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
         raise ValueError("must be non-empty and contain no control characters")
     return value
@@ -168,9 +170,11 @@ PositiveDuration = Annotated[float, _duration_validator(positive=True, bound=Fal
 Bound = Annotated[float | None, _duration_validator(positive=True, bound=True)]
 Integral = BeforeValidator(_integral)
 NotNull = BeforeValidator(_not_null)
-Bytes = Annotated[int, Integral, Field(ge=1)]
-Count = Annotated[int, Integral, Field(ge=0)]
-Turns = Annotated[int, Integral, Field(ge=1)]
+Bytes = Annotated[int, Integral, Field(ge=1, le=MAX_INTEGER)]
+Count = Annotated[int, Integral, Field(ge=0, le=MAX_INTEGER)]
+Days = Annotated[int, Integral, Field(ge=0, le=MAX_RETENTION_DAYS)]
+Turns = Annotated[int, Integral, Field(ge=1, le=MAX_INTEGER)]
+Model = Annotated[str, AfterValidator(_no_controls)]
 EnvSet = Annotated[dict[str, str], AfterValidator(_no_reserved)]
 SettingSources = Annotated[list[Literal["user", "project", "local"]], AfterValidator(_unique)]
 Sandbox = Literal["required", "preferred", "off"]
@@ -223,7 +227,7 @@ class Kind(_Model):
     auto_exit: bool
     backstop: bool
     notes_context: bool
-    model: str | None
+    model: Model | None
     claude_args: list[str]
 
 
@@ -249,7 +253,7 @@ class RepoKindOverride(_Model):
     write_dirs: Annotated[list[str] | None, NotNull] = None
     timeout: Bound = None
     max_turns: Turns | None = None
-    model: str | None = None
+    model: Model | None = None
 
 
 class Repo(_Model):
@@ -288,7 +292,7 @@ class Me(_Model):
 class Config(_Model):
     """The validated configuration. Durations are seconds (``None``: no bound)."""
 
-    claude_bin: Annotated[str, AfterValidator(_executable)]
+    claude_bin: Annotated[str, AfterValidator(_no_controls)]
     min_claude_version: Annotated[str, _matching(VERSION, "version")]
     # TODO(#9): an unknown default_kind gets the unknown-kind fallback (review profile + warning).
     default_kind: KindName
@@ -301,7 +305,7 @@ class Config(_Model):
     summary_max_bytes: Bytes
     artifact_max_bytes: Bytes
     input_max_bytes: Bytes
-    retention_days: Count
+    retention_days: Days
     lost_grace: PositiveDuration
     auto_exit_delay: Duration
     kill_grace: Duration
@@ -446,31 +450,46 @@ class _Refused(yaml.constructor.ConstructorError):
 
 _INT, _FLOAT = "tag:yaml.org,2002:int", "tag:yaml.org,2002:float"
 _MERGE = "tag:yaml.org,2002:merge"
+# YAML types with no JSON counterpart: loaded as ``_Unsupported`` (nothing built), refused by
+# ``_check_tree`` with the key path.
+_UNSUPPORTED = ("timestamp", "binary", "set", "omap", "pairs")
+
+
+class _Unsupported:
+    """Stands for a value of a non-JSON YAML type; holds the type name and position only."""
+
+    __slots__ = ("kind", "mark")
+
+    def __init__(self, kind: str, mark: Any) -> None:
+        self.kind = kind
+        self.mark = mark
 
 
 class _Loader(_BaseLoader):  # pyright: ignore[reportGeneralTypeIssues]
-    """Safe YAML loading that refuses duplicate mapping keys (and a second ``<<``), reads YAML 1.1
-    base-60 numbers (``1:30``) as strings and refuses them when tagged ``!!int``/``!!float``.
-    Constructor ``ValueError``s become ``_Refused("invalid value")`` at the node's position."""
+    """Safe YAML loading that refuses duplicate mapping keys and merge keys (``<<``, before
+    anything is merged), loads non-JSON types as ``_Unsupported``, reads YAML 1.1 base-60
+    numbers (``1:30``) as strings and refuses them when tagged ``!!int``/``!!float``. Any other
+    constructor exception becomes ``_Refused("invalid value")`` at the node's position."""
 
     def construct_object(self, node: yaml.Node, deep: bool = False) -> Any:
         try:
             return super().construct_object(node, deep=deep)
-        except ValueError:  # e.g. timestamp 2001-13-45, an integer over 4300 digits
+        except yaml.YAMLError:
+            raise
+        except Exception:  # e.g. !!bool x (KeyError), !!int '' (IndexError), 5000-digit ints
             raise _Refused("invalid value", node.start_mark) from None
 
     def flatten_mapping(self, node: yaml.MappingNode) -> None:
-        merges = [key for key, _ in node.value if key.tag == _MERGE]
-        if len(merges) > 1:  # several sources are written <<: [*a, *b]
-            raise _Refused("duplicate merge key", merges[1].start_mark)
+        for key_node, _ in node.value:
+            if key_node.tag == _MERGE:
+                raise _Refused("merge keys are not supported", key_node.start_mark)
         super().flatten_mapping(node)
 
     def construct_mapping(self, node: yaml.Node, deep: bool = False) -> dict[Any, Any]:
         if isinstance(node, yaml.MappingNode):
+            self.flatten_mapping(node)  # refuses merge keys before any key is constructed
             seen: set[tuple[type, Any]] = set()
             for key_node, _ in node.value:
-                if key_node.tag == _MERGE:
-                    continue
                 key = self.construct_object(key_node, deep=deep)
                 try:
                     marker = (type(key), key)  # True and 1 are different keys here
@@ -492,6 +511,11 @@ class _Loader(_BaseLoader):  # pyright: ignore[reportGeneralTypeIssues]
 
 _Loader.add_constructor(_INT, _Loader.construct_number)
 _Loader.add_constructor(_FLOAT, _Loader.construct_number)
+for _kind in _UNSUPPORTED:
+    _Loader.add_constructor(
+        f"tag:yaml.org,2002:{_kind}",
+        lambda _loader, node, kind=_kind: _Unsupported(kind, node.start_mark),
+    )
 _Loader.yaml_implicit_resolvers = {
     first: [(tag, regexp) for tag, regexp in resolvers if tag not in (_INT, _FLOAT)]
     for first, resolvers in _Loader.yaml_implicit_resolvers.items()
@@ -539,8 +563,14 @@ def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
             where = f" at line {mark.line + 1}, column {mark.column + 1}"
         # Parser and constructor messages may quote the file: report a fixed phrase only.
         raise UsageError("invalid config", detail=f"{path}{where}: {_problem(exc)}") from None
+    except UsageError:
+        raise
+    except Exception:  # never an internal error, never the original (possibly quoting) text
+        raise UsageError("invalid config", detail=f"{path}: invalid YAML") from None
     if data is None:
         return {}
+    if isinstance(data, _Unsupported):
+        raise _unsupported(data, "top level", path)
     if not isinstance(data, dict):
         found = type(data).__name__
         detail = f"top level: expected a mapping, got {found} (in {path})"
@@ -628,7 +658,13 @@ def _check_tree(data: dict[str, Any], path: Path) -> None:
         if depth > MAX_DEPTH:
             raise too_deep()
         if not isinstance(node, (dict, list)):
-            return 1, 0
+            if node is None or isinstance(node, (str, int, float)):  # bool is an int
+                return 1, 0
+            if isinstance(node, _Unsupported):
+                raise _unsupported(node, where, path)
+            # Not produced by _Loader; the guard that only JSON types get through.
+            detail = f"{where or 'top level'}: unsupported value type (in {path})"
+            raise UsageError("invalid config", detail=detail)
         if id(node) in seen:
             nodes, height = seen[id(node)]
             if depth + height > MAX_DEPTH:
@@ -660,6 +696,14 @@ def _check_tree(data: dict[str, Any], path: Path) -> None:
     walk(data, 0, "")
 
 
+def _unsupported(value: _Unsupported, where: str, path: Path) -> UsageError:
+    hint = "; quote it to use it as a string" if value.kind == "timestamp" else ""
+    mark = value.mark
+    at = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+    detail = f"{where or 'top level'}: unsupported value type ({value.kind}){hint} (in {path}{at})"
+    return UsageError("invalid config", detail=detail)
+
+
 def _key_path(where: str, key: str) -> str:
     """``where.key``; a repo key that is not a valid repo id is not echoed (it may hold
     credentials)."""
@@ -670,11 +714,17 @@ def _key_path(where: str, key: str) -> str:
 
 def _dropins(directory: Path) -> list[Path]:
     """``config.d/*.yaml`` (hidden names skipped) in byte order of file name. Entries that are
-    not regular files are returned too, so reading them fails."""
+    not regular files are returned too, so reading them fails. A missing ``config.d`` has no
+    drop-ins; one that exists but is not a directory (after symlinks) is an error."""
     try:
         names = os.listdir(directory)
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
+        if os.path.lexists(directory):
+            detail = f"{directory}: symlink does not resolve"
+            raise UsageError("cannot read config", detail=detail) from None
         return []
+    except NotADirectoryError:
+        raise UsageError("invalid config", detail=f"{directory}: not a directory") from None
     except OSError as exc:
         raise UsageError("cannot read config", detail=f"{directory}: {exc.strerror}") from None
     names = [n for n in names if n.endswith(DROPIN_SUFFIX) and not n.startswith(".")]
