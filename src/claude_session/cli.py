@@ -66,6 +66,8 @@ ADOPTION_FLAGS = {"json", "dry_run", "outcome_file", "verbose", "quiet", "yes"}
 OUTCOME_FILE_COMMANDS = ("exec", "start", "resume", "wait")
 # TODO(#5): move to ids.py with the other identifier grammars.
 ARTIFACT_NAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# argparse takes a token like this as an option value, not as an option.
+NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
 NUMBER_WITH_UNIT = re.compile(r"^(-?\d+(?:\.\d+)?)(ms|s|m|h|d)?$")
 
 
@@ -522,7 +524,7 @@ def _outcome_file_from_argv(argv: Sequence[str]) -> str | None:
             break
         if token == "--outcome-file" and index + 1 < len(argv):
             value = argv[index + 1]
-            if not value.startswith("-"):
+            if not value.startswith("-") or NEGATIVE_NUMBER.match(value):
                 found = value
         elif token.startswith("--outcome-file="):
             found = token.partition("=")[2]
@@ -533,7 +535,8 @@ def _write_outcome_file(path: str, error: CliError) -> None:
     # TODO(#21): skip a path rejected by the session-writable check (isolated runs).
     data = (json.dumps(error.envelope()) + "\n").encode()
     try:
-        fsutil.write_private_file(os.path.abspath(path), data)
+        # Not abspath: `..` must be resolved after symlinks (realpath in write_private_file).
+        fsutil.write_private_file(os.path.join(os.getcwd(), path), data)
     except OSError as exc:
         reason = sanitize(str(exc))
         print(f"{PROG}: warning: could not write --outcome-file: {reason}", file=sys.stderr)
@@ -560,11 +563,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
             if path:
                 _write_outcome_file(path, error)
-        _print_error(error, args.json if args else _given(argv, "--json"))
-        return error.exit_code
+        code = error.exit_code
+        _emit_error(error, args.json if args else _given(argv, "--json"))
+        return code
+    except BrokenPipeError:
+        raise  # a closed output stream; __main__ handles it
     except Exception as exc:  # last resort: any bug is reported as `internal` (exit 1)
-        if args.verbose if args else _given(argv, "--verbose"):
-            traceback.print_exc(file=sys.stderr)
         error = InternalError(f"internal error: {type(exc).__name__}")
-        _print_error(error, args.json if args else _given(argv, "--json"))
-        return error.exit_code
+        code = error.exit_code
+        try:
+            if args.verbose if args else _given(argv, "--verbose"):
+                traceback.print_exc(file=sys.stderr)
+        except BrokenPipeError:
+            pass
+        _emit_error(error, args.json if args else _given(argv, "--json"))
+        return code
+
+
+def _emit_error(error: CliError, json_mode: bool) -> None:
+    """Print ``error``; a closed stream must not change the exit code (``__main__`` then
+    points the stream at /dev/null)."""
+    try:
+        _print_error(error, json_mode)
+    except BrokenPipeError:
+        pass

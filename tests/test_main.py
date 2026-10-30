@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -59,29 +60,37 @@ def test_console_script_uses_the_light_entry_point() -> None:
     assert scripts == {"claude-session": "claude_session.__main__:main"}
 
 
-def run_python(code: str, *, close_stdout_pipe: bool = False) -> subprocess.CompletedProcess[str]:
-    """Run ``code`` in a fresh interpreter; optionally with a stdout pipe nobody reads."""
-    if not close_stdout_pipe:
-        return subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    read_end, write_end = os.pipe()
-    os.close(read_end)
+def run_python(
+    code: str, *, broken: tuple[str, ...] = (), env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run ``code`` in a fresh interpreter. Streams named in ``broken`` ("stdout", "stderr")
+    are pipes whose read end is already closed; the others are captured."""
+    streams: dict[str, Any] = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+    write_ends: list[int] = []
+    for name in broken:
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        write_ends.append(write_end)
+        streams[name] = write_end
     try:
         return subprocess.run(
             [sys.executable, "-c", code],
-            stdout=write_end,
-            stderr=subprocess.PIPE,
             text=True,
             timeout=60,
             check=False,
+            env={**os.environ, **(env or {})},
+            **streams,
         )
     finally:
-        os.close(write_end)
+        for fd in write_ends:
+            os.close(fd)
+
+
+def entry_code(argv: list[str]) -> str:
+    return f"import sys\nfrom claude_session.__main__ import main\nsys.exit(main({argv!r}))\n"
+
+
+UNBUFFERED = {"PYTHONUNBUFFERED": "1"}
 
 
 HOOK_PRINTS_THEN = """
@@ -110,12 +119,61 @@ def test_hook_event_with_closed_stdout_exits_0_silently() -> None:
 
 
 def test_broken_stdout_pipe_keeps_the_exit_code() -> None:
-    code = (
-        "import sys\n"
-        "from claude_session.__main__ import main\n"
-        "sys.exit(main(['exec', '--timeout', '0', '--json']))\n"
-    )
-    proc = run_python(code, close_stdout_pipe=True)
+    proc = run_python(entry_code(["exec", "--timeout", "0", "--json"]), broken=("stdout",))
     assert proc.returncode == 2
     assert "Exception ignored" not in proc.stderr
     assert "BrokenPipeError" not in proc.stderr
+
+
+def test_broken_stderr_pipe_keeps_the_usage_exit_code() -> None:
+    proc = run_python(entry_code(["exec", "--bogus"]), broken=("stderr",))
+    assert proc.returncode == 2
+
+
+def test_unbuffered_broken_stdout_keeps_the_usage_exit_code() -> None:
+    proc = run_python(entry_code(["exec", "--json", "--bogus"]), broken=("stdout",), env=UNBUFFERED)
+    assert proc.returncode == 2
+    assert "Traceback" not in proc.stderr
+    assert "Exception ignored" not in proc.stderr
+
+
+@pytest.mark.parametrize("argv", [["--help"], ["--version"], ["exec", "--help"]])
+def test_help_and_version_to_a_broken_stdout_exit_0_quietly(argv: list[str]) -> None:
+    proc = run_python(entry_code(argv), broken=("stdout",))
+    assert (proc.returncode, proc.stderr) == (0, "")
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "print('partial output')",
+        "print('x' * 65536)",
+        "sys.stderr.write('noise\\n')",
+    ],
+    ids=["unbuffered", "64k", "stderr"],
+)
+def test_hook_event_output_before_a_failure_never_escapes(output: str) -> None:
+    code = HOOK_OUTPUT_THEN.format(output=output, after="raise RuntimeError('x')")
+    proc = run_python(code, env=UNBUFFERED)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+
+
+def test_hook_event_stdout_is_written_and_stderr_dropped_on_success() -> None:
+    code = HOOK_OUTPUT_THEN.format(
+        output="print('{\"ok\": true}'); sys.stderr.write('noise\\n')", after="return 0"
+    )
+    proc = run_python(code, env=UNBUFFERED)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, '{"ok": true}\n', "")
+
+
+HOOK_OUTPUT_THEN = """
+import sys
+from claude_session import __main__ as entry, hookevent
+
+def hook(argv):
+    {output}
+    {after}
+
+hookevent.main = hook
+sys.exit(entry.main(["hook-event", "--state-dir", "/nonexistent", "Stop"]))
+"""

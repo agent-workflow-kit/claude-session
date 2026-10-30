@@ -534,3 +534,22 @@ def test_repeated_outcome_file_writes_the_last_path(
     assert main([*argv, *extra]) == 2
     assert read_envelope(last)["error"]["code"] == "usage"
     assert not first.exists()
+
+
+def test_outcome_file_dotdot_is_resolved_after_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "deep" / "real").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(tmp_path / "deep" / "real")
+    monkeypatch.chdir(tmp_path)
+    assert main(["exec", "--timeout", "0", "--outcome-file", "link/../o.json"]) == 2
+    assert read_envelope(tmp_path / "deep" / "o.json")["error"]["code"] == "usage"
+    assert not (tmp_path / "o.json").exists()
+
+
+def test_outcome_file_prescan_accepts_a_negative_number(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert main(["exec", "--bogus", "--outcome-file", "-1"]) == 2
+    assert read_envelope(tmp_path / "-1")["error"]["code"] == "usage"
