@@ -157,7 +157,10 @@ def _occurrences(text: str, secret: str) -> Iterator[int]:
 
     KMP, except that while no partial match is in progress the next occurrence is found with
     ``str.find`` (an occurrence never starts before the current position then); the
-    character-by-character scan runs only inside a match of a secret that overlaps itself."""
+    character-by-character scan runs only inside a match of a secret that overlaps itself.
+    An empty ``secret`` has no occurrences."""
+    if not secret:
+        return
     size = len(secret)
     failure = _failure(secret)
     border = failure[-1]  # how much of a match the next overlapping occurrence can reuse
@@ -233,6 +236,8 @@ def leaks_secret(text: str, secrets: Collection[str]) -> bool:
     itself part of the marker, such as ``redacted``, is looked for between markers only)."""
     pieces = text.split(REDACTED)
     for secret in secrets:
+        if not secret:
+            continue
         if secret in REDACTED:
             if any(secret in piece for piece in pieces):
                 return True

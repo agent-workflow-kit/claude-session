@@ -29,6 +29,9 @@ ACTIONS = frozenset(
 )
 RESULTS = frozenset({"ok", "refused", "error"})
 SANDBOX_LEVELS = frozenset({"required", "preferred", "off"})
+# schemas/audit.json inputs.grace: seconds, at most 2**53 (exact as a JSON number).
+GRACE_MIN = 0
+GRACE_MAX = 2**53
 INPUT_KEYS = frozenset(
     {
         "run_kind",
@@ -93,11 +96,14 @@ def _check_inputs(inputs: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         if level is not None and level not in SANDBOX_LEVELS:
             raise ValueError(f"audit input {key} must be one of {sorted(SANDBOX_LEVELS)}")
     grace = checked.get("grace")
-    # An int is always finite (math.isfinite raises OverflowError on a huge one); only a float
-    # can be NaN or infinite.
-    if grace is not None and not is_int(grace):
-        if not isinstance(grace, float) or not math.isfinite(grace):
+    # Only a float can be NaN or infinite; the bounds check compares without converting a
+    # huge int to a float or a string, and the message never echoes the value.
+    if grace is not None:
+        finite = is_int(grace) or (isinstance(grace, float) and math.isfinite(grace))
+        if not (isinstance(grace, int | float) and finite):
             raise ValueError("audit input grace must be a finite number or null")
+        if not GRACE_MIN <= grace <= GRACE_MAX:
+            raise ValueError("audit input grace is out of range")
     return checked
 
 

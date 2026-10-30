@@ -105,6 +105,8 @@ def test_enums_match_the_schema() -> None:
     assert set(audit.RESULTS) == set(schema["properties"]["result"]["enum"])
     input_schema = schema["properties"]["inputs"]["oneOf"][0]
     assert set(audit.INPUT_KEYS) == set(input_schema["properties"])
+    for key in ("sandbox_from", "sandbox_to"):
+        assert set(audit.SANDBOX_LEVELS) == set(input_schema["properties"][key]["enum"]) - {None}
 
 
 @pytest.mark.parametrize(
@@ -298,15 +300,32 @@ def test_label_with_a_secret_wholly_inside_the_value_keeps_its_key(audit_path: P
     assert records(audit_path)[0]["inputs"]["labels"] == ["k0123=redacted"]
 
 
-@pytest.mark.parametrize("grace", [10**400, 0, 2.5], ids=["huge-int", "zero", "float"])
-def test_finite_grace_is_written(grace: int | float, audit_path: Path) -> None:
+@pytest.mark.parametrize("grace", [0, 30.5, 2**53], ids=["zero", "float", "maximum"])
+def test_grace_in_bounds_is_written(grace: int | float, audit_path: Path) -> None:
     write(audit_path, inputs={"grace": grace})
     [record] = records(audit_path)
     validate(record, AUDIT_SCHEMA)
     assert record["inputs"]["grace"] == grace
 
 
-def test_grace_too_large_to_write_raises_value_error(audit_path: Path) -> None:
-    with pytest.raises(ValueError):
-        write(audit_path, inputs={"grace": 10**5000})
+@pytest.mark.parametrize(
+    "grace",
+    [-5, -0.5, 2**53 + 1, float(2**54), 10**400, 10**5000],
+    ids=["negative", "negative-float", "above-max", "above-max-float", "huge", "huger"],
+)
+def test_grace_out_of_bounds_is_rejected_without_echoing_it(
+    grace: int | float, audit_path: Path
+) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        write(audit_path, inputs={"grace": grace})
+    message = str(excinfo.value)
+    assert "grace" in message
+    assert not any(ch.isdigit() for ch in message)
     assert not audit_path.exists()
+
+
+def test_grace_bounds_match_the_schema() -> None:
+    schema = registry().contents(AUDIT_SCHEMA)
+    grace = schema["properties"]["inputs"]["oneOf"][0]["properties"]["grace"]
+    assert grace["minimum"] == audit.GRACE_MIN
+    assert grace["maximum"] == audit.GRACE_MAX

@@ -387,6 +387,13 @@ def test_overlapping_occurrences_redact_their_union(text: str, secret: str) -> N
     assert logs._secret_mask(text, [secret]) == covered
 
 
+def test_empty_secret_has_no_occurrences() -> None:
+    assert logs.redact_text("abc", [""]) == "abc"
+    assert logs.first_secret_index("abc", [""]) == -1
+    assert not logs.leaks_secret("abc", [""])
+    assert logs.redact_message("abc", [""]) == "abc"
+
+
 def test_whole_field_replaced_after_the_pre_cut_has_no_truncation_marker(log_path: Path) -> None:
     secrets = ["AAAAAAAA", "ted]BBBBBB"]
     limit = 2 * logs.MESSAGE_MAX_CHARS + max(map(len, secrets))
