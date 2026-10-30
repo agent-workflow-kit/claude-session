@@ -10,24 +10,31 @@ the hook path may import it (design.md, Hook-event fast path), but never migrate
   version it brings the database to, so an interrupted migration resumes where it stopped.
 - A database whose schema is newer than this code is refused with ``schema_newer`` (exit 12)
   before anything is written (interface.md, Launch order and Upgrades).
-- Leases (``migrate``, ``reconcile``, ``delivery:<id>``) record the holder's PID and process
-  start time and expire ``LEASE_TTL`` after their last renewal; a dead holder's lease may be
-  taken over at once.
+- Leases (``migrate``, ``reconcile``, ``delivery:<id>``) record the holder's PID, process
+  start time and a per-``Store`` token, and expire ``LEASE_TTL`` after their last renewal; a
+  dead holder's lease may be taken over at once.
+- Open refuses, with ``FailedError`` (exit 12), a state directory or ``state.db`` that is
+  unsafe (a symlink, not ours, hard-linked), unusable or not a claude-session database
+  (``PRAGMA application_id``); nothing is written to such a database.
 """
 
 from __future__ import annotations
 
+import errno
 import os
+import re
 import sqlite3
+import stat
 import time
 import urllib.parse
+import uuid
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .errors import InternalError, SchemaNewerError
+from .errors import FailedError, InternalError, SchemaNewerError
 
 DB_NAME = "state.db"
 BUSY_TIMEOUT = 5.0  # seconds (design.md, Data model: Concurrency)
@@ -37,6 +44,8 @@ MIGRATE_LEASE = "migrate"
 # How long ``open`` waits for another process's migration before giving up.
 MIGRATE_WAIT = 2 * LEASE_TTL.total_seconds()
 MIGRATE_POLL = 0.05  # seconds
+# ``PRAGMA application_id`` of a claude-session database ("CSes"; design.md, Data model).
+APPLICATION_ID = 0x43536573
 
 Version = tuple[int, int]
 Clock = Callable[[], datetime]
@@ -82,29 +91,82 @@ def db_path(root: str) -> str:
     return os.path.join(root, DB_NAME)
 
 
-def _ensure_private_dir(path: str) -> None:
-    """Create ``path`` (and missing parents); a directory created here gets mode 0700."""
-    parent = os.path.dirname(path)
-    if parent and parent != path:
-        os.makedirs(parent, exist_ok=True)
-    try:
-        os.mkdir(path, 0o700)
-    except FileExistsError:
-        return
-    os.chmod(path, 0o700)  # explicit, whatever the umask
+def _make_private_dirs(path: str) -> None:
+    """Create ``path`` and its missing parents, each with mode 0700 whatever the umask."""
+    missing = []
+    while not os.path.lexists(path):
+        missing.append(path)
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            continue
+        os.chmod(directory, 0o700)
 
 
-def _ensure_private_file(path: str) -> None:
-    """Create ``path`` with mode 0600 unless it exists (SQLite gives ``-wal``/``-shm`` the
-    database file's mode)."""
+def _check_private_dir(path: str) -> None:
+    """``path`` must be a real directory (not a symlink) owned by us; it is made 0700."""
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise _unsafe(path, "not a directory (or a symbolic link)")
+    if info.st_uid != os.geteuid():
+        raise _unsafe(path, f"owned by uid {info.st_uid}")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        os.chmod(path, 0o700)
+
+
+def _open_db_file(path: str, *, create: bool) -> int:
+    """Open (with ``create``, creating it) ``path`` without following a symlink; it must be
+    a regular file owned by us with a single link. Returns the file descriptor."""
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-    except FileExistsError:
-        return
+        fd = os.open(path, flags | (os.O_CREAT if create else 0), 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise _unsafe(path, "a symbolic link") from exc
+        raise
     try:
-        os.fchmod(fd, 0o600)
-    finally:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise _unsafe(path, "not a regular file")
+        if info.st_uid != os.geteuid():
+            raise _unsafe(path, f"owned by uid {info.st_uid}")
+        if info.st_nlink != 1:
+            raise _unsafe(path, f"has {info.st_nlink} hard links")
+    except BaseException:
         os.close(fd)
+        raise
+    return fd
+
+
+def _unsafe(path: str, cause: str) -> FailedError:
+    return FailedError("unsafe state path", detail=f"{path}: {cause}")
+
+
+def _open_failed(path: str, exc: OSError | sqlite3.Error) -> FailedError:
+    cause = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+    where = exc.filename if isinstance(exc, OSError) and exc.filename else path
+    return FailedError("cannot open the state database", detail=f"{where}: {cause}")
+
+
+def _connect(path: str, busy_timeout: float) -> sqlite3.Connection:
+    """Connect to an existing file (``mode=rw``: SQLite never creates it). isolation_level
+    None: no implicit transactions; writes use BEGIN IMMEDIATE."""
+    return sqlite3.connect(
+        f"file:{urllib.parse.quote(path)}?mode=rw",
+        timeout=busy_timeout,
+        isolation_level=None,
+        uri=True,
+    )
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    """Whether ``exc`` is SQLITE_BUSY or SQLITE_LOCKED (any extended code)."""
+    return exc.sqlite_errorcode & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
 # Time and process identity
@@ -124,15 +186,15 @@ def parse_ts(text: str) -> datetime:
 
 
 def current_holder() -> Holder:
-    """This process as a lease holder."""
-    # TODO(#6): wire procinfo liveness: record this process's real start time.
+    """This process as a lease holder (start ``""``: unknown, see ``Store.take_lease``)."""
+    # TODO(#6): wire procinfo.start_time/is_alive into current_holder() and the default
+    # liveness (a None start time becomes ""); keep liveness cheap, it runs inside
+    # BEGIN IMMEDIATE.
     return Holder(pid=os.getpid(), start="")
 
 
-def pid_alive(pid: int, start: str) -> bool:
-    """Interim liveness check: whether ``pid`` exists. It ignores ``start``, so a reused PID
-    counts as alive and its lease is only taken over once it expires (safe, just slower)."""
-    del start
+def pid_exists(pid: int) -> bool:
+    """Whether a process with ``pid`` exists (one we may not signal counts)."""
     if pid <= 0:
         return False
     try:
@@ -142,6 +204,13 @@ def pid_alive(pid: int, start: str) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def pid_alive(pid: int, start: str) -> bool:
+    """Interim liveness check: whether ``pid`` exists. It ignores ``start``, so a reused PID
+    counts as alive and its lease is only taken over once it expires (safe, just slower)."""
+    del start
+    return pid_exists(pid)
 
 
 # Schema
@@ -319,9 +388,9 @@ def format_version(version: Version) -> str:
 
 
 def parse_version(text: str) -> Version:
-    major, sep, minor = text.partition(".")
-    if not sep or not major.isdigit() or not minor.isdigit():
+    if not re.fullmatch(r"[0-9]+\.[0-9]+", text):
         raise InternalError(f"state.db has an invalid schema_version {text!r}")
+    major, _, minor = text.partition(".")
     return int(major), int(minor)
 
 
@@ -338,22 +407,37 @@ def _schema_newer(found: Version, code: Version) -> SchemaNewerError:
     )
 
 
+def _check_identity(conn: sqlite3.Connection, path: str, *, allow_new: bool) -> None:
+    """Refuse a database that is not ours, before anything is written to it. With
+    ``allow_new``, an empty database (application_id 0, no schema) is accepted."""
+    # One statement, one snapshot: a concurrent first open may bootstrap in between.
+    app_id, objects = conn.execute(
+        "SELECT (SELECT application_id FROM pragma_application_id), "
+        "(SELECT count(*) FROM sqlite_master)"
+    ).fetchone()
+    if app_id == APPLICATION_ID:
+        return
+    if allow_new and app_id == 0 and objects == 0:
+        return
+    cause = "empty, never migrated" if app_id == 0 and objects == 0 else f"application_id {app_id}"
+    raise FailedError("not a claude-session database", detail=f"{path}: {cause}")
+
+
 def _enable_wal(conn: sqlite3.Connection, busy_timeout: float) -> None:
-    """Switch to WAL (persistent). SQLite does not call the busy handler for this switch, so
-    a lock held by another process opening the same new database is retried here, up to the
-    busy timeout."""
+    """Switch to WAL (persistent). SQLite calls the busy handler for this switch, but when
+    several connections switch the same new database at once it may return SQLITE_BUSY at
+    once (waiting could deadlock); only that error is retried, up to the busy timeout."""
     deadline = time.monotonic() + busy_timeout
     while True:
         try:
             (mode,) = conn.execute("PRAGMA journal_mode=WAL").fetchone()
-        except sqlite3.OperationalError:
-            if time.monotonic() >= deadline:
+            break
+        except sqlite3.OperationalError as exc:
+            if not _is_busy(exc) or time.monotonic() >= deadline:
                 raise
             time.sleep(MIGRATE_POLL)
-            continue
-        if mode != "wal":
-            raise InternalError(f"state.db could not be switched to WAL mode (got {mode!r})")
-        return
+    if mode != "wal":
+        raise InternalError(f"state.db could not be switched to WAL mode (got {mode!r})")
 
 
 # Store
@@ -371,7 +455,9 @@ class Store:
         clock: Clock,
     ) -> None:
         self.conn = conn
-        self.holder = holder
+        self.holder = Holder(pid=holder.pid, start=holder.start or "")
+        # Lease ownership is (pid, start, token): two stores of one process never share one.
+        self.token = uuid.uuid4().hex
         self.liveness = liveness
         self.clock = clock
 
@@ -392,18 +478,38 @@ class Store:
 
         With ``migrate`` (every command but ``hook-event``): refuse a newer schema with
         ``SchemaNewerError`` before writing anything, and migrate an older one under the
-        ``migrate`` lease. Without it, the database must exist and its schema is used as it
-        is.
+        ``migrate`` lease. Without it (the hook path), the database must exist and have the
+        code's schema major version; it is used as it is, never created or migrated.
+
+        An unsafe, unusable or foreign state directory or database, and a migration lease
+        not obtained within ``migrate_wait``, raise ``FailedError`` naming the path.
         """
         migrations = MIGRATIONS if migrations is None else migrations
         _check_migrations(migrations)
-        if migrate:
-            _ensure_private_dir(os.path.dirname(os.path.abspath(path)))
-            _ensure_private_file(path)
-        # Without ``migrate`` (the hook path) a missing database is an error, never created.
-        target = path if migrate else f"file:{urllib.parse.quote(path)}?mode=rw"
-        # isolation_level=None: no implicit transactions; writes use BEGIN IMMEDIATE.
-        conn = sqlite3.connect(target, timeout=busy_timeout, isolation_level=None, uri=not migrate)
+        root = os.path.dirname(os.path.abspath(path))
+        try:
+            if migrate:
+                _make_private_dirs(root)
+            _check_private_dir(root)
+            fd = _open_db_file(path, create=migrate)
+        except OSError as exc:
+            raise _open_failed(path, exc) from exc
+        try:
+            conn = _connect(path, busy_timeout)
+            try:
+                _check_identity(conn, path, allow_new=migrate)
+                if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+                    os.fchmod(fd, 0o600)
+                if migrate:
+                    _enable_wal(conn, busy_timeout)
+            except sqlite3.DatabaseError as exc:
+                conn.close()
+                raise _open_failed(path, exc) from exc
+            except BaseException:
+                conn.close()
+                raise
+        finally:
+            os.close(fd)
         store = cls(
             conn,
             holder=holder or current_holder(),
@@ -413,8 +519,9 @@ class Store:
         )
         try:
             if migrate:
-                _enable_wal(conn, busy_timeout)
-                store._migrate(migrations, migrate_wait)
+                store._migrate(migrations, migrate_wait, path)
+            else:
+                store._check_hook_schema(code_version(migrations), path)
         except BaseException:
             conn.close()
             raise
@@ -438,10 +545,14 @@ class Store:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             yield self.conn
+            self.conn.execute("COMMIT")
         except BaseException:
-            self.conn.execute("ROLLBACK")
+            # SQLite may have rolled back already (e.g. INSERT OR ROLLBACK); a failed
+            # ROLLBACK must not mask the original error, which is re-raised.
+            if self.conn.in_transaction:
+                with suppress(sqlite3.Error):
+                    self.conn.execute("ROLLBACK")
             raise
-        self.conn.execute("COMMIT")
 
     # Schema version
 
@@ -455,9 +566,22 @@ class Store:
         row = self.conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         return (0, 0) if row is None else parse_version(row[0])
 
+    def _check_hook_schema(self, code: Version, path: str) -> None:
+        """The hook path uses a database of the code's major version as it is (a newer
+        minor too); anything else is refused."""
+        found = self.schema_version()
+        if found == (0, 0) or found[0] != code[0]:
+            raise FailedError(
+                f"state.db schema {format_version(found)} is not usable by this "
+                f"claude-session (schema {format_version(code)})",
+                detail=path,
+            )
+
     def _bootstrap(self) -> None:
-        """Create the tables migrations themselves need (``meta`` and ``leases``)."""
+        """Mark the database as ours and create the tables migrations themselves need
+        (``meta`` and ``leases``), in one transaction."""
         with self.transaction() as conn:
+            conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
             conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
             conn.execute(
                 """
@@ -465,24 +589,39 @@ class Store:
                     name TEXT PRIMARY KEY,
                     holder_pid INTEGER NOT NULL,
                     holder_start TEXT NOT NULL,
+                    holder_token TEXT NOT NULL DEFAULT '',
                     expires_at TEXT NOT NULL
                 )
                 """
             )
 
-    def _migrate(self, migrations: Sequence[Migration], wait: float) -> None:
+    def _wait_for_migrate_lease(self, wait: float, path: str) -> None:
+        """Bootstrap and take the ``migrate`` lease, retrying while another process holds
+        it or the database is busy (e.g. inside a migration step), for up to ``wait``."""
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                self._bootstrap()
+                if self.take_lease(MIGRATE_LEASE):
+                    return
+            except sqlite3.OperationalError as exc:
+                if not _is_busy(exc):
+                    raise
+            if time.monotonic() >= deadline:
+                raise FailedError(
+                    "timed out waiting for another process to migrate state.db",
+                    detail=f"{path}: migrate lease not obtained within {wait:g} s",
+                )
+            time.sleep(MIGRATE_POLL)
+
+    def _migrate(self, migrations: Sequence[Migration], wait: float, path: str) -> None:
         code = code_version(migrations)
         found = self.schema_version()
         if found > code:
             raise _schema_newer(found, code)
         if found == code:
             return
-        self._bootstrap()
-        deadline = time.monotonic() + wait
-        while not self.take_lease(MIGRATE_LEASE):
-            if time.monotonic() >= deadline:
-                raise InternalError("timed out waiting for another process to migrate state.db")
-            time.sleep(MIGRATE_POLL)
+        self._wait_for_migrate_lease(wait, path)
         try:
             for migration in migrations:
                 # Re-checked inside each transaction: the steps stay correct even if this
@@ -500,56 +639,67 @@ class Store:
                         (format_version(migration.version),),
                     )
                 # TODO(#7): log a `migration` event.
-                self.renew_lease(MIGRATE_LEASE)
+                if not self.renew_lease(MIGRATE_LEASE):
+                    raise FailedError(
+                        "lost the migrate lease while migrating state.db", detail=path
+                    )
         finally:
             self.release_lease(MIGRATE_LEASE)
 
     # Leases
 
     def take_lease(self, name: str) -> bool:
-        """Take lease ``name`` for this store's holder. Succeeds when the lease is free,
-        expired, held by a dead process (PID + start time) or already held by this holder
-        (then it is renewed). Returns whether this holder now holds it."""
+        """Take lease ``name`` for this store. Succeeds when the lease is free, expired
+        (including an expiry more than ``LEASE_TTL`` ahead: clock skew), held by a dead
+        process or already held by this store (then it is renewed). Returns whether this
+        store now holds it."""
         now = self.clock()
         me = self.holder
         with self.transaction() as conn:
             row = conn.execute(
-                "SELECT holder_pid, holder_start, expires_at FROM leases WHERE name = ?",
+                "SELECT holder_pid, holder_start, holder_token, expires_at "
+                "FROM leases WHERE name = ?",
                 (name,),
             ).fetchone()
             if row is not None:
-                pid, start, expires_at = row
-                mine = (pid, start) == (me.pid, me.start)
-                expired = parse_ts(expires_at) <= now
-                if not mine and not expired and self.liveness(pid, start):
+                pid, start, token, expires_at = row
+                mine = (pid, start, token) == (me.pid, me.start, self.token)
+                expiry = parse_ts(expires_at)
+                expired = expiry <= now or expiry > now + LEASE_TTL
+                if not mine and not expired and self._holder_alive(pid, start):
                     return False
             conn.execute(
-                "INSERT INTO leases (name, holder_pid, holder_start, expires_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET "
+                "INSERT INTO leases (name, holder_pid, holder_start, holder_token, expires_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET "
                 "holder_pid = excluded.holder_pid, holder_start = excluded.holder_start, "
-                "expires_at = excluded.expires_at",
-                (name, me.pid, me.start, format_ts(now + LEASE_TTL)),
+                "holder_token = excluded.holder_token, expires_at = excluded.expires_at",
+                (name, me.pid, me.start, self.token, format_ts(now + LEASE_TTL)),
             )
         return True
 
+    def _holder_alive(self, pid: int, start: str) -> bool:
+        """A holder with an unknown start time (``""``) is checked by PID only."""
+        return pid_exists(pid) if start == "" else self.liveness(pid, start)
+
     def renew_lease(self, name: str) -> bool:
-        """Extend lease ``name`` by ``LEASE_TTL`` from now. Returns False if this holder no
+        """Extend lease ``name`` by ``LEASE_TTL`` from now. Returns False if this store no
         longer holds it (it was taken over or released)."""
         expires_at = format_ts(self.clock() + LEASE_TTL)
         with self.transaction() as conn:
             cursor = conn.execute(
-                "UPDATE leases SET expires_at = ? "
-                "WHERE name = ? AND holder_pid = ? AND holder_start = ?",
-                (expires_at, name, self.holder.pid, self.holder.start),
+                "UPDATE leases SET expires_at = ? WHERE name = ? AND holder_pid = ? "
+                "AND holder_start = ? AND holder_token = ?",
+                (expires_at, name, self.holder.pid, self.holder.start, self.token),
             )
             return cursor.rowcount == 1
 
     def release_lease(self, name: str) -> None:
-        """Release lease ``name`` if this holder holds it."""
+        """Release lease ``name`` if this store holds it."""
         with self.transaction() as conn:
             conn.execute(
-                "DELETE FROM leases WHERE name = ? AND holder_pid = ? AND holder_start = ?",
-                (name, self.holder.pid, self.holder.start),
+                "DELETE FROM leases WHERE name = ? AND holder_pid = ? AND holder_start = ? "
+                "AND holder_token = ?",
+                (name, self.holder.pid, self.holder.start, self.token),
             )
 
     def lease_holder(self, name: str) -> tuple[Holder, datetime] | None:
@@ -564,11 +714,12 @@ class Store:
     # Sessions
 
     def list_sessions(self) -> list[dict[str, Any]]:
-        """Sessions that are not forgotten, newest first (raw ``sessions`` rows)."""
+        """Sessions that are not forgotten, most recently updated first (raw ``sessions``
+        rows)."""
         # TODO(#16): join the current run and labels, apply the list filters.
         cursor = self.conn.execute(
             "SELECT * FROM sessions WHERE forgotten_at IS NULL "
-            "ORDER BY created_at DESC, csession_id DESC"
+            "ORDER BY updated_at DESC, csession_id DESC"
         )
         names = [column[0] for column in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
-import os
 import sqlite3
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import pytest
 from claude_session import __main__ as entry
 from claude_session import cli, store
 from claude_session.cli import main
+from claude_session.errors import CliError
 
 from .schemas import validate
 from .test_cli import FULL_INVOCATIONS
@@ -68,7 +70,8 @@ def test_list_json_with_filters_on_an_empty_store(capsys: pytest.CaptureFixture[
 
 def test_list_human_on_an_empty_store(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["list"]) == 0
-    assert capsys.readouterr().err == ""
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("No sessions.\n", "")
 
 
 # Schema check (interface.md, Launch order step 1)
@@ -100,22 +103,34 @@ def test_schema_newer_golden(
         conn.close()
     assert main(["list", "--json"]) == 12
     envelope = json.loads(capsys.readouterr().out)
-    assert envelope == json.loads((GOLDEN / "error-schema-newer.json").read_text())
+    golden = json.loads((GOLDEN / "error-schema-newer.json").read_text())
+    validate(golden, ERROR_SCHEMA)
+    assert envelope == golden
+
+
+def capture_errors(monkeypatch: pytest.MonkeyPatch) -> list[CliError]:
+    seen: list[CliError] = []
+    monkeypatch.setattr(cli, "_emit_error", lambda error, json_mode: seen.append(error))
+    return seen
 
 
 @pytest.mark.parametrize("name", sorted(n for n in FULL_INVOCATIONS if not n.startswith("report")))
 def test_every_command_but_report_checks_the_schema(
-    name: str, capsys: pytest.CaptureFixture[str]
+    name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     make_newer()
-    assert main(FULL_INVOCATIONS[name]) == 12, capsys.readouterr().err
+    seen = capture_errors(monkeypatch)
+    assert main(FULL_INVOCATIONS[name]) == 12
+    assert [error.code for error in seen] == ["schema_newer"]
+    validate(seen[0].envelope(), ERROR_SCHEMA)
 
 
 def test_schema_check_comes_before_usage_checks(capsys: pytest.CaptureFixture[str]) -> None:
     make_newer()
     assert main(["list", "--bogus", "--json"]) == 12
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "schema_newer"
-    assert main(["exec", "--verbose", "--quiet"]) == 12
+    assert main(["exec", "--verbose", "--quiet", "--json"]) == 12
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "schema_newer"
 
 
 def test_schema_newer_is_not_written_to_the_outcome_file(
@@ -125,6 +140,23 @@ def test_schema_newer_is_not_written_to_the_outcome_file(
     outcome = tmp_path / "o.json"
     assert main(["wait", "cs-abcd2345", "--outcome-file", str(outcome)]) == 12
     assert not outcome.exists()
+
+
+def test_an_unsafe_store_is_failed(_private_state_dir: Path, tmp_path: Path) -> None:
+    target = tmp_path / "elsewhere.db"
+    root = _private_state_dir / "claude-session"
+    root.mkdir(parents=True, mode=0o700)
+    (root / "state.db").symlink_to(target)
+    outcome = tmp_path / "o.json"
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        assert main(["wait", "cs-abcd2345", "--outcome-file", str(outcome), "--json"]) == 12
+    envelope = json.loads(stdout.getvalue())
+    validate(envelope, ERROR_SCHEMA)
+    assert envelope["error"]["code"] == "failed"
+    assert str(root / "state.db") in envelope["error"]["detail"]
+    assert not target.exists()
+    assert not outcome.exists()  # the schema check precedes parsing
 
 
 def test_report_never_opens_the_store(
@@ -181,8 +213,6 @@ def test_an_older_store_is_migrated_by_a_command(
         assert s.schema_version() == (1, 1)
 
 
-def test_hook_event_ignores_a_newer_schema() -> None:
-    make_newer()
-    before = db_bytes()
-    assert entry.main(["hook-event", "--state-dir", os.path.dirname(db()), "Stop"]) == 0
-    assert db_bytes() == before
+# TODO(#13): add a CLI-level test that hook-event works with a newer additive schema (and
+# never migrates) once hook-event opens the store; the store level is covered in
+# test_store.py (test_open_without_migrate_accepts_a_newer_minor_schema).

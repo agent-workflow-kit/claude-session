@@ -577,7 +577,9 @@ def _needs_schema_check(argv: Sequence[str]) -> bool:
     """Whether ``argv`` runs a command that must check the schema before anything else.
 
     Exempt: ``report``; no command or an unknown one (a usage error); ``--help`` and
-    ``--version`` anywhere before ``--``, which only print text and never open state.db.
+    ``--version`` anywhere before ``--``, which only print text and never open state.db
+    (an option value spelled ``--help`` therefore also skips the check; interface.md,
+    Launch order step 1).
     """
     commands = {name.split()[0] for name in HANDLERS}
     if not argv or argv[0] not in commands or argv[0] in SCHEMA_CHECK_EXEMPT:

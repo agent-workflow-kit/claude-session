@@ -15,23 +15,43 @@ from pathlib import Path
 import pytest
 
 from claude_session import store
-from claude_session.errors import SchemaNewerError
+from claude_session.errors import FailedError, InternalError, SchemaNewerError
 from claude_session.store import LEASE_TTL, Holder, Migration, Store
 
 T0 = datetime(2026, 10, 30, 12, 0, 0, tzinfo=UTC)
 ME = Holder(pid=1000, start="100")
 OTHER = Holder(pid=2000, start="200")
-DESIGN_TABLES = {
-    "sessions",
-    "runs",
-    "claude_ids",
-    "labels",
-    "events",
-    "requests",
-    "deleted_ids",
-    "leases",
-    "meta",
+# design.md, Data model: every table and its columns.
+DESIGN_COLUMNS = {
+    "sessions": (
+        "csession_id created_at launch_kind csession_dir private_dir tmp_dir forked_from "
+        "tainted tainted_at tainted_by_run current_run claude_session_id state state_since "
+        "activity needs_input_reason git_dir updated_at forgotten_at"
+    ),
+    "runs": (
+        "csession_id run_no created_at run_kind reads_third_party mode cwd repo model skill "
+        "has_prompt spec_json resolved_json config_hash invocation_json permission_profile "
+        "permission_profile_snapshot sandbox_active decision_ids_json escalated_hooks "
+        "warnings_json message hook_interpreter config_path expires_at started_at "
+        "session_started_at ended_at stop_requested_at pending_cause wrapper_pid "
+        "wrapper_start child_pid child_start outbox_dev_ino artifacts_dev_ino secret_sha256 "
+        "backstop_used report_status report_implicit report_summary report_reason "
+        "artifact_name artifact_path artifact_sha256 artifact_size artifact_ingest_seq "
+        "reported_at phase outcome end_reason exit_code cost_usd num_turns is_error "
+        "session_end_reason outcome_file outcome_file_written_at"
+    ),
+    "claude_ids": "csession_id claude_session_id run_no source transcript_path seen_at",
+    "labels": "csession_id key value",
+    "events": (
+        "id csession_id run_no event_ts from_state to_state from_activity to_activity "
+        "needs_input_reason cause final labels_json delivered_at"
+    ),
+    "requests": "request_id csession_id run_no result ingested_at",
+    "deleted_ids": "csession_id deleted_at",
+    "leases": "name holder_pid holder_start holder_token expires_at",
+    "meta": "key value",
 }
+DESIGN_TABLES = set(DESIGN_COLUMNS)
 
 
 class FakeClock:
@@ -65,14 +85,20 @@ def open_as(
     *,
     alive: FakeProcesses | None = None,
     clock: FakeClock | None = None,
-    **kwargs: object,
+    migrate: bool = True,
+    busy_timeout: float = store.BUSY_TIMEOUT,
+    migrations: list[Migration] | None = None,
+    migrate_wait: float = store.MIGRATE_WAIT,
 ) -> Store:
     return Store.open(
         path,
         holder=holder,
         liveness=alive or FakeProcesses(ME, OTHER),
         clock=clock or FakeClock(),
-        **kwargs,  # type: ignore[arg-type]
+        migrate=migrate,
+        busy_timeout=busy_timeout,
+        migrations=migrations,
+        migrate_wait=migrate_wait,
     )
 
 
@@ -83,6 +109,22 @@ def tables(path: str) -> set[str]:
     finally:
         conn.close()
     return {name for (name,) in rows if not name.startswith("sqlite_")}
+
+
+def columns(path: str, table: str) -> set[str]:
+    conn = sqlite3.connect(path)
+    try:
+        return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    finally:
+        conn.close()
+
+
+def journal_mode(path: str) -> str:
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        conn.close()
 
 
 def set_version(path: str, version: str) -> None:
@@ -117,27 +159,157 @@ def test_state_dir_defaults_to_local_state(monkeypatch: pytest.MonkeyPatch) -> N
 # Open, WAL and modes
 
 
+def mode(path: str | Path) -> int:
+    return stat.S_IMODE(os.lstat(path).st_mode)
+
+
 def test_open_creates_a_private_wal_database(db: str) -> None:
-    old = os.umask(0)
+    old = os.umask(0o177)  # mkdir(0o700) alone would give 0o600
     try:
         open_as(db, ME).close()
     finally:
         os.umask(old)
-    assert stat.S_IMODE(os.stat(os.path.dirname(db)).st_mode) == 0o700
-    assert stat.S_IMODE(os.stat(db).st_mode) == 0o600
-    conn = sqlite3.connect(db)
+    assert mode(os.path.dirname(db)) == 0o700
+    assert mode(db) == 0o600
+    assert journal_mode(db) == "wal"
+
+
+def test_missing_parents_are_created_private_whatever_the_umask(tmp_path: Path) -> None:
+    path = tmp_path / "a" / "b" / "claude-session" / "state.db"
+    old = os.umask(0)
     try:
-        assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        open_as(str(path), ME).close()
     finally:
-        conn.close()
+        os.umask(old)
+    for directory in (tmp_path / "a", tmp_path / "a" / "b", path.parent):
+        assert mode(directory) == 0o700, directory
 
 
-def test_open_keeps_the_mode_of_an_existing_state_dir(tmp_path: Path) -> None:
+def test_a_loose_existing_state_dir_is_tightened(tmp_path: Path) -> None:
     root = tmp_path / "existing"
-    root.mkdir(mode=0o750)
-    os.chmod(root, 0o750)
+    root.mkdir()
+    os.chmod(root, 0o777)
     open_as(str(root / "state.db"), ME).close()
-    assert stat.S_IMODE(os.stat(root).st_mode) == 0o750
+    assert mode(root) == 0o700
+
+
+def test_a_symlinked_state_dir_is_refused(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (tmp_path / "state").symlink_to(target)
+    with pytest.raises(FailedError) as exc:
+        open_as(str(tmp_path / "state" / "state.db"), ME)
+    assert exc.value.exit_code == 12
+    assert str(tmp_path / "state") in (exc.value.detail or "")
+    assert list(target.iterdir()) == []
+
+
+def test_a_dangling_symlink_db_is_refused_and_its_target_not_created(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    target = tmp_path / "target.db"
+    (root / "state.db").symlink_to(target)
+    with pytest.raises(FailedError) as exc:
+        open_as(str(root / "state.db"), ME)
+    assert "symbolic link" in (exc.value.detail or "")
+    assert not target.exists()
+
+
+def test_a_symlink_to_an_existing_db_is_refused_and_its_target_unchanged(
+    tmp_path: Path,
+) -> None:
+    target = str(tmp_path / "real" / "state.db")
+    open_as(target, ME).close()
+    before = Path(target).read_bytes()
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    (root / "state.db").symlink_to(target)
+    with pytest.raises(FailedError):
+        open_as(str(root / "state.db"), ME)
+    with pytest.raises(FailedError):
+        open_as(str(root / "state.db"), ME, migrate=False)
+    assert Path(target).read_bytes() == before
+
+
+def test_a_hard_linked_db_is_refused(db: str, tmp_path: Path) -> None:
+    open_as(db, ME).close()
+    os.link(db, tmp_path / "elsewhere.db")
+    with pytest.raises(FailedError, match="unsafe") as exc:
+        open_as(db, ME)
+    assert "hard links" in (exc.value.detail or "")
+    with pytest.raises(FailedError):
+        open_as(db, ME, migrate=False)
+
+
+def test_a_loose_db_is_tightened_to_0600(db: str) -> None:
+    open_as(db, ME).close()
+    os.chmod(db, 0o644)
+    open_as(db, ME).close()
+    assert mode(db) == 0o600
+
+
+def test_a_db_that_cannot_be_opened_is_failed(db: str) -> None:
+    os.makedirs(db)  # a directory where state.db should be
+    with pytest.raises(FailedError) as exc:
+        open_as(db, ME)
+    assert db in (exc.value.detail or "")
+
+
+def test_a_corrupt_db_is_failed(db: str) -> None:
+    os.makedirs(os.path.dirname(db), mode=0o700)
+    Path(db).write_bytes(b"this is not a database at all" * 200)
+    os.chmod(db, 0o600)
+    with pytest.raises(FailedError) as exc:
+        open_as(db, ME)
+    assert db in (exc.value.detail or "")
+
+
+def test_a_foreign_database_is_refused_and_left_untouched(db: str) -> None:
+    os.makedirs(os.path.dirname(db), mode=0o700)
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE unrelated (x)")
+    conn.commit()
+    conn.close()
+    os.chmod(db, 0o600)
+    before = Path(db).read_bytes()
+    with pytest.raises(FailedError, match="not a claude-session database"):
+        open_as(db, ME)
+    with pytest.raises(FailedError, match="not a claude-session database"):
+        open_as(db, ME, migrate=False)
+    assert Path(db).read_bytes() == before
+    assert journal_mode(db) == "delete"
+
+
+def test_an_empty_file_is_initialized(db: str) -> None:
+    os.makedirs(os.path.dirname(db), mode=0o700)
+    Path(db).touch(mode=0o600)
+    with open_as(db, ME) as s:
+        assert s.schema_version() == store.code_version()
+        assert s.conn.execute("PRAGMA application_id").fetchone() == (store.APPLICATION_ID,)
+
+
+def test_wal_switch_waits_for_a_reader_within_the_busy_timeout(db: str) -> None:
+    open_as(db, ME).close()
+    conn = sqlite3.connect(db, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    reading = threading.Event()
+
+    def read() -> None:
+        reader = sqlite3.connect(db, isolation_level=None)
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM meta").fetchall()
+        reading.set()
+        time.sleep(0.3)
+        reader.execute("COMMIT")
+        reader.close()
+
+    conn.close()
+    thread = threading.Thread(target=read)
+    thread.start()
+    reading.wait(10)
+    open_as(db, ME, busy_timeout=5).close()
+    thread.join()
+    assert journal_mode(db) == "wal"
 
 
 def test_fresh_database_has_the_design_tables_and_current_version(db: str) -> None:
@@ -146,23 +318,45 @@ def test_fresh_database_has_the_design_tables_and_current_version(db: str) -> No
     assert tables(db) == DESIGN_TABLES
 
 
+@pytest.mark.parametrize("table", sorted(DESIGN_COLUMNS))
+def test_fresh_database_tables_have_the_design_columns(db: str, table: str) -> None:
+    open_as(db, ME).close()
+    assert columns(db, table) == set(DESIGN_COLUMNS[table].split())
+
+
 def test_migrate_lease_is_released_after_migration(db: str) -> None:
     with open_as(db, ME) as s:
         assert s.lease_holder(store.MIGRATE_LEASE) is None
 
 
-def test_open_without_migrate_does_not_create_or_migrate(tmp_path: Path) -> None:
-    path = str(tmp_path / "state.db")
-    open_as(path, ME).close()
-    set_version(path, "99.0")
-    with open_as(path, ME, migrate=False) as s:  # hook-event: never migrates, never refuses
-        assert s.schema_version() == (99, 0)
+def test_open_without_migrate_accepts_a_newer_minor_schema(db: str) -> None:
+    open_as(db, ME).close()
+    major, minor = store.code_version()
+    set_version(db, f"{major}.{minor + 3}")
+    with open_as(db, ME, migrate=False) as s:  # hook-event: never migrates
+        assert s.schema_version() == (major, minor + 3)
+
+
+@pytest.mark.parametrize("version", ["99.0", "0.5"])
+def test_open_without_migrate_refuses_another_major_schema(db: str, version: str) -> None:
+    open_as(db, ME).close()
+    set_version(db, version)
+    with pytest.raises(FailedError, match="schema"):
+        open_as(db, ME, migrate=False)
+
+
+def test_open_without_migrate_refuses_an_unmigrated_database(db: str) -> None:
+    os.makedirs(os.path.dirname(db), mode=0o700)
+    Path(db).touch(mode=0o600)
+    with pytest.raises(FailedError):
+        open_as(db, ME, migrate=False)
+    assert Path(db).read_bytes() == b""
 
 
 def test_open_without_migrate_never_creates_a_database(tmp_path: Path) -> None:
     path = tmp_path / "dir with space%" / "state.db"
-    path.parent.mkdir()
-    with pytest.raises(sqlite3.OperationalError):
+    path.parent.mkdir(mode=0o700)
+    with pytest.raises(FailedError):
         open_as(str(path), ME, migrate=False)
     assert not path.exists()
     open_as(str(path), ME).close()
@@ -174,20 +368,26 @@ def test_list_sessions_on_an_empty_store(db: str) -> None:
         assert s.list_sessions() == []
 
 
-def test_list_sessions_excludes_forgotten_newest_first(db: str) -> None:
+def test_list_sessions_excludes_forgotten_most_recently_updated_first(db: str) -> None:
+    day = "2026-01-0{}T00:00:00.000000Z".format
     with open_as(db, ME) as s:
         with s.transaction() as conn:
-            for sid, created, forgotten in [
-                ("cs-aaaaaaaa", "2026-01-01T00:00:00.000000Z", None),
-                ("cs-bbbbbbbb", "2026-01-02T00:00:00.000000Z", None),
-                ("cs-cccccccc", "2026-01-03T00:00:00.000000Z", "2026-01-04T00:00:00.000000Z"),
+            for sid, created, updated, forgotten in [
+                ("cs-aaaaaaaa", day(1), day(5), None),
+                ("cs-bbbbbbbb", day(2), day(3), None),
+                ("cs-dddddddd", day(4), day(3), None),
+                ("cs-cccccccc", day(3), day(9), day(9)),
             ]:
                 conn.execute(
                     "INSERT INTO sessions (csession_id, created_at, launch_kind, current_run, "
                     "state, updated_at, forgotten_at) VALUES (?, ?, 'k', 1, 'idle', ?, ?)",
-                    (sid, created, created, forgotten),
+                    (sid, created, updated, forgotten),
                 )
-        assert [r["csession_id"] for r in s.list_sessions()] == ["cs-bbbbbbbb", "cs-aaaaaaaa"]
+        assert [r["csession_id"] for r in s.list_sessions()] == [
+            "cs-aaaaaaaa",
+            "cs-dddddddd",
+            "cs-bbbbbbbb",
+        ]
 
 
 # Migrations
@@ -251,9 +451,80 @@ def test_migration_waits_for_a_live_holder_of_the_migrate_lease(db: str) -> None
     open_as(db, ME, migrations=make_migrations(log, [(1, 0)])).close()
     with open_as(db, OTHER, migrations=make_migrations(log, [(1, 0)])) as other:
         assert other.take_lease(store.MIGRATE_LEASE)
-    with pytest.raises(Exception, match="timed out waiting"):
+    with pytest.raises(FailedError, match="timed out waiting") as exc:
         open_as(db, ME, migrations=make_migrations(log, [(1, 0), (1, 1)]), migrate_wait=0.2)
+    assert db in (exc.value.detail or "")
     assert [version for version, _ in log] == ["1.0"]
+
+
+def hold_write_lock(db: str, seconds: float) -> tuple[threading.Thread, threading.Event]:
+    """Hold a write transaction on ``db`` in a thread for ``seconds``; returns the thread
+    and an event set once the lock is held."""
+    holding = threading.Event()
+
+    def hold() -> None:
+        conn = sqlite3.connect(db, isolation_level=None)
+        conn.execute("BEGIN IMMEDIATE")
+        holding.set()
+        time.sleep(seconds)
+        conn.execute("ROLLBACK")
+        conn.close()
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    holding.wait(10)
+    return thread, holding
+
+
+def test_migration_wait_retries_while_the_database_is_busy(db: str) -> None:
+    log: list[tuple[str, object]] = []
+    open_as(db, ME, migrations=make_migrations(log, [(1, 0)])).close()
+    thread, _ = hold_write_lock(db, 0.4)
+    try:
+        with open_as(
+            db,
+            ME,
+            migrations=make_migrations(log, [(1, 0), (1, 1)]),
+            busy_timeout=0.05,
+            migrate_wait=10,
+        ) as s:
+            assert s.schema_version() == (1, 1)
+    finally:
+        thread.join()
+
+
+def test_migration_wait_on_a_busy_database_times_out_as_failed(db: str) -> None:
+    log: list[tuple[str, object]] = []
+    open_as(db, ME, migrations=make_migrations(log, [(1, 0)])).close()
+    thread, _ = hold_write_lock(db, 1.0)
+    try:
+        with pytest.raises(FailedError, match="timed out waiting"):
+            open_as(
+                db,
+                ME,
+                migrations=make_migrations(log, [(1, 0), (1, 1)]),
+                busy_timeout=0.05,
+                migrate_wait=0.3,
+            )
+    finally:
+        thread.join()
+
+
+def test_a_migrator_that_loses_its_lease_stops_before_the_next_step(db: str) -> None:
+    log: list[str] = []
+
+    def stolen(conn: sqlite3.Connection) -> None:
+        log.append("1.0")
+        conn.execute(
+            "UPDATE leases SET holder_pid = ?, holder_start = ?, holder_token = 'x' "
+            "WHERE name = 'migrate'",
+            (OTHER.pid, OTHER.start),
+        )
+
+    migrations = [Migration((1, 0), stolen), Migration((1, 1), lambda c: log.append("1.1"))]
+    with pytest.raises(FailedError, match="lost the migrate lease"):
+        open_as(db, ME, migrations=migrations)
+    assert log == ["1.0"]
 
 
 def test_migration_takes_over_a_dead_holders_migrate_lease(db: str) -> None:
@@ -297,10 +568,11 @@ def test_same_schema_opens_without_taking_the_migrate_lease(db: str) -> None:
     open_as(db, ME, migrate_wait=0).close()
 
 
-def test_invalid_schema_version_is_an_internal_error(db: str) -> None:
+@pytest.mark.parametrize("version", ["one", "1.\u00b2", "1.0\n", " 1.0"])
+def test_invalid_schema_version_is_an_internal_error(db: str, version: str) -> None:
     open_as(db, ME).close()
-    set_version(db, "one")
-    with pytest.raises(Exception, match="invalid schema_version"):
+    set_version(db, version)
+    with pytest.raises(InternalError, match="invalid schema_version"):
         open_as(db, ME)
 
 
@@ -390,6 +662,34 @@ def test_release_frees_only_your_own_lease(db: str) -> None:
         assert me.take_lease("reconcile")
 
 
+def test_two_stores_in_one_process_do_not_share_a_lease(db: str) -> None:
+    with open_as(db, ME) as a, open_as(db, ME) as b:
+        assert a.take_lease("reconcile")
+        assert not b.take_lease("reconcile")
+        assert not b.renew_lease("reconcile")
+        b.release_lease("reconcile")
+        assert a.renew_lease("reconcile")
+        a.release_lease("reconcile")
+        assert b.take_lease("reconcile")
+
+
+def test_a_lease_far_in_the_future_counts_as_expired(db: str) -> None:
+    skewed = FakeClock(T0 + timedelta(hours=1))
+    with open_as(db, OTHER, clock=skewed) as other, open_as(db, ME) as me:
+        assert other.take_lease("reconcile")
+        assert me.take_lease("reconcile")
+        assert me.lease_holder("reconcile") == (ME, T0 + LEASE_TTL)
+
+
+def test_a_lease_with_an_unknown_start_time_uses_the_pid_only(db: str) -> None:
+    unknown = Holder(pid=os.getpid(), start="")
+    alive = FakeProcesses(ME)  # would call (getpid, "") dead
+    with open_as(db, unknown) as other, open_as(db, ME, alive=alive) as me:
+        assert other.take_lease("reconcile")
+        assert not me.take_lease("reconcile")
+        assert alive.calls == []
+
+
 def test_leases_are_independent_by_name(db: str) -> None:
     with open_as(db, ME) as me, open_as(db, OTHER) as other:
         assert other.take_lease("delivery:cs-aaaaaaaa")
@@ -407,6 +707,11 @@ def test_default_liveness_checks_the_pid() -> None:
         timeout=60,
     )
     assert not store.pid_alive(int(proc.stdout), "")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root may signal pid 1")
+def test_default_liveness_counts_a_pid_it_may_not_signal_as_alive() -> None:
+    assert store.pid_alive(1, "")  # EPERM: alive
 
 
 def test_default_holder_is_this_process() -> None:
@@ -509,6 +814,57 @@ def test_a_failed_transaction_rolls_back(db: str) -> None:
                 conn.execute("UPDATE counter SET n = 5")
                 raise RuntimeError("boom")
     assert counter(db) == 0
+
+
+def test_an_auto_rolled_back_error_surfaces_unmasked(db: str) -> None:
+    make_counter(db)
+    with open_as(db, ME) as s:
+        with s.transaction() as conn:
+            conn.execute("CREATE TABLE u (k INTEGER PRIMARY KEY)")
+            conn.execute("INSERT INTO u VALUES (1)")
+        with pytest.raises(sqlite3.IntegrityError):
+            with s.transaction() as conn:
+                conn.execute("UPDATE counter SET n = 5")
+                conn.execute("INSERT OR ROLLBACK INTO u VALUES (1)")
+        with s.transaction() as conn:
+            conn.execute("UPDATE counter SET n = n + 1")
+    assert counter(db) == 1
+
+
+def test_a_failed_commit_rolls_back_and_the_store_stays_usable(db: str) -> None:
+    make_counter(db)
+    with open_as(db, ME) as s:
+        with s.transaction() as conn:
+            conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            conn.execute(
+                "CREATE TABLE child (p INTEGER REFERENCES parent (id) "
+                "DEFERRABLE INITIALLY DEFERRED)"
+            )
+        s.conn.execute("PRAGMA foreign_keys = ON")
+        with pytest.raises(sqlite3.IntegrityError):
+            with s.transaction() as conn:
+                conn.execute("UPDATE counter SET n = 5")
+                conn.execute("INSERT INTO child VALUES (42)")  # fails only at COMMIT
+        assert not s.conn.in_transaction
+        with s.transaction() as conn:
+            conn.execute("UPDATE counter SET n = n + 1")
+    assert counter(db) == 1
+
+
+def test_event_ids_are_never_reused(db: str) -> None:
+    with open_as(db, ME) as s:
+        insert = (
+            "INSERT INTO events (csession_id, run_no, event_ts) "
+            "VALUES ('cs-aaaaaaaa', 1, '2026-01-01T00:00:00.000000Z')"
+        )
+        with s.transaction() as conn:
+            conn.execute(insert)
+            conn.execute(insert)
+            (last,) = conn.execute("SELECT max(id) FROM events").fetchone()
+            conn.execute("DELETE FROM events WHERE id = ?", (last,))
+            conn.execute(insert)
+            (new,) = conn.execute("SELECT max(id) FROM events").fetchone()
+            assert new > last
 
 
 OPENER = """

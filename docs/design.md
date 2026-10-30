@@ -294,7 +294,7 @@ events      id PK, csession_id, run_no, event_ts, from_state, to_state, from_act
             to_activity, needs_input_reason, cause, final, labels_json, delivered_at
 requests    request_id PK (UNIQUE), csession_id, run_no, result, ingested_at
 deleted_ids csession_id PK, deleted_at
-leases      name PK, holder_pid, holder_start, expires_at
+leases      name PK, holder_pid, holder_start, holder_token, expires_at
 meta        key PK, value            (schema_version)
 ```
 
@@ -315,6 +315,7 @@ meta        key PK, value            (schema_version)
 - Migrations are numbered functions applied at open under the lease `migrate`, forward only, and additive within a schema major version (`meta.schema_version` is `<major>.<minor>`). `hook-event` never migrates: with older code and a newer additive schema it keeps working, and it only reads and writes the columns it knows. Every other command checks the schema version first, before any allocation, and refuses a newer one with the error envelope `code: schema_newer`, exit 12 (dry runs too); it is never a run end reason.
 - Concurrency: every write is one `BEGIN IMMEDIATE` transaction with a busy timeout of 5 s; the per-session lock of the architecture is that transaction. `reconcile`, `migrate` and per-session delivery take a lease (holder PID + start time + `expires_at`): a lease expires 60 s after its last renewal, the holder renews it every 20 s while it works (hook delivery renews during long hooks), and a dead holder's lease may be taken over immediately.
 - Timestamps are UTC ISO 8601; durations inside `exec` use the monotonic clock.
+- `PRAGMA application_id` is `0x43536573` ("CSes"); a database with another id, or id 0 and a non-empty schema, is refused before anything is written. `holder_token` is random per open store, so two stores of one process never share a lease.
 
 ### Generated settings
 
@@ -632,7 +633,7 @@ Requests for other runs are discarded and logged; nothing is ingested for a run 
 ### Error handling
 
 - Invalid config fails fast naming the key: exit 2 with `code: usage` and a `detail`; at adoption the run ends `not-started` with `config_invalid` (exit 12).
-- Launch-phase failures exit 12 with `phase: launch`, an end reason and a hint (install command for bubblewrap/socat; `claude_bin`; minimum Claude Code version). Non-launch operational failures (cron install without `crontab`, transcript errors) exit 12 with error code `failed`.
+- Launch-phase failures exit 12 with `phase: launch`, an end reason and a hint (install command for bubblewrap/socat; `claude_bin`; minimum Claude Code version). Non-launch operational failures (cron install without `crontab`, transcript errors, an unusable, unsafe or foreign `state.db`) exit 12 with error code `failed`.
 - An unknown `--kind` gets the full review profile under the given name, with a warning on stderr and in `--json` `warnings`.
 - Post-hook and notes-context failures are logged and warned, never fatal (notes exit codes 0 and 10 are success).
 - `hook-event` never fails a session (see above).

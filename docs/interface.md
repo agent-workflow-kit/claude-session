@@ -81,7 +81,7 @@ Normative sections: [Launch order](#launch-order), [Flags at start and adoption]
 
 `start` creates the session and run 1 as a pending run (no wrapper); `start --resume` creates run n as a pending run. `exec --session-id <id>` **adopts** the pending run. `exec` without `--session-id` and `resume` perform every step themselves.
 
-1. **Schema check** (every command, before anything else, except `report`, which never opens `state.db`, and `hook-event`, which never migrates): a database schema newer than this claude-session → error envelope `code: schema_newer`, exit 12; nothing is allocated. An older schema is migrated (see [Upgrades](#upgrades)).
+1. **Schema check** (every command, before anything else, except `report`, which never opens `state.db`, and `hook-event`, which never migrates): a database schema newer than this claude-session → error envelope `code: schema_newer`, exit 12; nothing is allocated. An older schema is migrated (see [Upgrades](#upgrades)). A missing `state.db` (and state directory) is created (directory 0700, file 0600) and migrated to the current schema. The check is also skipped when the first argument is not a known command (a usage error follows), and when an argument before any `--` is `-h`, `--help` or `--version` (they only print usage or text; an option value spelled `--help` therefore also skips it).
 2. **Parse and usage checks** → exit 2; nothing is allocated. Includes config loading and validation (an invalid config exits 2, `code: usage`, with `detail`); the [flag rules](#flag-rules); the TTY check of plain `exec` and `resume` in interactive mode (stdin and stdout must be TTYs; exit 2 with a hint; `start` never checks the TTY for the run, its caller is a program); human-only flags without a TTY or an explicit `--actor human:*`; prompt and input files larger than `input_max_bytes`; an isolated run's `--outcome-file` under a [session-writable path](#session-writable-paths).
 3. **Refusal checks** (`live`, `tainted`, `already_adopted`, `expired`) → exit 20 (10 unknown or forgotten, 21 ambiguous); nothing is allocated. `resume`, `start --resume` and `stop` run the inline [liveness check](#liveness) first.
 4. **Allocate and record** the session and run (the taint is committed here: [Taint](#taint)).
@@ -186,6 +186,7 @@ Untrusted or agent-generated text is never accepted *only* as a flag value: prom
 - For isolated runs the path must not be under a [session-writable path](#session-writable-paths) (compared by realpath of the path or its nearest existing parent): exit 2 at `start`, `exec` and `resume`; at adoption a rejected `--outcome-file` exits 2 and the run stays pending. A rejected path is never written.
 - A refusal or usage error before a run is allocated writes its error envelope only to an `--outcome-file` given on that command line and not rejected.
 - A write failure never changes the run's outcome or the command's exit code: the command prints its normal output, adds a warning, and logs `outcome_file_failed`.
+- `schema_newer` and a `failed` at the schema check (step 1 of the [launch order](#launch-order)) write no outcome file: they precede parsing.
 
 `wait --outcome-file` writes `wait`'s own output (same rules).
 
@@ -673,7 +674,7 @@ The schemas encode the consistency rules once, in `outcome.json` `$defs/outcome_
 
 ### Error codes
 
-`code` in the error envelope ([schemas/cli/error.json](../schemas/cli/error.json)): `usage` (2), `not_found` (10), `ambiguous` (21, with `matches`), `refused` (20, with `reason`), `launch_failed` (12, `start` only, with a launch-validation `end_reason` (never a hook, `canceled`, `never_adopted`, `launch_interrupted`, `no_tty` or `config_invalid` reason), `hint`, a non-null `csession_id` and `run`), `failed` (12, an operational failure outside a launch: no `crontab`, transcript read errors; optional `detail`), `schema_newer` (12, any command; nothing allocated), `internal` (1). An invalid config is `usage` (2) with `detail`. An outcome-file write failure is a warning, never an error code ([Outcome file](#outcome-file)).
+`code` in the error envelope ([schemas/cli/error.json](../schemas/cli/error.json)): `usage` (2), `not_found` (10), `ambiguous` (21, with `matches`), `refused` (20, with `reason`), `launch_failed` (12, `start` only, with a launch-validation `end_reason` (never a hook, `canceled`, `never_adopted`, `launch_interrupted`, `no_tty` or `config_invalid` reason), `hint`, a non-null `csession_id` and `run`), `failed` (12, an operational failure outside a launch: no `crontab`, transcript read errors; also when the state directory or `state.db` cannot be created, opened, is unsafe or is not a claude-session database, or the migration lease cannot be obtained (`detail`: path and cause); optional `detail`), `schema_newer` (12, any command; nothing allocated), `internal` (1). An invalid config is `usage` (2) with `detail`. An outcome-file write failure is a warning, never an error code ([Outcome file](#outcome-file)).
 
 ## Hooks
 
@@ -855,7 +856,7 @@ Sessions carry labels (`--label` on `exec`/`start`/`resume`, `label add/remove`,
 
 ## Upgrades
 
-Database migrations are additive within a schema major version. `hook-event` never migrates; with older code and a newer additive schema it keeps working. Every other command checks the schema first: it migrates an older database, and refuses a newer one (error code `schema_newer`, exit 12, nothing allocated).
+Database migrations are additive within a schema major version. `hook-event` never migrates; with older code and a newer additive schema it keeps working. Every other command checks the schema first: it migrates an older database, and refuses a newer one (error code `schema_newer`, exit 12, nothing allocated). The schema check migrates an older database under `--dry-run` too; a migration is not an allocation.
 
 Upgrade claude-session while no sessions are live: the injected hooks run a recorded interpreter path, and `reconcile` and `status` warn when a live run's recorded hook interpreter path no longer exists.
 
