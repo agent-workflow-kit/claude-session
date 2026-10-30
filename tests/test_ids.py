@@ -137,7 +137,7 @@ def test_session_id_prefix_normalizes_input(text: str, prefix: str) -> None:
     assert ids.session_id_prefix(text) == prefix
 
 
-@pytest.mark.parametrize("text", ["", "a", "abc", "cs-", "cs-abc", "cs-a"])
+@pytest.mark.parametrize("text", ["", "a", "abc", "cs-", "cs-abc", "cs-a", "\u0130\u0130"])
 def test_session_id_prefix_shorter_than_4_chars_is_a_usage_error(text: str) -> None:
     with pytest.raises(UsageError, match="at least 4 characters") as info:
         ids.session_id_prefix(text)
@@ -192,6 +192,7 @@ def test_resolve_ambiguous_envelope_matches_golden() -> None:
         "qqqq",
         "cs-abcd2345a",  # longer than any id
         "QQQQ",  # case-insensitive, still unknown
+        "\u212a3v7",  # KELVIN SIGN: only ASCII letters fold
         "abc1",  # not base32
     ],
 )
@@ -381,7 +382,8 @@ def test_repo_id_pattern_equals_the_config_schema_pattern() -> None:
     assert ids.REPO_ID.pattern == _schema_repo_pattern()
 
 
-# The schema pattern's own edges: whatever it accepts, the code accepts.
+# Same grammar as the schema, applied with fullmatch (the schema's `$` would also match
+# before a trailing newline under Python's re.search; see test_repo_id_invalid).
 @pytest.mark.parametrize("repo", ["a..b/r", "example.org:0/r", "example.org:99999/r", "a-b/r"])
 def test_repo_id_accepts_what_the_schema_accepts(repo: str) -> None:
     assert re.search(_schema_repo_pattern(), repo)
@@ -439,8 +441,7 @@ def test_repo_id_invalid(repo: str) -> None:
         ("https://example.org/g/r.git/", "example.org/g/r"),
         ("https://example.org/g/r.GIT", "example.org/g/r"),
         ("git@example.org:g/r.Git", "example.org/g/r"),
-        ("user:tok@example.org:o/r", "example.org/o/r"),
-        ("deploy:ghp_SECRET@github.com:org/repo.git", "github.com/org/repo"),
+        ("git@example.org:o/r", "example.org/o/r"),
     ],
 )
 def test_repo_id_from_origin(origin: str, repo: str) -> None:
@@ -465,6 +466,11 @@ def test_repo_id_from_origin(origin: str, repo: str) -> None:
         "https://example.org/g/r\n",
         "git@example.org:g/r\n",
         "https://example.org/g/r\x7f",
+        # git splits scp origins at the first ':', so the host would be the user name.
+        "git@\u212aexample.org:o/r",  # KELVIN SIGN: hosts fold ASCII only
+        "https://\u212aexample.org/o/r",
+        "user:tok@example.org:o/r",
+        "deploy:ghp_SECRET@github.com:org/repo.git",
         "git@example.org:g/r\x00",
         "https://exa mple.org/g/r",
         "\tgit@example.org:g/r",
@@ -474,24 +480,52 @@ def test_repo_id_from_origin_without_a_valid_id_is_none(origin: str) -> None:
     assert ids.repo_id_from_origin(origin) is None
 
 
-USERINFO_ORIGINS = [
-    ("https://user:token@example.org/g/r", ("user", "token")),
-    ("ssh://git@example.org:2222/g/r", ("git@",)),
-    ("user:tok@example.org:o/r", ("user", "tok")),
-    ("deploy:ghp_SECRET@github.com:org/repo.git", ("deploy", "ghp_SECRET")),
-    ("deploy:ghp_SECRET@github.com/org/repo.git", ("deploy", "ghp_SECRET")),
-    ("a:b@c@example.org:o/r", ("a:b", "c@")),
-    ("https://user@example.org:8443/g/r", ("user",)),
+USERINFO_ORIGINS: list[tuple[str, str | None, tuple[str, ...]]] = [
+    ("https://user:token@example.org/g/r", "example.org/g/r", ("user", "token")),
+    ("ssh://git@example.org:2222/g/r", "example.org:2222/g/r", ("git",)),
+    ("user:tok@example.org:o/r", None, ("user", "tok")),
+    ("deploy:ghp_SECRET@github.com:org/repo.git", None, ("deploy", "ghp_SECRET")),
+    ("deploy:ghp_SECRET@github.com/org/repo.git", None, ("deploy", "ghp_SECRET")),
+    ("a:b@c@example.org:o/r", None, ("a:b", "c@")),
+    ("https://user@example.org:8443/g/r", "example.org:8443/g/r", ("user",)),
+    ("git@example.org:o/r", "example.org/o/r", ("git",)),
 ]
 
 
-@pytest.mark.parametrize(("origin", "secrets_"), USERINFO_ORIGINS)
-def test_derived_repo_id_never_contains_userinfo(origin: str, secrets_: tuple[str, ...]) -> None:
+@pytest.mark.parametrize(("origin", "expected", "userinfo"), USERINFO_ORIGINS)
+def test_derived_repo_id_never_contains_userinfo(
+    origin: str, expected: str | None, userinfo: tuple[str, ...]
+) -> None:
     repo = ids.repo_id_from_origin(origin)
+    assert repo == expected
     if repo is not None:
         assert "@" not in repo
-        for part in secrets_:
+        for part in userinfo:
             assert part not in repo
+
+
+# Origins urlsplit or the scp parser would silently clean into a valid id.
+CONTROL_ORIGINS = [
+    "https://exa\tmple.org/o/r",
+    "https://example.org/o\r/r",
+    "https://example.org/o/r\n",
+    "\x01https://example.org/o/r",
+    " https://example.org/o/r",
+    "\tgit@example.org:o/r",
+]
+
+
+@pytest.mark.parametrize("origin", CONTROL_ORIGINS)
+def test_origin_with_control_characters_is_none(origin: str) -> None:
+    assert ids.repo_id_from_origin(origin) is None
+
+
+@pytest.mark.parametrize("origin", CONTROL_ORIGINS)
+def test_control_character_check_is_what_rejects_them(
+    origin: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ids, "_ORIGIN_UNSAFE", re.compile(r"(?!)"))
+    assert ids.repo_id_from_origin(origin) == "example.org/o/r"
 
 
 # Module rules

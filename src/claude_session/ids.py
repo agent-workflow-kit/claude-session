@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import re
 import secrets
+import string
 from collections.abc import Callable, Iterable
 from typing import NamedTuple
 from urllib.parse import urlsplit
@@ -30,17 +31,20 @@ LABEL_KEY = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 LABEL_VALUE = re.compile(r"[A-Za-z0-9._:/#@+=,-]{0,256}")
 # Prefix input after `cs-`: what any id prefix of at least MIN_PREFIX_LENGTH can look like.
 ID_PREFIX_BODY = re.compile(r"[a-z2-7]{4,8}")
-# Identical to schemas/config.json `repos` propertyNames (tests check the two are equal).
+# Same grammar as schemas/config.json `repos` propertyNames (tests check the two are equal),
+# applied with fullmatch, so a trailing newline never passes.
 REPO_ID = re.compile(
     r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/(?!\.\.?(/|$))[A-Za-z0-9._-]+)+$"
 )
 # Default ports dropped when deriving a repo id from an origin URL.
 DEFAULT_PORTS = {"http": 80, "https": 443, "ssh": 22, "git+ssh": 22, "ssh+git": 22, "git": 9418}
 # scp-like `[user@]host:path`: no slash before the colon.
-# The userinfo (which may hold credentials) is dropped.
-_SCP_ORIGIN = re.compile(r"(?:[^@/]*@)?(?P<host>[^@/:]+):(?P<path>.*)")
+# git splits these at the first ':', so the user part holds no ':' (else: no repo id).
+_SCP_ORIGIN = re.compile(r"(?:[^@/:]+@)?(?P<host>[^@/:]+):(?P<path>.*)")
 # Space, C0 controls and DEL: never part of an origin (the caller trims git's newline).
 _ORIGIN_UNSAFE = re.compile(r"[\x00-\x20\x7f]")
+# Id input folds ASCII letters only (str.lower would map e.g. KELVIN SIGN to k).
+_ASCII_FOLD = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 _GIT_SUFFIX = re.compile(r"\.git$", re.IGNORECASE)
 
 
@@ -82,10 +86,11 @@ class IdCandidate(NamedTuple):
 
 
 def session_id_prefix(text: str, flag: str | None = None) -> str:
-    """Normalize session id input (case-insensitive) to a lowercase ``cs-`` prefix; fewer than
-    4 characters after ``cs-`` is a usage error (exit 2). Malformed input is not rejected here:
-    ``resolve_session_id`` reports it as unknown."""
-    body = text.lower().removeprefix(ID_PREFIX)
+    """Normalize session id input (ASCII case-insensitive) to a lowercase ``cs-`` prefix; fewer
+    than 4 characters after ``cs-`` is a usage error (exit 2). Malformed input is not rejected
+    here: ``resolve_session_id`` reports it as unknown."""
+    folded = text.translate(_ASCII_FOLD)  # one character for one: lengths are the input's
+    body = folded.removeprefix(ID_PREFIX)
     if len(body) < MIN_PREFIX_LENGTH:
         where = f"{flag}: " if flag else ""
         raise UsageError(
@@ -158,15 +163,15 @@ def repo_id_from_origin(origin: str) -> str | None:
     """Normalize an ``origin`` URL to a repo id, or None when it does not yield a valid one
     (local paths, ``file://``, unknown schemes, no path)."""
     # TODO(#9): call from the --repo derivation (git calls go through the gateway).
-    if _ORIGIN_UNSAFE.search(origin):
-        return None
+    if not origin.isascii() or _ORIGIN_UNSAFE.search(origin):
+        return None  # a repo id is ASCII; str.lower would fold e.g. KELVIN SIGN into k
     if "://" in origin:
         try:
             parts = urlsplit(origin)
             port = parts.port
         except ValueError:
             return None
-        scheme = parts.scheme.lower()
+        scheme = parts.scheme.translate(_ASCII_FOLD)
         if scheme not in DEFAULT_PORTS or not parts.hostname:
             return None
         host = parts.hostname
@@ -180,5 +185,5 @@ def repo_id_from_origin(origin: str) -> str | None:
         host = match.group("host")
         path = match.group("path")
     path = _GIT_SUFFIX.sub("", path.strip("/"))
-    repo = f"{host.lower()}/{path}"
+    repo = f"{host.translate(_ASCII_FOLD)}/{path}"
     return repo if is_repo_id(repo) else None
