@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+import time
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from claude_session import __main__ as entry
 from claude_session import cli, hookevent
+
+from .schemas import validate
 
 
 @pytest.mark.parametrize("error", [RuntimeError("boom"), SystemExit(2), KeyError("x")])
@@ -22,8 +27,13 @@ def test_hook_event_errors_exit_0_silently(
 
     silenced: list[bool] = []
     monkeypatch.setattr(hookevent, "main", broken)
+
     # Redirecting fds 1 and 2 would break pytest; the subprocess tests below cover it.
-    monkeypatch.setattr(entry, "_silence_output", lambda: silenced.append(True))
+    def silence(saved: list[int | None]) -> None:
+        entry._restore_output(saved)
+        silenced.append(True)
+
+    monkeypatch.setattr(entry, "_silence_output", silence)
     assert entry.main(["hook-event", "--state-dir", "/nonexistent", "Stop"]) == 0
     assert capsys.readouterr() == ("", "")
     assert silenced == [True]
@@ -177,3 +187,190 @@ def hook(argv):
 hookevent.main = hook
 sys.exit(entry.main(["hook-event", "--state-dir", "/nonexistent", "Stop"]))
 """
+
+
+# hook-event failures are logged at error (interface.md, Internal commands)
+
+LEAKY = "prompt text with s3cr3t-Value-0123456789"
+
+
+def fail_hook(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
+    def broken(argv: list[str]) -> int:
+        raise error
+
+    monkeypatch.setattr(hookevent, "main", broken)
+    monkeypatch.setattr(entry, "_silence_output", entry._restore_output)
+
+
+def log_records(state_dir: Path) -> list[dict[str, Any]]:
+    path = state_dir / "log.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_hook_event_failure_is_logged_at_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_hook(monkeypatch, RuntimeError(LEAKY))
+    monkeypatch.setenv("CSESSION_ID", "cs-abcd2345")
+    assert entry.main(["hook-event", "--state-dir", str(tmp_path), "Stop"]) == 0
+    [record] = log_records(tmp_path)
+    validate(record, "claude-session/log.json")
+    assert record["level"] == "error"
+    assert record["event"] == "hook_event_failed"
+    assert record["csession_id"] == "cs-abcd2345"
+    assert record["message"] == "Stop: RuntimeError"
+
+
+def test_hook_event_failure_log_never_carries_exception_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_hook(monkeypatch, KeyError(LEAKY))
+    entry.main(["hook-event", f"--state-dir={tmp_path}", "UserPromptSubmit"])
+    assert "s3cr3t" not in (tmp_path / "log.jsonl").read_text(encoding="utf-8")
+    assert log_records(tmp_path)[0]["message"] == "UserPromptSubmit: KeyError"
+
+
+@pytest.mark.parametrize("value", ["", "cs-bad", "cs-ABCD2345", "x" * 300])
+def test_hook_event_failure_ignores_a_malformed_session_id(
+    value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_hook(monkeypatch, RuntimeError("x"))
+    monkeypatch.setenv("CSESSION_ID", value)
+    entry.main(["hook-event", "--state-dir", str(tmp_path), "Stop"])
+    [record] = log_records(tmp_path)
+    validate(record, "claude-session/log.json")
+    assert "csession_id" not in record
+
+
+@pytest.mark.parametrize(
+    "event", ["NotAnEvent", "x" * 300, "--state-dir", "Stop\nforged"], ids=str.__len__
+)
+def test_hook_event_failure_names_only_a_known_event(
+    event: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_hook(monkeypatch, RuntimeError("x"))
+    entry.main(["hook-event", "--state-dir", str(tmp_path), event])
+    assert log_records(tmp_path)[0]["message"] == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["Stop"],
+        ["--state-dir", "relative/dir", "Stop"],
+        ["--state-dir=", "Stop"],
+        ["--state-dir"],
+    ],
+)
+def test_hook_event_failure_without_an_absolute_state_dir_logs_nothing(
+    argv: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_hook(monkeypatch, RuntimeError("x"))
+    monkeypatch.chdir(tmp_path)
+    assert entry.main(["hook-event", *argv]) == 0
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_hook_event_failure_with_an_unwritable_log_still_exits_0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fail_hook(monkeypatch, RuntimeError("x"))
+    (tmp_path / "log.jsonl").mkdir()
+    assert entry.main(["hook-event", "--state-dir", str(tmp_path), "Stop"]) == 0
+    assert capsys.readouterr() == ("", "")
+
+
+def test_hook_event_success_writes_no_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hookevent, "main", lambda argv: 0)
+    assert entry.main(["hook-event", "--state-dir", str(tmp_path), "Stop"]) == 0
+    assert not (tmp_path / "log.jsonl").exists()
+
+
+def test_hook_event_failure_is_logged_from_a_real_process(tmp_path: Path) -> None:
+    code = HOOK_OUTPUT_THEN.format(output="pass", after="raise RuntimeError('x')").replace(
+        "/nonexistent", str(tmp_path)
+    )
+    proc = run_python(code)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+    assert log_records(tmp_path)[0]["event"] == "hook_event_failed"
+
+
+def test_hook_event_always_exits_0() -> None:
+    code = HOOK_OUTPUT_THEN.format(output="print('oops')", after="return 2")
+    proc = run_python(code)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "oops\n", "")
+
+
+def test_hook_event_in_process_return_value_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hookevent, "main", lambda argv: 2)
+    assert entry.main(["hook-event", "--state-dir", "/nonexistent", "Stop"]) == 0
+
+
+@pytest.mark.parametrize("after", ["raise RuntimeError('x')", "return 0"], ids=["fail", "ok"])
+def test_hook_event_raw_fd_writes_never_escape(after: str) -> None:
+    code = HOOK_OUTPUT_THEN.format(
+        output="import os; os.write(1, b'raw out'); os.write(2, b'raw err')", after=after
+    )
+    proc = run_python(code)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+
+
+def test_hook_event_after_a_raw_write_keeps_printed_output() -> None:
+    code = HOOK_OUTPUT_THEN.format(
+        output="import os; os.write(1, b'raw'); print('{}')", after="return 0"
+    )
+    proc = run_python(code)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "{}\n", "")
+
+
+LOCKED_LOG = """
+import fcntl, os, sys, time
+from claude_session import __main__ as entry, fsutil, hookevent
+
+fsutil.LOCK_TIMEOUT = 0.2
+state_dir = sys.argv[1]
+holder = os.open(os.path.join(state_dir, "log.jsonl"), os.O_RDONLY)
+fcntl.flock(holder, fcntl.LOCK_EX)
+
+def hook(argv):
+    raise RuntimeError("x")
+
+hookevent.main = hook
+sys.exit(entry.main(["hook-event", "--state-dir", state_dir, "Stop"]))
+"""
+
+
+def test_hook_event_with_a_locked_log_exits_0_quickly(tmp_path: Path) -> None:
+    (tmp_path / "log.jsonl").write_bytes(b"")
+    (tmp_path / "log.jsonl").chmod(0o600)
+    started = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-c", LOCKED_LOG, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert time.monotonic() - started < 30
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+    assert (tmp_path / "log.jsonl").read_bytes() == b""
+
+
+def test_hook_event_whose_saved_fds_are_closed_exits_0_silently() -> None:
+    code = HOOK_OUTPUT_THEN.format(
+        output="import os; print('{}'); os.closerange(3, 64)", after="return 0"
+    )
+    proc = run_python(code)
+    assert (proc.returncode, proc.stderr) == (0, "")
+
+
+def test_hook_event_writes_to_the_real_streams_never_escape() -> None:
+    code = HOOK_OUTPUT_THEN.format(
+        output=(
+            "print('{\"ok\": true}'); sys.__stdout__.write('stray out'); "
+            "sys.__stderr__.write('stray err')"
+        ),
+        after="return 0",
+    )
+    proc = run_python(code)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, '{"ok": true}\n', "")
