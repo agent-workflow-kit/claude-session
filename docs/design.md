@@ -15,7 +15,7 @@ Runs and supervises Claude Code sessions (terminal-agnostic). Layer 1 (primitive
 | `bubblewrap`, `socat` (Linux, WSL2) | system packages | Needed by Claude Code's sandbox for sandboxed kinds; checked before launch. |
 | `git` | A, read-only | Only `git rev-parse --git-common-dir`/`--git-dir` for `${GIT_DIR}` and a linked worktree's gitdir, and the `origin` URL for the derived `--repo`, always hardened (section [Git calls](#git-calls)). claude-session never writes a repository. |
 
-Python dependencies: `pyyaml` and `pydantic` (both required by the design guide for config). Nothing else: process start times come from `/proc` (Linux) or `ps -o lstart=` (macOS) rather than `psutil`; the secret scan uses the standard library's keyed BLAKE2b.
+Python dependencies: `pyyaml` and `pydantic` (both required by the design guide for config). Nothing else: process start times come from `/proc` (Linux) or `ps -o lstart=` (macOS) rather than `psutil`; the secret scan uses the standard library's keyed BLAKE2b. Test-only (dev group): `jsonschema` and `referencing`, to validate every `--json` golden output against `schemas/` with a registry keyed by `$id`.
 
 Minimum Claude Code version: `exec` runs `claude --version` at launch and compares it with the built-in `min_claude_version` (2.1.312, the version the spike verified; overridable in config); an older version fails the launch with `claude_too_old`.
 
