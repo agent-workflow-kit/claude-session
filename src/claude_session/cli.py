@@ -17,6 +17,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, NoReturn
 
 from . import fsutil
+from .defaults import MAX_INTEGER
 from .errors import CliError, InternalError, RefusedError, UsageError
 
 PROG = "claude-session"
@@ -368,8 +369,10 @@ def _check_launch_flags(args: argparse.Namespace) -> None:
         if name not in hooks:
             raise UsageError(f"--hook-timeout {name}=... needs a --hook {name}=... too")
     _check_timeout(args)
-    if args.max_turns is not None and args.max_turns < 1:
-        raise UsageError("--max-turns must be at least 1")
+    if args.max_turns is not None and not 1 <= args.max_turns <= MAX_INTEGER:
+        raise UsageError(f"--max-turns must be between 1 and {MAX_INTEGER}")
+    if args.model is not None and args.model.startswith("-"):
+        raise UsageError("--model must not start with '-'")
     basenames: set[str] = set()
     for path in args.input_file or []:
         if path == "-":
