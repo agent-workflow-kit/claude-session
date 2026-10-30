@@ -50,6 +50,7 @@ dev = [
     { name = "pymarkdownlnt" },
     { name = "pyright" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "referencing" },
     { name = "ruff" },
 ]
@@ -62,6 +63,7 @@ dev = [
     { name = "pymarkdownlnt", specifier = ">=0.9.41" },
     { name = "pyright", specifier = ">=1.1.380" },
     { name = "pytest", specifier = ">=8" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "referencing", specifier = ">=0.37.0" },
     { name = "ruff", specifier = ">=0.6" },
 ]

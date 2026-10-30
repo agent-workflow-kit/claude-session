@@ -1,13 +1,14 @@
 """File writes that never follow a planted symlink. Standard library only.
 
-Used for ``--outcome-file`` (interface.md, Outcome file) and reusable for the session-directory
-writes (design.md, File handling).
+Used for ``--outcome-file`` (interface.md, Outcome file), the ``log.jsonl`` and ``audit.jsonl``
+appends, and reusable for the session-directory writes (design.md, File handling).
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+import stat
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -71,3 +72,39 @@ def write_private_file(path: str, data: bytes) -> None:
         os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
+
+
+def append_private_line(path: str, line: bytes) -> None:
+    """Append one newline-terminated ``line`` to ``path`` with a single ``os.write``.
+
+    The file is opened ``O_APPEND`` (created mode 0600, and tightened to 0600 if it was
+    looser), so lines from concurrent writers never interleave. The parent directory is
+    resolved and walked as in ``write_private_file``; the file itself is opened with
+    ``O_NOFOLLOW`` (a symlink fails) and ``O_NONBLOCK`` (a FIFO fails instead of blocking), and
+    anything but a regular file is refused. The parent directory is never created. Raises
+    ``OSError`` on failure, including a short write.
+    """
+    if not os.path.isabs(path):
+        raise ValueError(f"path must be absolute: {path!r}")
+    if not line.endswith(b"\n") or b"\n" in line[:-1]:
+        raise ValueError("line must contain exactly one newline, at its end")
+    parent, name = os.path.split(path)
+    if not name:
+        raise IsADirectoryError(path)
+    dir_fd = open_dir_nofollow(os.path.realpath(parent))
+    try:
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+        fd = os.open(name, flags | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"not a regular file: {path}")
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+        written = os.write(fd, line)
+        if written != len(line):
+            raise OSError(f"short write to {path}: {written} of {len(line)} bytes")
+    finally:
+        os.close(fd)

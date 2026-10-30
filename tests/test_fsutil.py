@@ -117,3 +117,86 @@ def test_cleanup_error_does_not_mask_the_original_error(
 def test_requires_an_absolute_path() -> None:
     with pytest.raises(ValueError):
         write_private_file("relative.json", b"x")
+
+
+# append_private_line
+
+
+def test_append_creates_a_0600_file_under_a_restrictive_umask(tmp_path: Path) -> None:
+    target = tmp_path / "log.jsonl"
+    old_umask = os.umask(0o777)
+    try:
+        fsutil.append_private_line(str(target), b"one\n")
+    finally:
+        os.umask(old_umask)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert target.read_bytes() == b"one\n"
+
+
+def test_append_keeps_existing_lines_and_tightens_the_mode(tmp_path: Path) -> None:
+    target = tmp_path / "log.jsonl"
+    target.write_bytes(b"one\n")
+    target.chmod(0o644)
+    fsutil.append_private_line(str(target), b"two\n")
+    assert target.read_bytes() == b"one\ntwo\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_append_uses_a_single_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    writes: list[bytes] = []
+    real_write = os.write
+
+    def record(fd: int, data: bytes) -> int:
+        writes.append(bytes(data))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(fsutil.os, "write", record)
+    fsutil.append_private_line(str(tmp_path / "log.jsonl"), b"x" * 100_000 + b"\n")
+    assert len(writes) == 1
+
+
+def test_append_short_write_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_write = os.write
+    monkeypatch.setattr(fsutil.os, "write", lambda fd, data: real_write(fd, data[:1]))
+    with pytest.raises(OSError, match="short write"):
+        fsutil.append_private_line(str(tmp_path / "log.jsonl"), b"abc\n")
+
+
+def test_append_refuses_a_symlink(tmp_path: Path) -> None:
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"untouched")
+    target = tmp_path / "log.jsonl"
+    target.symlink_to(victim)
+    with pytest.raises(OSError):
+        fsutil.append_private_line(str(target), b"x\n")
+    assert victim.read_bytes() == b"untouched"
+
+
+def test_append_refuses_a_fifo_without_blocking(tmp_path: Path) -> None:
+    target = tmp_path / "log.jsonl"
+    os.mkfifo(target, 0o600)
+    with pytest.raises(OSError):
+        fsutil.append_private_line(str(target), b"x\n")
+
+
+def test_append_refuses_a_directory(tmp_path: Path) -> None:
+    (tmp_path / "log.jsonl").mkdir()
+    with pytest.raises(OSError):
+        fsutil.append_private_line(str(tmp_path / "log.jsonl"), b"x\n")
+
+
+def test_append_does_not_create_the_parent(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        fsutil.append_private_line(str(tmp_path / "missing" / "log.jsonl"), b"x\n")
+
+
+def test_append_requires_a_newline_terminated_line(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        fsutil.append_private_line(str(tmp_path / "log.jsonl"), b"x")
+    with pytest.raises(ValueError):
+        fsutil.append_private_line(str(tmp_path / "log.jsonl"), b"x\ny\n")
+
+
+def test_append_requires_an_absolute_path() -> None:
+    with pytest.raises(ValueError):
+        fsutil.append_private_line("relative/log.jsonl", b"x\n")

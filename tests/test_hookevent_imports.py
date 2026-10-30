@@ -110,3 +110,18 @@ def test_checker_flags_cli() -> None:
     assert "import attempted: claude_session.cli" in found
     assert "import attempted: argparse" in found
     assert "unexpected module: claude_session.cli" in found
+
+
+def test_failing_hook_event_logs_without_heavy_imports() -> None:
+    failing = (
+        "import claude_session.hookevent as h\n"
+        "def broken(argv):\n"
+        "    raise RuntimeError('x')\n"
+        "h.main = broken\n"
+        "import claude_session.__main__ as entry\n"
+        "entry._silence_output = lambda: None  # keep the probe's own output"
+    )
+    result = run_probe(failing, runner=CONSOLE_SCRIPT)
+    assert result["code"] == 0
+    assert "claude_session.logs" in result["package"]
+    assert violations(result) == []

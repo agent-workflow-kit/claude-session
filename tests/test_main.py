@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from claude_session import __main__ as entry
 from claude_session import cli, hookevent
+
+from .schemas import validate
 
 
 @pytest.mark.parametrize("error", [RuntimeError("boom"), SystemExit(2), KeyError("x")])
@@ -177,3 +181,109 @@ def hook(argv):
 hookevent.main = hook
 sys.exit(entry.main(["hook-event", "--state-dir", "/nonexistent", "Stop"]))
 """
+
+
+# hook-event failures are logged at error (interface.md, Internal commands)
+
+LEAKY = "prompt text with s3cr3t-Value-0123456789"
+
+
+def fail_hook(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
+    def broken(argv: list[str]) -> int:
+        raise error
+
+    monkeypatch.setattr(hookevent, "main", broken)
+    monkeypatch.setattr(entry, "_silence_output", lambda: None)
+
+
+def log_records(state_dir: Path) -> list[dict[str, Any]]:
+    path = state_dir / "log.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_hook_event_failure_is_logged_at_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_hook(monkeypatch, RuntimeError(LEAKY))
+    monkeypatch.setenv("CSESSION_ID", "cs-abcd2345")
+    assert entry.main(["hook-event", "--state-dir", str(tmp_path), "Stop"]) == 0
+    [record] = log_records(tmp_path)
+    validate(record, "claude-session/log.json")
+    assert record["level"] == "error"
+    assert record["event"] == "hook_event_failed"
+    assert record["csession_id"] == "cs-abcd2345"
+    assert record["message"] == "Stop: RuntimeError"
+
+
+def test_hook_event_failure_log_never_carries_exception_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_hook(monkeypatch, KeyError(LEAKY))
+    entry.main(["hook-event", f"--state-dir={tmp_path}", "UserPromptSubmit"])
+    assert "s3cr3t" not in (tmp_path / "log.jsonl").read_text(encoding="utf-8")
+    assert log_records(tmp_path)[0]["message"] == "UserPromptSubmit: KeyError"
+
+
+@pytest.mark.parametrize("value", ["", "cs-bad", "cs-ABCD2345", "x" * 300])
+def test_hook_event_failure_ignores_a_malformed_session_id(
+    value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_hook(monkeypatch, RuntimeError("x"))
+    monkeypatch.setenv("CSESSION_ID", value)
+    entry.main(["hook-event", "--state-dir", str(tmp_path), "Stop"])
+    [record] = log_records(tmp_path)
+    validate(record, "claude-session/log.json")
+    assert "csession_id" not in record
+
+
+@pytest.mark.parametrize(
+    "event", ["NotAnEvent", "x" * 300, "--state-dir", "Stop\nforged"], ids=str.__len__
+)
+def test_hook_event_failure_names_only_a_known_event(
+    event: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_hook(monkeypatch, RuntimeError("x"))
+    entry.main(["hook-event", "--state-dir", str(tmp_path), event])
+    assert log_records(tmp_path)[0]["message"] == "RuntimeError"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["Stop"],
+        ["--state-dir", "relative/dir", "Stop"],
+        ["--state-dir=", "Stop"],
+        ["--state-dir"],
+    ],
+)
+def test_hook_event_failure_without_an_absolute_state_dir_logs_nothing(
+    argv: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_hook(monkeypatch, RuntimeError("x"))
+    monkeypatch.chdir(tmp_path)
+    assert entry.main(["hook-event", *argv]) == 0
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_hook_event_failure_with_an_unwritable_log_still_exits_0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fail_hook(monkeypatch, RuntimeError("x"))
+    (tmp_path / "log.jsonl").mkdir()
+    assert entry.main(["hook-event", "--state-dir", str(tmp_path), "Stop"]) == 0
+    assert capsys.readouterr() == ("", "")
+
+
+def test_hook_event_success_writes_no_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hookevent, "main", lambda argv: 0)
+    assert entry.main(["hook-event", "--state-dir", str(tmp_path), "Stop"]) == 0
+    assert not (tmp_path / "log.jsonl").exists()
+
+
+def test_hook_event_failure_is_logged_from_a_real_process(tmp_path: Path) -> None:
+    code = HOOK_OUTPUT_THEN.format(output="pass", after="raise RuntimeError('x')").replace(
+        "/nonexistent", str(tmp_path)
+    )
+    proc = run_python(code)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+    assert log_records(tmp_path)[0]["event"] == "hook_event_failed"
