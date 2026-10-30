@@ -24,8 +24,8 @@ class FakeClock:
         return self._monotonic
 
     def sleep(self, seconds: float) -> None:
-        self.sleeps.append(seconds)
         self.advance(seconds)
+        self.sleeps.append(seconds)
 
     def advance(self, seconds: float) -> None:
         if seconds < 0:

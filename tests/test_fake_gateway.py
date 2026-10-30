@@ -7,9 +7,10 @@ import sys
 
 import pytest
 
-from claude_session.gateway import DEVNULL, Gateway, GatewayTimeout, SystemGateway
+from claude_session.gateway import DEVNULL, INHERIT, Gateway, GatewayTimeout, SystemGateway
 
-from .fake_gateway import FAKE_PID_BASE, FakeChild, FakeGateway
+from .fake_clock import FakeClock
+from .fake_gateway import FAKE_PID_BASE, FakeChild, FakeGateway, Response
 
 
 def test_satisfies_the_gateway_protocol() -> None:
@@ -73,3 +74,82 @@ def test_spawn_via_starts_the_real_program_and_records_it() -> None:
     child = fake.spawn([sys.executable, "-I", "-c", "raise SystemExit(7)"], stdin=DEVNULL)
     assert child.wait(timeout=30) == 7
     assert fake.calls[0].kind == "spawn"
+
+
+@pytest.mark.parametrize("argv", ["/usr/bin/git", b"/usr/bin/git"])
+def test_refuses_str_or_bytes_argv(argv: object) -> None:
+    fake = FakeGateway()
+    fake.on(["/"])
+    with pytest.raises(TypeError):
+        fake.run(argv)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        fake.spawn(argv)  # type: ignore[arg-type]
+
+
+def test_records_spawn_streams_separately() -> None:
+    fake = FakeGateway()
+    fake.on(["/opt/claude"])
+    fake.spawn(["/opt/claude"], stdout=7, stderr=8)
+    fake.spawn(["/opt/claude"], stdin=INHERIT)
+    first, second = fake.calls
+    assert (first.stdin, first.stdout, first.stderr) == (DEVNULL, 7, 8)
+    assert (second.stdin, second.stdout, second.stderr) == (INHERIT, None, None)
+
+
+def test_records_run_process_group_and_kill_grace() -> None:
+    fake = FakeGateway()
+    fake.on(["/bin/sh"])
+    fake.run(["/bin/sh", "-c", "true"], new_process_group=True, kill_grace=10, timeout=30)
+    (call,) = fake.calls
+    assert (call.new_process_group, call.kill_grace, call.timeout) == (True, 10, 30)
+
+
+def test_kill_grace_contract_matches_the_real_gateway() -> None:
+    fake = FakeGateway()
+    fake.on(["/bin/sh"])
+    with pytest.raises(ValueError):
+        fake.run(["/bin/sh"], kill_grace=1)
+    with pytest.raises(ValueError):
+        fake.run(["/bin/sh"], new_process_group=True, kill_grace=-1)
+
+
+def test_a_response_list_is_consumed_in_order_and_the_last_repeats() -> None:
+    fake = FakeGateway()
+    ps = ["/bin/ps", "-p", "42"]
+    fake.on(
+        ps,
+        responses=[
+            Response(stdout="S Thu Oct 30 17:08:12 2026\n"),
+            Response(returncode=1),
+        ],
+    )
+    codes = [fake.run(ps).returncode for _ in range(4)]
+    assert codes == [0, 1, 1, 1]
+
+
+def test_a_response_list_scripts_spawned_children_too() -> None:
+    fake = FakeGateway()
+    fake.on(["/opt/claude"], responses=[Response(timeout=True), Response(returncode=3)])
+    assert fake.spawn(["/opt/claude"]).poll() is None
+    assert fake.spawn(["/opt/claude"]).poll() == 3
+
+
+def test_responses_exclude_single_response_arguments() -> None:
+    with pytest.raises(ValueError):
+        FakeGateway().on(["/bin/ps"], returncode=1, responses=[Response()])
+    with pytest.raises(ValueError):
+        FakeGateway().on(["/bin/ps"], responses=[])
+
+
+def test_waiting_on_a_running_child_advances_the_fake_clock() -> None:
+    clock = FakeClock()
+    fake = FakeGateway(clock=clock)
+    fake.on(["/opt/claude"], timeout=True)
+    child = fake.spawn(["/opt/claude"])
+    start = clock.monotonic()
+    assert child.wait(timeout=5) is None
+    assert clock.monotonic() - start == 5
+    assert isinstance(child, FakeChild)
+    child.exit(0)
+    assert child.wait(timeout=5) == 0
+    assert clock.monotonic() - start == 5  # an exited child returns at once

@@ -42,3 +42,10 @@ def test_fake_clock_refuses_naive_start_and_negative_advance() -> None:
         FakeClock(datetime(2026, 1, 1))  # noqa: DTZ001
     with pytest.raises(ValueError):
         FakeClock().advance(-1)
+
+
+def test_fake_clock_rejects_a_negative_sleep_without_recording_it() -> None:
+    clock = FakeClock()
+    with pytest.raises(ValueError):
+        clock.sleep(-1)
+    assert clock.sleeps == []

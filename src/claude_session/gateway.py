@@ -1,43 +1,66 @@
 """Gateway: the only module that starts subprocesses (design.md, Modules).
 
 Standard library only (the ``hook-event`` fast path imports it). It runs ``claude``, ``git``, the
-notes command, ``crontab``, the sandbox prerequisite checks and ``ps`` (procinfo on macOS).
-Callers never import ``subprocess``; they receive a ``Gateway`` object, so tests inject
+notes command, lifecycle hooks, ``crontab``, the sandbox prerequisite checks and ``ps`` (procinfo
+on macOS). Callers never import ``subprocess``; they receive a ``Gateway`` object, so tests inject
 ``tests/fake_gateway.FakeGateway`` without patching any call site.
 
 Rules every call follows:
 
-- ``argv[0]`` is an absolute path (resolved by the caller outside every session-writable path,
-  interface.md, Path rules); a bare name is refused with ``ValueError``. There is never a shell.
-- Environment: by default the child gets this process's environment with ``PATH`` sanitized
-  (empty and relative entries dropped, see ``sanitize_path``), plus ``extra_env``. A caller that
-  built a complete environment itself (the session environment, a hook's environment) passes it
-  as ``env``; it is used unchanged, because those builders already apply the PATH rules.
-- ``run`` gives the child ``/dev/null`` as stdin unless ``stdin`` text is given, so a child never
-  consumes the hook payload on ``hook-event``'s stdin.
+- ``argv`` is a sequence of strings (a bare ``str`` or ``bytes`` is refused with ``TypeError``)
+  whose first entry is an absolute path, resolved by the caller outside every session-writable
+  path (interface.md, Path rules); a bare name is refused with ``ValueError``. Never
+  ``shell=True``: lifecycle hooks are run as an explicit absolute ``/bin/sh -c <cmd>`` argv.
+- Environment: with no explicit ``env`` the child gets this process's environment, plus
+  ``extra_env``, with empty and relative ``PATH`` entries dropped (``sanitize_path``). That
+  default carries *every* inherited variable, secrets and ``CSESSION_*`` included, so the
+  builders for hooks, the notes command and the session pass a complete ``env`` instead; it is
+  used unchanged, because those builders apply the PATH rules themselves.
+- ``run`` gives the child ``/dev/null`` as stdin unless ``stdin`` text is given, and ``spawn``
+  does too unless ``INHERIT`` is passed (interactive ``claude``), so a child never consumes the
+  hook payload on ``hook-event``'s stdin.
+- Lifecycle hooks and the notes command use ``run(..., new_process_group=True, kill_grace=...)``
+  so a timeout ends everything they started (see ``GatewayTimeout``).
 
 ``die_with_parent`` (``spawn``, Linux only, ignored elsewhere) sets ``PR_SET_PDEATHSIG(SIGTERM)``
 in the child between fork and exec (through ``ctypes``, resolved before the fork, in
 ``preexec_fn``), so a headless ``claude`` never outlives a dead ``exec``. The kernel sends the
 signal when the *thread* that forked the child exits, so spawn such children from a thread that
 lives as long as the process (the main thread). If the parent already died before the child set
-the flag, the child sends itself SIGTERM.
+the flag, the child exits with ``PARENT_GONE_EXIT`` without running the program.
 """
 
 from __future__ import annotations
 
+import enum
 import os
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, runtime_checkable
 
-# Pass as a ``spawn`` stdin/stdout/stderr to connect it to /dev/null; ``None`` inherits.
-DEVNULL = subprocess.DEVNULL
+# Pass as a ``spawn`` stream to connect it to /dev/null (``spawn``'s default stdin).
+DEVNULL: Final = subprocess.DEVNULL
+
+
+class Inherit(enum.Enum):
+    """The type of ``INHERIT``."""
+
+    INHERIT = "inherit"
+
+
+# Pass as a ``spawn`` stream to share this process's descriptor (interactive ``claude``).
+INHERIT: Final = Inherit.INHERIT
+
+# Exit code of a ``die_with_parent`` child whose parent died before the death signal was set.
+PARENT_GONE_EXIT: Final = 128 + signal.SIGTERM
 
 _PR_SET_PDEATHSIG = 1
+_SIG_DFL = 0
+_GRACE_POLL = 0.02
 
 
 @dataclass(frozen=True)
@@ -51,7 +74,15 @@ class Result:
 
 
 class GatewayTimeout(Exception):
-    """``run`` exceeded its timeout; the child was killed and reaped."""
+    """``run`` exceeded its timeout. Before this is raised:
+
+    - without ``new_process_group``: the direct child got SIGKILL and was reaped. Only the
+      direct child: processes it started may keep running.
+    - with ``new_process_group``: the child's process group got SIGTERM, then, after
+      ``kill_grace`` seconds or as soon as the leader exited, SIGKILL (with ``kill_grace=None``,
+      SIGKILL straight away), and the leader was reaped. The group is signaled only while its
+      leader is unreaped, so its ID cannot have been reused.
+    """
 
     def __init__(self, argv: Sequence[str], timeout: float | None) -> None:
         super().__init__(f"{argv[0]} timed out after {timeout} s")
@@ -92,9 +123,13 @@ class Gateway(Protocol):
         cwd: str | None = None,
         stdin: str | None = None,
         timeout: float | None = None,
+        new_process_group: bool = False,
+        kill_grace: float | None = None,
     ) -> Result:
-        """Run to completion, capturing text output. Raises ``GatewayTimeout``, and ``OSError``
-        when the program cannot be started."""
+        """Run to completion, capturing text output. ``new_process_group`` puts the child in
+        its own process group, which a timeout ends as a whole; ``kill_grace`` (only with a
+        group) is the SIGTERM-to-SIGKILL delay. Raises ``GatewayTimeout``, and ``OSError`` when
+        the program cannot be started."""
         ...
 
     def spawn(
@@ -104,16 +139,23 @@ class Gateway(Protocol):
         env: Mapping[str, str] | None = None,
         extra_env: Mapping[str, str] | None = None,
         cwd: str | None = None,
-        stdin: int | None = None,
-        stdout: int | None = None,
-        stderr: int | None = None,
+        stdin: int | Inherit = DEVNULL,
+        stdout: int | Inherit | None = None,
+        stderr: int | Inherit | None = None,
         new_process_group: bool = False,
         die_with_parent: bool = False,
     ) -> Child:
-        """Start without waiting. ``stdin``/``stdout``/``stderr`` are file descriptors,
-        ``DEVNULL`` or ``None`` (inherit). ``new_process_group`` puts the child in its own
-        process group (headless ``claude``, hooks); otherwise it stays in ours (interactive
-        ``claude`` in the terminal's foreground group)."""
+        """Start without waiting. Streams are file descriptors, ``DEVNULL`` or ``INHERIT``;
+        ``stdin`` defaults to ``DEVNULL``, ``stdout``/``stderr`` to inheriting (``None``).
+        ``new_process_group`` puts the child in its own process group (headless ``claude``);
+        otherwise it stays in ours (interactive ``claude`` in the terminal's foreground group).
+
+        ``die_with_parent`` uses ``preexec_fn``, which is not safe while other threads run:
+        spawn such children before starting worker threads where possible. The child resets
+        SIGTERM to its default action and unblocks it, so the death signal works even when
+        this process ignores SIGTERM; any other ignored (``SIG_IGN``) signal is inherited
+        across exec, so callers install no-op handlers instead of ``SIG_IGN``. Raises
+        ``OSError`` when the program cannot be started (including a failed ``prctl``)."""
         ...
 
 
@@ -128,11 +170,26 @@ def check_argv(
     env: Mapping[str, str] | None,
     extra_env: Mapping[str, str] | None,
 ) -> None:
-    """The call contract shared by the real gateway and its fakes."""
-    if not argv or not os.path.isabs(argv[0]):
-        raise ValueError(f"gateway needs an absolute executable path, got {list(argv)!r}")
+    """The call contract shared by the real gateway and its fakes. Error messages name only
+    ``argv[0]``: later arguments may carry secrets."""
+    if isinstance(argv, str | bytes | bytearray):
+        raise TypeError("gateway argv must be a sequence of strings, not a single string")
+    if not argv:
+        raise ValueError("gateway needs an argv, got an empty one")
+    if not isinstance(argv[0], str) or not os.path.isabs(argv[0]):
+        raise ValueError(f"gateway needs an absolute executable path, got {argv[0]!r}")
     if env is not None and extra_env is not None:
         raise ValueError("pass either env or extra_env, not both")
+
+
+def check_kill_grace(kill_grace: float | None, *, new_process_group: bool) -> None:
+    """``run``'s ``kill_grace`` contract, shared with the fakes."""
+    if kill_grace is None:
+        return
+    if not new_process_group:
+        raise ValueError("kill_grace needs new_process_group (it applies to the group)")
+    if kill_grace < 0:
+        raise ValueError(f"kill_grace must not be negative, got {kill_grace}")
 
 
 def _child_env(
@@ -141,28 +198,93 @@ def _child_env(
     if env is not None:
         return dict(env)
     base = dict(os.environ)
+    base.update(extra_env or {})
     if "PATH" in base:
         base["PATH"] = sanitize_path(base["PATH"])
-    base.update(extra_env or {})
     return base
 
 
-def _pdeathsig_preexec() -> Callable[[], None] | None:
-    """A ``preexec_fn`` setting ``PR_SET_PDEATHSIG(SIGTERM)``, or ``None`` off Linux."""
-    if not sys.platform.startswith("linux"):
-        return None
+def _stream(value: int | Inherit | None) -> int | None:
+    return None if value is Inherit.INHERIT else value
+
+
+@dataclass(frozen=True)
+class _Libc:
+    prctl: Callable[..., int]
+    signal: Callable[..., object]
+    get_errno: Callable[[], int]
+
+
+def _prctl() -> Callable[..., int]:
     import ctypes  # lazy: keeps the hook-event import path light
 
-    prctl = ctypes.CDLL(None, use_errno=True).prctl  # resolved before the fork
-    parent = os.getpid()
+    return ctypes.CDLL(None, use_errno=True).prctl
+
+
+def _libc() -> _Libc:
+    import ctypes
+
+    libc_signal = ctypes.CDLL(None).signal
+    libc_signal.restype = ctypes.c_void_p
+    libc_signal.argtypes = (ctypes.c_int, ctypes.c_void_p)
+    return _Libc(_prctl(), libc_signal, ctypes.get_errno)
+
+
+def _pdeathsig_preexec(parent: int | None = None) -> Callable[[], None] | None:
+    """A ``preexec_fn`` setting ``PR_SET_PDEATHSIG(SIGTERM)``, or ``None`` off Linux.
+
+    ``parent`` is the PID the child must see as its parent (default: this process)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    libc = _libc()  # resolved before the fork
+    expected = os.getpid() if parent is None else parent
 
     def preexec() -> None:
-        if prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
-            raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
-        if os.getppid() != parent:  # the parent died before the flag was set
-            os.kill(os.getpid(), signal.SIGTERM)
+        # An inherited SIG_IGN or blocked SIGTERM would make the death signal a no-op.
+        libc.signal(signal.SIGTERM, _SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+        if libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+            raise OSError(libc.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+        if os.getppid() != expected:  # the parent died before the flag was set
+            os._exit(PARENT_GONE_EXIT)
 
     return preexec
+
+
+def _wait_exited_unreaped(pid: int, seconds: float) -> None:
+    """Wait up to ``seconds`` for ``pid`` to exit, leaving it unreaped (so its PID, which is
+    the process group ID, stays ours). Without ``os.waitid`` (macOS) it waits the full time."""
+    waitid = getattr(os, "waitid", None)
+    deadline = time.monotonic() + seconds
+    while (remaining := deadline - time.monotonic()) > 0:
+        if waitid is not None:
+            try:
+                if waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None:
+                    return
+            except ChildProcessError:
+                return
+        time.sleep(min(_GRACE_POLL, remaining))
+
+
+def _signal_group(popen: subprocess.Popen[str], sig: int) -> None:
+    if popen.returncode is not None:  # leader reaped: its PID may name another group now
+        return
+    try:
+        os.killpg(popen.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _end(popen: subprocess.Popen[str], *, group: bool, kill_grace: float | None) -> None:
+    """End a ``run`` child (see ``GatewayTimeout``) and reap it."""
+    if group:
+        if kill_grace is not None:
+            _signal_group(popen, signal.SIGTERM)
+            _wait_exited_unreaped(popen.pid, kill_grace)
+        _signal_group(popen, signal.SIGKILL)
+    else:
+        popen.kill()
+    popen.wait()
 
 
 class _PopenChild:
@@ -198,26 +320,33 @@ class SystemGateway:
         cwd: str | None = None,
         stdin: str | None = None,
         timeout: float | None = None,
+        new_process_group: bool = False,
+        kill_grace: float | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env)
+        check_kill_grace(kill_grace, new_process_group=new_process_group)
         args = tuple(argv)
-        try:
-            proc = subprocess.run(
-                args,
-                input=stdin,
-                stdin=DEVNULL if stdin is None else None,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=_child_env(env, extra_env),
-                cwd=cwd,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            raise GatewayTimeout(args, timeout) from None
-        return Result(args, proc.returncode, proc.stdout, proc.stderr)
+        with subprocess.Popen(
+            args,
+            stdin=DEVNULL if stdin is None else subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_child_env(env, extra_env),
+            cwd=cwd,
+            process_group=0 if new_process_group else None,
+        ) as popen:
+            try:
+                out, err = popen.communicate(stdin, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _end(popen, group=new_process_group, kill_grace=kill_grace)
+                raise GatewayTimeout(args, timeout) from None
+            except BaseException:
+                _end(popen, group=new_process_group, kill_grace=None)
+                raise
+        return Result(args, popen.returncode, out, err)
 
     def spawn(
         self,
@@ -226,21 +355,24 @@ class SystemGateway:
         env: Mapping[str, str] | None = None,
         extra_env: Mapping[str, str] | None = None,
         cwd: str | None = None,
-        stdin: int | None = None,
-        stdout: int | None = None,
-        stderr: int | None = None,
+        stdin: int | Inherit = DEVNULL,
+        stdout: int | Inherit | None = None,
+        stderr: int | Inherit | None = None,
         new_process_group: bool = False,
         die_with_parent: bool = False,
     ) -> Child:
         check_argv(argv, env=env, extra_env=extra_env)
-        popen = subprocess.Popen(
-            tuple(argv),
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-            env=_child_env(env, extra_env),
-            cwd=cwd,
-            process_group=0 if new_process_group else None,
-            preexec_fn=_pdeathsig_preexec() if die_with_parent else None,
-        )
+        try:
+            popen = subprocess.Popen(
+                tuple(argv),
+                stdin=_stream(stdin),
+                stdout=_stream(stdout),
+                stderr=_stream(stderr),
+                env=_child_env(env, extra_env),
+                cwd=cwd,
+                process_group=0 if new_process_group else None,
+                preexec_fn=_pdeathsig_preexec() if die_with_parent else None,
+            )
+        except subprocess.SubprocessError as exc:  # preexec_fn failed in the child
+            raise OSError(f"could not start {argv[0]!r}: {exc}") from exc
         return _PopenChild(popen)

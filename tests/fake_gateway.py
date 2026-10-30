@@ -2,9 +2,14 @@
 
 Every later stage injects this where production code takes a ``Gateway``: register expected
 commands with ``on()``, run the code under test, then inspect ``calls``. An unexpected command
-fails loudly. ``spawn`` returns a scripted ``FakeChild`` unless the fake was built with
-``spawn_via`` (normally a ``SystemGateway``), which really starts the program (for example the
-fake ``claude`` in ``tests/fakebin``) and still records the call.
+fails loudly. ``run`` is always answered from ``on()`` rules (it never starts a program).
+``spawn`` returns a scripted ``FakeChild`` unless the fake was built with ``spawn_via``
+(normally a ``SystemGateway``), which really starts the program (for example the fake
+``claude`` in ``tests/fakebin``) and still records the call.
+
+A rule holds one response, or a list consumed one per matching call (the last one repeats), so
+a polling test can script, say, "alive, alive, gone". With ``clock``, a scripted child's
+``wait(timeout)`` on a still-running child advances that clock by ``timeout``.
 """
 
 from __future__ import annotations
@@ -12,7 +17,18 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
-from claude_session.gateway import Child, Gateway, GatewayTimeout, Result, check_argv
+from claude_session.gateway import (
+    DEVNULL,
+    Child,
+    Gateway,
+    GatewayTimeout,
+    Inherit,
+    Result,
+    check_argv,
+    check_kill_grace,
+)
+
+from .fake_clock import FakeClock
 
 # Above the largest Linux pid_max (2**22), so a fake PID can never name a real process.
 FAKE_PID_BASE = 2**22 + 1
@@ -27,30 +43,49 @@ class Call:
     env: Mapping[str, str] | None = None
     extra_env: Mapping[str, str] | None = None
     cwd: str | None = None
-    stdin: str | int | None = None
+    stdin: str | int | Inherit | None = None  # run: the text; spawn: the stream
     timeout: float | None = None
     new_process_group: bool = False
     die_with_parent: bool = False
+    stdout: int | Inherit | None = None  # spawn only
+    stderr: int | Inherit | None = None  # spawn only
+    kill_grace: float | None = None  # run only
+
+
+@dataclass(frozen=True)
+class Response:
+    """One scripted answer. ``timeout``: ``run`` raises ``GatewayTimeout``, a spawned child
+    keeps running. ``error``: the call raises it."""
+
+    returncode: int = 0
+    stdout: str = ""
+    stderr: str = ""
+    timeout: bool = False
+    error: OSError | None = None
 
 
 @dataclass
 class _Rule:
     prefix: tuple[str, ...]
-    returncode: int
-    stdout: str
-    stderr: str
-    timeout: bool
-    error: OSError | None
+    responses: list[Response]
+    used: int = 0
+
+    def next(self) -> Response:
+        response = self.responses[min(self.used, len(self.responses) - 1)]
+        self.used += 1
+        return response
 
 
 @dataclass
 class FakeChild:
     """A scripted child: ``poll``/``wait`` report ``returncode`` once ``exit()`` was called (or
-    at once when built with one); signals are recorded, never sent."""
+    at once when built with one); signals are recorded, never sent. With a ``clock``, waiting
+    on a running child advances it by the timeout, as a real wait would take that long."""
 
     pid: int
     returncode: int | None = None
     signals: list[int] = field(default_factory=list)
+    clock: FakeClock | None = None
 
     def exit(self, returncode: int) -> None:
         self.returncode = returncode
@@ -59,7 +94,8 @@ class FakeChild:
         return self.returncode
 
     def wait(self, timeout: float | None = None) -> int | None:
-        del timeout
+        if self.returncode is None and self.clock is not None and timeout is not None:
+            self.clock.advance(timeout)
         return self.returncode
 
     def send_signal(self, sig: int) -> None:
@@ -69,11 +105,12 @@ class FakeChild:
 class FakeGateway:
     """Records calls and answers them from rules registered with ``on()``."""
 
-    def __init__(self, *, spawn_via: Gateway | None = None) -> None:
+    def __init__(self, *, spawn_via: Gateway | None = None, clock: FakeClock | None = None) -> None:
         self.calls: list[Call] = []
         self.children: list[FakeChild] = []
         self._rules: list[_Rule] = []
         self._spawn_via = spawn_via
+        self._clock = clock
 
     def on(
         self,
@@ -84,15 +121,26 @@ class FakeGateway:
         stderr: str = "",
         timeout: bool = False,
         error: OSError | None = None,
+        responses: Sequence[Response] | None = None,
     ) -> None:
-        """Answer commands whose argv starts with ``prefix``. The most recent matching rule wins,
-        so a test can override a fixture's default."""
-        self._rules.append(_Rule(tuple(prefix), returncode, stdout, stderr, timeout, error))
+        """Answer commands whose argv starts with ``prefix``, with one response (the keyword
+        arguments) or ``responses`` in order (the last repeats). The most recent matching rule
+        wins, so a test can override a fixture's default."""
+        single = Response(returncode, stdout, stderr, timeout, error)
+        if responses is None:
+            scripted = [single]
+        elif single != Response():
+            raise ValueError("pass either responses or a single response, not both")
+        elif not responses:
+            raise ValueError("responses must not be empty")
+        else:
+            scripted = list(responses)
+        self._rules.append(_Rule(tuple(prefix), scripted))
 
-    def _match(self, argv: tuple[str, ...]) -> _Rule:
+    def _answer(self, argv: tuple[str, ...]) -> Response:
         for rule in reversed(self._rules):
             if argv[: len(rule.prefix)] == rule.prefix:
-                return rule
+                return rule.next()
         raise AssertionError(f"FakeGateway: unexpected command {list(argv)}")
 
     def run(
@@ -104,16 +152,31 @@ class FakeGateway:
         cwd: str | None = None,
         stdin: str | None = None,
         timeout: float | None = None,
+        new_process_group: bool = False,
+        kill_grace: float | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env)
+        check_kill_grace(kill_grace, new_process_group=new_process_group)
         args = tuple(argv)
-        self.calls.append(Call("run", args, env, extra_env, cwd, stdin, timeout))
-        rule = self._match(args)
-        if rule.error is not None:
-            raise rule.error
-        if rule.timeout:
+        self.calls.append(
+            Call(
+                "run",
+                args,
+                env=env,
+                extra_env=extra_env,
+                cwd=cwd,
+                stdin=stdin,
+                timeout=timeout,
+                new_process_group=new_process_group,
+                kill_grace=kill_grace,
+            )
+        )
+        response = self._answer(args)
+        if response.error is not None:
+            raise response.error
+        if response.timeout:
             raise GatewayTimeout(args, timeout)
-        return Result(args, rule.returncode, rule.stdout, rule.stderr)
+        return Result(args, response.returncode, response.stdout, response.stderr)
 
     def spawn(
         self,
@@ -122,9 +185,9 @@ class FakeGateway:
         env: Mapping[str, str] | None = None,
         extra_env: Mapping[str, str] | None = None,
         cwd: str | None = None,
-        stdin: int | None = None,
-        stdout: int | None = None,
-        stderr: int | None = None,
+        stdin: int | Inherit = DEVNULL,
+        stdout: int | Inherit | None = None,
+        stderr: int | Inherit | None = None,
         new_process_group: bool = False,
         die_with_parent: bool = False,
     ) -> Child:
@@ -134,13 +197,14 @@ class FakeGateway:
             Call(
                 "spawn",
                 args,
-                env,
-                extra_env,
-                cwd,
-                stdin,
-                None,
-                new_process_group,
-                die_with_parent,
+                env=env,
+                extra_env=extra_env,
+                cwd=cwd,
+                stdin=stdin,
+                new_process_group=new_process_group,
+                die_with_parent=die_with_parent,
+                stdout=stdout,
+                stderr=stderr,
             )
         )
         if self._spawn_via is not None:
@@ -155,11 +219,11 @@ class FakeGateway:
                 new_process_group=new_process_group,
                 die_with_parent=die_with_parent,
             )
-        rule = self._match(args)
-        if rule.error is not None:
-            raise rule.error
-        child = FakeChild(FAKE_PID_BASE + len(self.children))
-        if not rule.timeout:
-            child.exit(rule.returncode)
+        response = self._answer(args)
+        if response.error is not None:
+            raise response.error
+        child = FakeChild(FAKE_PID_BASE + len(self.children), clock=self._clock)
+        if not response.timeout:
+            child.exit(response.returncode)
         self.children.append(child)
         return child
