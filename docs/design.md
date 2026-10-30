@@ -221,9 +221,10 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 | `toolhooks` | Runs `pre-launch` and `post-state-change` hooks (`sh -c`, own process group, timeouts with SIGTERM to the group, `kill_grace`, SIGKILL to the group; selectors; outcome rules). |
 | `transcripts` | Claude Code transcript layout and rendering. |
 | `reconcile` | Liveness repair for all sessions, salvage, retention sweep. |
-| `procinfo` | Process start time and liveness (Linux `/proc/<pid>/stat`, macOS `ps -o lstart= -p`). |
-| `gateway` | The only module that starts subprocesses: `claude`, `git`, the notes command, sandbox prerequisite checks, `crontab`. Standard library only; runs every child with an absolute path, the sanitized `PATH` and, on Linux, `PR_SET_PDEATHSIG(SIGTERM)` for headless `claude`. Tests replace it. |
+| `procinfo` | Process start time and liveness (Linux `/proc/<pid>/stat`, macOS `ps -o lstart= -p`). A start time is an opaque token compared only for equality (Linux: boot id plus start ticks; macOS: `lstart` with `LC_ALL=C` and `TZ=UTC`); a zombie counts as dead. |
+| `gateway` | The only module that starts subprocesses: `claude`, `git`, the notes command, sandbox prerequisite checks, `crontab`, and `ps` for `procinfo` on macOS. Standard library only; runs every child with an absolute path, the sanitized `PATH` and, on Linux, `PR_SET_PDEATHSIG(SIGTERM)` for headless `claude`. Tests replace it. |
 | `audit`, `logs` | `audit.jsonl` and `log.jsonl` writers. |
+| `clock` | Standard library only: the injectable clock (UTC wall time, monotonic time, sleep); tests drive time with a fake. |
 | `fsutil` | Standard library only: atomic private-file writes (temporary file plus rename relative to a parent-directory descriptor opened with `O_NOFOLLOW`, mode 0600), used for `--outcome-file`. |
 
 ### Session directories
