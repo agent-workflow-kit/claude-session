@@ -143,7 +143,7 @@
                 "const": "none"
               }
             ],
-            "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). null or 'none': no bound."
+            "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). A text value so small that it underflows to zero (e.g. '0.' then hundreds of zeros then '1s') matches the pattern but is refused by the loader. null or 'none': no bound."
           },
           "interactive_timeout": {
             "anyOf": [
@@ -163,7 +163,7 @@
                 "const": "none"
               }
             ],
-            "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). null or 'none': no bound."
+            "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). A text value so small that it underflows to zero (e.g. '0.' then hundreds of zeros then '1s') matches the pattern but is refused by the loader. null or 'none': no bound."
           },
           "max_turns": {
             "type": [
@@ -188,8 +188,8 @@
               "null"
             ],
             "minLength": 1,
-            "pattern": "^[^\u0000-\u001f\u007f-\u009f]+$",
-            "description": "When set: non-empty, no control characters (C0, DEL or C1)."
+            "pattern": "^[^-\u0000-\u001f\u007f-\u009f][^\u0000-\u001f\u007f-\u009f]*$",
+            "description": "When set: non-empty, no control characters (C0, DEL or C1), and not starting with '-' (it is passed as claude --model <value>)."
           },
           "claude_args": {
             "type": "array",
@@ -267,7 +267,8 @@
           "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)[0-9]+(\\.[0-9]+)?(ms|s|m|h|d)$"
         }
       ],
-      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not)."
+      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). A text value so small that it underflows to zero (e.g. '0.' then hundreds of zeros then '1s') matches the pattern but is refused by the loader.",
+      "default": "5s"
     },
     "notes_context_max_bytes": {
       "type": "integer",
@@ -330,7 +331,8 @@
           "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)[0-9]+(\\.[0-9]+)?(ms|s|m|h|d)$"
         }
       ],
-      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not)."
+      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). A text value so small that it underflows to zero (e.g. '0.' then hundreds of zeros then '1s') matches the pattern but is refused by the loader.",
+      "default": "10m"
     },
     "auto_exit_delay": {
       "anyOf": [
@@ -344,7 +346,8 @@
           "pattern": "^[0-9]+(\\.[0-9]+)?(ms|s|m|h|d)$"
         }
       ],
-      "description": "Seconds as a non-negative number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not)."
+      "description": "Seconds as a non-negative number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not).",
+      "default": "2s"
     },
     "kill_grace": {
       "anyOf": [
@@ -358,7 +361,8 @@
           "pattern": "^[0-9]+(\\.[0-9]+)?(ms|s|m|h|d)$"
         }
       ],
-      "description": "Seconds as a non-negative number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not)."
+      "description": "Seconds as a non-negative number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not).",
+      "default": "10s"
     },
     "poll_interval": {
       "anyOf": [
@@ -372,7 +376,8 @@
           "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)[0-9]+(\\.[0-9]+)?(ms|s|m|h|d)$"
         }
       ],
-      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not)."
+      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). A text value so small that it underflows to zero (e.g. '0.' then hundreds of zeros then '1s') matches the pattern but is refused by the loader.",
+      "default": "0.5s"
     },
     "session_start_timeout": {
       "anyOf": [
@@ -386,7 +391,7 @@
           "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)[0-9]+(\\.[0-9]+)?(ms|s|m|h|d)$"
         }
       ],
-      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). Headless runs: when no SessionStart arrives within it, exec logs a warning and adds it to warnings (injected hooks may be suppressed by disableAllHooks or managed-only hooks).",
+      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). A text value so small that it underflows to zero (e.g. '0.' then hundreds of zeros then '1s') matches the pattern but is refused by the loader. Headless runs: when no SessionStart arrives within it, exec logs a warning and adds it to warnings (injected hooks may be suppressed by disableAllHooks or managed-only hooks).",
       "default": "120s"
     },
     "hooks": {
@@ -412,7 +417,7 @@
                     "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)[0-9]+(\\.[0-9]+)?(ms|s|m|h|d)$"
                   }
                 ],
-                "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). Default 30s. On timeout the hook's process group gets SIGTERM, then SIGKILL after kill_grace. Gate hooks need an explicit longer timeout.",
+                "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). A text value so small that it underflows to zero (e.g. '0.' then hundreds of zeros then '1s') matches the pattern but is refused by the loader. Default 30s. On timeout the hook's process group gets SIGTERM, then SIGKILL after kill_grace. Gate hooks need an explicit longer timeout.",
                 "default": "30s"
               },
               "kinds": {
@@ -468,7 +473,7 @@
                     "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)[0-9]+(\\.[0-9]+)?(ms|s|m|h|d)$"
                   }
                 ],
-                "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). Default 30s. On timeout the hook's process group gets SIGTERM, then SIGKILL after kill_grace. Gate hooks need an explicit longer timeout.",
+                "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). A text value so small that it underflows to zero (e.g. '0.' then hundreds of zeros then '1s') matches the pattern but is refused by the loader. Default 30s. On timeout the hook's process group gets SIGTERM, then SIGKILL after kill_grace. Gate hooks need an explicit longer timeout.",
                 "default": "30s"
               },
               "async": {
@@ -625,7 +630,7 @@
                       "const": "none"
                     }
                   ],
-                  "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). null or 'none': no bound."
+                  "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). A text value so small that it underflows to zero (e.g. '0.' then hundreds of zeros then '1s') matches the pattern but is refused by the loader. null or 'none': no bound."
                 },
                 "max_turns": {
                   "type": [
@@ -641,8 +646,8 @@
                     "null"
                   ],
                   "minLength": 1,
-                  "pattern": "^[^\u0000-\u001f\u007f-\u009f]+$",
-                  "description": "When set: non-empty, no control characters (C0, DEL or C1)."
+                  "pattern": "^[^-\u0000-\u001f\u007f-\u009f][^\u0000-\u001f\u007f-\u009f]*$",
+                  "description": "When set: non-empty, no control characters (C0, DEL or C1), and not starting with '-' (it is passed as claude --model <value>)."
                 }
               },
               "required": [],

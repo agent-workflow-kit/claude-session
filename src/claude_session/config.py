@@ -48,7 +48,7 @@ DROPIN_SUFFIX = ".yaml"
 MAX_FILE_BYTES = 1 << 20
 MAX_NODES = 100_000  # with aliases expanded
 MAX_DEPTH = 64
-MAX_INTEGER = (1 << 53) - 1  # every integer key (JSON's exact-integer range)
+MAX_INTEGER = defaults.MAX_INTEGER  # every integer key (JSON's exact-integer range)
 MAX_RETENTION_DAYS = 36500
 
 # Grammars (interface.md, Identifiers). TODO(#5): use the ids grammars.
@@ -128,6 +128,13 @@ def _integral(value: Any) -> Any:
     return value
 
 
+def _no_leading_dash(value: str) -> str:
+    """``model`` is passed as ``claude --model <value>``: a leading ``-`` reads as an option."""
+    if value.startswith("-"):
+        raise ValueError("must not start with '-'")
+    return value
+
+
 def _no_controls(value: str) -> str:
     """Non-empty, no C0, DEL or C1 control characters (``claude_bin``, ``model``)."""
     if not value or any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
@@ -174,7 +181,7 @@ Bytes = Annotated[int, Integral, Field(ge=1, le=MAX_INTEGER)]
 Count = Annotated[int, Integral, Field(ge=0, le=MAX_INTEGER)]
 Days = Annotated[int, Integral, Field(ge=0, le=MAX_RETENTION_DAYS)]
 Turns = Annotated[int, Integral, Field(ge=1, le=MAX_INTEGER)]
-Model = Annotated[str, AfterValidator(_no_controls)]
+Model = Annotated[str, AfterValidator(_no_controls), AfterValidator(_no_leading_dash)]
 EnvSet = Annotated[dict[str, str], AfterValidator(_no_reserved)]
 SettingSources = Annotated[list[Literal["user", "project", "local"]], AfterValidator(_unique)]
 Sandbox = Literal["required", "preferred", "off"]
@@ -371,7 +378,7 @@ def load(
     its ``config.d/`` drop-ins. With ``path`` (``--config``): only that file, which must exist
     unless ``required`` is false.
 
-    TODO(#15): commands do not pass the parsed ``--config`` to ``load`` yet.
+    TODO(#9): pass --config into config.load
     TODO(#28): ``start`` also needs the absolute config path used and a ``config_hash``.
     """
     env = os.environ if env is None else env
@@ -477,7 +484,10 @@ class _Loader(_BaseLoader):  # pyright: ignore[reportGeneralTypeIssues]
         except yaml.YAMLError:
             raise
         except Exception:  # e.g. !!bool x (KeyError), !!int '' (IndexError), 5000-digit ints
-            raise _Refused("invalid value", node.start_mark) from None
+            pass
+        # Raised outside the handler: the original exception (it may quote the value) must not
+        # become its ``__context__``.
+        raise _Refused("invalid value", node.start_mark)
 
     def flatten_mapping(self, node: yaml.MappingNode) -> None:
         for key_node, _ in node.value:
@@ -549,10 +559,17 @@ def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
     raw = _read_bytes(path, required=required)
     if raw is None:
         return None
+    # Errors are raised after the handlers, so the original exception (which may hold or quote
+    # the file's content) is never their ``__context__``.
+    problem: str | None = None
+    text = ""
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise UsageError("invalid config", detail=f"{path}: not UTF-8 ({exc.reason})") from None
+        problem = f"{path}: not UTF-8 ({exc.reason})"
+    if problem is not None:
+        raise UsageError("invalid config", detail=problem)
+    data: Any = None
     try:
         _check_nesting(text, path)
         data = yaml.load(text, Loader=_Loader)  # noqa: S506 (a safe loader)
@@ -562,11 +579,13 @@ def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
         if mark is not None:
             where = f" at line {mark.line + 1}, column {mark.column + 1}"
         # Parser and constructor messages may quote the file: report a fixed phrase only.
-        raise UsageError("invalid config", detail=f"{path}{where}: {_problem(exc)}") from None
+        problem = f"{path}{where}: {_problem(exc)}"
     except UsageError:
         raise
     except Exception:  # never an internal error, never the original (possibly quoting) text
-        raise UsageError("invalid config", detail=f"{path}: invalid YAML") from None
+        problem = f"{path}: invalid YAML"
+    if problem is not None:
+        raise UsageError("invalid config", detail=problem)
     if data is None:
         return {}
     if isinstance(data, _Unsupported):
@@ -752,11 +771,13 @@ def _apply_env(raw: dict[str, Any], env: Mapping[str, str]) -> dict[str, str]:
         if env[var] == "":
             detail = f"{key}: must not be empty (in environment variable {var})"
             raise UsageError("invalid config", detail=detail)
+        problem: str | None = None
         try:
             raw[key] = convert(env[var])
         except ValueError as exc:
-            detail = f"{key}: {exc} (in environment variable {var})"
-            raise UsageError("invalid config", detail=detail) from None
+            problem = f"{key}: {exc} (in environment variable {var})"
+        if problem is not None:  # raised outside the handler: no ``__context__``
+            raise UsageError("invalid config", detail=problem)
         applied[key] = var
     return applied
 
@@ -820,7 +841,9 @@ def _validate[M: BaseModel](
         return model.model_validate(data, context={"bare": bare})
     except ValidationError as exc:
         problems = [_describe(error, source) for error in exc.errors()]
-        raise UsageError("invalid config", detail="; ".join(problems)) from None
+    # Raised outside the handler: the ValidationError (it holds the input values) must not become
+    # its ``__context__``.
+    raise UsageError("invalid config", detail="; ".join(problems))
 
 
 def _describe(error: Any, source: Callable[[tuple[str | int, ...]], str]) -> str:

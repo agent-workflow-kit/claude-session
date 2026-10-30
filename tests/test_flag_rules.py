@@ -69,7 +69,11 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     (["wait", SID, "--timeout", "0"], "--timeout must be positive"),
     (["wait", SID, "--timeout", "0ms"], "--timeout must be positive"),
     # bounds
-    (["exec", "--max-turns", "0"], "--max-turns must be at least 1"),
+    (["exec", "--max-turns", "0"], "--max-turns must be between 1 and 9007199254740991"),
+    (
+        ["exec", "--max-turns", "9007199254740992"],
+        "--max-turns must be between 1 and 9007199254740991",
+    ),
     (["list", "--limit", "0"], "--limit must be at least 1"),
     (["cron", "install", "--interval", "0"], "--interval must be between 1 and 59"),
     (["cron", "install", "--interval", "60"], "--interval must be between 1 and 59"),
@@ -134,6 +138,7 @@ ALLOWED: list[list[str]] = [
     ["exec", "--setting-sources", "user,project,local"],
     ["exec", "--input-file", "a/x.txt", "--input-file", "a/y.txt"],
     ["exec", "--max-turns", "1"],
+    ["exec", "--max-turns", "9007199254740991"],
     ["start", "--json", "--resume", SID, "--mode", "headless"],
     ["start", "--json", "--resume", SID, "--reset", "model", "--kind", "review"],
     ["resume", SID, "--fork", "--allow-tainted"],

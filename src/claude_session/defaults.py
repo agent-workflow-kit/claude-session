@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
+# Largest value of every integer setting (JSON's exact-integer range, 2^53 - 1): the integer
+# config keys and ``--max-turns`` (interface.md, Config and Launch flags).
+MAX_INTEGER = (1 << 53) - 1
+
 
 def _env(*, inherit: bool, set_: dict[str, str] | None = None) -> dict[str, Any]:
     return {"inherit": inherit, "allow": [], "set": set_ or {}, "path_prepend": []}

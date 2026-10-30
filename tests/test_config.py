@@ -434,6 +434,9 @@ INVALID: list[tuple[str, str]] = [
     ('kinds: {implement: {model: "a\\x7f"}}\n', "kinds.implement.model"),
     ('kinds: {implement: {model: "a\\x85b"}}\n', "kinds.implement.model"),
     ('repos: {example.com/x: {kinds: {respond: {model: "\\tm"}}}}\n', "model"),
+    ("kinds: {implement: {model: -x}}\n", "kinds.implement.model"),
+    ("kinds: {implement: {model: --dangerously-skip-permissions}}\n", "kinds.implement.model"),
+    ("repos: {example.com/x: {kinds: {respond: {model: '-m'}}}}\n", "model"),
     ("- a list\n", "top level"),
 ]
 
@@ -474,6 +477,8 @@ VALID = [
     "notes_context_max_bytes: 9007199254740991\n",
     "kinds: {implement: {max_turns: 9007199254740991, model: claude-x.1}}\n",
     "repos: {example.com/x: {kinds: {respond: {max_turns: 9007199254740991, model: m}}}}\n",
+    # a model may contain a dash, just not start with one
+    "kinds: {implement: {model: m-1}}\n",
     # a quoted merge key is an ordinary key
     "me: {'<<': x}\n",
 ]
@@ -1244,3 +1249,92 @@ def test_flag_model_refuses_control_characters(cfg_dir: Path, value: str) -> Non
 def test_model_null_is_still_accepted(cfg_dir: Path) -> None:
     write(cfg_dir / "config.yaml", "kinds: {implement: {model: null}}\n")
     assert load(cfg_dir).kinds["implement"].model is None
+
+
+# Leading dash in model (it is passed as claude --model <value>)
+
+
+def test_flags_refuse_a_model_with_a_leading_dash(cfg_dir: Path) -> None:
+    kind = load(cfg_dir).kinds["implement"]
+    with pytest.raises(UsageError) as info:
+        config.with_flags(kind, model="-x")
+    assert "model" in str(info.value.detail)
+    assert config.with_flags(kind, model="m-1").model == "m-1"
+
+
+# Offending values never reach the exception chain
+
+SENTINEL = "secretx"
+
+
+def _chain(error: BaseException) -> list[BaseException]:
+    seen: list[BaseException] = []
+    pending: list[BaseException | None] = [error]
+    while pending:
+        current = pending.pop()
+        if current is None or any(current is s for s in seen):
+            continue
+        seen.append(current)
+        pending += [current.__cause__, current.__context__]
+    return seen
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"kinds: {{implement: {{sandbox: !!bool {SENTINEL}}}}}\n",  # KeyError in the constructor
+        f"summary_max_bytes: {SENTINEL}\n",  # pydantic error with input_value
+        f"kinds: {{implement: {{model: '-{SENTINEL}'}}}}\n",
+        f"kinds: {{implement: [{SENTINEL}\n",  # YAML syntax error
+        f"kill_grace: !!int {SENTINEL}\n",
+    ],
+)
+def test_offending_value_is_not_in_the_exception_chain(cfg_dir: Path, text: str) -> None:
+    write(cfg_dir / "config.yaml", text)
+    for error in _chain(invalid(cfg_dir)):
+        assert SENTINEL not in repr(error), type(error)
+        assert SENTINEL not in str(error), type(error)
+
+
+def test_offending_flag_value_is_not_in_the_exception_chain(cfg_dir: Path) -> None:
+    kind = load(cfg_dir).kinds["implement"]
+    with pytest.raises(UsageError) as info:
+        config.with_flags(kind, timeout=SENTINEL)
+    for error in _chain(info.value):
+        assert SENTINEL not in repr(error), type(error)
+
+
+def test_offending_env_value_is_not_in_the_exception_chain(cfg_dir: Path) -> None:
+    error = invalid(cfg_dir, {"CSESSION_RETENTION_DAYS": SENTINEL})
+    for link in _chain(error):
+        assert SENTINEL not in repr(link), type(link)
+
+
+# Drop-in selection
+
+
+def test_hidden_and_non_yaml_dropins_are_skipped(cfg_dir: Path) -> None:
+    for name in [".hidden.yaml", "x.yml", "x.yaml.bak", "x.json", "x"]:
+        write(cfg_dir / "config.d" / name, "kinds: {implement: [\n")
+    write(cfg_dir / "config.d" / "ok.yaml", "kill_grace: 3s\n")
+    assert load(cfg_dir).kill_grace == 3.0
+
+
+# Schema defaults
+
+
+def test_schema_defaults_equal_the_example_file() -> None:
+    schema = schemas.registry().contents(CONFIG_SCHEMA)
+    example = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    for key, value in example.items():
+        if isinstance(value, dict):
+            continue  # maps (kinds, hooks, ...) are documented by the example, not a default
+        assert "default" in schema["properties"][key], key
+    for key, prop in schema["properties"].items():
+        if "default" in prop:
+            assert prop["default"] == example[key], key
+
+
+def test_positive_duration_that_underflows_to_zero_is_refused(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "lost_grace: 0." + "0" * 400 + "1s\n")
+    assert "lost_grace" in str(invalid(cfg_dir).detail)
