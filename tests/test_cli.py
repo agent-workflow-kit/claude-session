@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import argparse
+import importlib.metadata
 import json
+import os
+import stat
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
@@ -9,16 +13,17 @@ from typing import Any
 import pytest
 
 from claude_session import __version__, cli
-from claude_session.cli import main
-from claude_session.errors import AmbiguousError, NotFoundError, UsageError
+from claude_session.cli import build_parser, main
+from claude_session.errors import AmbiguousError, NotFoundError, RefusedError, UsageError
 
 from .schemas import validate
 
 ROOT = Path(__file__).resolve().parent.parent
 GOLDEN = Path(__file__).resolve().parent / "golden"
 SID = "cs-abcd2345"
+ERROR_SCHEMA = "claude-session/cli/error.json"
 
-# One invocation per command, each with every flag interface.md lists for it.
+# One invocation per command form, together using every flag interface.md lists.
 FULL_INVOCATIONS: dict[str, list[str]] = {
     "exec": [
         "exec",
@@ -32,25 +37,27 @@ FULL_INVOCATIONS: dict[str, list[str]] = {
         *("--no-auto-exit", "--env-allow", "A", "--env-allowlist-only", "B"),
         *("--outcome-file", "/tmp/o.json", "--actor", "auto:test"),
         *("--decision-id", "d1", "--decision-id", "d2", "--dry-run"),
-        *("--json", "--config", "c.yaml", "--verbose", "--yes"),
+        *("--json", "--config", "c.yaml", "--verbose"),
     ],
     "exec-adopt": ["exec", "--session-id", SID, "--dry-run", "--outcome-file", "o", "--json"],
     "start": [
         "start",
         *("--kind", "implement", "--mode", "interactive", "--auto-exit", "--label", "a=b"),
-        *("--dry-run", "--json"),
+        *("--setting-sources", "user,project", "--dry-run", "--json"),
     ],
     "start-resume": [
         "start",
         *("--resume", SID, "--fork", "--reset", "model", "--reset", "sandbox"),
-        *("--allow-tainted", "--override-escalation", "--cwd", "/w", "--dry-run", "--json"),
+        *("--allow-tainted", "--cwd", "/w", "--dry-run", "--json"),
     ],
+    "start-resume-escalation": ["start", "--resume", SID, "--override-escalation", "--json"],
     "resume": [
         "resume",
         SID,
-        *("--fork", "--reset", "timeout", "--allow-tainted", "--override-escalation"),
+        *("--reset", "timeout", "--allow-tainted", "--override-escalation"),
         *("--kind", "review", "--outcome-file", "o", "--dry-run", "--json", "--quiet"),
     ],
+    "resume-fork": ["resume", SID, "--fork", "--cwd", "/w"],
     "stop": [
         "stop",
         SID,
@@ -111,8 +118,11 @@ PUBLIC_COMMANDS = {
     "export",
     "cron install",
     "cron uninstall",
-    "verify-secret",
 }
+
+
+def parse(argv: list[str]) -> argparse.Namespace:
+    return cli.parse(build_parser(), argv)
 
 
 def run_json(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, Any, str]:
@@ -121,11 +131,18 @@ def run_json(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, 
     return code, json.loads(captured.out), captured.err
 
 
-def raising(error: Exception) -> Callable[[Any], int]:
+def raising(error: BaseException) -> Callable[[Any], int]:
     def handler(args: Any) -> int:
         raise error
 
     return handler
+
+
+SENTINEL = 77
+
+
+def sentinel(args: argparse.Namespace) -> int:
+    return SENTINEL
 
 
 # --version
@@ -137,85 +154,193 @@ def test_version_prints_package_version(capsys: pytest.CaptureFixture[str]) -> N
     assert exc.value.code == 0
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert __version__ == pyproject["project"]["version"]
-    assert capsys.readouterr().out.strip() == f"claude-session {__version__}"
+    assert capsys.readouterr().out == f"claude-session {__version__}\n"
 
 
-def test_version_accepted_after_a_command(capsys: pytest.CaptureFixture[str]) -> None:
+def test_version_is_plain_text_after_a_command_with_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     with pytest.raises(SystemExit) as exc:
-        main(["list", "--version"])
+        main(["list", "--json", "--version"])
     assert exc.value.code == 0
-    assert capsys.readouterr().out.strip() == f"claude-session {__version__}"
+    assert capsys.readouterr().out == f"claude-session {__version__}\n"
+
+
+def test_version_metadata_is_read_only_when_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(name: str) -> str:
+        raise AssertionError("importlib.metadata.version called")
+
+    monkeypatch.setattr(importlib.metadata, "version", fail)
+    assert parse(["list"]).handler == "list"
+
+
+def test_version_falls_back_to_unknown(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def missing(name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", missing)
+    with pytest.raises(SystemExit):
+        main(["--version"])
+    assert capsys.readouterr().out == "claude-session unknown\n"
 
 
 # argparse surface
 
 
-def test_parser_has_every_public_command() -> None:
-    assert set(cli.HANDLERS) == PUBLIC_COMMANDS
+def test_handlers_cover_public_and_internal_commands() -> None:
+    assert set(cli.HANDLERS) == PUBLIC_COMMANDS | {"verify-secret"}
+    assert set(build_parser().leaves) == set(cli.HANDLERS)
+
+
+def test_help_lists_public_commands_only() -> None:
+    text = build_parser().format_help()
+    for name in ("exec", "list", "label", "cron", "reconcile"):
+        assert f"    {name} " in text
+    assert "verify-secret" not in text
+    assert "hook-event" not in text
 
 
 @pytest.mark.parametrize("name", sorted(FULL_INVOCATIONS))
-def test_every_documented_flag_parses(name: str, capsys: pytest.CaptureFixture[str]) -> None:
-    argv = FULL_INVOCATIONS[name]
-    # Stubs fail with `failed` (12); a parse error would be usage (2).
-    assert main(argv) == 12, capsys.readouterr().err
+def test_every_documented_flag_parses_and_passes_rules(name: str) -> None:
+    args = parse(FULL_INVOCATIONS[name])
+    cli.check_flag_rules(args)
+    assert args.handler in cli.HANDLERS
+
+
+def test_launch_flags_are_parsed_into_fields() -> None:
+    args = parse(FULL_INVOCATIONS["exec"])
+    assert args.kind == "review"
+    assert args.mode == "headless"
+    assert args.input_file == ["a.txt", "b.txt"]
+    assert args.plugin_dir == ["/p1", "/p2"]
+    assert args.label == ["a=b", "c="]
+    assert args.hook == ["pre-launch=true"]
+    assert args.hook_timeout == ["pre-launch=10s"]
+    assert args.max_turns == 5
+    assert args.setting_sources == ""
+    assert args.reads_third_party is True
+    assert args.auto_exit is False
+    assert args.env_allowlist_only == ["B"]
+    assert args.decision_id == ["d1", "d2"]
+    assert (args.dry_run, args.json, args.verbose, args.config) == (True, True, True, "c.yaml")
+
+
+def test_unset_launch_flags_are_none() -> None:
+    args = parse(["exec"])
+    assert (args.auto_exit, args.reads_third_party, args.max_turns, args.label) == (
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def test_resume_only_flags_are_parsed() -> None:
+    args = parse(FULL_INVOCATIONS["start-resume"])
+    assert (args.resume, args.fork, args.reset, args.allow_tainted) == (
+        SID,
+        True,
+        ["model", "sandbox"],
+        True,
+    )
+
+
+def test_nested_commands_and_positionals() -> None:
+    args = parse(FULL_INVOCATIONS["label-add"])
+    assert (args.handler, args.id, args.pairs) == ("label add", SID, ["a=b", "c=d"])
+    args = parse(FULL_INVOCATIONS["cron-install"])
+    assert (args.handler, args.interval, args.env_file) == ("cron install", 5, "/e")
+    args = parse(FULL_INVOCATIONS["list"])
+    assert args.state == ["working", "idle"]
+    assert args.report_status == ["done", "none"]
+
+
+def test_label_pairs_after_an_option_are_collected() -> None:
+    args = parse(["label", "add", SID, "a=b", "--dry-run", "c=d"])
+    assert (args.pairs, args.dry_run) == (["a=b", "c=d"], True)
 
 
 @pytest.mark.parametrize("name", sorted(FULL_INVOCATIONS))
-def test_yes_is_accepted_as_a_no_op(name: str, capsys: pytest.CaptureFixture[str]) -> None:
-    argv = [*FULL_INVOCATIONS[name], "--yes"]
-    without = main(FULL_INVOCATIONS[name])
-    first = capsys.readouterr()
-    assert main(argv) == without
-    second = capsys.readouterr()
-    assert (second.out, second.err) == (first.out, first.err)
-
-
-def test_yes_is_accepted_by_hook_event() -> None:
-    assert main(["hook-event", "--state-dir", "/nonexistent", "Stop", "--yes"]) == 0
+def test_yes_is_accepted_as_a_no_op(name: str) -> None:
+    without = vars(parse(FULL_INVOCATIONS[name]))
+    with_yes = vars(parse([*FULL_INVOCATIONS[name], "--yes"]))
+    assert with_yes.pop("yes") is True
+    assert without.pop("yes") is False
+    assert with_yes == without
 
 
 @pytest.mark.parametrize(
-    "argv",
+    ("argv", "message"),
     [
-        ["exec", "--reset", "model"],
-        ["exec", "--fork"],
-        ["exec", "--allow-tainted"],
-        ["exec", "--override-escalation"],
-        ["exec", "--mode", "batch"],
-        ["exec", "--max-turns", "many"],
-        ["list", "--state", "sleeping"],
-        ["list", "--report-status", "maybe"],
-        ["report", "finished", "--summary", "x"],
-        ["report", "done", "--summary", "x", "--summary-file", "f"],
-        ["transcript", SID, "--raw", "--paths"],
-        ["label", "add", SID],
-        ["label"],
-        ["cron"],
-        ["status"],
-        ["nonsense"],
-        [],
+        (["exec", "--reset", "model"], "unrecognized arguments: --reset model"),
+        (["exec", "--fork"], "unrecognized arguments: --fork"),
+        (["exec", "--allow-tainted"], "unrecognized arguments: --allow-tainted"),
+        (["exec", "--override-escalation"], "unrecognized arguments: --override-escalation"),
+        (["exec", "--mode", "batch"], "invalid choice: 'batch'"),
+        (["exec", "--max-turns", "many"], "invalid int value: 'many'"),
+        (["resume", SID, "--reset", "reads-third-party"], "invalid choice: 'reads-third-party'"),
+        (["list", "--state", "sleeping"], "invalid choice: 'sleeping'"),
+        (["list", "--report-status", "maybe"], "invalid choice: 'maybe'"),
+        (["report", "finished", "--summary", "x"], "invalid choice: 'finished'"),
+        (["report", "done", "--summary", "x", "--summary-file", "f"], "not allowed with"),
+        (["transcript", SID, "--raw", "--paths"], "not allowed with"),
+        (["label", "add", SID], "the following arguments are required: KEY=VALUE"),
+        (["label"], "the following arguments are required: <action>"),
+        (["cron"], "the following arguments are required: <action>"),
+        (["status"], "the following arguments are required: id"),
+        (["list", "--jso"], "unrecognized arguments: --jso"),
+        (["nonsense"], "invalid choice: 'nonsense'"),
+        ([], "the following arguments are required: <command>"),
     ],
 )
-def test_usage_errors_exit_2(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+def test_usage_errors_exit_2(
+    argv: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
     assert main(argv) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "claude-session" in captured.err
+    assert message in captured.err
 
 
-def test_abbreviated_flags_are_rejected(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["list", "--jso"]) == 2
-    assert capsys.readouterr().out == ""
+def test_unrecognized_arguments_show_the_command_usage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["status", SID, "--bogus"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("usage: claude-session status ")
 
 
-# Unimplemented commands
+# Dispatch
 
 
-def test_unimplemented_command_reports_failed(capsys: pytest.CaptureFixture[str]) -> None:
-    code, envelope, err = run_json(["list", "--json"], capsys)
-    assert code == 12
-    validate(envelope, "claude-session/cli/error.json")
+def test_handler_return_code_is_the_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(cli.HANDLERS, "kinds", sentinel)
+    assert main(["kinds", "--json"]) == SENTINEL
+
+
+def test_json_after_double_dash_is_a_positional(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: list[str] = []
+
+    def handler(args: argparse.Namespace) -> int:
+        seen.append(args.id)
+        assert args.json is False
+        return SENTINEL
+
+    monkeypatch.setitem(cli.HANDLERS, "status", handler)
+    assert main(["status", "--", "--json"]) == SENTINEL
+    assert seen == ["--json"]
+
+
+def test_unimplemented_command_is_internal_not_implemented(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code, envelope, err = run_json(["kinds", "--json"], capsys)
+    assert code == 1
+    validate(envelope, ERROR_SCHEMA)
     assert envelope == json.loads((GOLDEN / "error-not-implemented.json").read_text())
     assert "not implemented" in err
 
@@ -231,19 +356,15 @@ def test_unimplemented_command_reports_failed(capsys: pytest.CaptureFixture[str]
         ["nonsense", "--json"],
         ["--json"],
         ["label", "add", SID, "--json"],
+        ["list", "--json=yes"],
     ],
 )
 def test_usage_error_envelope(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
     code, envelope, err = run_json(argv, capsys)
     assert code == 2
-    validate(envelope, "claude-session/cli/error.json")
+    validate(envelope, ERROR_SCHEMA)
     assert envelope["error"]["code"] == "usage"
     assert envelope["error"]["message"] in err
-
-
-def test_json_after_double_dash_is_not_json_mode(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["status", "--", "--json"]) == 12
-    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize(
@@ -268,7 +389,7 @@ def test_error_envelope_golden(
     monkeypatch.setitem(cli.HANDLERS, "status", raising(error))
     code, envelope, err = run_json(["status", "abcd", "--json"], capsys)
     assert code == exit_code
-    validate(envelope, "claude-session/cli/error.json")
+    validate(envelope, ERROR_SCHEMA)
     assert envelope == json.loads((GOLDEN / f"error-{golden}.json").read_text())
     assert envelope["error"]["message"] in err
 
@@ -283,21 +404,28 @@ def test_error_without_json_goes_to_stderr_only(
     assert captured.err == "claude-session: error: unknown session: x\n"
 
 
-def test_unexpected_exception_is_internal_error(
+# Internal errors
+
+
+def test_internal_error_envelope_hides_exception_text(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setitem(cli.HANDLERS, "status", raising(RuntimeError("boom")))
-    code, envelope, _ = run_json(["status", SID, "--json"], capsys)
+    monkeypatch.setitem(cli.HANDLERS, "status", raising(RuntimeError("secret-ish detail")))
+    code, envelope, err = run_json(["status", SID, "--json"], capsys)
     assert code == 1
-    validate(envelope, "claude-session/cli/error.json")
-    assert envelope["error"]["code"] == "internal"
+    validate(envelope, ERROR_SCHEMA)
+    assert envelope == {"error": {"code": "internal", "message": "internal error: RuntimeError"}}
+    assert err == "claude-session: error: internal error: RuntimeError\n"
 
 
-def test_handler_return_code_is_the_exit_code(
+def test_internal_error_traceback_only_with_verbose(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setitem(cli.HANDLERS, "kinds", lambda args: 0)
-    assert main(["kinds", "--json"]) == 0
+    monkeypatch.setitem(cli.HANDLERS, "status", raising(RuntimeError("secret-ish detail")))
+    assert main(["status", SID, "--verbose"]) == 1
+    err = capsys.readouterr().err
+    assert "Traceback" in err
+    assert "secret-ish detail" in err
 
 
 # Human output sanitization
@@ -316,3 +444,74 @@ def test_human_error_message_is_sanitized(
     assert envelope["error"]["message"] == "unknown: x\x1b[2J"
     assert "\x1b" not in err
     assert "x\\x1b[2J" in err
+
+
+# --outcome-file for usage errors and refusals
+
+
+def read_envelope(path: Path) -> Any:
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    envelope = json.loads(path.read_text())
+    validate(envelope, ERROR_SCHEMA)
+    return envelope
+
+
+def test_flag_rule_error_is_written_to_outcome_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "outcome.json"
+    assert main(["exec", "--timeout", "0", "--outcome-file", str(out)]) == 2
+    assert read_envelope(out)["error"]["code"] == "usage"
+
+
+def test_parse_error_is_written_to_outcome_file_from_argv(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "outcome.json"
+    assert main(["wait", SID, f"--outcome-file={out}", "--bogus"]) == 2
+    assert read_envelope(out)["error"]["message"] == "unrecognized arguments: --bogus"
+
+
+def test_relative_outcome_file_is_made_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert main(["start", "--outcome-file", "o.json"]) == 2
+    assert read_envelope(tmp_path / "o.json")["error"]["message"] == "start requires --json"
+
+
+def test_refusal_is_written_to_outcome_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setitem(cli.HANDLERS, "resume", raising(RefusedError("live", reason="live")))
+    out = tmp_path / "outcome.json"
+    assert main(["resume", SID, "--outcome-file", str(out)]) == 20
+    assert read_envelope(out) == {"error": {"code": "refused", "message": "live", "reason": "live"}}
+
+
+def test_not_found_is_not_written_to_outcome_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setitem(cli.HANDLERS, "wait", raising(NotFoundError("unknown")))
+    out = tmp_path / "outcome.json"
+    assert main(["wait", SID, "--outcome-file", str(out)]) == 10
+    assert not out.exists()
+
+
+def test_outcome_file_ignored_for_commands_without_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "outcome.json"
+    assert main(["list", "--outcome-file", str(out)]) == 2
+    assert not out.exists()
+
+
+def test_outcome_file_write_failure_is_a_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "missing-dir" / "outcome.json"
+    assert main(["exec", "--timeout", "0", "--outcome-file", str(out), "--json"]) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"]["code"] == "usage"
+    assert "warning: could not write --outcome-file" in captured.err
+    assert not os.path.exists(out)

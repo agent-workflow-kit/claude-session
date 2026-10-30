@@ -1,6 +1,6 @@
 """The injected-hook fast path (``hook-event``); see design.md, Hook-event fast path.
 
-``cli`` dispatches here before building the argument parser, so this module and everything it
+``__main__`` dispatches here before importing ``cli``, so this module and everything it
 imports must stay standard library only (plus ``store``, ``outbox`` and ``gateway`` once they
 exist): never ``config``, Pydantic or YAML.
 """

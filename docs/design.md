@@ -204,7 +204,9 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 
 | Module | Responsibility |
 |---|---|
-| `cli` | argparse surface, dispatch, `--json` error envelope, human output sanitization. |
+| `__main__` | Entry point of `python -m claude_session` and the `claude-session` script. Standard library only; dispatches `hook-event` before importing `cli`, and contains its errors (exit 0, no output). |
+| `cli` | argparse surface, argv-only flag rules, dispatch of every other command, printing of error envelopes (stdout with `--json`, and to `--outcome-file` for usage errors and refusals), human output sanitization. |
+| `errors` | Standard library only: one error class per error code, with its exit code and envelope fields. |
 | `config` | YAML and `config.d/` merge (maps deep-merged, lists replaced, `hooks.*` lists appended), Pydantic models, `CSESSION_*` overrides (top-level scalar keys only: `claude_bin`, `default_kind`, caps, durations, `retention_days`; `kinds`, `permission_profiles`, `repos`, `hooks`, `secret_env`, `claude_auth_env`, `claude_args`, `notes_context_cmd`, `notes_context_sources` and `me` cannot be set from the environment; reserved names ignored), precedence (built-in → config files → environment → flags for those scalars). Never imported by the hook path. |
 | `kinds` | Effective profile and its origins: built-in kind → config kind → per-repo override → previous run's explicit flags → flags given now (section [Resume](#resume-and-fork)); unknown-kind fallback; profile validation. |
 | `settings_builder` | Pure function: effective profile + session paths → generated settings JSON, `claude` argv, sandbox lists. The security boundary; exhaustively unit-tested. |
@@ -222,6 +224,7 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 | `procinfo` | Process start time and liveness (Linux `/proc/<pid>/stat`, macOS `ps -o lstart= -p`). |
 | `gateway` | The only module that starts subprocesses: `claude`, `git`, the notes command, sandbox prerequisite checks, `crontab`. Standard library only; runs every child with an absolute path, the sanitized `PATH` and, on Linux, `PR_SET_PDEATHSIG(SIGTERM)` for headless `claude`. Tests replace it. |
 | `audit`, `logs` | `audit.jsonl` and `log.jsonl` writers. |
+| `fsutil` | Standard library only: atomic private-file writes (temporary file plus rename relative to a parent-directory descriptor opened with `O_NOFOLLOW`, mode 0600), used for `--outcome-file`. |
 
 ### Session directories
 

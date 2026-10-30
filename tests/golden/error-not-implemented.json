@@ -1,1 +1,1 @@
-{"error": {"code": "failed", "message": "list is not implemented yet", "detail": "not_implemented"}}
+{"error": {"code": "internal", "message": "kinds is not implemented yet", "detail": "not_implemented"}}
