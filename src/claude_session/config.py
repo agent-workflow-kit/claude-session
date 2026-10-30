@@ -1,11 +1,13 @@
 """Configuration: YAML files, ``config.d/`` drop-ins, ``CSESSION_*`` overrides and validation.
 
-Behavior is interface.md, Config and Environment variables: ``config.yaml`` and then
-``config.d/*.yaml`` in lexical order are merged over the built-in defaults (maps deep-merged,
-lists replaced, ``hooks.*`` lists appended); the documented ``CSESSION_<KEY>`` variables then
-override top-level scalars; flags override everything (``with_flags``). Kind settings: built-in
-kind, config kind, per-repo override (``kind_settings``), flags. Any invalid value raises
-``UsageError`` (exit 2, ``code: usage``) whose ``detail`` names the key and where it was set.
+Behavior is interface.md, Config and Environment variables: the default ``config.yaml`` and then
+``config.d/*.yaml`` next to it in byte order of file name (or only the ``--config`` file) are
+merged over the built-in defaults (maps deep-merged, lists replaced, ``hooks.*`` lists appended);
+the documented ``CSESSION_<KEY>`` variables then override top-level scalars; flags override
+everything (``with_flags``). Kind settings: built-in kind, config kind, per-repo override
+(``kind_settings``), flags. Any invalid value raises
+``UsageError`` (exit 2, ``code: usage``) whose ``detail`` names the key and where it was set,
+never the offending value.
 
 Never imported by the hook path (design.md, Hook-event fast path): it needs Pydantic and PyYAML.
 """
@@ -15,6 +17,7 @@ from __future__ import annotations
 import copy
 import os
 import re
+import stat
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
@@ -37,6 +40,10 @@ TOOL = "claude-session"
 CONFIG_FILE = "config.yaml"
 DROPIN_DIR = "config.d"
 DROPIN_SUFFIX = ".yaml"
+# Limits for each config file (interface.md, Config).
+MAX_FILE_BYTES = 1 << 20
+MAX_NODES = 100_000  # with aliases expanded
+MAX_DEPTH = 64
 
 # Grammars (interface.md, Identifiers). TODO(#5): use the ids grammars.
 KIND_NAME = r"[a-z0-9][a-z0-9_-]{0,63}"
@@ -45,6 +52,7 @@ LABEL = r"[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}"
 REPO_ID = r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/(?!\.\.?(/|$))[A-Za-z0-9._-]+)+"
 VERSION = r"[0-9]+(\.[0-9]+)*"
 # Names that are never config keys and may not be set in env.set (interface.md).
+INVALID_REPO = "<invalid repo id>"
 RESERVED_ENV = (
     "CSESSION_ID",
     "CSESSION_DIR",
@@ -56,8 +64,11 @@ RESERVED_ENV = (
 
 def _integer(text: str) -> int:
     if not re.fullmatch(r"-?[0-9]+", text):
-        raise ValueError(f"expected an integer, got {text!r}")
-    return int(text)
+        raise ValueError("expected an integer (ASCII digits)")
+    try:
+        return int(text)
+    except ValueError:  # more digits than int() converts
+        raise ValueError("expected an integer (ASCII digits)") from None
 
 
 def _duration(text: str) -> float:
@@ -91,10 +102,30 @@ def _matching(pattern: str, what: str) -> AfterValidator:
 
     def check(value: str) -> str:
         if not compiled.fullmatch(value):
-            raise ValueError(f"{what} {value!r} must match ^{pattern}$")
+            raise ValueError(f"{what} must match ^{pattern}$")
         return value
 
     return AfterValidator(check)
+
+
+def _not_null(value: Any) -> Any:
+    """Refuses an explicit ``null`` for a field whose ``None`` default only means "not given"."""
+    if value is None:
+        raise ValueError("must not be null")
+    return value
+
+
+def _integral(value: Any) -> Any:
+    """An integral float (``3.0``) is an integer, as in JSON Schema; anything else is unchanged."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _executable(value: str) -> str:
+    if not value or any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError("must be non-empty and contain no control characters")
+    return value
 
 
 def _duration_validator(*, positive: bool, bound: bool) -> BeforeValidator:
@@ -130,8 +161,11 @@ Label = Annotated[str, _matching(LABEL, "label")]
 Duration = Annotated[float, _duration_validator(positive=False, bound=False)]
 PositiveDuration = Annotated[float, _duration_validator(positive=True, bound=False)]
 Bound = Annotated[float | None, _duration_validator(positive=True, bound=True)]
-Bytes = Annotated[int, Field(ge=1)]
-Turns = Annotated[int, Field(ge=1)]
+Integral = BeforeValidator(_integral)
+NotNull = BeforeValidator(_not_null)
+Bytes = Annotated[int, Integral, Field(ge=1)]
+Count = Annotated[int, Integral, Field(ge=0)]
+Turns = Annotated[int, Integral, Field(ge=1)]
 EnvSet = Annotated[dict[str, str], AfterValidator(_no_reserved)]
 SettingSources = Annotated[list[Literal["user", "project", "local"]], AfterValidator(_unique)]
 Sandbox = Literal["required", "preferred", "off"]
@@ -167,6 +201,7 @@ class KindEnv(_Model):
 class Kind(_Model):
     """A kind profile; every field is present once merged over a built-in kind."""
 
+    # TODO(#22): check that permission_profile names a configured profile (or is a file).
     permission_profile: ProfileName
     sandbox: Sandbox
     reads_third_party: bool
@@ -187,21 +222,26 @@ class Kind(_Model):
     claude_args: list[str]
 
 
+# In the override and selector models below, ``None`` defaults mean "not given"; an explicit
+# ``null`` is refused (``NotNull``) wherever schemas/config.json refuses it.
+
+
 class EnvOverride(_Model):
-    inherit: bool | None = None
-    allow: list[str] | None = None
-    set: EnvSet | None = None
-    path_prepend: list[str] | None = None
+    inherit: Annotated[bool | None, NotNull] = None
+    allow: Annotated[list[str] | None, NotNull] = None
+    set: Annotated[EnvSet | None, NotNull] = None
+    path_prepend: Annotated[list[str] | None, NotNull] = None
 
 
 class RepoKindOverride(_Model):
     """Per-repo override of a kind; only the fields that were given apply (``exclude_unset``)."""
 
-    permission_profile: ProfileName | None = None
-    sandbox: Sandbox | None = None
-    env: EnvOverride | None = None
-    read_dirs: list[str] | None = None
-    write_dirs: list[str] | None = None
+    # TODO(#22): check that permission_profile names a configured profile (or is a file).
+    permission_profile: Annotated[ProfileName | None, NotNull] = None
+    sandbox: Annotated[Sandbox | None, NotNull] = None
+    env: Annotated[EnvOverride | None, NotNull] = None
+    read_dirs: Annotated[list[str] | None, NotNull] = None
+    write_dirs: Annotated[list[str] | None, NotNull] = None
     timeout: Bound = None
     max_turns: Turns | None = None
     model: str | None = None
@@ -212,21 +252,21 @@ class Repo(_Model):
 
 
 class PermissionProfile(_Model):
-    permissions: dict[str, Any] | None = None
-    sandbox: dict[str, Any] | None = None
+    permissions: Annotated[dict[str, Any] | None, NotNull] = None
+    sandbox: Annotated[dict[str, Any] | None, NotNull] = None
 
 
 class PreLaunchHook(_Model):
     cmd: str
     timeout: PositiveDuration = 30.0
-    kinds: list[KindName] | None = None
-    exclude_kinds: list[KindName] | None = None
-    labels: list[Label] | None = None
+    kinds: Annotated[list[KindName] | None, NotNull] = None
+    exclude_kinds: Annotated[list[KindName] | None, NotNull] = None
+    labels: Annotated[list[Label] | None, NotNull] = None
 
 
 class PostStateChangeHook(PreLaunchHook):
     async_: bool = Field(default=False, alias="async")
-    states: list[State] | None = None
+    states: Annotated[list[State] | None, NotNull] = None
 
 
 class Hooks(_Model):
@@ -237,25 +277,26 @@ class Hooks(_Model):
 class Me(_Model):
     model_config = ConfigDict(strict=True, extra="allow", frozen=True)
 
-    name: str | None = None
+    name: Annotated[str | None, NotNull] = None
 
 
 class Config(_Model):
     """The validated configuration. Durations are seconds (``None``: no bound)."""
 
-    claude_bin: str
+    claude_bin: Annotated[str, AfterValidator(_executable)]
     min_claude_version: Annotated[str, _matching(VERSION, "version")]
-    default_kind: str
+    # TODO(#9): an unknown default_kind gets the unknown-kind fallback (review profile + warning).
+    default_kind: KindName
     claude_auth_env: list[str]
     secret_env: list[str]
     notes_context_cmd: Annotated[list[str], Field(min_length=1)]
     notes_context_timeout: PositiveDuration
-    notes_context_max_bytes: Annotated[int, Field(ge=0)]
+    notes_context_max_bytes: Count
     notes_context_sources: list[Literal["startup", "resume", "fork", "clear", "compact", "other"]]
     summary_max_bytes: Bytes
     artifact_max_bytes: Bytes
     input_max_bytes: Bytes
-    retention_days: Annotated[int, Field(ge=0)]
+    retention_days: Count
     lost_grace: PositiveDuration
     auto_exit_delay: Duration
     kill_grace: Duration
@@ -270,6 +311,30 @@ class Config(_Model):
     def with_flags(self, **flags: Any) -> Self:
         """This config with the given flag values (``None``: flag not given) on top."""
         return with_flags(self, **flags)
+
+
+# Keys a flag may set (interface.md, Launch flags; ``stop --grace`` for ``kill_grace``). Anything
+# else passed to ``with_flags`` is a programming error.
+CONFIG_FLAG_KEYS = frozenset({"kill_grace"})
+KIND_FLAG_KEYS = frozenset(
+    {
+        "timeout",  # --timeout (headless)
+        "interactive_timeout",  # --timeout (interactive)
+        "max_turns",
+        "model",
+        "permission_profile",
+        "sandbox",
+        "setting_sources",
+        "reads_third_party",
+        "mcp",  # implied by --reads-third-party
+        "env",  # --env-allow, --env-allowlist-only; inherit implied by --reads-third-party
+        "auto_exit",
+    }
+)
+FLAG_KEYS: dict[type[BaseModel], frozenset[str]] = {
+    Config: CONFIG_FLAG_KEYS,
+    Kind: KIND_FLAG_KEYS,
+}
 
 
 # Loading
@@ -292,9 +357,13 @@ def load(
     env: Mapping[str, str] | None = None,
     required: bool | None = None,
 ) -> Config:
-    """Load and validate the config at ``path`` (default: ``default_path``) and its drop-ins
-    (``config.d/`` next to it). A missing file is an error only when ``required`` (default:
-    when ``path`` is given, i.e. ``--config``); drop-ins are read either way."""
+    """Load and validate the config. Without ``path``: ``default_path`` (missing is fine) and
+    its ``config.d/`` drop-ins. With ``path`` (``--config``): only that file, which must exist
+    unless ``required`` is false.
+
+    TODO(#15): commands do not pass the parsed ``--config`` to ``load`` yet.
+    TODO(#28): ``start`` also needs the absolute config path used and a ``config_hash``.
+    """
     env = os.environ if env is None else env
     if required is None:
         required = path is not None
@@ -303,8 +372,9 @@ def load(
     data = _read(main, required=required)
     if data is not None:
         sources.append((str(main), data))
-    for dropin in _dropins(main.parent / DROPIN_DIR):
-        sources.append((str(dropin), _read(dropin, required=True) or {}))
+    if path is None:
+        for dropin in _dropins(main.parent / DROPIN_DIR):
+            sources.append((str(dropin), _read(dropin, required=True) or {}))
 
     raw = copy.deepcopy(defaults.BUILTIN)
     for _, layer in sources:
@@ -343,60 +413,208 @@ def kind_settings(cfg: Config, kind: str, repo: str | None = None) -> Kind:
 
 
 def with_flags[M: BaseModel](settings: M, /, **flags: Any) -> M:
-    """``settings`` with the given flag values on top (``None``: flag not given). Durations may
-    be bare numbers of seconds, as on the command line."""
-    data = settings.model_dump(by_alias=True)
+    """``settings`` (a ``Config`` or ``Kind``) with the given flag values on top (``None``: flag
+    not given). Durations may be bare numbers of seconds, as on the command line. A key that no
+    flag sets raises ``TypeError``."""
+    allowed = FLAG_KEYS.get(type(settings), frozenset())
+    unknown = sorted(set(flags) - allowed)
+    if unknown:
+        raise TypeError(f"not settable by flags on {type(settings).__name__}: {unknown}")
+    data = settings.model_dump(by_alias=True, exclude_unset=True)
     data.update({key: value for key, value in flags.items() if value is not None})
     return _validate(type(settings), data, lambda loc: "flags", bare=True)
 
 
+try:
+    from yaml import CSafeLoader as _BaseLoader
+except ImportError:  # PyYAML built without libyaml
+    from yaml import SafeLoader as _BaseLoader
+
+
+class _Loader(_BaseLoader):  # pyright: ignore[reportGeneralTypeIssues]
+    """Safe YAML loading that refuses duplicate mapping keys and reads YAML 1.1 base-60 numbers
+    (``1:30``) as strings."""
+
+    def construct_mapping(self, node: yaml.Node, deep: bool = False) -> dict[Any, Any]:
+        if isinstance(node, yaml.MappingNode):
+            seen: set[tuple[type, Any]] = set()
+            for key_node, _ in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    continue
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    marker = (type(key), key)  # True and 1 are different keys here
+                    duplicate = marker in seen
+                except TypeError:  # unhashable key: the base constructor reports it
+                    continue
+                if duplicate:
+                    raise yaml.constructor.ConstructorError(
+                        None, None, "duplicate mapping key", key_node.start_mark
+                    )
+                seen.add(marker)
+        return super().construct_mapping(node, deep=deep)
+
+
+_INT, _FLOAT = "tag:yaml.org,2002:int", "tag:yaml.org,2002:float"
+_Loader.yaml_implicit_resolvers = {
+    first: [(tag, regexp) for tag, regexp in resolvers if tag not in (_INT, _FLOAT)]
+    for first, resolvers in _Loader.yaml_implicit_resolvers.items()
+}
+# PyYAML's int and float resolvers without their base-60 alternatives.
+_Loader.add_implicit_resolver(
+    _FLOAT,
+    re.compile(
+        r"""^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+][0-9]+)?
+        |\.[0-9][0-9_]*(?:[eE][-+][0-9]+)?
+        |[-+]?\.(?:inf|Inf|INF)
+        |\.(?:nan|NaN|NAN))$""",
+        re.X,
+    ),
+    list("-+0123456789."),
+)
+_Loader.add_implicit_resolver(
+    _INT,
+    re.compile(
+        r"""^(?:[-+]?0b[0-1_]+
+        |[-+]?0[0-7_]+
+        |[-+]?(?:0|[1-9][0-9_]*)
+        |[-+]?0x[0-9a-fA-F_]+)$""",
+        re.X,
+    ),
+    list("-+0123456789"),
+)
+
+
 def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
+    raw = _read_bytes(path, required=required)
+    if raw is None:
+        return None
     try:
-        text = path.read_bytes().decode("utf-8")
-    except FileNotFoundError:
-        if not required:
-            return None
-        raise UsageError("config file not found", detail=f"{path}: no such file") from None
+        text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise UsageError("invalid config", detail=f"{path}: not UTF-8 ({exc.reason})") from None
-    except OSError as exc:
-        raise UsageError("cannot read config", detail=f"{path}: {exc.strerror}") from None
     try:
-        data = yaml.load(text, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+        data = yaml.load(text, Loader=_Loader)  # noqa: S506 (a safe loader)
     except yaml.YAMLError as exc:
         where = ""
         mark = getattr(exc, "problem_mark", None)
         if mark is not None:
             where = f" at line {mark.line + 1}, column {mark.column + 1}"
         problem = getattr(exc, "problem", None) or "invalid YAML"
+        # Quoted parts (tags, anchors, characters) may come from the file: never echo them.
+        problem = re.sub(r"'[^']*'|\"[^\"]*\"", "<redacted>", problem)
         raise UsageError("invalid config", detail=f"{path}{where}: {problem}") from None
+    except (ValueError, RecursionError):  # e.g. an integer with too many digits
+        detail = f"{path}: a value cannot be loaded (too long or too deeply nested)"
+        raise UsageError("invalid config", detail=detail) from None
     if data is None:
         return {}
     if not isinstance(data, dict):
         found = type(data).__name__
         detail = f"top level: expected a mapping, got {found} (in {path})"
         raise UsageError("invalid config", detail=detail)
+    _check_tree(data, path)
     return data
 
 
-def _dropins(directory: Path) -> list[Path]:
-    """``config.d/*.yaml`` in lexical order (hidden files and non-files skipped)."""
+def _read_bytes(path: Path, *, required: bool) -> bytes | None:
+    """The file's bytes: a regular file (symlinks followed) of at most ``MAX_FILE_BYTES``.
+    Opened non-blocking, so a FIFO is refused instead of waited on."""
     try:
-        entries = list(directory.iterdir())
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        if os.path.lexists(path):
+            detail = f"{path}: symlink does not resolve"
+            raise UsageError("cannot read config", detail=detail) from None
+        if not required:
+            return None
+        raise UsageError("config file not found", detail=f"{path}: no such file") from None
+    except OSError as exc:
+        raise UsageError("cannot read config", detail=f"{path}: {exc.strerror}") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise UsageError("invalid config", detail=f"{path}: not a regular file")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= MAX_FILE_BYTES:
+            chunk = os.read(fd, MAX_FILE_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as exc:
+        raise UsageError("cannot read config", detail=f"{path}: {exc.strerror}") from None
+    finally:
+        os.close(fd)
+    if size > MAX_FILE_BYTES:
+        raise UsageError("invalid config", detail=f"{path}: larger than 1 MiB")
+    return b"".join(chunks)
+
+
+def _check_tree(data: dict[str, Any], path: Path) -> None:
+    """Refuse trees over ``MAX_NODES`` nodes (aliases expanded) or ``MAX_DEPTH`` levels, and
+    non-string mapping keys. Shared (aliased) nodes are walked once (memoized by identity)."""
+    seen: dict[int, tuple[int, int]] = {}  # id -> (nodes, height)
+
+    def too_deep() -> UsageError:
+        detail = f"{path}: nested more than {MAX_DEPTH} levels deep"
+        return UsageError("invalid config", detail=detail)
+
+    def walk(node: Any, depth: int, where: str) -> tuple[int, int]:
+        if depth > MAX_DEPTH:
+            raise too_deep()
+        if not isinstance(node, (dict, list)):
+            return 1, 0
+        if id(node) in seen:
+            nodes, height = seen[id(node)]
+            if depth + height > MAX_DEPTH:
+                raise too_deep()
+            return nodes, height
+        if isinstance(node, dict):
+            children = []
+            for key, value in node.items():
+                if not isinstance(key, str):
+                    detail = (
+                        f"{where or 'top level'}: mapping keys must be strings; quote the key "
+                        f"(in {path})"
+                    )
+                    raise UsageError("invalid config", detail=detail)
+                children.append((value, _key_path(where, key)))
+        else:
+            children = [(value, f"{where}.{index}") for index, value in enumerate(node)]
+        nodes, height = 1, 0
+        for child, child_where in children:
+            child_nodes, child_height = walk(child, depth + 1, child_where)
+            nodes += child_nodes
+            height = max(height, child_height + 1)
+            if nodes > MAX_NODES:
+                detail = f"{path}: more than {MAX_NODES} nodes (with aliases expanded)"
+                raise UsageError("invalid config", detail=detail)
+        seen[id(node)] = (nodes, height)
+        return nodes, height
+
+    walk(data, 0, "")
+
+
+def _key_path(where: str, key: str) -> str:
+    """``where.key``; a repo key that is not a valid repo id is not echoed (it may hold
+    credentials)."""
+    if where == "repos" and not re.fullmatch(REPO_ID, key):
+        key = INVALID_REPO
+    return f"{where}.{key}" if where else key
+
+
+def _dropins(directory: Path) -> list[Path]:
+    """``config.d/*.yaml`` (hidden names skipped) in byte order of file name. Entries that are
+    not regular files are returned too, so reading them fails."""
+    try:
+        names = os.listdir(directory)
     except (FileNotFoundError, NotADirectoryError):
         return []
     except OSError as exc:
         raise UsageError("cannot read config", detail=f"{directory}: {exc.strerror}") from None
-    return sorted(
-        (
-            entry
-            for entry in entries
-            if entry.name.endswith(DROPIN_SUFFIX)
-            and not entry.name.startswith(".")
-            and entry.is_file()
-        ),
-        key=lambda entry: entry.name,
-    )
+    names = [n for n in names if n.endswith(DROPIN_SUFFIX) and not n.startswith(".")]
+    return [directory / name for name in sorted(names, key=os.fsencode)]
 
 
 def _complete_new_kinds(raw: dict[str, Any]) -> None:
@@ -417,6 +635,9 @@ def _apply_env(raw: dict[str, Any], env: Mapping[str, str]) -> dict[str, str]:
     for var, (key, convert) in ENV_OVERRIDES.items():
         if var not in env:
             continue
+        if env[var] == "":
+            detail = f"{key}: must not be empty (in environment variable {var})"
+            raise UsageError("invalid config", detail=detail)
         try:
             raw[key] = convert(env[var])
         except ValueError as exc:
@@ -490,7 +711,10 @@ def _validate[M: BaseModel](
 
 def _describe(error: Any, source: Callable[[tuple[str | int, ...]], str]) -> str:
     loc = tuple(part for part in error["loc"] if part != "[key]")
-    key = ".".join(str(part) for part in loc) or "top level"
+    key = ""
+    for part in loc:
+        key = _key_path(key, str(part))
+    key = key or "top level"
     message = str(error["msg"]).removeprefix("Value error, ")
     if loc and loc[-1] == "sandbox" and isinstance(error.get("input"), bool):
         message += ' (quote "off" in YAML)'

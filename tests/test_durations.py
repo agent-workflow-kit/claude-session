@@ -31,7 +31,26 @@ def test_valid(text: str | float, seconds: float) -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["", "-5", "-5s", "5 s", "5x", "s", ".5s", "5.s", "1e3", "5S", " 5s", "none", "inf", "nan"],
+    [
+        *[
+            "",
+            "-5",
+            "-5s",
+            "5 s",
+            "5x",
+            "s",
+            ".5s",
+            "5.s",
+            "1e3",
+            "5S",
+            " 5s",
+            "none",
+            "inf",
+            "nan",
+        ],
+        # ASCII digits only, whole string only, no sign, separators or exponent forms
+        *["\u0665s", "\uff15", "5s\n", "5\n", "+5", "1_000", ".5", "5.", "1e3s", "+5s"],
+    ],
 )
 def test_invalid(text: str) -> None:
     with pytest.raises(ValueError, match="invalid duration"):
@@ -73,3 +92,26 @@ def test_bound_parses_and_is_positive_by_default() -> None:
     with pytest.raises(ValueError, match="greater than zero"):
         durations.parse_bound("0")
     assert durations.parse_bound("0", positive=False) == 0.0
+
+
+def test_max_is_36500_days() -> None:
+    assert durations.parse("36500d") == 36500 * 86400
+    assert durations.parse(36500 * 86400) == 36500 * 86400
+
+
+@pytest.mark.parametrize(
+    "value", ["36501d", "9" * 400 + "d", "9" * 400, "3153600001", 3153600001, 10**400, 1e300]
+)
+def test_rejects_durations_over_36500_days(value: str | float) -> None:
+    with pytest.raises(ValueError, match="at most 36500d"):
+        durations.parse(value)
+
+
+def test_errors_never_echo_the_value() -> None:
+    for value in ["SENTINEL", "SENTINELs", "9" * 400 + "SENTINEL"]:
+        with pytest.raises(ValueError) as info:
+            durations.parse(value)
+        assert "SENTINEL" not in str(info.value)
+    with pytest.raises(ValueError) as info:
+        durations.parse(-123456789)
+    assert "123456789" not in str(info.value)

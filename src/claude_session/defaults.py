@@ -68,6 +68,7 @@ _NO_NETWORK_TOOLS = ["WebFetch", "WebSearch", "mcp__*"]
 _SUBAGENTS = ["Agent", "Task", "Skill"]
 _NO_NETWORK_SANDBOX = {"network": {"allowedDomains": []}}
 
+# TODO(#9): kinds.py should reuse BUILTIN_KINDS rather than keep a second built-in kinds table.
 BUILTIN_KINDS: dict[str, dict[str, Any]] = {
     "implement": _kind(),
     "draft-ticket": _kind(),

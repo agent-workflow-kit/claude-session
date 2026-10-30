@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import copy
+import os
+import shutil
 import textwrap
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +34,8 @@ def cfg_dir(tmp_path: Path) -> Path:
 
 
 def load(cfg_dir: Path, env: dict[str, str] | None = None) -> config.Config:
-    return config.load(cfg_dir / "config.yaml", env=env or {}, required=False)
+    """The default config (``cfg_dir/config.yaml`` and its drop-ins) via ``XDG_CONFIG_HOME``."""
+    return config.load(None, env={"XDG_CONFIG_HOME": str(cfg_dir.parent), **(env or {})})
 
 
 def invalid(cfg_dir: Path, env: dict[str, str] | None = None) -> UsageError:
@@ -46,8 +51,11 @@ def test_builtin_defaults_equal_the_example_file() -> None:
     assert defaults.BUILTIN == yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
 
 
-def test_loading_nothing_gives_the_example_values(cfg_dir: Path) -> None:
-    from_example = config.load(EXAMPLE, env={})
+def test_loading_nothing_gives_the_example_values(cfg_dir: Path, tmp_path: Path) -> None:
+    example = tmp_path / "example" / "config.yaml"
+    example.parent.mkdir()
+    shutil.copyfile(EXAMPLE, example)
+    from_example = config.load(example, env={})
     assert load(cfg_dir) == from_example
     assert from_example == config.Config.model_validate(defaults.BUILTIN)
 
@@ -305,8 +313,8 @@ def test_scalar_precedence_flags_env_config_builtin(cfg_dir: Path) -> None:
 
 def test_flags_are_validated(cfg_dir: Path) -> None:
     with pytest.raises(UsageError) as info:
-        load(cfg_dir).with_flags(poll_interval="0s")
-    assert "poll_interval" in str(info.value.detail)
+        load(cfg_dir).with_flags(kill_grace="soon")
+    assert "kill_grace" in str(info.value.detail)
 
 
 def test_kind_precedence_flags_repo_config_builtin(cfg_dir: Path) -> None:
@@ -391,8 +399,8 @@ INVALID: list[tuple[str, str]] = [
         "hooks.post-state-change.0.states",
     ),
     ("hooks: {on-exit: []}\n", "hooks.on-exit"),
-    ("repos: {Example.com/x: {}}\n", "repos.Example.com/x"),
-    ("repos: {example.com/../x: {}}\n", "repos.example.com/../x"),
+    ("repos: {Example.com/x: {}}\n", "repos.<invalid repo id>"),
+    ("repos: {example.com/../x: {}}\n", "repos.<invalid repo id>"),
     (
         "repos: {example.com/x: {kinds: {respond: {reads_third_party: false}}}}\n",
         "reads_third_party",
@@ -400,6 +408,13 @@ INVALID: list[tuple[str, str]] = [
     ("repos: {example.com/x: {kinds: {Bad: {}}}}\n", "repos.example.com/x.kinds.Bad"),
     ("repos: {example.com/x: {kinds: {respond: {timeout: 0}}}}\n", "kinds.respond.timeout"),
     ("me: {name: 5}\n", "me.name"),
+    ("default_kind: Bad\n", "default_kind"),
+    ("default_kind: ''\n", "default_kind"),
+    ("claude_bin: ''\n", "claude_bin"),
+    ('claude_bin: "a\\x01b"\n', "claude_bin"),
+    ("retention_days: 3.5\n", "retention_days"),
+    ("kinds: {implement: {max_turns: 1.5}}\n", "kinds.implement.max_turns"),
+    ("summary_max_bytes: true\n", "summary_max_bytes"),
     ("- a list\n", "top level"),
 ]
 
@@ -428,6 +443,12 @@ VALID = [
     "hooks: {post-state-change: [{cmd: x, labels: ['a.b=c=d', 'e='], states: [idle]}]}\n",
     "repos: {example.com/a/b.c: {kinds: {review: {timeout: null}}}}\n",
     "me: {name: x, other: [1]}\n",
+    # integral floats are integers (JSON Schema "integer")
+    "summary_max_bytes: 3.0\nretention_days: 0.0\nkinds: {implement: {max_turns: 2.0}}\n",
+    # the only nulls the schema allows
+    "kinds: {implement: {model: null, max_turns: null, interactive_timeout: null}}\n",
+    "repos: {example.com/x: {kinds: {respond: {timeout: null, max_turns: null, model: null}}}}\n",
+    "default_kind: x_1-y\nkill_grace: 36500d\n",
 ]
 
 
@@ -474,3 +495,366 @@ def test_invalid_config_envelope_matches_schema(cfg_dir: Path) -> None:
     envelope = invalid(cfg_dir).envelope()
     schemas.validate(envelope, "claude-session/cli/error.json")
     assert envelope["error"]["code"] == "usage"
+
+
+# Nulls (R16): the loader and the schema agree on every field that refuses null.
+
+_OVERRIDE = "repos: {example.com/x: {kinds: {respond: %s}}}\n"
+NULLS = [
+    *[
+        _OVERRIDE % f"{{{field}: null}}"
+        for field in ["permission_profile", "sandbox", "env", "read_dirs", "write_dirs"]
+    ],
+    *[
+        _OVERRIDE % f"{{env: {{{field}: null}}}}"
+        for field in ["inherit", "allow", "set", "path_prepend"]
+    ],
+    *[
+        f"hooks: {{pre-launch: [{{cmd: x, {field}: null}}]}}\n"
+        for field in ["kinds", "exclude_kinds", "labels", "timeout"]
+    ],
+    "hooks: {post-state-change: [{cmd: x, states: null}]}\n",
+    "hooks: {post-state-change: [{cmd: x, async: null}]}\n",
+    "permission_profiles: {p: {permissions: null}}\n",
+    "permission_profiles: {p: {sandbox: null}}\n",
+    "me: {name: null}\n",
+    "kinds: {implement: {env: {set: null}}}\n",
+    "kinds: {implement: {permission_profile: null}}\n",
+    "default_kind: null\n",
+]
+
+
+@pytest.mark.parametrize("text", NULLS)
+def test_null_is_refused_where_the_schema_refuses_it(cfg_dir: Path, text: str) -> None:
+    write(cfg_dir / "config.yaml", text)
+    assert "config.yaml" in str(invalid(cfg_dir).detail)
+    with pytest.raises(jsonschema.ValidationError):
+        schemas.validate(yaml.safe_load(text), CONFIG_SCHEMA)
+
+
+@pytest.mark.parametrize("value", ["claude\\n", "\\tclaude", "clau\\x7fde"])
+def test_claude_bin_refuses_control_characters(cfg_dir: Path, value: str) -> None:
+    # (Python's re lets the schema's "$" match before a trailing newline; ECMA-262 does not.)
+    write(cfg_dir / "config.yaml", f'claude_bin: "{value}"\n')
+    assert "claude_bin" in str(invalid(cfg_dir).detail)
+
+
+def test_integral_floats_become_ints(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "summary_max_bytes: 3.0\nkinds: {implement: {max_turns: 2.0}}\n")
+    cfg = load(cfg_dir)
+    assert cfg.summary_max_bytes == 3
+    assert type(cfg.summary_max_bytes) is int
+    assert cfg.kinds["implement"].max_turns == 2
+
+
+# Files read (R1, R6, R9, R23)
+
+
+def test_explicit_config_reads_only_that_file(tmp_path: Path) -> None:
+    path = write(tmp_path / "shared" / "config.yaml", "kill_grace: 1s\n")
+    write(
+        tmp_path / "shared" / "config.d" / "x.yaml",
+        "kill_grace: 2s\nhooks: {pre-launch: [{cmd: x}]}\n",
+    )
+    default_dir = tmp_path / "xdg" / "claude-session"
+    write(default_dir / "config.d" / "y.yaml", "kill_grace: 3s\n")
+    cfg = config.load(path, env={"XDG_CONFIG_HOME": str(default_dir.parent)})
+    assert cfg.kill_grace == 1.0
+    assert cfg.hooks.pre_launch == []
+
+
+def test_dropins_apply_in_byte_order_of_file_name(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.d" / "9-a.yaml", "kill_grace: 9s\n")
+    write(cfg_dir / "config.d" / "10-b.yaml", "kill_grace: 10s\n")
+    write(cfg_dir / "config.d" / "B.yaml", "lost_grace: 2s\n")
+    write(cfg_dir / "config.d" / "a.yaml", "lost_grace: 1s\n")
+    cfg = load(cfg_dir)
+    assert cfg.kill_grace == 9.0  # "10-b" < "9-a"
+    assert cfg.lost_grace == 1.0  # "B" < "a"
+
+
+def test_fifo_config_is_refused_without_blocking(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    os.mkfifo(path)
+    started = time.monotonic()
+    with pytest.raises(UsageError) as info:
+        config.load(path, env={})
+    assert time.monotonic() - started < 5
+    assert "not a regular file" in str(info.value.detail)
+
+
+def test_character_device_config_is_refused() -> None:
+    with pytest.raises(UsageError) as info:
+        config.load("/dev/null", env={})
+    assert "not a regular file" in str(info.value.detail)
+
+
+def test_config_over_1_mib_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b"#" * config.MAX_FILE_BYTES + b"\n")
+    with pytest.raises(UsageError) as info:
+        config.load(path, env={})
+    assert "1 MiB" in str(info.value.detail)
+
+
+def test_config_of_exactly_1_mib_is_read(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b"#" * (config.MAX_FILE_BYTES - 1) + b"\n")
+    assert config.load(path, env={}) == config.Config.model_validate(defaults.BUILTIN)
+
+
+def test_symlinked_config_is_followed(tmp_path: Path) -> None:
+    target = write(tmp_path / "real.yaml", "kill_grace: 4s\n")
+    link = tmp_path / "config.yaml"
+    link.symlink_to(target)
+    assert config.load(link, env={}).kill_grace == 4.0
+
+
+def test_dangling_default_config_symlink_is_an_error(cfg_dir: Path) -> None:
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.yaml").symlink_to(cfg_dir / "missing.yaml")
+    assert "config.yaml" in str(invalid(cfg_dir).detail)
+
+
+def _dropin_directory(path: Path) -> None:
+    path.mkdir()
+
+
+def _dropin_dangling(path: Path) -> None:
+    path.symlink_to(path.parent / "missing")
+
+
+def _dropin_loop(path: Path) -> None:
+    path.symlink_to(path)
+
+
+def _dropin_fifo(path: Path) -> None:
+    os.mkfifo(path)
+
+
+@pytest.mark.parametrize("make", [_dropin_directory, _dropin_dangling, _dropin_loop, _dropin_fifo])
+def test_unreadable_dropin_is_an_error(cfg_dir: Path, make: Any) -> None:
+    (cfg_dir / "config.d").mkdir(parents=True)
+    make(cfg_dir / "config.d" / "x.yaml")
+    assert "x.yaml" in str(invalid(cfg_dir).detail)
+
+
+# YAML hardening (R5, R7, R10, R11, R12)
+
+
+def test_alias_bomb_is_refused_quickly(cfg_dir: Path) -> None:
+    lines = ["a0: &a0 [x, x, x, x, x, x, x, x, x, x]"]
+    for level in range(1, 6):
+        refs = ", ".join([f"*a{level - 1}"] * 10)
+        lines.append(f"a{level}: &a{level} [{refs}]")
+    # me allows extra keys, so only the size limit can refuse this (10^6 nodes expanded)
+    text = "me:\n" + "".join(f"  {line}\n" for line in lines)
+    write(cfg_dir / "config.yaml", text)
+    started = time.monotonic()
+    detail = str(invalid(cfg_dir).detail)
+    assert time.monotonic() - started < 5
+    assert "nodes" in detail
+    assert "config.yaml" in detail
+
+
+def test_deep_nesting_is_refused(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "me: {x: " + "[" * 100 + "]" * 100 + "}\n")
+    detail = str(invalid(cfg_dir).detail)
+    assert "nested" in detail
+    assert "config.yaml" in detail
+
+
+def test_nesting_at_the_limit_is_accepted(cfg_dir: Path) -> None:
+    depth = config.MAX_DEPTH - 2  # top-level mapping, me, x, then the lists
+    write(cfg_dir / "config.yaml", "me: {x: " + "[" * depth + "]" * depth + "}\n")
+    load(cfg_dir)
+
+
+def test_very_deep_nesting_is_a_usage_error(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "me: {x: " + "[" * 900 + "]" * 900 + "}\n")
+    assert "config.yaml" in str(invalid(cfg_dir).detail)
+
+
+def test_recursive_alias_is_refused(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "me: {x: &a [*a]}\n")
+    assert "config.yaml" in str(invalid(cfg_dir).detail)
+
+
+def test_overlong_integer_is_a_usage_error(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "retention_days: " + "1" * 5000 + "\n")
+    assert "config.yaml" in str(invalid(cfg_dir).detail)
+
+
+def test_huge_integer_duration_is_a_usage_error(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "kill_grace: 1" + "0" * 400 + "\n")
+    assert "kill_grace" in str(invalid(cfg_dir).detail)
+
+
+def test_duplicate_keys_are_refused(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "kill_grace: 1s\nlost_grace: 1m\nkill_grace: 2s\n")
+    detail = str(invalid(cfg_dir).detail)
+    assert "duplicate" in detail
+    assert "line 3" in detail
+
+
+def test_nested_duplicate_keys_are_refused(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "kinds:\n  implement: {timeout: 1m, timeout: 2m}\n")
+    assert "duplicate" in str(invalid(cfg_dir).detail)
+
+
+@pytest.mark.parametrize("value", ["1:30", "1:30:00", "1:30.5"])
+def test_sexagesimal_numbers_stay_strings(cfg_dir: Path, value: str) -> None:
+    write(cfg_dir / "config.yaml", f"kill_grace: {value}\n")
+    assert "kill_grace" in str(invalid(cfg_dir).detail)
+
+
+def test_ordinary_yaml_numbers_still_load(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "retention_days: 12\nkill_grace: 1.5\nlost_grace: 0x10\n")
+    cfg = load(cfg_dir)
+    assert (cfg.retention_days, cfg.kill_grace, cfg.lost_grace) == (12, 1.5, 16.0)
+
+
+@pytest.mark.parametrize(
+    ("text", "parent"),
+    [
+        ("kinds: {yes: {}}\n", "kinds"),
+        ("kinds: {implement: {env: {set: {1: x}}}}\n", "kinds.implement.env.set"),
+        ("1: x\n", "top level"),
+    ],
+)
+def test_non_string_keys_are_refused(cfg_dir: Path, text: str, parent: str) -> None:
+    write(cfg_dir / "config.yaml", text)
+    detail = str(invalid(cfg_dir).detail)
+    assert parent in detail
+    assert "quote" in detail
+
+
+# Values never echoed in details (R8)
+
+SECRET = "SENTINEL0secret"
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        "CSESSION_RETENTION_DAYS",
+        "CSESSION_KILL_GRACE",
+        "CSESSION_MIN_CLAUDE_VERSION",
+        "CSESSION_DEFAULT_KIND",
+        "CSESSION_CLAUDE_BIN",
+    ],
+)
+def test_env_values_are_not_echoed(cfg_dir: Path, var: str) -> None:
+    error = invalid(cfg_dir, {var: SECRET + "\x01"})
+    assert var in str(error.detail)
+    assert SECRET not in str(error.detail)
+    assert SECRET not in error.message
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"repos: {{'{SECRET}@example.com/x': {{}}}}\n",
+        f"claude_bin: !{SECRET} x\n",
+        f"me: !!python/name:{SECRET} x\n",
+        f"kill_grace: {SECRET}\n",
+        f"min_claude_version: {SECRET}\n",
+        f"me: *{SECRET}\n",
+    ],
+)
+def test_config_values_are_not_echoed(cfg_dir: Path, text: str) -> None:
+    write(cfg_dir / "config.yaml", text)
+    error = invalid(cfg_dir)
+    assert SECRET not in str(error.detail)
+    assert "config.yaml" in str(error.detail)
+
+
+# Environment edge cases (R13, R14, R24)
+
+
+@pytest.mark.parametrize("var", sorted(config.ENV_OVERRIDES))
+def test_empty_env_override_is_invalid(cfg_dir: Path, var: str) -> None:
+    assert var in str(invalid(cfg_dir, {var: ""}).detail)
+
+
+@pytest.mark.parametrize("value", ["+5", " 5", "5 ", "5\n", "٥", "1_000", "0x10"])
+def test_env_integers_are_plain_ascii_digits(cfg_dir: Path, value: str) -> None:
+    assert "CSESSION_RETENTION_DAYS" in str(
+        invalid(cfg_dir, {"CSESSION_RETENTION_DAYS": value}).detail
+    )
+
+
+@pytest.mark.parametrize("value", ["5s\n", "+5", "٥s", "1e3", "36501d"])
+def test_env_durations_use_the_duration_grammar(cfg_dir: Path, value: str) -> None:
+    assert "CSESSION_KILL_GRACE" in str(invalid(cfg_dir, {"CSESSION_KILL_GRACE": value}).detail)
+
+
+@pytest.mark.parametrize("value", ["5s\n", "٥s", "+5s", "1:30"])
+def test_yaml_durations_use_the_duration_grammar(cfg_dir: Path, value: str) -> None:
+    write(cfg_dir / "config.yaml", f"kill_grace: {yaml.safe_dump(value).strip()}\n")
+    assert "kill_grace" in str(invalid(cfg_dir).detail)
+
+
+def test_env_default_kind_must_match_the_grammar(cfg_dir: Path) -> None:
+    error = invalid(cfg_dir, {"CSESSION_DEFAULT_KIND": "Bad Kind"})
+    assert "CSESSION_DEFAULT_KIND" in str(error.detail)
+
+
+def test_builtin_defaults_are_not_mutated_by_loading(cfg_dir: Path) -> None:
+    before = copy.deepcopy(defaults.BUILTIN)
+    write(
+        cfg_dir / "config.yaml",
+        """
+        hooks: {pre-launch: [{cmd: a}], post-state-change: [{cmd: b}]}
+        kinds:
+          triage: {timeout: 1m, env: {set: {A: "1"}}}
+          implement: {env: {set: {B: "2"}, allow: [C]}}
+        permission_profiles: {review: {permissions: {allow: [X]}}}
+        """,
+    )
+    write(cfg_dir / "config.d" / "x.yaml", "hooks: {pre-launch: [{cmd: c}]}\n")
+    load(cfg_dir)
+    load(cfg_dir)
+    assert defaults.BUILTIN == before
+
+
+# Flags (R4, R18)
+
+
+def test_flag_durations_are_capped(cfg_dir: Path) -> None:
+    with pytest.raises(UsageError):
+        load(cfg_dir).with_flags(kill_grace="36501d")
+    with pytest.raises(UsageError):
+        load(cfg_dir).with_flags(kill_grace=10**400)
+
+
+@pytest.mark.parametrize("key", ["secret_env", "hooks", "kinds", "claude_bin", "repos", "me"])
+def test_config_flags_are_allowlisted(cfg_dir: Path, key: str) -> None:
+    with pytest.raises(TypeError):
+        load(cfg_dir).with_flags(**{key: []})
+
+
+@pytest.mark.parametrize("key", ["claude_args", "write_dirs", "implicit_done", "backstop", "cwd"])
+def test_kind_flags_are_allowlisted(cfg_dir: Path, key: str) -> None:
+    with pytest.raises(TypeError):
+        config.with_flags(load(cfg_dir).kinds["implement"], **{key: None})
+
+
+def test_kind_flag_keys_are_settable(cfg_dir: Path) -> None:
+    kind = load(cfg_dir).kinds["implement"]
+    flagged = config.with_flags(
+        kind,
+        timeout="5m",
+        interactive_timeout="none",
+        max_turns=3,
+        model="m",
+        permission_profile="review",
+        sandbox="required",
+        setting_sources=[],
+        reads_third_party=True,
+        mcp="none",
+        env={"inherit": False, "allow": ["A"], "set": {}, "path_prepend": []},
+        auto_exit=False,
+    )
+    assert flagged.sandbox == "required"
+    assert flagged.env.allow == ["A"]

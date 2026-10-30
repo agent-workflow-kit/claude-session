@@ -74,7 +74,7 @@ Normative sections: [Launch order](#launch-order), [Flags at start and adoption]
 - **Skill names** (`--skill`): `^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$`; invalid exits 2.
 - **Artifact names** (also `--input-file` basenames): one path segment matching `^[A-Za-z0-9._-]{1,128}$`, not `.` or `..`.
 - **Secret**: 32 random bytes as 64 lowercase hex characters, new for every run.
-- **Durations** (flags, config and environment overrides): a non-negative number of seconds (fractions allowed), or `<number><unit>` matching `^\d+(\.\d+)?(ms|s|m|h|d)$` (e.g. `500ms`, `90s`, `10m`, `2h`). Where a bound may be absent, `none` (or `null` in config) means no bound.
+- **Durations** (flags, config and environment overrides): a non-negative number of seconds (fractions allowed; as text, matching `^[0-9]+(\.[0-9]+)?$`, so `.5`, `5.`, `1e3`, `+5` and `1_000` are invalid), or `<number><unit>` matching `^[0-9]+(\.[0-9]+)?(ms|s|m|h|d)$` (e.g. `500ms`, `90s`, `10m`, `2h`). Digits are ASCII and the whole value must match. A duration is at most `36500d`. Where a bound may be absent, `none` (or `null` in config) means no bound.
 - **Repo id**: lowercase host, an optional `:port` only for a non-default port, then `/` and path segments matching `[A-Za-z0-9._-]+`, never `.` or `..` (`host/<full project path>`). Derived from an `origin` URL by stripping the scheme, `user@`, a default port and a trailing `.git`, and lowercasing the host; the scp form `git@host:path` becomes `host/path`. A repo id is passed to the notes command as one token, `--repo=<id>`, omitted when the session has no repo. When it is derived: see [`--repo`](#launch-flags).
 
 ## Launch order
@@ -713,11 +713,11 @@ Configured under `hooks:` in config (design guide section 8) or per invocation w
 
 ## Config
 
-`~/.config/claude-session/config.yaml` plus `config.d/*.yaml` ([schemas/config.json](../schemas/config.json); every key with its default in [config.example.yaml](../config.example.yaml)). Maps are deep-merged; lists are replaced, except `hooks.*` lists, which append (design guide section 5).
+`~/.config/claude-session/config.yaml` plus `config.d/*.yaml` ([schemas/config.json](../schemas/config.json); every key with its default in [config.example.yaml](../config.example.yaml)). Maps are deep-merged; lists are replaced, except `hooks.*` lists, which append (design guide section 5). Drop-ins are applied after `config.yaml` in lexical (byte) order of file name; hidden names are skipped, and any other `config.d` entry ending in `.yaml` that is not (after symlinks) a regular file is an invalid config, as is a default `config.yaml` symlink that does not resolve. `--config <path>` replaces the default file and its drop-ins: only that file is read; `config.d/` is read only next to the default `config.yaml`.
 
 **Environment overrides** use the prefix `CSESSION_` and apply only to these top-level scalar keys: `CSESSION_CLAUDE_BIN`, `CSESSION_DEFAULT_KIND`, `CSESSION_MIN_CLAUDE_VERSION`, `CSESSION_SUMMARY_MAX_BYTES`, `CSESSION_ARTIFACT_MAX_BYTES`, `CSESSION_INPUT_MAX_BYTES`, `CSESSION_NOTES_CONTEXT_TIMEOUT`, `CSESSION_NOTES_CONTEXT_MAX_BYTES`, `CSESSION_RETENTION_DAYS`, `CSESSION_LOST_GRACE`, `CSESSION_AUTO_EXIT_DELAY`, `CSESSION_KILL_GRACE`, `CSESSION_POLL_INTERVAL`, `CSESSION_SESSION_START_TIMEOUT`. Durations accept bare numbers of seconds. Nothing else (`kinds`, `permission_profiles`, `repos`, `hooks`, `secret_env`, `claude_auth_env`, `claude_args`, `notes_context_cmd`, `notes_context_sources`, `me`) can be set from the environment. The reserved names `CSESSION_ID`, `CSESSION_DIR`, `CSESSION_KIND`, `CSESSION_HOOK` and `CSESSION_OBJECT_TYPE` are never config keys and are ignored by the loader.
 
-Config validation: an invalid config (schema or semantic error) exits 2 with `code: usage` and `detail`; at adoption it ends the run `not-started` with `config_invalid`. Durations that bound something (kind `timeout`, `interactive_timeout`, hook `timeout`, `notes_context_timeout`, `lost_grace`, `poll_interval`, `session_start_timeout`) must be greater than zero (`exclusiveMinimum: 0`).
+Config validation: an invalid config (schema or semantic error) exits 2 with `code: usage` and `detail`; at adoption it ends the run `not-started` with `config_invalid`. Durations that bound something (kind `timeout`, `interactive_timeout`, hook `timeout`, `notes_context_timeout`, `lost_grace`, `poll_interval`, `session_start_timeout`) must be greater than zero (`exclusiveMinimum: 0`). `default_kind` must match the [kind-name grammar](#identifiers); `claude_bin` must be non-empty and contain no control characters; `null` is accepted only where the schema allows it. Limits per config file: a regular file (symlinks are followed) of at most 1 MiB, at most 100,000 YAML nodes (aliases expanded) and 64 levels of nesting; duplicate mapping keys and non-string keys (quote keys such as `yes`) are invalid, and YAML 1.1 base-60 numbers (`1:30`) are read as strings. `detail` never contains the offending value.
 
 Precedence: top-level scalars: built-in → config → environment → flags. Kind settings: built-in kind → config kind → per-repo override → previous run's stored explicit flags → flags given now.
 
@@ -840,7 +840,7 @@ Set by `exec` for the session (after clearing any inherited `CSESSION_*`):
 
 Reserved names, never config keys and not allowed in `env.set`: `CSESSION_ID`, `CSESSION_DIR`, `CSESSION_KIND`, `CSESSION_HOOK`, `CSESSION_OBJECT_TYPE`.
 
-Read by claude-session: the `CSESSION_<KEY>` config overrides listed in [Config](#config); `CSESSION_ID`/`CSESSION_DIR` (by `report` and `hook-event`); `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME` (unsafe write targets). Hook environment: `CSESSION_HOOK`, `CSESSION_ID`, `CSESSION_OBJECT_TYPE`.
+Read by claude-session: the `CSESSION_<KEY>` config overrides listed in [Config](#config); `CSESSION_ID`/`CSESSION_DIR` (by `report` and `hook-event`); `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME` (unsafe write targets). An empty `CSESSION_<KEY>` override is an invalid config (exit 2; `detail` names the variable). Hook environment: `CSESSION_HOOK`, `CSESSION_ID`, `CSESSION_OBJECT_TYPE`.
 
 No credentials are required by claude-session itself. `claude` uses its own login (or the variables in `claude_auth_env`).
 
