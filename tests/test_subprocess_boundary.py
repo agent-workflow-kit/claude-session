@@ -104,9 +104,56 @@ REEXPORT_ROOTS = {
 }
 
 
+# Re-export roots that are also common attribute names (``args.pty``, ``self._os``,
+# ``cfg.venv``, ``opts.concurrent``): read off an object that is not a module, they count only
+# when followed by a real starter of that module (``self.pty.spawn``, ``self._os.system``).
+COMMON_ROOTS = {"os", "pty", "venv", "concurrent"}
+
+
 def _reexport_root(attr: str) -> bool:
     """Whether ``attr`` names a re-export root, also as a private alias (``tempfile._os``)."""
     return attr in REEXPORT_ROOTS or attr.lstrip("_") in REEXPORT_ROOTS
+
+
+def _has_member(module: str, attr: str) -> bool:
+    """Whether the stdlib module ``module`` (one of ``COMMON_ROOTS``) has ``attr``, as an
+    attribute or a submodule."""
+    try:
+        if hasattr(importlib.import_module(module), attr):
+            return True
+        return importlib.util.find_spec(f"{module}.{attr}") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _top_level_module(name: str) -> bool:
+    """Whether ``name`` is an importable top-level module (found, not imported)."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _off_object(attrs: list[str]) -> bool:
+    """Whether the attribute chain ``attrs``, read off an object that is not a module (``self``,
+    ``args``, ``sys.modules['x']``), reaches a process starter: a starter function by its full
+    name (``.platform.uname``), a starter module (``.subprocess``, ``._subprocess``), a common
+    root followed by one of its starters (``.pty.spawn``, ``.concurrent.futures.process``), or
+    a module followed by a re-export root (``.shutil.os``)."""
+    for i, attr in enumerate(attrs):
+        chain = attrs[i:]
+        root = attr.lstrip("_")
+        if _bad_function(".".join(chain), private=False):
+            return True
+        if root in COMMON_ROOTS:
+            if len(chain) > 1 and _bad(".".join([root, *chain[1:]])):
+                if _has_member(root, chain[1]):
+                    return True
+        elif _reexport_root(attr):
+            return True
+        elif len(chain) > 1 and _reexport_root(chain[1]) and _top_level_module(attr):
+            return True
+    return False
 
 
 def _gateway_internals() -> set[str]:
@@ -130,11 +177,14 @@ def _canonical(name: str) -> str:
     return name
 
 
-def _bad_function(name: str) -> bool:
+def _bad_function(name: str, private: bool = True) -> bool:
     """Whether ``name`` (``a.b``, possibly read off any object) is a process-starting function
-    by its full name, or a private name of a module in ``PRIVATE_STARTERS``."""
+    by its full name, or (with ``private``, for a name read off a module) a private name of a
+    module in ``PRIVATE_STARTERS``."""
     if any(name == f or name.startswith(f + ".") for f in FORBIDDEN_NAMES):
         return True
+    if not private:
+        return False
     module, _, attr = name.partition(".")
     attr = attr.split(".")[0]
     dunder = attr.startswith("__") and attr.endswith("__")
@@ -226,7 +276,10 @@ def _import_call(node: ast.AST, aliases: dict[str, str]) -> tuple[str, str] | No
             package = _constant(_arg(node, 1, "package"), str)
             if not isinstance(package, str):
                 raise Dynamic
-            name = importlib.util.resolve_name(name, package)
+            try:
+                name = importlib.util.resolve_name(name, package)
+            except (ImportError, ValueError) as exc:  # beyond the top-level package
+                raise Dynamic from exc
         return func, name
     level = _constant(_arg(node, 4, "level"), int) or 0
     if level == 1:  # the package is flat: relative to claude_session
@@ -265,14 +318,28 @@ def _dotted(node: ast.expr, aliases: dict[str, str]) -> str | None:
     return ".".join(reversed(parts))
 
 
-def _module_base(node: ast.Attribute, aliases: dict[str, str]) -> bool:
-    """Whether the base of the chain ``node`` is a name bound by an import or an import call
-    (so its attributes are a module's), rather than some other object."""
+def _is_module(name: str) -> bool:
+    """Whether the full name ``name``, imported with ``from X import Y``, is a module (the
+    package's modules, ``gateway`` bound through another one included) rather than a class,
+    function or other value."""
+    if _package_module(name) or _canonical(name) == GATEWAY_MODULE:
+        return True
+    if _bad(name.rpartition(".")[0]):
+        return True  # importing from it is a violation already; finding Y would import it
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError, AttributeError):
+        return False  # the parent is not a package: Y is a value
+
+
+def _module_base(node: ast.Attribute, aliases: dict[str, str], values: set[str]) -> bool:
+    """Whether the base of the chain ``node`` is a module: a name bound by an import that is
+    not one of the imported ``values`` (``from argparse import Namespace``), or an import call."""
     base: ast.expr = node
     while isinstance(base, ast.Attribute):
         base = base.value
     if isinstance(base, ast.Name):
-        return base.id in aliases
+        return base.id in aliases and base.id not in values
     return _imported(base, aliases) is not None
 
 
@@ -286,9 +353,11 @@ def _attrs(node: ast.Attribute) -> list[str]:
     return attrs[::-1]
 
 
-def _imports(tree: ast.AST) -> tuple[dict[str, str], list[str]]:
-    """Names bound by import statements (to their full names), and import violations."""
+def _imports(tree: ast.AST) -> tuple[dict[str, str], set[str], list[str]]:
+    """Names bound by import statements (to their full names), those of them that ``from``
+    imports bound to values rather than modules, and import violations."""
     aliases: dict[str, str] = {}
+    values: set[str] = set()
     found: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -309,14 +378,16 @@ def _imports(tree: ast.AST) -> tuple[dict[str, str], list[str]]:
                     continue
                 full = f"{module}.{a.name}"
                 aliases[a.asname or a.name] = full
+                if not _is_module(full):
+                    values.add(a.asname or a.name)
                 if _bad(full) or _reexport_root(a.name):
                     found.append(f"from {module} import {a.name}")
-    return aliases, found
+    return aliases, values, found
 
 
 def violations(source: str) -> list[str]:
     tree = ast.parse(source)
-    aliases, found = _imports(tree)
+    aliases, values, found = _imports(tree)
     parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
 
     def read_as_attribute(node: ast.expr) -> bool:
@@ -334,20 +405,20 @@ def violations(source: str) -> list[str]:
             call = _import_call(node, aliases)
             name = None if isinstance(node, ast.Call) else _dotted(node, aliases)
             module = _imported(node, aliases) if call is not None else None
-            of_module = isinstance(node, ast.Attribute) and _module_base(node, aliases)
+            of_module = isinstance(node, ast.Attribute) and _module_base(node, aliases, values)
         except Dynamic:
             found.append(f"dynamic import: {ast.unparse(node)}")
             continue
         if isinstance(node, ast.Attribute):
             attrs = _attrs(node) if not read_as_attribute(node) else []
-            # Off a module, any name reaching a starter; off another object, only a starter
-            # function's full name (``sys.modules['x'].platform.uname``).
-            reaches = _bad if of_module else _bad_function
+            # Off a module, any name reaching a starter; off another object, see _off_object.
             if node.attr in FORBIDDEN_ATTRS:
                 found.append(f"<object>.{node.attr}")
             elif of_module and _reexport_root(node.attr):
                 found.append(f"re-export: {ast.unparse(node)}")
-            elif any(reaches(".".join(attrs[i:])) for i in range(len(attrs))):
+            elif of_module and any(_bad(".".join(attrs[i:])) for i in range(len(attrs))):
+                found.append(f"re-export: {ast.unparse(node)}")
+            elif not of_module and _off_object(attrs):
                 found.append(f"re-export: {ast.unparse(node)}")
         if call is not None:
             assert module is not None
@@ -534,6 +605,19 @@ def test_gateway_is_the_module_that_does() -> None:
         # relative import calls through __package__ (claude_session)
         "import importlib\nimportlib.import_module('.gateway', __package__)._prctl()",
         "from importlib import import_module\nimport_module('.gateway', package=__package__).os",
+        # starter modules (or starter chains) read off objects that are not modules
+        "self.subprocess.Popen(['/bin/x'])",
+        "def f(args):\n    return args.subprocess",
+        "args.multiprocessing",
+        "self._subprocess",
+        "self.pty.spawn(['/bin/x'])",
+        "session.pty.fork()",
+        "self.shutil.os.system('x')",
+        "self.shutil.os",
+        "cfg.venv.create('/tmp/x')",
+        "opts.concurrent.futures.process",
+        # a relative import call that cannot be resolved
+        "from importlib import import_module\nimport_module('..x', __package__)",
     ],
 )
 def test_checker_catches(source: str) -> None:
@@ -572,10 +656,17 @@ def test_checker_catches(source: str) -> None:
         "self._os",
         "cfg.venv",
         "opts.concurrent",
-        "def f(args):\n    return args.subprocess",
         "import importlib\nimportlib.import_module('.clock', __package__).SystemClock()",
         "from importlib import import_module\nimport_module('.clock', package=__package__).x",
         "import uuid\nuuid.__name__",
+        # names imported from a module that are not modules themselves
+        "from argparse import Namespace\nNamespace.pty",
+        "from argparse import Namespace\nNamespace.subprocess_ok",
+        # private names of uuid or platform only count when read off those modules
+        "self.platform._name",
+        "args.uuid._x",
+        "self._os.path",
+        "opts.concurrent.futures.ThreadPoolExecutor",
     ],
 )
 def test_checker_allows(source: str) -> None:
