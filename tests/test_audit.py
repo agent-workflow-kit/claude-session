@@ -120,6 +120,11 @@ def test_enums_match_the_schema() -> None:
         {"inputs": {"run": True}},
         {"inputs": {"kind": 3}},
         {"inputs": {"run_kind": ["review"]}},
+        {"inputs": {"kind": "Bad Kind"}},
+        {"inputs": {"kind": "-review"}},
+        {"inputs": {"kind": "k" * 65}},
+        {"inputs": {"run_kind": "review!"}},
+        {"inputs": {"run_kind": ""}},
         {"inputs": {"forked_from": "parent"}},
         {"inputs": {"tty": 1}},
         {"inputs": {"overridden_hooks": "h1"}},
@@ -162,8 +167,6 @@ def test_secrets_never_appear_in_records(audit_path: Path) -> None:
         actor=f"auto:{SECRET}",
         decision_ids=[SECRET],
         inputs={
-            "kind": f"k-{SECRET}",
-            "run_kind": SECRET,
             "overridden_hooks": [f"h{SECRET}"],
             "labels": [f"token={SECRET}", "plain=1", f"{SECRET.lower()}=v"],
         },
@@ -229,3 +232,35 @@ def test_secret_formed_across_a_marker_is_not_written(audit_path: Path) -> None:
 def test_returned_record_is_the_redacted_one(audit_path: Path) -> None:
     returned = write(audit_path, actor=f"auto:{SECRET}", secrets=[SECRET])
     assert SECRET not in json.dumps(returned)
+
+
+@pytest.mark.parametrize("secret", ["gate-check", "draft-ticket"])
+def test_kind_names_are_validated_not_redacted(secret: str, audit_path: Path) -> None:
+    inputs = {"kind": secret, "run_kind": secret}
+    write(audit_path, inputs=inputs, actor=f"auto:{secret}", secrets=[secret])
+    [record] = records(audit_path)
+    validate(record, AUDIT_SCHEMA)
+    assert record["inputs"] == inputs
+    assert record["actor"] == "auto:[redacted]"
+
+
+LEAK = "s3cr3tVALUE"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"action": LEAK},
+        {"result": LEAK},
+        {"target": f"cs-{LEAK}"},
+        {"inputs": {f"x{LEAK}": 1}},
+        {"inputs": {"forked_from": LEAK}},
+        {"inputs": {"labels": [f"Bad {LEAK}"]}},
+        {"inputs": {"kind": f"Bad {LEAK}"}},
+        {"inputs": {"sandbox_from": LEAK}},
+    ],
+)
+def test_rejection_messages_never_echo_the_value(kwargs: dict[str, Any], audit_path: Path) -> None:
+    with pytest.raises(ValueError) as info:
+        write(audit_path, **kwargs)
+    assert LEAK not in str(info.value)

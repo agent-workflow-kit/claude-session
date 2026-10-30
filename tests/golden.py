@@ -50,12 +50,13 @@ def assert_golden(
 ) -> None:
     """Validate ``actual`` against its schema, then compare it with ``<root>/<name>.json``.
 
-    ``normalize`` (applied to ``actual`` first, before validation, comparison and
-    ``UPDATE_GOLDEN`` writes) replaces volatile values such as timestamps or paths.
+    ``normalize`` (applied after validation, so the real output is what is validated, and
+    before comparison and ``UPDATE_GOLDEN`` writes) replaces volatile values such as
+    timestamps or paths.
     """
+    validate(actual, schema_id_for(name))
     if normalize is not None:
         actual = normalize(actual)
-    validate(actual, schema_id_for(name))
     path = root / f"{name}.json"
     if os.environ.get("UPDATE_GOLDEN") == "1":
         path.parent.mkdir(parents=True, exist_ok=True)

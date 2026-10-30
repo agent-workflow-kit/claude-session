@@ -7,12 +7,18 @@ for the session-directory writes (design.md, File handling).
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import secrets
 import stat
+import time
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# Seconds append_private_line waits for the append lock before giving up: a process holding
+# it must not hang hook-event or an audited command.
+LOCK_TIMEOUT = 1.0
+_LOCK_RETRY_INTERVAL = 0.005
 
 
 def open_dir_nofollow(path: str) -> int:
@@ -87,8 +93,10 @@ def append_private_line(path: str, line: bytes) -> None:
     before anything is written or chmodded. Under an exclusive ``flock`` (held by every
     writer, so a concurrent write in progress is never mistaken for a torn line), if the file
     does not end in a newline (an earlier short write left a torn line), the line is prefixed
-    with one, so it stays a line of its own. The parent directory is never created. Raises
-    ``OSError`` on failure, including a short write.
+    with one, so it stays a line of its own. The lock is waited for at most ``LOCK_TIMEOUT``
+    seconds. An existing file the user cannot read (such as mode 0200) is checked, tightened
+    to 0600 and reopened. The parent directory is never created. Raises ``OSError`` on
+    failure, including a short write and a lock still held at the deadline.
     """
     if not os.path.isabs(path):
         raise ValueError(f"path must be absolute: {path!r}")
@@ -99,22 +107,12 @@ def append_private_line(path: str, line: bytes) -> None:
         raise IsADirectoryError(path)
     dir_fd = open_dir_nofollow(os.path.realpath(parent))
     try:
-        # O_RDWR, not O_WRONLY: the last byte is read back to detect a torn line.
-        flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
-        fd = os.open(name, flags | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
+        fd = _open_for_append(name, dir_fd, path)
     finally:
         os.close(dir_fd)
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError(f"not a regular file: {path}")
-        if st.st_nlink != 1:
-            raise OSError(f"file has {st.st_nlink} links: {path}")
-        if st.st_uid != os.getuid():
-            raise OSError(f"file is owned by another user: {path}")
-        if stat.S_IMODE(st.st_mode) != 0o600:
-            os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)  # released when fd is closed
+        _check_and_tighten(fd, path)
+        _lock(fd, path)  # released when fd is closed
         size = os.fstat(fd).st_size
         if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
             line = b"\n" + line
@@ -123,3 +121,49 @@ def append_private_line(path: str, line: bytes) -> None:
             raise OSError(f"short write to {path}: {written} of {len(line)} bytes")
     finally:
         os.close(fd)
+
+
+# O_RDWR, not O_WRONLY: the last byte is read back to detect a torn line.
+_APPEND_FLAGS = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def _open_for_append(name: str, dir_fd: int, path: str) -> int:
+    try:
+        return os.open(name, _APPEND_FLAGS | os.O_CREAT, 0o600, dir_fd=dir_fd)
+    except PermissionError:
+        # An existing file without read permission: check it through a write-only descriptor,
+        # tighten it to 0600, then open it once more for reading and appending.
+        flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        fd = os.open(name, flags, dir_fd=dir_fd)
+        try:
+            _check_and_tighten(fd, path)
+        finally:
+            os.close(fd)
+        return os.open(name, _APPEND_FLAGS, dir_fd=dir_fd)
+
+
+def _check_and_tighten(fd: int, path: str) -> None:
+    """Refuse anything but a regular file with one link owned by the user; set mode 0600."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(f"not a regular file: {path}")
+    if st.st_nlink != 1:
+        raise OSError(f"file has {st.st_nlink} links: {path}")
+    if st.st_uid != os.getuid():
+        raise OSError(f"file is owned by another user: {path}")
+    if stat.S_IMODE(st.st_mode) != 0o600:
+        os.fchmod(fd, 0o600)
+
+
+def _lock(fd: int, path: str) -> None:
+    """Take an exclusive ``flock`` on ``fd``, waiting at most ``LOCK_TIMEOUT`` seconds."""
+    deadline = time.monotonic() + LOCK_TIMEOUT
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                message = f"timed out waiting for the lock: {path}"
+                raise OSError(errno.EWOULDBLOCK, message) from None
+            time.sleep(_LOCK_RETRY_INTERVAL)

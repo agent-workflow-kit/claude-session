@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -248,3 +250,66 @@ def test_append_requires_a_newline_terminated_line(tmp_path: Path) -> None:
 def test_append_requires_an_absolute_path() -> None:
     with pytest.raises(ValueError):
         fsutil.append_private_line("relative/log.jsonl", b"x\n")
+
+
+def test_append_gives_up_on_a_held_lock_within_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "log.jsonl"
+    fsutil.append_private_line(str(target), b"one\n")
+    monkeypatch.setattr(fsutil, "LOCK_TIMEOUT", 0.2)
+    # flock locks belong to the open file description: a second open conflicts in-process.
+    holder = os.open(target, os.O_RDONLY)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        started = time.monotonic()
+        with pytest.raises(OSError, match="lock"):
+            fsutil.append_private_line(str(target), b"two\n")
+        assert time.monotonic() - started < 5
+    finally:
+        os.close(holder)
+    assert target.read_bytes() == b"one\n"
+
+
+def test_lock_deadline_is_short() -> None:
+    assert 0 < fsutil.LOCK_TIMEOUT <= 2
+
+
+def test_append_waits_for_a_lock_released_before_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "log.jsonl"
+    fsutil.append_private_line(str(target), b"one\n")
+    holder = os.open(target, os.O_RDONLY)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    real_sleep = time.sleep
+
+    def release_then_sleep(seconds: float) -> None:
+        os.close(holder)  # the first retry finds the lock free
+        monkeypatch.setattr(fsutil.time, "sleep", real_sleep)
+        real_sleep(seconds)
+
+    monkeypatch.setattr(fsutil.time, "sleep", release_then_sleep)
+    fsutil.append_private_line(str(target), b"two\n")
+    assert target.read_bytes() == b"one\ntwo\n"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can open a mode-0200 file for reading")
+def test_append_to_a_write_only_file_tightens_it_and_appends(tmp_path: Path) -> None:
+    target = tmp_path / "log.jsonl"
+    target.write_bytes(b"one\n")
+    target.chmod(0o200)
+    fsutil.append_private_line(str(target), b"two\n")
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert target.read_bytes() == b"one\ntwo\n"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can open a mode-0200 file for reading")
+def test_append_to_a_write_only_hard_linked_file_is_refused_untouched(tmp_path: Path) -> None:
+    target = tmp_path / "log.jsonl"
+    target.write_bytes(b"one\n")
+    target.chmod(0o200)
+    os.link(target, tmp_path / "other")
+    with pytest.raises(OSError, match="links"):
+        fsutil.append_private_line(str(target), b"two\n")
+    assert stat.S_IMODE(target.stat().st_mode) == 0o200

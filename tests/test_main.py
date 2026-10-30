@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +27,13 @@ def test_hook_event_errors_exit_0_silently(
 
     silenced: list[bool] = []
     monkeypatch.setattr(hookevent, "main", broken)
+
     # Redirecting fds 1 and 2 would break pytest; the subprocess tests below cover it.
-    monkeypatch.setattr(entry, "_silence_output", lambda: silenced.append(True))
+    def silence(saved: list[int | None]) -> None:
+        entry._restore_output(saved)
+        silenced.append(True)
+
+    monkeypatch.setattr(entry, "_silence_output", silence)
     assert entry.main(["hook-event", "--state-dir", "/nonexistent", "Stop"]) == 0
     assert capsys.readouterr() == ("", "")
     assert silenced == [True]
@@ -193,7 +199,7 @@ def fail_hook(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
         raise error
 
     monkeypatch.setattr(hookevent, "main", broken)
-    monkeypatch.setattr(entry, "_silence_output", lambda: None)
+    monkeypatch.setattr(entry, "_silence_output", entry._restore_output)
 
 
 def log_records(state_dir: Path) -> list[dict[str, Any]]:
@@ -287,3 +293,64 @@ def test_hook_event_failure_is_logged_from_a_real_process(tmp_path: Path) -> Non
     proc = run_python(code)
     assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
     assert log_records(tmp_path)[0]["event"] == "hook_event_failed"
+
+
+def test_hook_event_always_exits_0() -> None:
+    code = HOOK_OUTPUT_THEN.format(output="print('oops')", after="return 2")
+    proc = run_python(code)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "oops\n", "")
+
+
+def test_hook_event_in_process_return_value_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hookevent, "main", lambda argv: 2)
+    assert entry.main(["hook-event", "--state-dir", "/nonexistent", "Stop"]) == 0
+
+
+@pytest.mark.parametrize("after", ["raise RuntimeError('x')", "return 0"], ids=["fail", "ok"])
+def test_hook_event_raw_fd_writes_never_escape(after: str) -> None:
+    code = HOOK_OUTPUT_THEN.format(
+        output="import os; os.write(1, b'raw out'); os.write(2, b'raw err')", after=after
+    )
+    proc = run_python(code)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+
+
+def test_hook_event_after_a_raw_write_keeps_printed_output() -> None:
+    code = HOOK_OUTPUT_THEN.format(
+        output="import os; os.write(1, b'raw'); print('{}')", after="return 0"
+    )
+    proc = run_python(code)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "{}\n", "")
+
+
+LOCKED_LOG = """
+import fcntl, os, sys, time
+from claude_session import __main__ as entry, fsutil, hookevent
+
+fsutil.LOCK_TIMEOUT = 0.2
+state_dir = sys.argv[1]
+holder = os.open(os.path.join(state_dir, "log.jsonl"), os.O_RDONLY)
+fcntl.flock(holder, fcntl.LOCK_EX)
+
+def hook(argv):
+    raise RuntimeError("x")
+
+hookevent.main = hook
+sys.exit(entry.main(["hook-event", "--state-dir", state_dir, "Stop"]))
+"""
+
+
+def test_hook_event_with_a_locked_log_exits_0_quickly(tmp_path: Path) -> None:
+    (tmp_path / "log.jsonl").write_bytes(b"")
+    (tmp_path / "log.jsonl").chmod(0o600)
+    started = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-c", LOCKED_LOG, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert time.monotonic() - started < 30
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+    assert (tmp_path / "log.jsonl").read_bytes() == b""

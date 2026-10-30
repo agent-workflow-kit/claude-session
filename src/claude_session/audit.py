@@ -45,6 +45,8 @@ INPUT_KEYS = frozenset(
 # interface.md, Identifiers (and schemas/audit.json inputs.labels).
 LABEL = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}")
 LABEL_REDACTED_VALUE = "redacted"
+# interface.md, Identifiers: kind names.
+KIND_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
 
 def _string_list(name: str, value: object) -> list[str]:
@@ -56,29 +58,29 @@ def _string_list(name: str, value: object) -> list[str]:
     return items
 
 
-def _optional_text(key: str, value: object) -> None:
-    if value is not None and not isinstance(value, str):
-        raise ValueError(f"audit input {key} must be a string or null")
+def _optional_kind(key: str, value: object) -> None:
+    if value is not None and not (isinstance(value, str) and KIND_NAME.fullmatch(value)):
+        raise ValueError(f"audit input {key} must be a kind name or null")
 
 
 def _check_inputs(inputs: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
     if not isinstance(inputs, Mapping):
         raise ValueError("audit inputs must be a mapping or None")
     if unknown := set(inputs) - INPUT_KEYS:
-        raise ValueError(f"unknown audit inputs: {sorted(unknown)}")
+        raise ValueError(f"unknown audit inputs ({len(unknown)})")
     checked = dict(inputs)
     for key in ("run_kind", "kind"):
-        _optional_text(key, checked.get(key))
+        _optional_kind(key, checked.get(key))
     run = checked.get("run")
     if run is not None and not is_int(run):
         raise ValueError("audit input run must be an integer or null")
     forked_from = checked.get("forked_from")
     if forked_from is not None and not is_csession_id(forked_from):
-        raise ValueError(f"audit input forked_from is not a csession_id: {forked_from!r}")
+        raise ValueError("audit input forked_from is not a csession_id")
     if "labels" in checked:
         labels = _string_list("audit input labels", checked["labels"])
-        if bad := [label for label in labels if not LABEL.fullmatch(label)]:
-            raise ValueError(f"malformed labels: {bad!r}")
+        if not all(LABEL.fullmatch(label) for label in labels):
+            raise ValueError("audit input labels: malformed label")
         checked["labels"] = list(labels)
     if "tty" in checked and not isinstance(checked["tty"], bool):
         raise ValueError("audit input tty must be a boolean")
@@ -111,10 +113,6 @@ def _redact_label(label: str, secrets: Collection[str]) -> str | None:
 
 def _redact_inputs(inputs: dict[str, JSONValue], secrets: Collection[str]) -> dict[str, JSONValue]:
     out = dict(inputs)
-    for key in ("run_kind", "kind"):
-        value = out.get(key)
-        if isinstance(value, str):
-            out[key] = redact_text(value, secrets)
     if "overridden_hooks" in out:
         hooks = _string_list("overridden_hooks", out["overridden_hooks"])
         out["overridden_hooks"] = [redact_text(h, secrets) for h in hooks]
@@ -141,7 +139,8 @@ def append(
 
     ``secrets`` (build them with ``logs.secret_values``; values shorter than
     ``logs.MIN_SECRET_CHARS`` are ignored) are redacted from the text fields: ``actor``,
-    ``decision_id`` and the ``run_kind``, ``kind``, ``overridden_hooks`` and ``labels`` inputs.
+    ``decision_id`` and the ``overridden_hooks`` and ``labels`` inputs. ``run_kind`` and
+    ``kind`` are kind names: validated, never redacted.
     A label containing a secret is written as ``<key>=redacted``, and dropped if its key
     contains one.
 
@@ -152,11 +151,11 @@ def append(
     # TODO(#3): callers build secrets with logs.secret_values from config's secret_env and
     # claude_auth_env names (and the run secret where they have one).
     if action not in ACTIONS:
-        raise ValueError(f"unknown audit action: {action!r}")
+        raise ValueError("unknown audit action")
     if result not in RESULTS:
-        raise ValueError(f"unknown audit result: {result!r}")
+        raise ValueError("unknown audit result")
     if not is_csession_id(target):
-        raise ValueError(f"audit target is not a csession_id: {target!r}")
+        raise ValueError("audit target is not a csession_id")
     if not isinstance(actor, str):
         raise ValueError("audit actor must be a string")
     ids = _string_list("decision_ids", decision_ids)

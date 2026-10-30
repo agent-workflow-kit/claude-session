@@ -6,6 +6,7 @@ hooks stay fast (design.md, Hook-event fast path). Keep this module standard lib
 
 from __future__ import annotations
 
+import fcntl
 import io
 import os
 import sys
@@ -39,42 +40,76 @@ def _redirect_to_devnull(*fds: int) -> None:
         pass
 
 
-def _silence_output() -> None:
+def _divert_output() -> list[int | None]:
+    """Save fds 1 and 2 aside (above 2, close-on-exec) and point both at /dev/null, so raw fd
+    writes (``os.write``, child processes) during hook-event never reach Claude Code. Returns
+    the saved descriptors (None for one that was closed)."""
+    saved: list[int | None] = []
+    for fd in (1, 2):
+        try:
+            saved.append(fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3))
+        except OSError:
+            saved.append(None)
+    _redirect_to_devnull(1, 2)
+    return saved
+
+
+def _restore_output(saved: list[int | None]) -> None:
+    """Point fds 1 and 2 back at the descriptors ``_divert_output`` saved, and close those."""
+    for fd, copy in zip((1, 2), saved, strict=True):
+        if copy is None:
+            continue
+        try:
+            os.dup2(copy, fd)
+        except OSError:
+            pass
+        finally:
+            os.close(copy)
+
+
+def _silence_output(saved: list[int | None]) -> None:
+    """Leave fds 1 and 2 at /dev/null for the rest of the process and close the saved ones."""
+    for copy in saved:
+        if copy is not None:
+            os.close(copy)
     _redirect_to_devnull(1, 2)
 
 
 def _hook_event(argv: list[str]) -> int:
-    """Run ``hook-event``; it never fails a session, so any error exits 0 with no output.
+    """Run ``hook-event``. It always exits 0 (it acts on Claude Code only through its JSON
+    output) and never fails a session: any error exits 0 with no output.
 
-    Its stdout is captured and written only after it returns normally, so a failure can never
-    leak partial output to Claude Code.
+    While it runs, ``sys.stdout``/``sys.stderr`` are captured and fds 1 and 2 point at
+    /dev/null. Only after it returns normally are the fds restored and the captured stdout
+    written; raw fd writes and the captured stderr are dropped, so a failure can never leak
+    partial output to Claude Code.
     """
+    saved = _divert_output()
     real_stdout, real_stderr = sys.stdout, sys.stderr
     captured_stdout, captured_stderr = io.StringIO(), io.StringIO()
     sys.stdout, sys.stderr = captured_stdout, captured_stderr
     failed = False
-    code = 0
     try:
         from . import hookevent
 
-        code = hookevent.main(argv)
+        hookevent.main(argv)  # the return value is ignored: hook-event always exits 0
     except BaseException as exc:  # containment: hook-event never fails a session
         failed = True
         _log_hook_event_failure(argv, exc)
     finally:
         sys.stdout, sys.stderr = real_stdout, real_stderr
     if failed:
-        _silence_output()
+        _silence_output(saved)
         return 0
+    _restore_output(saved)
     # captured_stderr is dropped. TODO(#13): decide whether hook-event's own stderr reaches the
     # log; schemas/log.json has no event for it and the text may carry payload data.
     try:
         real_stdout.write(captured_stdout.getvalue())
         real_stdout.flush()
     except BaseException:
-        _silence_output()
-        return 0
-    return code
+        _redirect_to_devnull(1, 2)
+    return 0
 
 
 def _state_dir_and_event(argv: list[str]) -> tuple[str | None, str | None]:

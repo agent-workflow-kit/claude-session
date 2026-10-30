@@ -134,7 +134,9 @@ def test_assert_golden_validates_before_comparing() -> None:
 ERROR = {"error": {"code": "usage", "message": "bad", "detail": None}}
 
 
-def test_assert_golden_normalizes_before_validating_and_comparing(tmp_path: Path) -> None:
+def test_assert_golden_normalizes_after_validating_and_before_comparing(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "error-norm.json").write_text(json.dumps(ERROR), encoding="utf-8")
     volatile = {"error": {"code": "usage", "message": "bad /tmp/x123", "detail": None}}
 
@@ -149,6 +151,23 @@ def test_assert_golden_normalizes_before_validating_and_comparing(tmp_path: Path
             "error-norm",
             root=tmp_path,
         )
+
+
+def test_assert_golden_validates_the_raw_output_not_the_normalized_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "error-norm.json").write_text(json.dumps(ERROR), encoding="utf-8")
+    invalid = {"error": {"code": "usage", "message": 3, "detail": None}}
+
+    def normalize(value: Any) -> Any:
+        return {"error": {**value["error"], "message": "bad"}}
+
+    with pytest.raises(ValidationError):
+        assert_golden(invalid, "error-norm", normalize=normalize, root=tmp_path)
+    monkeypatch.setenv("UPDATE_GOLDEN", "1")
+    with pytest.raises(ValidationError):
+        assert_golden(invalid, "error-new", normalize=normalize, root=tmp_path)
+    assert not (tmp_path / "error-new.json").exists()
 
 
 def test_update_golden_writes_indented_sorted_json(

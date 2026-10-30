@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -182,6 +183,40 @@ def test_long_message_is_truncated(log_path: Path) -> None:
     assert message.endswith(logs.TRUNCATED)
 
 
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        (SID, True),
+        ("cs-abcd2345a", False),  # too long, allowed characters only
+        ("cs-abcd234", False),  # too short, allowed characters only
+        ("cs-abcd23451", False),
+        ("cs-ABCD2345", False),
+        ("xs-abcd2345", False),
+        (None, False),
+    ],
+)
+def test_is_csession_id(value: object, valid: bool) -> None:
+    assert logs.is_csession_id(value) is valid
+
+
+LEAK = "s3cr3tVALUE"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"event": f"x{LEAK}"},
+        {"event": "adopt", "level": LEAK},
+        {"event": "report_rejected", "reason": LEAK},
+        {"event": "adopt", "csession_id": f"cs-{LEAK}"},
+    ],
+)
+def test_rejection_messages_never_echo_the_value(kwargs: dict[str, Any], log_path: Path) -> None:
+    with pytest.raises(ValueError) as info:
+        logs.EventLog(str(log_path)).write(**kwargs)
+    assert LEAK not in str(info.value)
+
+
 # Secrets
 
 
@@ -265,6 +300,50 @@ def test_secret_spanning_the_truncation_point_is_redacted_first(log_path: Path) 
     assert SECRET[:5] not in raw(log_path)
 
 
+def test_secret_straddling_the_pre_cut_is_not_partly_kept(log_path: Path) -> None:
+    # Long secrets collapse into one short marker, so text near the pre-cut ends up inside
+    # the final cut: a secret cut in half there must not survive in part.
+    long_secret = "L" * 200
+    tail_secret = "QWERTYUIOPASDFGHJKLZ"
+    limit = 2 * logs.MESSAGE_MAX_CHARS + len(long_secret)
+    head = long_secret * 30
+    message = head + "x" * (limit - 10 - len(head)) + tail_secret + "y" * 100
+    log = logs.EventLog(str(log_path), secrets=[long_secret, tail_secret])
+    log.write("adopt", message=message)
+    text = records(log_path)[0]["message"]
+    assert "QWERTYUIOP" not in text
+    assert "Q" not in text
+    assert text.endswith(logs.TRUNCATED)
+    assert len(text) <= logs.MESSAGE_MAX_CHARS
+
+
+def test_full_secret_before_a_pre_cut_secret_prefix_stays_redacted(log_path: Path) -> None:
+    # The pre-cut text ends in a whole secret A whose end is a prefix of secret B: dropping
+    # that prefix must not leave part of A unredacted.
+    a, b = "AAAAAAAAzzz", "zzzBBBBBBBB"
+    limit = 2 * logs.MESSAGE_MAX_CHARS + len(b)
+    message = "x" * (limit - len(a)) + a + "w" * 50
+    logs.EventLog(str(log_path), secrets=[a, b]).write("adopt", message=message)
+    text = records(log_path)[0]["message"]
+    assert "AAAA" not in text
+    assert text.endswith(logs.TRUNCATED)
+
+
+def test_many_overlapping_secrets_in_a_large_message_finish_quickly(log_path: Path) -> None:
+    secrets = ["a" * n for n in range(8, 200)]
+    started = time.monotonic()
+    logs.EventLog(str(log_path), secrets=secrets).write("adopt", message="a" * 2_000_000)
+    assert time.monotonic() - started < 10
+    assert records(log_path)[0]["message"] == logs.REDACTED + logs.TRUNCATED
+
+
+def test_truncation_never_splits_a_marker(log_path: Path) -> None:
+    keep = logs.MESSAGE_MAX_CHARS - len(logs.TRUNCATED)
+    message = "x" * (keep - 3) + SECRET + "y" * 100
+    logs.EventLog(str(log_path), secrets=[SECRET]).write("adopt", message=message)
+    assert records(log_path)[0]["message"] == "x" * (keep - 3) + logs.TRUNCATED
+
+
 def test_overlapping_secrets_are_both_redacted(log_path: Path) -> None:
     secrets = ["abcdefgh", "efghijkl"]
     logs.EventLog(str(log_path), secrets=secrets).write("adopt", message="xxabcdefghijklyy")
@@ -308,22 +387,6 @@ def test_secret_needing_json_escapes_is_redacted(log_path: Path) -> None:
 def test_empty_secret_is_ignored(log_path: Path) -> None:
     logs.EventLog(str(log_path), secrets=["", SECRET]).write("adopt", message="plain")
     assert records(log_path)[0]["message"] == "plain"
-
-
-def test_redact_walks_nested_values() -> None:
-    value = {"a": [SECRET, {"b": (f"x{SECRET}", 3, None, True)}], "c": 1.5}
-    assert logs.redact(value, [SECRET]) == {
-        "a": [logs.REDACTED, {"b": [f"x{logs.REDACTED}", 3, None, True]}],
-        "c": 1.5,
-    }
-
-
-def test_redact_redacts_dictionary_keys() -> None:
-    assert logs.redact({f"k-{SECRET}": 1}, [SECRET]) == {f"k-{logs.REDACTED}": 1}
-
-
-def test_redact_ignores_short_secrets() -> None:
-    assert logs.redact({"info": "info"}, ["info"]) == {"info": "info"}
 
 
 def test_secret_values_from_env() -> None:

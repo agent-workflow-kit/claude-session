@@ -2,9 +2,9 @@
 
 Standard library only and import-light: ``__main__`` logs contained ``hook-event`` errors
 through it (design.md, Hook-event fast path), so it imports no third-party modules (and no
-``re``). Text fields are redacted against the secret values before a record is written;
-identifiers, enums and timestamps are validated instead. Records are appended with one
-``os.write`` each.
+direct ``re`` import; ``json`` loads ``re`` itself). Text fields are redacted against the
+secret values before a record is written; identifiers, enums and timestamps are validated
+instead. Records are appended with one ``os.write`` each.
 """
 
 from __future__ import annotations
@@ -134,33 +134,48 @@ def usable_secrets(secrets: Iterable[str]) -> frozenset[str]:
     return frozenset(s for s in secrets if len(s) >= MIN_SECRET_CHARS)
 
 
-def _replace_secrets(text: str, secrets: Collection[str]) -> str:
-    """One pass: every occurrence of a secret replaced by ``REDACTED``; overlapping or
-    adjacent occurrences collapse into one marker."""
-    spans: list[tuple[int, int]] = []
+def _secret_mask(text: str, secrets: Collection[str]) -> bytearray:
+    """One byte per character of ``text``: 1 where a secret occurs. Overlapping occurrences of
+    one secret mark each character once, so the work stays linear in ``len(text)`` per
+    secret."""
+    mask = bytearray(len(text))
     for secret in secrets:
+        covered = 0  # characters before this index are already marked for this secret
         start = text.find(secret)
         while start != -1:
-            spans.append((start, start + len(secret)))
+            end = start + len(secret)
+            begin = max(start, covered)
+            mask[begin:end] = b"\x01" * (end - begin)
+            covered = end
             start = text.find(secret, start + 1)
-    if not spans:
-        return text
-    spans.sort()
+    return mask
+
+
+def _apply_mask(text: str, mask: bytearray, end: int) -> str:
+    """``text[:end]`` with every marked run replaced by one ``REDACTED`` (a run that crosses
+    ``end`` still becomes a marker)."""
     parts: list[str] = []
     pos = 0
-    end = -1
-    for span_start, span_end in spans:
-        if span_start > end:  # a new, disjoint span: close the previous one
-            if end >= 0:
-                parts.append(REDACTED)
-            parts.append(text[pos:span_start])
-            end = span_end
-        else:  # overlapping or adjacent secrets collapse into one marker
-            end = max(end, span_end)
-        pos = end
-    parts.append(REDACTED)
-    parts.append(text[pos:])
+    while pos < end:
+        start = mask.find(1, pos, end)
+        if start == -1:
+            parts.append(text[pos:end])
+            break
+        parts.append(text[pos:start])
+        parts.append(REDACTED)
+        stop = mask.find(0, start)
+        pos = len(text) if stop == -1 else stop
     return "".join(parts)
+
+
+def _replace_secrets(text: str, secrets: Collection[str], end: int | None = None) -> str:
+    """One pass over ``text[:end]``: every occurrence of a secret (found in the whole ``text``)
+    replaced by ``REDACTED``; overlapping or adjacent occurrences collapse into one marker."""
+    mask = _secret_mask(text, secrets)
+    end = len(text) if end is None else end
+    if 1 not in mask:
+        return text[:end]
+    return _apply_mask(text, mask, end)
 
 
 def leaks_secret(text: str, secrets: Collection[str]) -> bool:
@@ -182,32 +197,60 @@ def redact_text(text: str, secrets: Collection[str]) -> str:
     becomes ``REDACTED``, so no secret survives and redaction always terminates.
     ``secrets`` must already be filtered with ``usable_secrets``."""
     result = _replace_secrets(text, secrets)
-    if result is not text and leaks_secret(result, secrets):
+    if result != text and leaks_secret(result, secrets):
         return REDACTED
     return result
 
 
-def redact(value: JSONValue, secrets: Iterable[str]) -> JSONValue:
-    """``value`` with secrets redacted from every string at any depth: list items, dictionary
-    values and dictionary keys. Integers, floats, bools and None are typed ids and counters and
-    are never redacted. Secrets shorter than ``MIN_SECRET_CHARS`` are ignored. Tuples become
-    lists.
+def _prefix_at_end(text: str, secret: str) -> int:
+    """The length of the longest strict prefix of ``secret`` that ``text`` ends with (KMP,
+    linear in ``len(secret)``)."""
+    failure = [0] * len(secret)
+    k = 0
+    for i in range(1, len(secret)):
+        while k and secret[i] != secret[k]:
+            k = failure[k - 1]
+        if secret[i] == secret[k]:
+            k += 1
+        failure[i] = k
+    matched = 0
+    for char in text[-(len(secret) - 1) :] if len(secret) > 1 else "":
+        while matched and char != secret[matched]:
+            matched = failure[matched - 1]
+        if char == secret[matched]:
+            matched += 1
+        if matched == len(secret):  # a whole occurrence: keep only its longest strict border
+            matched = failure[matched - 1]
+    return matched
 
-    Writers call this on text fields only; identifiers, enums and timestamps are validated, not
-    redacted (interface.md, Audit and log).
+
+def _end_before_secret_prefix(text: str, secrets: Collection[str]) -> int:
+    """The length of ``text`` without its longest tail that is a strict prefix of a secret
+    (a secret cut in half at the end of ``text``)."""
+    return len(text) - max((_prefix_at_end(text, s) for s in secrets), default=0)
+
+
+def redact_message(message: str, secrets: Collection[str]) -> str:
+    """``message`` redacted and truncated to ``MESSAGE_MAX_CHARS``, with bounded work.
+
+    The message is first cut to ``2 * MESSAGE_MAX_CHARS`` plus the longest secret, and any
+    tail of that cut which is the start of a secret is dropped, so no part of a secret
+    survives the cut even when earlier redactions shorten the text. Redaction happens before
+    the final cut, which never splits a ``REDACTED`` marker; a secret completed by the
+    ``TRUNCATED`` marker makes the whole message ``REDACTED``. ``secrets`` must already be
+    filtered with ``usable_secrets``.
     """
-    usable = usable_secrets(secrets)
-    return _redact(value, usable) if usable else value
-
-
-def _redact(value: JSONValue, secrets: Collection[str]) -> JSONValue:
-    if isinstance(value, str):
-        return redact_text(value, secrets)
-    if isinstance(value, dict):
-        return {redact_text(k, secrets): _redact(v, secrets) for k, v in value.items()}
-    if isinstance(value, list | tuple):
-        return [_redact(item, secrets) for item in value]
-    return value
+    limit = 2 * MESSAGE_MAX_CHARS + max(map(len, secrets), default=0)
+    precut = len(message) > limit
+    if precut:
+        text = message[:limit]
+        result = _replace_secrets(text, secrets, _end_before_secret_prefix(text, secrets))
+        if leaks_secret(result, secrets):
+            result = REDACTED
+    else:
+        result = redact_text(message, secrets)
+    result = _truncate(result, force=precut)
+    return REDACTED if leaks_secret(result, secrets) else result
 
 
 def timestamp(now: datetime | None = None) -> str:
@@ -228,10 +271,17 @@ def append_record(path: str, record: Mapping[str, JSONValue]) -> None:
     fsutil.append_private_line(path, line.encode("ascii"))
 
 
-def _truncate(message: str) -> str:
-    if len(message) <= MESSAGE_MAX_CHARS:
+def _truncate(message: str, *, force: bool = False) -> str:
+    """``message`` cut to ``MESSAGE_MAX_CHARS`` with a final ``TRUNCATED`` (also when
+    ``force``, for a message cut earlier). A cut inside a ``REDACTED`` marker moves back to
+    the marker's start."""
+    if len(message) <= MESSAGE_MAX_CHARS and not force:
         return message
-    return message[: MESSAGE_MAX_CHARS - len(TRUNCATED)] + TRUNCATED
+    cut = min(len(message), MESSAGE_MAX_CHARS - len(TRUNCATED))
+    inside = message.find(REDACTED, max(0, cut - len(REDACTED) + 1), cut + len(REDACTED) - 1)
+    if inside != -1 and inside < cut:
+        cut = inside
+    return message[:cut] + TRUNCATED
 
 
 def _string_list(name: str, value: Iterable[str]) -> list[str]:
@@ -278,13 +328,13 @@ class EventLog:
         ``OSError`` when the file cannot be written.
         """
         if event not in EVENTS:
-            raise ValueError(f"unknown log event: {event!r}")
+            raise ValueError("unknown log event")
         if level not in LEVELS:
-            raise ValueError(f"unknown log level: {level!r}")
+            raise ValueError("unknown log level")
         if reason is not None and reason not in REASONS:
-            raise ValueError(f"unknown log reason: {reason!r}")
+            raise ValueError("unknown log reason")
         if csession_id is not None and not is_csession_id(csession_id):
-            raise ValueError(f"malformed csession_id: {csession_id!r}")
+            raise ValueError("malformed csession_id")
         for name, number in (("run", run), ("pid", pid)):
             if number is not None and not is_int(number):
                 raise ValueError(f"{name} must be an integer")
@@ -304,8 +354,5 @@ class EventLog:
         }
         record.update((key, value) for key, value in optional.items() if value is not None)
         if message is not None:
-            # Redact before truncating, so a cut can never leave part of a secret behind; the
-            # truncation marker could complete a secret, so check once more.
-            text = _truncate(redact_text(message, self.secrets))
-            record["message"] = REDACTED if leaks_secret(text, self.secrets) else text
+            record["message"] = redact_message(message, self.secrets)
         append_record(self.path, record)
