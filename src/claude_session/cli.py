@@ -371,6 +371,8 @@ def _check_launch_flags(args: argparse.Namespace) -> None:
     _check_timeout(args)
     if args.max_turns is not None and not 1 <= args.max_turns <= MAX_INTEGER:
         raise UsageError(f"--max-turns must be between 1 and {MAX_INTEGER}")
+    if args.model is not None and args.model.startswith("-"):
+        raise UsageError("--model must not start with '-'")
     basenames: set[str] = set()
     for path in args.input_file or []:
         if path == "-":
