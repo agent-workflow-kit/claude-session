@@ -57,6 +57,7 @@ APPLICATION_ID = 0x43536573
 # drops this process's POSIX locks, so no other thread may connect before that close. Any
 # thread that takes it after the creator finds the file and closed descriptor; it is never
 # held across a database wait.
+# The guarantee assumes state.db is not deleted from outside while the process runs.
 _OPEN_LOCK = threading.Lock()
 
 
@@ -569,12 +570,13 @@ class Store:
         """Open (creating it, mode 0600 in a 0700 directory) the database at ``path``.
 
         With ``migrate`` (every command but ``hook-event``): refuse a newer schema with
-        ``SchemaNewerError`` before writing anything, and migrate an older one under the
+        ``SchemaNewerError`` before writing any data, and migrate an older one under the
         ``migrate`` lease. Without it (the hook path), the database must exist and have the
         code's schema major version; it is used as it is, never created or migrated.
 
         An unsafe, unusable or foreign state directory or database, and a migration lease
-        not obtained within ``migrate_wait``, raise ``FailedError`` naming the path.
+        not obtained within ``migrate_wait`` or a migration that cannot complete (lease
+        lost, database locked), raise ``FailedError`` naming the path.
         """
         migrations = MIGRATIONS if migrations is None else migrations
         _check_migrations(migrations)
