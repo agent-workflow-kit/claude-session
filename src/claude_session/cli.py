@@ -1241,11 +1241,39 @@ def check_schema(argv: Sequence[str]) -> None:
         store.open_state().close()
 
 
+def _is_utf8(text: str) -> bool:
+    """Whether ``text`` encodes to UTF-8 (no lone surrogate, which is how Python carries an
+    argv byte it could not decode)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def check_argv_utf8(argv: Sequence[str]) -> None:
+    """Refuse an argv token that is not valid UTF-8 (``UsageError``, exit 2), before the
+    schema check or anything else reads or writes. Every argv value is stored, logged, put
+    in JSON or echoed in an error, and none of those can carry such bytes. The message names
+    the token's position and, for a flag's value, the flag, never the value."""
+    for index, token in enumerate(argv):
+        if _is_utf8(token):
+            continue
+        flag = token.partition("=")[0] if token.startswith("--") and "=" in token else None
+        if flag is None and index > 0 and argv[index - 1].startswith("--"):
+            flag = argv[index - 1]
+        where = f"argument {index + 1}"
+        if flag is not None and _is_utf8(flag):
+            where = f"{where} ({sanitize(flag)})"
+        raise UsageError(f"{where} is not valid UTF-8")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args: argparse.Namespace | None = None
     schema_checked = False
     try:
+        check_argv_utf8(argv)
         check_schema(argv)
         schema_checked = True
         args = parse(build_parser(), argv)
@@ -1292,6 +1320,10 @@ def _write_error_outcome_file(
     """Write ``error``'s envelope to the ``--outcome-file`` given, if any."""
     path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
     if not path:
+        return
+    # A refused undecodable argv: no file whose own path (or the --cwd it is checked against)
+    # cannot be encoded.
+    if not _is_utf8(path) or not _is_utf8(_value_from_argv(argv, "--cwd") or ""):
         return
     try:
         writable = _envelope_writable(args, argv, store.state_dir())

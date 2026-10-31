@@ -172,6 +172,7 @@ Shared by `exec`, `start` and `resume` (where each is accepted: [Flags at start 
 
 Each of these exits 2 before anything is allocated:
 
+- any argv token that is not valid UTF-8 (see [Argv encoding](#argv-encoding));
 - `--hook-timeout <name>=…` without a `--hook <name>=…` in the same call, or an unknown hook name;
 - `--timeout 0` (use `none`); `wait --timeout 0`;
 - `--reset`, `--fork`, `--allow-tainted` or `--override-escalation` on plain `start` (without `--resume`) or on `exec`;
@@ -181,6 +182,12 @@ Each of these exits 2 before anything is allocated:
 - `--override-escalation` with `--fork`, or when the previous run did not end `escalated`; `--allow-tainted` or `--override-escalation` without a TTY or an explicit `--actor human:*` (human-only flags; exit 2 rather than 13 because they are flags on an otherwise automatable command);
 - a headless new session with neither skill nor prompt;
 - outside launches: `transcript --raw --json` and `transcript --raw --paths`; `label add`/`label remove` without any `key=value` pair; `forget <id>` with a bulk-only flag (`--older-than`, `--state`, `--kind`, `--label`); `forget` without an id or `--older-than`.
+
+### Argv encoding
+
+Every command-line token must be valid UTF-8: a flag name, a flag value (every flag, in both the `--flag value` and `--flag=value` forms), a positional (command words, ids, `key=value` pairs) and anything after `--`. A token with an undecodable byte (Python carries it as a lone surrogate) is refused as the first action of the command: exit 2, error `code: usage`, message `argument <n> (<flag>) is not valid UTF-8` (`<n>` is the 1-based position among the arguments after the program name; `<flag>` is present when the token is a flag's value; the offending value is never echoed). This precedes the schema check and `--help` and `--version`: nothing is read, opened, logged, audited, allocated or started, and no state directory is created. There is no lossy decoding or replacement: `exec` and `start` flags (`--model`, `--hook`, `--hook-timeout`, `--actor`, `--decision-id`, `--label`, `--kind`, `--skill`, `--repo`, `--prompt-file`, `--input-file`, `--plugin-dir`, `--cwd`, `--outcome-file`, `--env-allow`, `--env-allowlist-only`, `--setting-sources`, `--permission-profile`, `--config` and the rest) are all treated alike. A non-UTF-8 `--cwd` is therefore a usage error, not the `unsafe_cwd` launch failure; `unsafe_cwd` is for the process's own working directory when no `--cwd` is given.
+
+The refusal's error envelope is written to an `--outcome-file` given on the command line as for any usage error ([Outcome file](#outcome-file)), except when the `--outcome-file` path or the `--cwd` is itself undecodable: then nothing is written there. `hook-event` takes only the argv this tool injected and never fails: with an undecodable token it exits 0 silently (its containment rule, see [Internal commands](#internal-commands)).
 
 Non-empty setting sources on a third-party-reading run (for example `--reads-third-party --setting-sources user`) is not a flag rule: it is a launch validation (`not-started`, `unsafe_setting_sources`, exit 12).
 
