@@ -61,8 +61,14 @@ Upgrade claude-session while no sessions are live.
 ## Install
 
 ```sh
-uv tool install git+https://github.com/agent-workflow-kit/claude-session
+uv tool install --link-mode=copy git+https://github.com/agent-workflow-kit/claude-session
 ```
+
+`--link-mode=copy` (or `UV_LINK_MODE=copy`) is required for sandboxed and third-party-reading
+kinds: by default uv hard-links the installed files to its cache, and a sandboxed session that
+can write the cache could then change the code of claude-session's hooks, which run outside the
+sandbox. Isolated runs refuse to launch (`unsafe_path`) when claude-session's files have more
+than one link; reinstall with `--link-mode=copy` (add `--reinstall`) to fix that.
 
 ## Documentation
 

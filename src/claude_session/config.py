@@ -15,6 +15,7 @@ Never imported by the hook path (design.md, Hook-event fast path): it needs Pyda
 from __future__ import annotations
 
 import copy
+import math
 import os
 import re
 import stat
@@ -52,15 +53,19 @@ MAX_INTEGER = defaults.MAX_INTEGER  # every integer key (JSON's exact-integer ra
 MAX_RETENTION_DAYS = 36500
 
 VERSION = r"[0-9]+(\.[0-9]+)*"
-# Names that are never config keys and may not be set in env.set (interface.md).
 INVALID_REPO = "<invalid repo id>"
-RESERVED_ENV = (
-    "CSESSION_ID",
-    "CSESSION_DIR",
-    "CSESSION_KIND",
-    "CSESSION_HOOK",
-    "CSESSION_OBJECT_TYPE",
+# No env.set name may start with it (interface.md, Environment variables).
+CSESSION_PREFIX = "CSESSION_"
+# env.allow entries: a name, or a PREFIX* glob whose prefix is a valid name start.
+ENV_PATTERN = r"[A-Za-z_][A-Za-z0-9_]*\*?"
+# The only references env.set values may contain (interface.md, Permission profiles).
+EXPAND_VARS = ("CSESSION_DIR", "CWD", "HOME", "GIT_DIR")
+ENV_REFERENCE = re.compile(r"\$\{(" + "|".join(EXPAND_VARS) + r")\}")
+REFERENCE_PROBLEM = (
+    "only ${CSESSION_DIR}, ${CWD}, ${HOME} and ${GIT_DIR} may be referenced"
+    " (any other '${' is refused)"
 )
+INVALID_ENV_NAME = "<invalid variable name>"
 
 
 def _integer(text: str) -> int:
@@ -172,11 +177,46 @@ def _unique(values: list[str]) -> list[str]:
     return values
 
 
-def _no_reserved(values: dict[str, str]) -> dict[str, str]:
-    for name in values:
-        if name in RESERVED_ENV:
-            raise ValueError(f"{name} is reserved and cannot be set")
-    return values
+def _settable(name: str) -> str:
+    """``env.set`` names: every ``CSESSION_*`` name is claude-session's own (step 8 of
+    design.md, Environment clears and sets them), so none may be set."""
+    if name.startswith(CSESSION_PREFIX):
+        raise ValueError(f"{CSESSION_PREFIX}* names cannot be set")
+    return name
+
+
+def env_set_value_problem(value: str) -> str | None:
+    """Why ``value`` is not a valid ``env.set`` value (None: valid). A value has no NUL, and
+    every ``${`` in it starts one of the exact references ``${CSESSION_DIR}``, ``${CWD}``,
+    ``${HOME}``, ``${GIT_DIR}``. A ``$``, ``{`` or ``}`` on its own is literal (``$${HOME}{``
+    is valid: expansion is single-pass, so no new reference forms). The message never contains
+    the value."""
+    if "\x00" in value:
+        return "must not contain a NUL character"
+    start = value.find("${")
+    while start != -1:
+        if not ENV_REFERENCE.match(value, start):
+            return REFERENCE_PROBLEM
+        start = value.find("${", start + 1)
+    return None
+
+
+def _set_value(value: str) -> str:
+    problem = env_set_value_problem(value)
+    if problem:
+        raise ValueError(problem)
+    return value
+
+
+def is_path_entry(entry: str) -> bool:
+    """A ``PATH`` entry is one absolute path: non-empty, starts with ``/``, no ``:`` or NUL."""
+    return entry.startswith("/") and ":" not in entry and "\x00" not in entry
+
+
+def _path_entry(entry: str) -> str:
+    if not is_path_entry(entry):
+        raise ValueError("must be an absolute path without ':' or NUL (not expanded)")
+    return entry
 
 
 KindName = Annotated[str, _grammar(ids.is_kind_name, "kind name", ids.KIND_NAME.pattern)]
@@ -200,7 +240,12 @@ Count = Annotated[int, Integral, Field(ge=0, le=MAX_INTEGER)]
 Days = Annotated[int, Integral, Field(ge=0, le=MAX_RETENTION_DAYS)]
 Turns = Annotated[int, Integral, Field(ge=1, le=MAX_INTEGER)]
 Model = Annotated[str, AfterValidator(_no_controls), AfterValidator(_no_leading_dash)]
-EnvSet = Annotated[dict[str, str], AfterValidator(_no_reserved)]
+EnvName = Annotated[str, _grammar(ids.is_env_name, "variable name", ids.ENV_NAME.pattern)]
+EnvSetName = Annotated[EnvName, AfterValidator(_settable)]
+EnvSetValue = Annotated[str, AfterValidator(_set_value)]
+EnvSet = dict[EnvSetName, EnvSetValue]
+EnvPattern = Annotated[str, _matching(ENV_PATTERN, "entry")]
+PathEntry = Annotated[str, AfterValidator(_path_entry)]
 SettingSources = Annotated[list[Literal["user", "project", "local"]], AfterValidator(_unique)]
 Sandbox = Literal["required", "preferred", "off"]
 State = Literal[
@@ -227,16 +272,15 @@ class _Model(BaseModel):
 
 class KindEnv(_Model):
     inherit: bool
-    allow: list[str]
+    allow: list[EnvPattern]
     set: EnvSet
-    path_prepend: list[str]
+    path_prepend: list[PathEntry]
 
 
 class Kind(_Model):
     """A kind profile; every field is present once merged over a built-in kind."""
 
-    # TODO(#22): check that permission_profile names a configured profile (or is a file).
-    permission_profile: ProfileName
+    permission_profile: ProfileName  # names a built-in or configured profile (``load``)
     sandbox: Sandbox
     reads_third_party: bool
     implicit_done: bool
@@ -262,15 +306,15 @@ class Kind(_Model):
 
 class EnvOverride(_Model):
     inherit: Annotated[bool | None, NotNull] = None
-    allow: Annotated[list[str] | None, NotNull] = None
+    allow: Annotated[list[EnvPattern] | None, NotNull] = None
     set: Annotated[EnvSet | None, NotNull] = None
-    path_prepend: Annotated[list[str] | None, NotNull] = None
+    path_prepend: Annotated[list[PathEntry] | None, NotNull] = None
 
 
 class RepoKindOverride(_Model):
     """Per-repo override of a kind; only the fields that were given apply (``exclude_unset``)."""
 
-    # TODO(#22): check that permission_profile names a configured profile (or is a file).
+    # Names a built-in or configured profile (``load``).
     permission_profile: Annotated[ProfileName | None, NotNull] = None
     sandbox: Annotated[Sandbox | None, NotNull] = None
     env: Annotated[EnvOverride | None, NotNull] = None
@@ -320,8 +364,8 @@ class Config(_Model):
     claude_bin: Annotated[str, AfterValidator(_no_controls)]
     min_claude_version: Annotated[str, _matching(VERSION, "version")]
     default_kind: KindName  # also names a built-in or configured kind (checked by ``load``)
-    claude_auth_env: list[str]
-    secret_env: list[str]
+    claude_auth_env: list[EnvName]
+    secret_env: list[EnvName]
     notes_context_cmd: Annotated[list[str], Field(min_length=1)]
     notes_context_timeout: PositiveDuration
     notes_context_max_bytes: Count
@@ -429,7 +473,28 @@ def load(
                     f" (in {where})"
                 )
                 raise UsageError("invalid config", detail=detail)
+    _check_profile_references(cfg, lambda loc: _source(loc, sources, from_env))
     return cfg
+
+
+def _check_profile_references(cfg: Config, source: Callable[[tuple[str | int, ...]], str]) -> None:
+    """Every kind's and per-repo override's ``permission_profile`` names a built-in or
+    configured profile (config kinds hold names only; files are a flag form)."""
+    refs: list[tuple[tuple[str, ...], str | None]] = [
+        (("kinds", name, "permission_profile"), kind.permission_profile)
+        for name, kind in cfg.kinds.items()
+    ]
+    for repo_id, repo in cfg.repos.items():
+        for name, override in repo.kinds.items():
+            loc = ("repos", repo_id, "kinds", name, "permission_profile")
+            refs.append((loc, override.permission_profile))
+    for loc, profile in refs:
+        if profile is not None and profile not in cfg.permission_profiles:
+            detail = (
+                f"{'.'.join(loc)}: names no built-in or configured permission profile"
+                f" (in {source(loc)})"
+            )
+            raise UsageError("invalid config", detail=detail)
 
 
 def merge(base: dict[str, Any], over: Mapping[str, Any], path: tuple[str, ...] = ()) -> None:
@@ -494,7 +559,7 @@ class _Refused(yaml.constructor.ConstructorError):
 _INT, _FLOAT = "tag:yaml.org,2002:int", "tag:yaml.org,2002:float"
 _MERGE = "tag:yaml.org,2002:merge"
 # YAML types with no JSON counterpart: loaded as ``_Unsupported`` (nothing built), refused by
-# ``_check_tree`` with the key path.
+# ``check_tree`` with the key path.
 _UNSUPPORTED = ("timestamp", "binary", "set", "omap", "pairs")
 
 
@@ -595,6 +660,16 @@ def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
     raw = _read_bytes(path, required=required)
     if raw is None:
         return None
+    return parse_yaml(raw, path)
+
+
+def parse_yaml(raw: bytes, path: Path, *, empty: bool = True) -> dict[str, Any]:
+    """A YAML document (``raw``, read from ``path``) with every config-file rule: UTF-8, the
+    safe loader (no duplicate or merge keys, JSON types only), the node and depth limits and a
+    mapping at the top level (an empty document or ``null`` is ``{}`` when ``empty``, else
+    refused). Raises ``UsageError("invalid config")``
+    whose ``detail`` names ``path`` and the problem, never the content. Also used for
+    permission-profile files."""
     # Errors are raised after the handlers, so the original exception (which may hold or quote
     # the file's content) is never their ``__context__``.
     problem: str | None = None
@@ -622,7 +697,7 @@ def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
         problem = f"{path}: invalid YAML"
     if problem is not None:
         raise UsageError("invalid config", detail=problem)
-    if data is None:
+    if data is None and empty:
         return {}
     if isinstance(data, _Unsupported):
         raise _unsupported(data, "top level", path)
@@ -630,7 +705,7 @@ def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
         found = type(data).__name__
         detail = f"top level: expected a mapping, got {found} (in {path})"
         raise UsageError("invalid config", detail=detail)
-    _check_tree(data, path)
+    check_tree(data, path)
     return data
 
 
@@ -649,7 +724,7 @@ def _problem(exc: yaml.YAMLError) -> str:
 
 
 def _check_nesting(text: str, path: Path) -> None:
-    """Refuse nesting deeper than ``_check_tree`` allows from the event stream, before composing:
+    """Refuse nesting deeper than ``check_tree`` allows from the event stream, before composing:
     libyaml's composer recurses once per level without limit. The parser is not recursive, and
     scanning stops at the first event that is too deep."""
     depth = 0
@@ -700,9 +775,11 @@ def _read_bytes(path: Path, *, required: bool) -> bytes | None:
     return b"".join(chunks)
 
 
-def _check_tree(data: dict[str, Any], path: Path) -> None:
-    """Refuse trees over ``MAX_NODES`` nodes (aliases expanded) or ``MAX_DEPTH`` levels, and
-    non-string mapping keys. Shared (aliased) nodes are walked once (memoized by identity)."""
+def check_tree(data: dict[str, Any], path: Path) -> None:
+    """Refuse (``UsageError``) trees over ``MAX_NODES`` nodes (aliases expanded) or
+    ``MAX_DEPTH`` levels, non-string mapping keys and non-finite numbers (``.inf``, ``.nan``,
+    ``1e400``: not JSON). Shared (aliased) nodes are walked once (memoized by identity). Also
+    applied to JSON permission-profile files."""
     seen: dict[int, tuple[int, int]] = {}  # id -> (nodes, height)
 
     def too_deep() -> UsageError:
@@ -713,6 +790,9 @@ def _check_tree(data: dict[str, Any], path: Path) -> None:
         if depth > MAX_DEPTH:
             raise too_deep()
         if not isinstance(node, (dict, list)):
+            if isinstance(node, float) and not math.isfinite(node):
+                detail = f"{where or 'top level'}: not a finite number (in {path})"
+                raise UsageError("invalid config", detail=detail)
             if node is None or isinstance(node, (str, int, float)):  # bool is an int
                 return 1, 0
             if isinstance(node, _Unsupported):
@@ -760,10 +840,12 @@ def _unsupported(value: _Unsupported, where: str, path: Path) -> UsageError:
 
 
 def _key_path(where: str, key: str) -> str:
-    """``where.key``; a repo key that is not a valid repo id is not echoed (it may hold
-    credentials)."""
+    """``where.key``; a repo key that is not a valid repo id and an ``env.set`` key that is not
+    a valid variable name are not echoed (they may hold credentials or control characters)."""
     if where == "repos" and not ids.is_repo_id(key):
         key = INVALID_REPO
+    elif (where == "env.set" or where.endswith(".env.set")) and not ids.is_env_name(key):
+        key = INVALID_ENV_NAME
     return f"{where}.{key}" if where else key
 
 
