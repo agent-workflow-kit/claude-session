@@ -53,7 +53,10 @@ handlers on entry to a Python function). Residuals: signals to the forking threa
 child has exec'd (or failed to); a handler (for a signal another thread took) that raises inside
 ``Popen`` after the fork, before ``spawn`` holds the ``Popen``, leaves that child running. ``run``
 (Linux) starts its child the same way, without the death signal, so a handler that raises in
-``exec``'s launch phase does so only once ``run`` holds the ``Popen`` and ends its child.
+``exec``'s launch phase does so only once ``run`` holds the ``Popen`` and ends its child. A
+``gated`` spawn forks the same way on every platform, and its child restores the caller's mask
+there too; SIGTERM is reset only with ``die_with_parent`` (``run`` and an interactive gated
+child keep an inherited ignored or blocked SIGTERM).
 
 ``run(..., discard_output=True)`` connects stdout and stderr to ``/dev/null`` (no pipes): it
 then waits only for the child itself to exit, never for descendants that keep the output open
@@ -288,9 +291,11 @@ class Gateway(Protocol):
         keeps both. The program is checked (exists, executable) here, raising as an ungated
         spawn would; an exec that fails anyway (a bad interpreter, a race) makes ``release``
         raise that ``OSError``, and the child exits ``GATE_EXEC_FAILED``. Gated children are
-        started like ``die_with_parent`` ones (every signal blocked around the fork; on Linux
-        the child resets the signals with a Python handler here, and SIGTERM, to their
-        default action before it waits at the gate)."""
+        started like ``die_with_parent`` ones on every platform (every signal blocked around
+        the fork; before it waits at the gate the child resets the signals with a Python
+        handler here to their default action and restores the caller's mask). Only with
+        ``die_with_parent`` is SIGTERM also reset and unblocked; without it an inherited
+        ignored or blocked SIGTERM stays so, as for an ungated child."""
         ...
 
 
@@ -373,7 +378,7 @@ def _stream(value: int | Inherit | None) -> int | None:
 
 @dataclass(frozen=True)
 class _Libc:
-    prctl: Callable[..., int]
+    prctl: Callable[..., int] | None  # Linux only
     signal: Callable[..., object]
     get_errno: Callable[[], int]
 
@@ -398,26 +403,31 @@ def _libc() -> _Libc:
     libc_signal = ctypes.CDLL(None).signal
     libc_signal.restype = ctypes.c_void_p
     libc_signal.argtypes = (ctypes.c_int, ctypes.c_void_p)
-    return _Libc(_prctl(), libc_signal, ctypes.get_errno)
+    prctl = _prctl() if sys.platform.startswith("linux") else None
+    return _Libc(prctl, libc_signal, ctypes.get_errno)
 
 
 def _pdeathsig_preexec(
     child_mask: set[int], parent: int | None = None, *, death_signal: bool = True
-) -> Callable[[], None] | None:
-    """A ``preexec_fn`` setting ``PR_SET_PDEATHSIG(SIGTERM)``, or ``None`` off Linux.
+) -> Callable[[], None]:
+    """A ``preexec_fn`` for a fork made with every signal blocked (``_start_blocked``).
 
-    The fork happens with every signal blocked (``spawn``, ``run``); the child resets
-    the signals that have a Python handler here, and SIGTERM, to their default action, then
-    sets ``child_mask`` (the caller's mask) without SIGTERM. ``parent`` is the PID the child
-    must see as its parent (default: this process). Without ``death_signal`` (``run``) only
-    the handlers and the mask are reset."""
-    if not sys.platform.startswith("linux"):
-        return None
+    On every platform the child resets the signals that have a Python handler here to their
+    default action and then sets ``child_mask`` (the caller's mask). With ``death_signal``
+    SIGTERM is also reset to its default and dropped from the mask, and on Linux the child
+    sets ``PR_SET_PDEATHSIG(SIGTERM)``; ``parent`` is the PID the child must then see as its
+    parent (default: this process). Without ``death_signal`` (``run``, an interactive gated
+    spawn) an inherited ignored or blocked SIGTERM stays as it was."""
     libc = _libc()  # resolved before the fork
     expected = os.getpid() if parent is None else parent
-    handled = [s for s in signal.valid_signals() if callable(signal.getsignal(s))]
-    reset = sorted({*handled, signal.SIGTERM})
-    mask = child_mask - {signal.SIGTERM}
+    handled = {s for s in signal.valid_signals() if callable(signal.getsignal(s))}
+    if death_signal:
+        reset = sorted({*handled, signal.SIGTERM})
+        mask = child_mask - {signal.SIGTERM}
+    else:
+        reset = sorted(handled)
+        mask = set(child_mask)
+    prctl = libc.prctl if death_signal else None
 
     def preexec() -> None:
         # A Python handler would run here, in the forked child, if its signal arrived; an
@@ -425,9 +435,9 @@ def _pdeathsig_preexec(
         for sig in reset:
             libc.signal(sig, _SIG_DFL)
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        if not death_signal:
+        if prctl is None:  # no death signal asked for, or not Linux
             return
-        if libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+        if prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
             raise OSError(libc.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
         if os.getppid() != expected:  # the parent died before the flag was set
             os._exit(PARENT_GONE_EXIT)
