@@ -12,8 +12,9 @@ of a launch: ``git`` (repo id and git directory) and the sandbox prerequisite pr
 the checks pass, the sandbox state comes from them (no second probe); when one fails, the
 prerequisites are probed with ``bwrap`` and ``socat`` resolved against the session-writable
 paths known without a session (``unchecked_writable``: with the permission profile's write
-paths), and a binary a launch would refuse is reported, never run; with a profile file that
-was not read, nothing is probed.
+paths, and their ``${GIT_DIR}`` entries once the checks found the git directory), and a
+binary a launch would refuse is reported, never run; with a profile file that was not read,
+or a ``${GIT_DIR}`` write entry before the git directory is known, nothing is probed.
 
 A new session has no id yet: its paths (session directory, private tmpdir, settings file)
 are shown with the placeholder id ``PLACEHOLDER_ID``, and its own ``work/``, ``outbox/`` and
@@ -24,7 +25,9 @@ are shown with the placeholder id ``PLACEHOLDER_ID``, and its own ``work/``, ``o
 checks of a launch (it has no session); it probes ``claude --version`` (minimal environment,
 ``claude_version.probe``) and the sandbox prerequisites, never running a binary under a path
 a session could write without a session context (``launch.step2_writable``) or under the
-kind's ``write_dirs`` and permission profile write paths (``unchecked_writable``).
+kind's ``write_dirs`` and permission profile write paths (``unchecked_writable``); it never
+knows the git directory, so an isolated kind with a ``${GIT_DIR}`` write entry probes
+nothing.
 
 TODO(#28): ``start --resume --dry-run`` and ``exec --session-id <id> --dry-run`` (inspect
 the pending run without adopting it: ``would_refuse`` ``already_adopted``/``expired``,
@@ -37,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -46,6 +50,7 @@ from . import (
     claude_version,
     durations,
     envbuild,
+    gitinfo,
     kinds,
     launch,
     pathrules,
@@ -76,6 +81,8 @@ SANDBOX_LISTS = {
 # Profile variables that need a session; read_dirs/write_dirs entries using them are shown
 # as written by ``kinds``.
 _SESSION_VARIABLES = ("${CSESSION_DIR}", "${CWD}", "${GIT_DIR}")
+# The tool name of a permission rule (``Tool`` or ``Tool(content)``).
+_RULE_TOOL = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 
 
 # Shared pieces
@@ -246,16 +253,20 @@ def unchecked_writable(
     probe_cwd: str | None,
     caller_cwd: str | None,
     recorded: Profile | None = None,
+    git: GitDir | None = None,
 ) -> pathrules.SessionWritable | None:
     """The session-writable paths known without a session (a dry run whose checks failed,
     and ``kinds``): the step-2 set (``probe_cwd``, ``<state>/sessions``, the tmp root;
-    ``launch.step2_writable``) plus, for an isolated kind, the set the launch resolves git
-    against (``launch.git_writable``: the placeholder session's paths, ``write_dirs`` and the
-    permission profile's write paths, without ``${GIT_DIR}``), and for a trusted kind (a
-    launch checks none) its ``write_dirs`` that resolve without a session. None when the
+    ``launch.step2_writable``) plus, for an isolated kind, the placeholder session's paths,
+    ``write_dirs`` and the permission profile's write paths: once the dry run's checks found
+    the git directory (``git``), the full set the launch checks its tools against
+    (``launch.full_writable``, ``${GIT_DIR}`` expanded); before that, the set the launch
+    resolves git against (``launch.git_writable``), which is the whole set only when no
+    ``write_dirs`` entry or profile write entry uses ``${GIT_DIR}``. For a trusted kind (a
+    launch checks none): its ``write_dirs`` that resolve without a session. None when the
     profile or the ``write_dirs`` cannot be known (a profile file that was not read, an entry
-    that does not expand): nothing may be probed. ``caller_cwd`` is the run's
-    (None: ``work/``)."""
+    that does not expand, a ``${GIT_DIR}`` write entry while the git directory is not known):
+    nothing may be probed. ``caller_cwd`` is the run's (None: ``work/``)."""
     step2 = launch.step2_writable(process, probe_cwd).paths
     home = os.path.realpath(process.environ.get("HOME", "/"))
     if not resolution.isolated():
@@ -272,11 +283,55 @@ def unchecked_writable(
     tmp = None if resolution.profile.sandbox == "off" else tmpdir.run_path(PLACEHOLDER_ID)
     cwd = os.path.realpath(caller_cwd or os.path.join(alloc.session_dir, sessiondir.WORK))
     try:
-        writable = launch.git_writable(resolution, alloc, cwd, home, tmp, profile)
+        if git is not None:
+            variables = launch.profile_variables(alloc, cwd, home, git.dirs)
+            expanded = permission_profiles.expand(profile.content, variables)
+            _, write = launch.resolve_run_dirs(resolution, variables, home, alloc)
+            full = launch.full_writable(resolution, alloc, cwd, home, tmp, write, expanded)
+            assert full is not None
+            return pathrules.SessionWritable([*step2, *full.paths])
+        if _uses_git_dir(resolution, profile):
+            return None
+        before_git = launch.git_writable(resolution, alloc, cwd, home, tmp, profile)
     except LaunchValidationError:
         return None
-    assert isinstance(writable, pathrules.SessionWritable)
-    return pathrules.SessionWritable([*step2, *writable.paths])
+    assert isinstance(before_git, pathrules.SessionWritable)
+    return pathrules.SessionWritable([*step2, *before_git.paths])
+
+
+@dataclass(frozen=True)
+class GitDir:
+    """The git directory the launch checks found (``dirs`` None: the cwd has none)."""
+
+    dirs: gitinfo.GitDirs | None
+
+
+def _uses_git_dir(resolution: kinds.Resolution, profile: Profile) -> bool:
+    """Whether a ``write_dirs`` entry or a profile write entry (sandbox ``allowWrite``, an
+    ``Edit``/``Write`` allow rule) uses ``${GIT_DIR}``: the session-writable paths are then
+    not known until git found the git directory."""
+    variable = launch.GIT_DIR_VARIABLE
+    if any(variable in entry for entry in resolution.profile.write_dirs):
+        return True
+    content = profile.content
+    sandbox = content.get("sandbox")
+    filesystem = sandbox.get("filesystem") if isinstance(sandbox, dict) else None
+    allow_write = filesystem.get("allowWrite") if isinstance(filesystem, dict) else None
+    if isinstance(allow_write, list) and any(
+        isinstance(entry, str) and variable in entry for entry in allow_write
+    ):
+        return True
+    permissions = content.get("permissions")
+    rules = permissions.get("allow") if isinstance(permissions, dict) else None
+    if not isinstance(rules, list):
+        return False
+    for rule in rules:
+        if not isinstance(rule, str) or variable not in rule:
+            continue
+        tool = _RULE_TOOL.match(rule)
+        if tool is None or tool.group(0) in pathrules.WRITE_TOOLS:
+            return True
+    return False
 
 
 def placeholder_alloc(process: launch.Process, resolution: kinds.Resolution) -> launch.Allocated:
@@ -635,18 +690,23 @@ class Outcome:
     message: str | None = None
     warnings: list[str] = field(default_factory=list)
     profile: Profile | None = None  # the permission profile, once read
+    git: GitDir | None = None  # the git directory, once the checks found it
 
 
 class DryRunEffects(launch.Effects):
-    """The effects of a dry run: nothing is recorded or created; the permission profile
-    and the warnings are kept for a plan whose checks fail later."""
+    """The effects of a dry run: nothing is recorded or created; the permission profile,
+    the git directory and the warnings are kept for a plan whose checks fail later."""
 
     def __init__(self) -> None:
         self.profile: Profile | None = None
+        self.git: GitDir | None = None
         self.warnings: list[str] = []
 
     def record_profile(self, profile: Profile) -> None:
         self.profile = profile
+
+    def record_git_dir(self, git_dirs: gitinfo.GitDirs | None) -> None:
+        self.git = GitDir(git_dirs)
 
     def warn(self, warnings: Sequence[str]) -> None:
         self.warnings += warnings
@@ -694,6 +754,7 @@ def run_checks(
             f"a launch would fail ({error.end_reason}): {found.message}",
         ]
     found.profile = effects.profile
+    found.git = effects.git
     return found
 
 
@@ -719,6 +780,7 @@ def new_session_plan(
         probe_cwd=resolved.caller_cwd,
         caller_cwd=resolved.caller_cwd,
         recorded=found.profile,
+        git=found.git,
     )
     sandbox: Sandbox | None
     if found.checked is not None:

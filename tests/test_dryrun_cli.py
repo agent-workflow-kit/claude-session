@@ -692,6 +692,173 @@ def test_kinds_words_a_trusted_kinds_unrun_claude_as_not_probed(
     assert not any("a launch refuses it" in w for w in claude)
 
 
+# Tools under a ${GIT_DIR} write path (G1, G2)
+
+
+def separate_git_dir(work: Path, git_dir: Path) -> None:
+    """``work`` as a repository whose git directory is ``git_dir`` (outside the cwd)."""
+    subprocess.run(
+        ["git", "init", "-q", f"--separate-git-dir={git_dir}", str(work)],
+        check=True,
+        timeout=30,
+        env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+
+
+# A ${GIT_DIR}/tools write entry in each place a run's write paths come from: the config
+# (write_dirs) and the permission profile (sandbox allowWrite, an Edit allow rule).
+GIT_DIR_ENTRIES = ["write_dirs", "allowWrite", "edit_rule"]
+
+
+def git_dir_profile(entry: str) -> dict[str, Any]:
+    if entry == "allowWrite":
+        return {
+            "permissions": {"allow": ["Read"]},
+            "sandbox": {"filesystem": {"allowWrite": ["${GIT_DIR}/tools"]}},
+        }
+    return {"permissions": {"allow": ["Read", "Edit(/${GIT_DIR}/tools/**)"]}}
+
+
+def git_dir_config(kind: str, entry: str) -> str:
+    """Config giving ``kind`` the ``entry`` form of a ``${GIT_DIR}/tools`` write path."""
+    if entry == "write_dirs":
+        return f"kinds:\n  {kind}:\n    write_dirs: ['${{GIT_DIR}}/tools']\n"
+    profile = json.dumps(git_dir_profile(entry))
+    return (
+        f"permission_profiles:\n  gitdir: {profile}\n"
+        f"kinds:\n  {kind}:\n    permission_profile: gitdir\n"
+    )
+
+
+@pytest.mark.parametrize("entry", ["profile_file", *GIT_DIR_ENTRIES])
+def test_a_failing_dry_run_never_runs_a_tool_under_a_git_dir_write_path(
+    entry: str, tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """The launch adds the ``${GIT_DIR}`` entries once git found the git directory and
+    refuses a tool under them (``unsafe_path``); the dry run's probes never run it."""
+    git_dir = tmp_path / "gd"
+    separate_git_dir(work, git_dir)
+    marker = tmp_path / "ran"
+    plant(git_dir / "tools" / "bin", marker)
+    extra: list[str] = []
+    config = ""
+    if entry == "profile_file":
+        profile = tmp_path / "profile.json"
+        profile.write_text(json.dumps(git_dir_profile("allowWrite")), encoding="utf-8")
+        extra = ["--permission-profile", str(profile)]
+    else:
+        config = git_dir_config("respond", entry)
+    proc, plan = dry_run(
+        "respond",
+        *extra,
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=config,
+        env={"PATH": f"{git_dir / 'tools' / 'bin'}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 12
+    assert plan["would_fail"] == "unsafe_path", plan["warnings"]
+    assert not marker.exists()
+    assert plan["sandbox"]["available"] is False
+    assert any("a launch refuses it" in p for p in plan["sandbox"]["problems"])
+
+
+@pytest.mark.parametrize("entry", GIT_DIR_ENTRIES)
+def test_kinds_never_runs_a_tool_under_a_git_dir_write_path(
+    entry: str, tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """``kinds`` never knows the git directory: a ``${GIT_DIR}`` write entry leaves the
+    kind's session-writable paths unknown, so neither ``claude`` nor the sandbox
+    prerequisites are probed."""
+    git_dir = tmp_path / "gd"
+    separate_git_dir(work, git_dir)
+    marker = tmp_path / "ran"
+    plant(git_dir / "tools" / "bin", marker)
+    proc = cli(
+        ["kinds", "--json", "--kind", "respond"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=git_dir_config("respond", entry),
+        env={"PATH": f"{git_dir / 'tools' / 'bin'}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists()
+    report = json.loads(proc.stdout)
+    validate(report, KINDS)
+    assert report["claude_bin_resolved"] is None and report["claude_version"] is None
+    assert any("not probed by a dry run" in w for w in report["warnings"])
+    (respond,) = report["kinds"]
+    assert respond["sandbox_available"] is False
+    assert any("not probed by a dry run" in p for p in respond["sandbox_problems"])
+
+
+@pytest.mark.parametrize("entry", GIT_DIR_ENTRIES)
+@pytest.mark.parametrize("kind", ISOLATED)
+def test_a_git_dir_write_path_never_lets_a_tool_run(
+    kind: str, entry: str, tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """The general rule, for every isolated kind and every source of a write path: while
+    the git directory is not known (``kinds``), a ``${GIT_DIR}`` write entry means nothing
+    is probed; a dry run (which knows it once git ran) never runs a tool under it."""
+    git_dir = tmp_path / "gd"
+    separate_git_dir(work, git_dir)
+    marker = tmp_path / "ran"
+    plant(git_dir / "tools" / "bin", marker)
+    path = f"{git_dir / 'tools' / 'bin'}:{tools}:/usr/bin:/bin"
+    config = git_dir_config(kind, entry)
+    proc = cli(
+        ["kinds", "--json", "--kind", kind],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=config,
+        env={"PATH": path},
+    )
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    validate(report, KINDS)
+    assert report["claude_bin_resolved"] is None
+    (row,) = report["kinds"]
+    assert any("not probed by a dry run" in p for p in row["sandbox_problems"])
+    assert not marker.exists()
+    run = cli(
+        ["exec", "--dry-run", "--json", "--kind", kind, "--mode", "headless"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=config,
+        env={"PATH": path},
+    )
+    assert run.returncode in (2, 12), run.stdout
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("entry", GIT_DIR_ENTRIES)
+def test_a_dry_run_failing_before_git_probes_no_tool_under_a_git_dir_write_path(
+    entry: str, tmp_path: Path, tools: Path
+) -> None:
+    """A dry run whose checks fail before git runs (``unsafe_cwd``: the cwd is ``$HOME``)
+    does not know the git directory: nothing is probed."""
+    home = Path(os.environ["HOME"])
+    (home / "prompt.md").write_text("Do it.\n", encoding="utf-8")
+    marker = tmp_path / "ran"
+    plant(tmp_path / "gd" / "tools" / "bin", marker)
+    proc, plan = dry_run(
+        "respond",
+        cwd=home,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=git_dir_config("respond", entry),
+        env={"PATH": f"{tmp_path / 'gd' / 'tools' / 'bin'}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 12 and plan["would_fail"] == "unsafe_cwd"
+    assert not marker.exists()
+    assert plan["sandbox"]["available"] is False
+    assert any("not probed by a dry run" in p for p in plan["sandbox"]["problems"])
+
+
 # permission_profile when a later check fails (R2)
 
 
