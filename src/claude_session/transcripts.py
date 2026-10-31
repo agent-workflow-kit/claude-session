@@ -10,18 +10,23 @@ Everything here is untrusted: the recorded paths (a hook payload), the files (wr
 Code, steered by the agent) and their content. So:
 
 - A recorded path is used only when it is ``<projects root>/<project>/<claude id>.jsonl`` for a
-  projects root of this user (``$HOME/.claude/projects`` or ``$CLAUDE_CONFIG_DIR/projects``),
-  in normal form and printable unchanged; any other is reported with ``path: null`` and a
-  warning, never opened.
+  projects root of this user (``$HOME/.claude/projects`` or ``$CLAUDE_CONFIG_DIR/projects``,
+  dropped when it resolves to ``/``, ``$HOME``, an ancestor of it or a directory that is or
+  contains a credential path), in normal form and printable unchanged; any other is
+  reported with ``path: null`` and a warning, never opened.
 - Files and directories are opened one component at a time below the projects root without
   following symlinks (``O_NOFOLLOW``) and without blocking on a FIFO (``O_NONBLOCK``). A file
   must be a regular file with one link owned by the user, a directory a real directory owned
-  by the user; anything else fails the command (``failed``, exit 12). A missing one is
-  reported (``exists: false``), never fatal.
+  by the user (the root also not writable by others); anything else fails the command
+  (``failed``, exit 12). A missing one is reported (``exists: false``), never fatal. An
+  offloaded tool result that fails the file check is not referenced (a marker and a
+  warning instead).
 - A file is read only up to its size when it was opened (a live session keeps appending), a
   JSONL record longer than ``RECORD_MAX_BYTES`` is skipped, records that are not JSON objects
-  (malformed, too deeply nested, invalid UTF-8 replaced) are skipped, and the whole command
-  stops (``failed``) once it has spent ``READ_DEADLINE`` seconds reading.
+  (malformed, too deeply nested, invalid UTF-8 replaced) are skipped (both with a marker in
+  text), a directory listing keeps at most ``MAX_DIR_ENTRIES`` matching names, and the whole
+  command stops (``failed``) once it has spent ``READ_DEADLINE`` seconds in file system
+  calls (time spent writing the output does not count).
 - Rendered text passes every value through ``terminal.display`` (one line each, with control,
   bidi and invisible characters escaped); ``--raw`` copies the bytes unchanged.
 
@@ -39,12 +44,15 @@ import os
 import re
 import stat
 import time
+import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO
 
 from . import fsutil
 from .errors import FailedError
+from .pathrules import CREDENTIAL_PATHS
 from .terminal import display, no_surrogates
 
 # Claude Code session ids are lowercase UUIDs (hook-event refuses anything else).
@@ -52,7 +60,9 @@ CLAUDE_SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}
 # Subagent files; other names in the subagents directory are ignored.
 AGENT_FILE = re.compile(r"agent-([A-Za-z0-9_-]{1,128})\.jsonl")
 AGENT_META = re.compile(r"agent-([A-Za-z0-9_-]{1,128})\.meta\.json")
-# Offloaded tool-result names referenced from tool-result text.
+AGENT_NAME = re.compile(r"agent-[A-Za-z0-9_-]{1,128}(?:\.jsonl|\.meta\.json)")
+# Offloaded tool-result names, and their references in tool-result text.
+TOOL_RESULT_NAME = re.compile(r"[A-Za-z0-9._-]{1,255}")
 TOOL_RESULT_REF = re.compile(r"tool-results/([A-Za-z0-9._-]{1,255})")
 SOURCES = frozenset({"startup", "resume", "fork", "clear", "compact", "other"})
 
@@ -60,8 +70,9 @@ SOURCES = frozenset({"startup", "resume", "fork", "clear", "compact", "other"})
 META_MAX_BYTES = 64 * 1024
 RECORD_MAX_BYTES = 8 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
-MAX_DIR_ENTRIES = 10_000
-READ_DEADLINE = 300.0
+MAX_DIR_ENTRIES = 10_000  # matching names kept per directory
+DIR_SCAN_FACTOR = 10  # entries scanned per directory: at most this many times MAX_DIR_ENTRIES
+READ_DEADLINE = 300.0  # seconds spent in file system calls, not waiting for the output
 # Render limits.
 RESULT_LINES = 20
 LINE_MAX_CHARS = 4000
@@ -88,21 +99,55 @@ class _Missing(Exception):
     """A file or directory that does not exist (Claude Code deleted it, or never wrote it)."""
 
 
+class _Unsafe(FailedError):
+    """A symlink, a file that is not a regular file with one link owned by the user, or a
+    directory that is not a real directory owned by the user."""
+
+
 # Allowed locations
 
 
-def projects_roots(environ: Mapping[str, str]) -> list[str]:
+def projects_roots(environ: Mapping[str, str], warnings: list[str] | None = None) -> list[str]:
     """The directories transcripts may live under: ``$HOME/.claude/projects`` and, when set,
     ``$CLAUDE_CONFIG_DIR/projects`` (Claude Code's own relocation). Relative or empty values
-    are ignored."""
-    roots: list[str] = []
+    are ignored. A root that resolves to ``/``, ``$HOME`` or an ancestor of it, or to a
+    directory that is or contains a credential path (``pathrules.CREDENTIAL_PATHS``), is
+    dropped with a warning appended to ``warnings``."""
+    candidates: list[str] = []
     home = environ.get("HOME", "")
+    real_home: str | None = None
     if os.path.isabs(home) and "\0" not in home:
-        roots.append(os.path.join(os.path.normpath(home), ".claude", "projects"))
+        candidates.append(os.path.join(os.path.normpath(home), ".claude", "projects"))
+        real_home = os.path.realpath(home)
     config_dir = environ.get("CLAUDE_CONFIG_DIR", "")
     if os.path.isabs(config_dir) and "\0" not in config_dir:
-        roots.append(os.path.join(os.path.normpath(config_dir), "projects"))
-    return list(dict.fromkeys(roots))
+        candidates.append(os.path.join(os.path.normpath(config_dir), "projects"))
+    roots: list[str] = []
+    for root in dict.fromkeys(candidates):
+        problem = _root_problem(os.path.realpath(root), real_home)
+        if problem is None:
+            roots.append(root)
+        elif warnings is not None:
+            warnings.append(f"the Claude Code projects directory {root} {problem}; it is not used")
+    return roots
+
+
+def _root_problem(real: str, real_home: str | None) -> str | None:
+    if real == "/":
+        return "resolves to /"
+    if real_home is None:
+        return None
+    if _under(real_home, real):
+        return "resolves to $HOME or an ancestor of it"
+    for name in CREDENTIAL_PATHS:
+        credential = os.path.join(real_home, name)
+        if _under(credential, real) or _under(os.path.realpath(credential), real):
+            return f"resolves to a directory that is or contains ~/{name}"
+    return None
+
+
+def _under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
 
 
 @dataclass(frozen=True)
@@ -161,27 +206,44 @@ def locate(path: object, claude_session_id: object, roots: Sequence[str]) -> Loc
 
 class Reader:
     """Opens files below a projects root without following symlinks, within one deadline
-    for the whole command (``clock`` is ``time.monotonic`` outside tests)."""
+    for the whole command (``deadline`` seconds, ``READ_DEADLINE`` by default; ``clock`` is
+    ``time.monotonic`` outside tests). Only the time spent in its own file system calls
+    (open, fstat, read, directory listing) counts, never the time a caller spends between
+    them (writing the output to a slow consumer)."""
 
     def __init__(
         self,
         *,
-        deadline: float = READ_DEADLINE,
-        clock: Callable[[], float] = time.monotonic,
+        deadline: float | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
-        self._clock = clock
-        self._limit = deadline
-        self._end = clock() + deadline
+        self._clock = time.monotonic if clock is None else clock
+        self._limit = READ_DEADLINE if deadline is None else deadline
+        self._spent = 0.0
+        self._started = 0.0  # the start of the current timed block (blocks never nest)
 
     def check_time(self) -> None:
-        if self._clock() > self._end:
+        if self._spent > self._limit:
             raise FailedError(f"reading transcripts took longer than {self._limit:g} seconds")
+
+    @contextmanager
+    def _timed(self) -> Iterator[None]:
+        """Check the deadline, then count the time the block takes."""
+        self.check_time()
+        self._started = self._clock()
+        try:
+            yield
+        finally:
+            self._spent += self._clock() - self._started
 
     def open_dir(self, loc: Location, segments: Sequence[str]) -> int:
         """The directory ``<root>/<project>/<segments...>``, each component opened without
-        following symlinks and checked to be a directory owned by the user. Raises
-        ``_Missing`` or ``FailedError``."""
-        self.check_time()
+        following symlinks and checked to be a directory owned by the user (the root also
+        not writable by others). Raises ``_Missing`` or ``FailedError``."""
+        with self._timed():
+            return self._open_dir(loc, segments)
+
+    def _open_dir(self, loc: Location, segments: Sequence[str]) -> int:
         shown = os.path.join(loc.directory, *segments)
         try:
             fd = fsutil.open_dir_nofollow(loc.real_root)
@@ -190,6 +252,7 @@ class Reader:
         except OSError as exc:
             raise _failed(shown, exc) from None
         try:
+            _check_root(fd, os.path.dirname(loc.directory))
             for part in (loc.project, *segments):
                 next_fd = _open_entry(fd, part, _DIR_FLAGS, shown)
                 os.close(fd)
@@ -204,46 +267,82 @@ class Reader:
         """The regular file ``name`` in ``open_dir(loc, segments)``: one link, owned by the
         user. Raises ``_Missing`` or ``FailedError``."""
         shown = os.path.join(loc.directory, *segments, name)
-        dir_fd = self.open_dir(loc, segments)
-        try:
-            fd = _open_entry(dir_fd, name, _FILE_FLAGS, shown)
-        finally:
-            os.close(dir_fd)
-        try:
-            _check_file(fd, shown)
-        except BaseException:
-            os.close(fd)
-            raise
+        with self._timed():
+            dir_fd = self._open_dir(loc, segments)
+            try:
+                fd = _open_entry(dir_fd, name, _FILE_FLAGS, shown)
+            finally:
+                os.close(dir_fd)
+            try:
+                _check_file(fd, shown)
+            except BaseException:
+                os.close(fd)
+                raise
         return fd
 
-    def list_dir(self, loc: Location, segments: Sequence[str]) -> list[str]:
-        """The entry names of a directory (sorted; at most ``MAX_DIR_ENTRIES``), or ``[]``
-        when it is missing."""
+    def list_dir(
+        self,
+        loc: Location,
+        segments: Sequence[str],
+        pattern: re.Pattern[str],
+        warnings: list[str],
+    ) -> list[str]:
+        """The names in a directory that match ``pattern`` (sorted), or ``[]`` when it is
+        missing. At most ``MAX_DIR_ENTRIES`` matching names are kept and at most
+        ``DIR_SCAN_FACTOR`` times as many entries scanned; hitting either bound appends a
+        warning to ``warnings``."""
+        shown = os.path.join(loc.directory, *segments)
         try:
             fd = self.open_dir(loc, segments)
         except _Missing:
             return []
+        keep, scan = MAX_DIR_ENTRIES, MAX_DIR_ENTRIES * DIR_SCAN_FACTOR
+        names: list[str] = []
         try:
-            names = sorted(os.listdir(fd))
+            with self._timed(), os.scandir(fd) as entries:
+                for scanned, entry in enumerate(entries, 1):
+                    if scanned > scan:
+                        warnings.append(
+                            f"{shown}: more than {scan} entries; only those listed first are used"
+                        )
+                        break
+                    if scanned % 1000 == 0:
+                        self._lap()
+                    if pattern.fullmatch(entry.name) is None:
+                        continue
+                    if len(names) == keep:
+                        warnings.append(
+                            f"{shown}: more than {keep} entries match; only {keep} are used"
+                        )
+                        break
+                    names.append(entry.name)
         except OSError as exc:
-            raise _failed(os.path.join(loc.directory, *segments), exc) from None
+            raise _failed(shown, exc) from None
         finally:
             os.close(fd)
-        return names[:MAX_DIR_ENTRIES]
+        return sorted(names)
+
+    def _lap(self) -> None:
+        """Inside a timed block: count the time so far and check the deadline."""
+        now = self._clock()
+        self._spent += now - self._started
+        self._started = now
+        self.check_time()
 
     def chunks(self, fd: int, shown: str = "") -> Iterator[bytes]:
         """The bytes of the open file ``fd`` (``shown`` in errors) up to its size now, in
         chunks. A read error raises ``FailedError``."""
-        try:
-            remaining = os.fstat(fd).st_size
-        except OSError as exc:
-            raise _failed(shown, exc) from None
-        while remaining > 0:
-            self.check_time()
+        with self._timed():
             try:
-                data = os.read(fd, min(CHUNK_BYTES, remaining))
+                remaining = os.fstat(fd).st_size
             except OSError as exc:
                 raise _failed(shown, exc) from None
+        while remaining > 0:
+            with self._timed():
+                try:
+                    data = os.read(fd, min(CHUNK_BYTES, remaining))
+                except OSError as exc:
+                    raise _failed(shown, exc) from None
             if not data:
                 return
             remaining -= len(data)
@@ -257,7 +356,7 @@ def _open_entry(dir_fd: int, name: str, flags: int, shown: str) -> int:
         raise _Missing(shown) from None
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise FailedError(
+            raise _Unsafe(
                 "unsafe transcript file", detail=f"{shown}: a symlink or not a directory"
             ) from None
         raise _failed(shown, exc) from None
@@ -266,19 +365,27 @@ def _open_entry(dir_fd: int, name: str, flags: int, shown: str) -> int:
 def _check_owned_dir(fd: int, shown: str) -> None:
     info = os.fstat(fd)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
-        raise FailedError(
+        raise _Unsafe(
             "unsafe transcript file", detail=f"{shown}: not a directory owned by this user"
         )
+
+
+def _check_root(fd: int, shown: str) -> None:
+    """The projects root: a directory owned by the user and not writable by others (group
+    write is allowed: a user-private group with umask 002 is common)."""
+    _check_owned_dir(fd, shown)
+    if os.fstat(fd).st_mode & stat.S_IWOTH:
+        raise _Unsafe("unsafe transcript file", detail=f"{shown}: writable by others")
 
 
 def _check_file(fd: int, shown: str) -> None:
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
-        raise FailedError("unsafe transcript file", detail=f"{shown}: not a regular file")
+        raise _Unsafe("unsafe transcript file", detail=f"{shown}: not a regular file")
     if info.st_nlink != 1:
-        raise FailedError("unsafe transcript file", detail=f"{shown}: {info.st_nlink} links")
+        raise _Unsafe("unsafe transcript file", detail=f"{shown}: {info.st_nlink} links")
     if info.st_uid != os.geteuid():
-        raise FailedError("unsafe transcript file", detail=f"{shown}: owned by another user")
+        raise _Unsafe("unsafe transcript file", detail=f"{shown}: owned by another user")
 
 
 def _failed(shown: str, exc: OSError) -> FailedError:
@@ -317,6 +424,8 @@ class TranscriptFile:
     exists: bool
     location: Location | None = None
     subagents: list[Subagent] = field(default_factory=list)
+    # Names in <dir>/<claude session id>/tool-results (listed once, for the renderer).
+    tool_results: frozenset[str] = frozenset()
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -379,7 +488,11 @@ def discover(
                 )
         else:
             entry.exists = _exists(reader, loc, (), loc.name)
-            entry.subagents = _subagents(reader, loc)
+            entry.subagents = _subagents(reader, loc, warnings)
+            segments = (loc.claude_session_id, "tool-results")
+            entry.tool_results = frozenset(
+                reader.list_dir(loc, segments, TOOL_RESULT_NAME, warnings)
+            )
         files.append(entry)
     return Listing(csession_id, files, warnings)
 
@@ -392,9 +505,9 @@ def _exists(reader: Reader, loc: Location, segments: Sequence[str], name: str) -
     return True
 
 
-def _subagents(reader: Reader, loc: Location) -> list[Subagent]:
+def _subagents(reader: Reader, loc: Location, warnings: list[str]) -> list[Subagent]:
     segments = (loc.claude_session_id, "subagents")
-    names = reader.list_dir(loc, segments)
+    names = reader.list_dir(loc, segments, AGENT_NAME, warnings)
     agent_ids: set[str] = set()
     for name in names:
         match = AGENT_FILE.fullmatch(name) or AGENT_META.fullmatch(name)
@@ -462,12 +575,14 @@ def _parse(line: bytes) -> dict[str, Any] | None:
 
 
 OVERSIZED: dict[str, Any] = {"type": "__oversized__"}
+UNPARSEABLE: dict[str, Any] = {"type": "__unparseable__"}
 
 
 def records(reader: Reader, fd: int, shown: str = "") -> Iterator[dict[str, Any] | None]:
-    """The records of an open JSONL file: a dict per JSON-object line, None for any other
-    line, ``OVERSIZED`` for a line longer than ``RECORD_MAX_BYTES`` (never held in memory
-    whole). A last line without a newline is parsed too."""
+    """The records of an open JSONL file: a dict per JSON-object line, ``UNPARSEABLE`` for
+    any other line, None for a blank one, ``OVERSIZED`` for a line longer than
+    ``RECORD_MAX_BYTES`` (never held in memory whole). A last line without a newline is
+    parsed too."""
     pending: list[bytes] = []
     pending_size = 0
     oversized = False
@@ -497,7 +612,8 @@ def records(reader: Reader, fd: int, shown: str = "") -> Iterator[dict[str, Any]
 def _line_record(line: bytes) -> dict[str, Any] | None:
     if not line.strip():
         return None
-    return _parse(line)
+    parsed = _parse(line)
+    return UNPARSEABLE if parsed is None else parsed
 
 
 # Rendering
@@ -509,8 +625,13 @@ class Renderer:
 
     reader: Reader
     subagents: bool = False
+    # Warnings for stderr (offloaded results not shown), filled while rendering.
+    warnings: list[str] = field(default_factory=list)
     # (claude session id, agent id) of the subagents already shown inline.
     _shown: set[tuple[str, str]] = field(default_factory=set)
+    # The current section's offloaded tool-result names, and the line shown for each.
+    _offloaded: frozenset[str] = frozenset()
+    _references: dict[tuple[str, str], str] = field(default_factory=dict)
 
     def lines(self, listing: Listing) -> Iterator[str]:
         if not listing.files:
@@ -528,6 +649,7 @@ class Renderer:
                 yield "file: (not available)"
                 continue
             yield f"file: {display(loc.path)}"
+            self._offloaded = entry.tool_results
             if not entry.exists:
                 yield "(missing: Claude Code deleted it or never wrote it)"
             else:
@@ -546,7 +668,7 @@ class Renderer:
         kind = display(sub.agent_type) if sub.agent_type is not None else "subagent"
         line = f"{indent}--- subagent {display(sub.agent_id)} ({kind})"
         if sub.description is not None:
-            line += f": {_clip(display(sub.description))}"
+            line += f": {_clip(sub.description)}"
         yield line
         inner = indent + "  | "
         if not sub.exists:
@@ -568,7 +690,6 @@ class Renderer:
         except _Missing:
             yield f"{indent}(missing: deleted while reading)"
             return
-        offloaded = set(self.reader.list_dir(loc, (loc.claude_session_id, "tool-results")))
         by_tool = {sub.tool_use_id: sub for sub in subs if sub.tool_use_id is not None}
         shown = os.path.join(loc.directory, *segments, name)
         try:
@@ -576,16 +697,39 @@ class Renderer:
                 if record is OVERSIZED:
                     yield f"{indent}[record over {RECORD_MAX_BYTES} bytes skipped]"
                     continue
+                if record is UNPARSEABLE:
+                    yield f"{indent}[unparseable record skipped]"
+                    continue
                 if record is None:
                     continue
                 for line, tool_id in _record_lines(record):
                     yield indent + line
                     if self.subagents and tool_id is not None and tool_id in by_tool:
                         yield from self._subagent(loc, by_tool[tool_id], indent + "  ")
-                for ref in _offloaded_refs(record, offloaded):
-                    yield f"{indent}[offloaded] {display(loc.tool_result_path(ref))}"
+                for ref in _offloaded_refs(record, self._offloaded):
+                    yield indent + self._reference(loc, ref)
         finally:
             os.close(fd)
+
+    def _reference(self, loc: Location, name: str) -> str:
+        """The line for an offloaded result: its path when it is a regular file with one
+        link owned by the user (checked once per file), else a marker and a warning."""
+        key = (loc.claude_session_id, name)
+        if key not in self._references:
+            path = loc.tool_result_path(name)
+            try:
+                os.close(self.reader.open_file(loc, (loc.claude_session_id, "tool-results"), name))
+                line = f"[offloaded] {display(path)}"
+            except _Missing:
+                line = "[offloaded result not shown: deleted]"
+            except _Unsafe:
+                line = "[offloaded result not shown: unsafe file]"
+                self.warnings.append(
+                    f"offloaded tool result not shown: {path} is not a regular file with one"
+                    " link owned by this user"
+                )
+            self._references[key] = line
+        return self._references[key]
 
 
 def _record_lines(record: Mapping[str, Any]) -> Iterator[tuple[str, str | None]]:
@@ -631,7 +775,7 @@ def _labeled(
         lines = lines[:max_lines]
     pad = " " * len(label)
     for index, line in enumerate(lines):
-        yield f"{label if index == 0 else pad} {_clip(display(line))}".rstrip(), None
+        yield f"{label if index == 0 else pad} {_clip(line)}".rstrip(), None
     if extra:
         yield f"{pad} ... ({extra} more lines)", None
 
@@ -675,7 +819,7 @@ def _result_text(content: object) -> str:
     return "\n".join(parts)
 
 
-def _offloaded_refs(record: Mapping[str, Any], offloaded: set[str]) -> list[str]:
+def _offloaded_refs(record: Mapping[str, Any], offloaded: frozenset[str]) -> list[str]:
     """Offloaded tool-result files a record's tool results name (those that exist)."""
     if not offloaded or record.get("type") != "user":
         return []
@@ -693,9 +837,17 @@ def _offloaded_refs(record: Mapping[str, Any], offloaded: set[str]) -> list[str]
 
 
 def _clip(text: str) -> str:
+    """``text`` through ``display``, cut to ``LINE_MAX_CHARS`` source characters first (so
+    the cut never splits an escape), never between a base character and the combining marks
+    after it; the count is of omitted source characters."""
     if len(text) <= LINE_MAX_CHARS:
-        return text
-    return f"{text[:LINE_MAX_CHARS]} ... ({len(text) - LINE_MAX_CHARS} more characters)"
+        return display(text)
+    cut = LINE_MAX_CHARS
+    while cut > 0 and unicodedata.category(text[cut]).startswith("M"):
+        cut -= 1
+    if cut == 0:
+        cut = LINE_MAX_CHARS  # nothing but marks: cut anywhere
+    return f"{display(text[:cut])} ... ({len(text) - cut} more characters)"
 
 
 # Paths and raw output
@@ -711,42 +863,62 @@ def path_lines(listing: Listing) -> list[str]:
     return lines
 
 
-def missing_warnings(listing: Listing) -> list[str]:
+def missing_warnings(listing: Listing, *, subagents: bool) -> list[str]:
+    """Warnings for the missing main files and, when ``subagents``, subagent files."""
     warnings: list[str] = []
     for entry in listing.files:
         if entry.path is not None and not entry.exists:
             warnings.append(f"transcript file missing: {entry.path}")
-        warnings += [
-            f"subagent transcript file missing: {sub.path}"
-            for sub in entry.subagents
-            if not sub.exists
-        ]
+        if subagents:
+            warnings += [
+                f"subagent transcript file missing: {sub.path}"
+                for sub in entry.subagents
+                if not sub.exists
+            ]
     return warnings
 
 
 def write_raw(listing: Listing, reader: Reader, out: BinaryIO, *, subagents: bool) -> None:
     """``--raw``: the existing files' bytes, unchanged, each main file followed by its
-    subagent files when ``subagents``."""
+    subagent files when ``subagents``. A newline goes between a file whose bytes do not end
+    in one and the next file with bytes, so records of two files never share a line."""
+    open_line = False
     for entry in listing.files:
         loc = entry.location
         if loc is None:
             continue
         if entry.exists:
-            _copy(reader, loc, (), loc.name, out)
+            open_line = _copy(reader, loc, (), loc.name, out, open_line)
         if subagents:
             for sub in entry.subagents:
                 if sub.exists:
                     segments = (loc.claude_session_id, "subagents")
-                    _copy(reader, loc, segments, f"agent-{sub.agent_id}.jsonl", out)
+                    name = f"agent-{sub.agent_id}.jsonl"
+                    open_line = _copy(reader, loc, segments, name, out, open_line)
 
 
-def _copy(reader: Reader, loc: Location, segments: Sequence[str], name: str, out: BinaryIO) -> None:
+def _copy(
+    reader: Reader,
+    loc: Location,
+    segments: Sequence[str],
+    name: str,
+    out: BinaryIO,
+    open_line: bool,
+) -> bool:
+    """Copy one file to ``out``, first ending the previous file's last line when
+    ``open_line`` and this file has bytes. Returns whether a line is left open."""
     try:
         fd = reader.open_file(loc, segments, name)
     except _Missing:
-        return
+        return open_line
+    last: bytes | None = None
     try:
         for chunk in reader.chunks(fd, os.path.join(loc.directory, *segments, name)):
+            if open_line:
+                out.write(b"\n")  # before this file's first bytes only
             out.write(chunk)
+            open_line = False
+            last = chunk
     finally:
         os.close(fd)
+    return open_line if last is None else not last.endswith(b"\n")

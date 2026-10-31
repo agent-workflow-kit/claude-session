@@ -505,15 +505,30 @@ def test_hostile_meta_is_carried_escaped_in_json(
         b"[" * 100_000 + b"]" * 100_000,
         b'{"type": "user", "message": {"content": ' + b"[" * 100_000 + b"]" * 100_000 + b"}}",
         b'{"type": "user", "message": {"content": 1' + b"0" * 10_000 + b"}}",
+        b"\x00\x00\x00",
+    ],
+)
+def test_unparseable_records_are_skipped_with_a_marker(
+    st: Store, clock: Clock, projects: Path, capsys: pytest.CaptureFixture[str], line: bytes
+) -> None:
+    session(st, clock)
+    data = jsonl(user("before"), line, user("after"))
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, data)))
+    lines = render(["transcript", SID], capsys)
+    assert lines[2:] == ["[user] before", "[unparseable record skipped]", "[user] after"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
         b'{"type": "user", "message": "not an object"}',
         b'{"type": "user", "message": {"content": [1, "x", null, {"type": "text"}]}}',
         b'{"type": "summary", "summary": "skipped"}',
         b'{"type": "unknown-future-type", "message": {"content": "hidden"}}',
-        b"\x00\x00\x00",
         b"   ",
     ],
 )
-def test_malformed_and_unknown_records_are_skipped(
+def test_unknown_records_and_blank_lines_are_skipped_silently(
     st: Store, clock: Clock, projects: Path, capsys: pytest.CaptureFixture[str], line: bytes
 ) -> None:
     session(st, clock)
@@ -897,3 +912,367 @@ def test_a_read_error_fails_with_the_path(
     assert main(["transcript", SID, *form]) == 12
     err = capsys.readouterr().err
     assert f"cannot read transcript file ({path}: Input/output error)" in err
+
+
+# Review round 1
+
+
+class FakeTime:
+    """A monotonic clock that moves only when a test says so."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def rows(*cids: str, projects: Path) -> list[dict[str, Any]]:
+    return [
+        {
+            "claude_session_id": cid,
+            "run_no": 1,
+            "source": "startup",
+            "transcript_path": str(projects / PROJECT / f"{cid}.jsonl"),
+        }
+        for cid in cids
+    ]
+
+
+def test_time_waiting_for_the_text_consumer_does_not_count(projects: Path) -> None:
+    write_main(projects, CID1, jsonl(*(user(f"line {n}") for n in range(5))))
+    write_subagent(projects, CID1, "a1", jsonl(user("sub")), {"toolUseId": "t"})
+    now = FakeTime()
+    reader = transcripts.Reader(deadline=3, clock=now)
+    listing = transcripts.discover(
+        SID, rows(CID1, projects=projects), transcripts.projects_roots(os.environ), reader
+    )
+    lines = []
+    for line in transcripts.Renderer(reader, subagents=True).lines(listing):
+        lines.append(line)
+        now.now += 100  # a slow pager
+    assert "[user] line 4" in lines and "  | [user] sub" in lines
+
+
+def test_time_waiting_for_the_raw_consumer_does_not_count(
+    projects: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(transcripts, "CHUNK_BYTES", 8)
+    data = jsonl(*(user(f"line {n}") for n in range(5)))
+    write_main(projects, CID1, data)
+    now = FakeTime()
+    reader = transcripts.Reader(deadline=3, clock=now)
+    listing = transcripts.discover(
+        SID, rows(CID1, projects=projects), transcripts.projects_roots(os.environ), reader
+    )
+
+    class SlowSink:
+        def __init__(self) -> None:
+            self.data = b""
+
+        def write(self, chunk: bytes) -> int:
+            now.now += 100
+            self.data += chunk
+            return len(chunk)
+
+    sink = SlowSink()
+    transcripts.write_raw(listing, reader, sink, subagents=True)  # type: ignore[arg-type]
+    assert sink.data == data
+
+
+def test_slow_reads_still_fail_after_the_deadline(
+    st: Store,
+    clock: Clock,
+    projects: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(transcripts, "CHUNK_BYTES", 8)
+    session(st, clock)
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, jsonl(user("x" * 200)))))
+    now = FakeTime()
+    real_reader, real_read = transcripts.Reader, os.read
+
+    def slow_read(fd: int, size: int) -> bytes:
+        now.now += 2
+        return real_read(fd, size)
+
+    monkeypatch.setattr(transcripts, "Reader", lambda: real_reader(deadline=3, clock=now))
+    monkeypatch.setattr(transcripts.os, "read", slow_read)
+    assert main(["transcript", SID]) == 12
+    assert "longer than 3 seconds" in capsys.readouterr().err
+
+
+def _plant_tool_results_symlink(projects: Path) -> None:
+    real = projects.parent / "elsewhere"
+    real.mkdir()
+    (real / "abc.txt").write_text("secret")
+    (projects / PROJECT / CID1).mkdir(parents=True)
+    (projects / PROJECT / CID1 / "tool-results").symlink_to(real)
+
+
+@pytest.mark.parametrize("form", [[], ["--json"], ["--paths"], ["--raw"]])
+def test_an_unsafe_tool_results_directory_fails_before_any_output(
+    st: Store,
+    clock: Clock,
+    projects: Path,
+    capfd: pytest.CaptureFixture[str],
+    form: list[str],
+) -> None:
+    session(st, clock)
+    data = jsonl(user("hello"), tool_result("t", "saved to tool-results/abc.txt"))
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, data)))
+    _plant_tool_results_symlink(projects)
+    code = main(["transcript", SID, *form])
+    out, err = capfd.readouterr()
+    assert code == 12
+    if form == ["--json"]:
+        assert json.loads(out)["error"]["message"] == "unsafe transcript file"
+    else:
+        assert out == ""
+        assert "unsafe transcript file" in err
+
+
+def _symlink_entry(path: Path) -> None:
+    target = path.parent.parent / "secret.txt"
+    target.write_text("secret")
+    path.symlink_to(target)
+
+
+def _fifo_entry(path: Path) -> None:
+    os.mkfifo(path)
+
+
+def _hardlink_entry(path: Path) -> None:
+    target = path.parent.parent / "secret.txt"
+    target.write_text("secret")
+    os.link(target, path)
+
+
+@pytest.mark.parametrize("plant", [_symlink_entry, _fifo_entry, _hardlink_entry])
+def test_an_unsafe_offloaded_entry_is_not_referenced(
+    st: Store, clock: Clock, projects: Path, capsys: pytest.CaptureFixture[str], plant: Any
+) -> None:
+    session(st, clock)
+    results = projects / PROJECT / CID1 / "tool-results"
+    results.mkdir(parents=True)
+    plant(results / "abc.txt")
+    (results / "ok.txt").write_text("fine")
+    data = jsonl(tool_result("t", "saved to tool-results/abc.txt and tool-results/ok.txt"))
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, data)))
+    code, out, err = run(["transcript", SID], capsys)
+    assert code == 0
+    lines = out.splitlines()
+    assert "[offloaded result not shown: unsafe file]" in lines
+    assert f"[offloaded] {results}/ok.txt" in lines
+    assert not any("abc.txt" in line and line.startswith("[offloaded]") for line in lines)
+    assert f"offloaded tool result not shown: {results}/abc.txt" in err
+
+
+def test_raw_separates_files_without_a_final_newline(
+    st: Store, clock: Clock, projects: Path, capfdbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    session(st, clock)
+    main_data = jsonl(user("a")) + b'{"type": "user"'  # caught mid-record
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, main_data)))
+    write_subagent(projects, CID1, "a1", b"", None)  # empty: adds nothing
+    write_subagent(projects, CID1, "b2", b'{"sub": 1}')
+    write_subagent(projects, CID1, "c3", b'{"sub": 2}\n')
+    code, out = run_raw(["transcript", SID, "--raw", "--subagents"], capfdbinary)
+    assert code == 0
+    assert out == main_data + b'\n{"sub": 1}\n{"sub": 2}\n'
+    code, out = run_raw(["transcript", SID, "--raw"], capfdbinary)
+    assert out == main_data  # nothing follows: unchanged
+
+
+def test_raw_warns_about_missing_subagents_only_with_subagents(
+    full: Path, capfdbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    assert main(["transcript", SID, "--raw"]) == 0
+    err = capfdbinary.readouterr().err.decode()
+    assert "subagent transcript file missing" not in err
+    assert "transcript file missing" in err
+    assert main(["transcript", SID, "--raw", "--subagents"]) == 0
+    err = capfdbinary.readouterr().err.decode()
+    assert "subagent transcript file missing" in err
+
+
+def test_unrelated_names_do_not_use_up_the_entry_cap(
+    st: Store,
+    clock: Clock,
+    projects: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(transcripts, "MAX_DIR_ENTRIES", 5)
+    session(st, clock)
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, b"")))
+    directory = projects / PROJECT / CID1 / "subagents"
+    directory.mkdir(parents=True)
+    for n in range(6):
+        (directory / f"agent-{n}.txt").write_text("")  # sorts before agent-real.jsonl
+    write_subagent(projects, CID1, "real", b"")
+    code, obj, err = run_json(["transcript", SID], capsys)
+    assert code == 0
+    assert [s["agent_id"] for s in obj["files"][0]["subagents"]] == ["real"]
+    assert "entries" not in err
+
+
+def test_more_matching_entries_than_the_cap_warn(
+    st: Store,
+    clock: Clock,
+    projects: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(transcripts, "MAX_DIR_ENTRIES", 2)
+    session(st, clock)
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, b"")))
+    for name in ("a", "b", "c"):
+        write_subagent(projects, CID1, name, b"")
+    code, obj, err = run_json(["transcript", SID], capsys)
+    assert code == 0
+    assert len(obj["files"][0]["subagents"]) == 2
+    assert "more than 2 entries" in err
+
+
+def test_a_huge_directory_is_scanned_only_so_far_and_warns(
+    st: Store,
+    clock: Clock,
+    projects: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(transcripts, "MAX_DIR_ENTRIES", 2)
+    session(st, clock)
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, b"")))
+    directory = projects / PROJECT / CID1 / "subagents"
+    directory.mkdir(parents=True)
+    for n in range(10 * 2 + 5):
+        (directory / f"junk-{n}.txt").write_text("")
+    code, _obj, err = run_json(["transcript", SID], capsys)
+    assert code == 0
+    assert "more than 20 entries" in err
+
+
+def test_tool_results_are_listed_once_per_claude_id(
+    full: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    listed: list[str] = []
+    real_list_dir = transcripts.Reader.list_dir
+
+    def counting(self: transcripts.Reader, loc: Any, segments: Any, *args: Any, **kw: Any) -> Any:
+        if segments[-1:] == ("tool-results",):
+            listed.append(segments[0])
+        return real_list_dir(self, loc, segments, *args, **kw)
+
+    monkeypatch.setattr(transcripts.Reader, "list_dir", counting)
+    render(["transcript", SID, "--subagents"], capsys)
+    assert sorted(listed) == sorted({CID1, CID2, CID3})
+
+
+@pytest.mark.parametrize(("records", "code"), [(2000, 1), (1, 0)])
+def test_a_closed_stdout_ends_the_command_without_noise(
+    st: Store, clock: Clock, projects: Path, records: int, code: int
+) -> None:
+    """interface.md, Exit codes: a write that fails while the command runs exits 1; output
+    that fits in the stream buffer fails only at the final flush and keeps the exit code."""
+    from .test_main import entry_code, run_python
+
+    session(st, clock)
+    data = jsonl(*(user(f"line {n} " + "x" * 100) for n in range(records)))
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, data)))
+    proc = run_python(entry_code(["transcript", SID]), broken=("stdout",))
+    assert (proc.returncode, proc.stderr) == (code, "")
+
+
+def _home_root(home: Path) -> None:
+    (home / ".claude").mkdir()
+    (home / ".claude" / "projects").symlink_to(home)
+
+
+def _ancestor_root(home: Path) -> None:
+    (home / ".claude").mkdir()
+    (home / ".claude" / "projects").symlink_to(home.parent)
+
+
+def _credential_root(home: Path) -> None:
+    (home / ".local" / "state").mkdir(parents=True)
+    (home / ".claude").mkdir()
+    (home / ".claude" / "projects").symlink_to(home / ".local")
+
+
+@pytest.mark.parametrize("plant", [_home_root, _ancestor_root, _credential_root])
+def test_a_projects_root_at_or_above_home_is_not_used(
+    st: Store,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+    capfdbinary: pytest.CaptureFixture[bytes],
+    plant: Any,
+) -> None:
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    home = Path(os.environ["HOME"])
+    plant(home)
+    session(st, clock)
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / f"{CID1}.jsonl").write_text("secret key")
+    recorded = home / ".claude" / "projects" / ".ssh" / f"{CID1}.jsonl"
+    claude_id(st, CID1, 1, "startup", str(recorded))
+    assert main(["transcript", SID, "--json"]) == 0
+    out, err = capfdbinary.readouterr()
+    assert json.loads(out)["files"][0]["path"] is None
+    assert b"projects directory" in err and b"is not used" in err
+    code, out = run_raw(["transcript", SID, "--raw"], capfdbinary)
+    assert code == 0 and b"secret" not in out
+
+
+def test_projects_roots_drops_home_and_its_ancestors(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "projects").symlink_to(home)
+    warnings: list[str] = []
+    assert transcripts.projects_roots({"HOME": str(home)}, warnings) == []
+    assert len(warnings) == 1
+    config = tmp_path / "config"
+    config.mkdir()
+    assert transcripts.projects_roots(
+        {"HOME": str(home), "CLAUDE_CONFIG_DIR": str(config)}, []
+    ) == [str(config / "projects")]
+    slash = tmp_path / "slash"
+    (slash / "projects").parent.mkdir()
+    (slash / "projects").symlink_to("/")
+    assert (
+        transcripts.projects_roots({"HOME": str(home), "CLAUDE_CONFIG_DIR": str(slash)}, []) == []
+    )
+
+
+@pytest.mark.parametrize(("mode", "code"), [(0o777, 12), (0o757, 12), (0o775, 0), (0o700, 0)])
+def test_the_projects_root_must_not_be_writable_by_others(
+    st: Store,
+    clock: Clock,
+    projects: Path,
+    capsys: pytest.CaptureFixture[str],
+    mode: int,
+    code: int,
+) -> None:
+    session(st, clock)
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, jsonl(user("hi")))))
+    projects.chmod(mode)
+    got, out, err = run(["transcript", SID], capsys)
+    assert got == code
+    if code:
+        assert out == "" and "unsafe transcript file" in err and "writable by others" in err
+    else:
+        assert "[user] hi" in out.splitlines()
+
+
+def test_the_clip_never_cuts_an_escape(
+    st: Store, clock: Clock, projects: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    session(st, clock)
+    limit = transcripts.LINE_MAX_CHARS
+    data = jsonl(user("a" * (limit - 2) + "\x1b[31m"), user("b" * (limit - 1) + "é̂z"))
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, data)))
+    lines = render(["transcript", SID], capsys)
+    assert lines[2] == f"[user] {'a' * (limit - 2)}\\x1b[ ... (3 more characters)"
+    assert lines[3] == f"[user] {'b' * (limit - 1)} ... (4 more characters)"

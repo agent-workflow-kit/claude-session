@@ -269,23 +269,26 @@ def _transcript(args: argparse.Namespace) -> int:
     if args.run is not None and not 1 <= args.run <= record.runs:
         raise NotFoundError(f"session {sid} has no run {args.run}")
     reader = transcripts.Reader()
-    roots = transcripts.projects_roots(os.environ)
+    warnings: list[str] = []
+    roots = transcripts.projects_roots(os.environ, warnings)
     listing = transcripts.discover(sid, record.claude_ids, roots, reader, run_no=args.run)
-    warnings = list(listing.warnings)
+    warnings += listing.warnings
     if args.json:
         print(json.dumps(listing.as_json(), allow_nan=False))
     elif args.paths:
-        warnings += transcripts.missing_warnings(listing)
+        warnings += transcripts.missing_warnings(listing, subagents=True)
         for line in transcripts.path_lines(listing):
             print(line)
     elif args.raw:
-        warnings += transcripts.missing_warnings(listing)
+        warnings += transcripts.missing_warnings(listing, subagents=args.subagents)
         sys.stdout.flush()
         transcripts.write_raw(listing, reader, sys.stdout.buffer, subagents=args.subagents)
         sys.stdout.buffer.flush()
     else:
-        for line in transcripts.Renderer(reader, subagents=args.subagents).lines(listing):
+        renderer = transcripts.Renderer(reader, subagents=args.subagents)
+        for line in renderer.lines(listing):
             print(line)
+        warnings += renderer.warnings
     for warning in warnings:
         print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
     return 0

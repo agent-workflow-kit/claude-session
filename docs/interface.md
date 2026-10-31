@@ -414,16 +414,17 @@ claude-session transcript <id> [--raw | --paths] [--subagents] [--run <n>] [--js
 ```
 
 - Default: the session's Claude Code transcripts rendered as readable text, in order (one section per Claude session id, headed by its source and run): user and assistant text, tool calls as one-line summaries, tool results truncated to 20 lines, offloaded tool results referenced by path.
-- `--raw`: the transcript JSONL files concatenated, unchanged (no control-character stripping). `--raw --json` and `--raw --paths` exit 2.
+- `--raw`: the transcript JSONL files concatenated, unchanged (no control-character stripping); a newline is added after a file that does not end in one when another file follows, so records of different files never share a line. Meant for programs: do not print it to a terminal. `--raw --json` and `--raw --paths` exit 2.
 - `--paths` / `--json`: the list of files ([schemas/cli/transcript.json](../schemas/cli/transcript.json)), each with its subagent transcripts.
 - `--subagents`: include subagent transcripts (inline after the tool call that started them; with `--raw`, appended after their parent file).
 - `--run <n>`: only the files of run `n`.
 
 All transcript content is untrusted. claude-session never copies transcripts; files Claude Code has deleted are reported with `exists: false`. A read error exits 12 (`failed`).
 
-- A recorded transcript path (from a `SessionStart` payload) is used only when it is `<root>/<project>/<claude session id>.jsonl` for a root `$HOME/.claude/projects` or `$CLAUDE_CONFIG_DIR/projects` (as written or resolved), in normal form and printable unchanged. Any other is listed with `path: null` and a warning on stderr, and never read.
-- Files are opened below the root one component at a time without following symlinks. A transcript, subagent or meta file that is not a regular file with one link owned by the user, or a directory on the way that is a symlink or not a directory owned by the user, exits 12 (`failed`). A file is read up to its size when opened (a live session keeps appending); reading stops with exit 12 after 300 seconds.
-- `--paths` prints the existing files, each main file followed by its subagent files (as `--json` lists them, with or without `--subagents`); missing files are warned about on stderr. `--raw` skips missing files the same way.
+- A recorded transcript path (from a `SessionStart` payload) is used only when it is `<root>/<project>/<claude session id>.jsonl` for a root `$HOME/.claude/projects` or `$CLAUDE_CONFIG_DIR/projects` (as written or resolved), in normal form and printable unchanged. Any other is listed with `path: null` and a warning on stderr, and never read. A root that resolves to `/`, `$HOME`, an ancestor of `$HOME`, or a directory that is or contains a credential path ([Path rules](#path-rules)) is not used (a warning on stderr).
+- Files are opened below the root one component at a time without following symlinks. A transcript, subagent or meta file that is not a regular file with one link owned by the user, a directory on the way (`subagents` and `tool-results` included) that is a symlink or not a directory owned by the user, or a root writable by others (group write is allowed), exits 12 (`failed`) before any output. An offloaded tool result is referenced by path only if it is a regular file with one link owned by the user; otherwise the text shows `[offloaded result not shown: unsafe file]` and stderr a warning. A file is read up to its size when opened (a live session keeps appending); reading stops with exit 12 after 300 seconds spent reading (time waiting for the output to be consumed does not count).
+- Read caps: a JSONL record over 8 MiB is skipped (text shows `[record over 8388608 bytes skipped]`), a record that is not a JSON object is skipped (text shows `[unparseable record skipped]`), a meta file over 64 KiB gives null fields, a directory listing keeps at most 10,000 matching names after scanning at most 100,000 entries (a warning on stderr when either bound is hit), and a rendered text line is cut at 4000 characters (`... (<n> more characters)`).
+- `--paths` prints the existing files, each main file followed by its subagent files (as `--json` lists them, with or without `--subagents`); missing files are warned about on stderr. `--raw` skips missing files the same way (missing subagent files are warned about only with `--subagents`).
 - `--run <n>` selects the Claude session ids first seen in run `n`: a plain resume keeps its Claude id, so what it appends stays in the file of the run that started that id.
 
 ### `forget`
@@ -657,6 +658,8 @@ Per outcome (encoded in [schemas/cli/outcome.json](../schemas/cli/outcome.json) 
 | 20 | refused; `reason` is one of `live`, `tainted`, `already_adopted`, `expired` (also `--dry-run` with `would_refuse`) |
 | 21 | ambiguous session id prefix |
 | 22 | `wait --timeout` expired while the run was still live |
+
+A closed stdout (output piped to `head`, for example) ends any command with exit 1 and no error message when a write fails while the command runs; output small enough to stay in the stream buffer fails only at exit, and the command keeps its exit code.
 
 ## Output by exit code
 
