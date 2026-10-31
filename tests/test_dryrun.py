@@ -25,6 +25,7 @@ from claude_session import (
     pathrules,
     sessiondir,
     settings_builder,
+    tmpdir,
 )
 from claude_session.errors import LaunchValidationError, UsageError
 from claude_session.sessiondir import SessionDirUnsafe
@@ -908,3 +909,28 @@ def test_printable_escapes_strings_that_are_not_utf8() -> None:
     shown = dryrun.printable({"cwd": odd, "list": [odd, 1, None], "ok": "fine"})
     assert shown == {"cwd": "/x/odd\\udcff", "list": ["/x/odd\\udcff", 1, None], "ok": "fine"}
     json.dumps(shown, ensure_ascii=False).encode("utf-8")
+
+
+def test_unchecked_writable_uses_the_given_session_not_the_placeholder(tmp_path: Path) -> None:
+    # The adoption dry run passes the pending run's session: its directory and private
+    # tmpdir are session-writable, the placeholder's are not.
+    cfg = config.load(None, env={"XDG_CONFIG_HOME": str(tmp_path / "none")})
+    proc = process(tmp_path, {"PATH": "/usr/bin", "HOME": str(tmp_path / "home")}, FakeGateway())
+    resolution = kinds.resolve(cfg, "review", mode="headless", repo=None, cwd=None, flags={})
+    sid = "cs-bbbbbbbb"
+    alloc = launch.Allocated(
+        csession_id=sid,
+        run=1,
+        session_dir=sessiondir.session_dir(proc.state_root, sid),
+        private_dir=sessiondir.private_dir(proc.state_root, sid),
+        warnings=(),
+    )
+    writable = dryrun.unchecked_writable(
+        cfg, proc, resolution, probe_cwd=None, caller_cwd=None, git=dryrun.GitDir(None), alloc=alloc
+    )
+    assert writable is not None
+    assert writable(os.path.join(alloc.session_dir, sessiondir.WORK, "x"))
+    assert writable(os.path.join(tmpdir.run_path(sid), "x"))
+    placeholder = sessiondir.session_dir(proc.state_root, dryrun.PLACEHOLDER_ID)
+    assert any(p.startswith(alloc.session_dir) for p in writable.paths)
+    assert not any(p.startswith(placeholder) for p in writable.paths)
