@@ -12,6 +12,7 @@ its whole group, the fake included, if a test fails.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -125,8 +126,12 @@ class Terminal:
                 self.type(b"\n")
             _, err = self.proc.communicate(timeout=timeout)
         finally:
-            if self.proc.poll() is None:
-                self.proc.kill()
+            if self.proc.returncode is None:
+                # The process group this test created (start_new_session), the fake included,
+                # SIGKILLed while its leader is still unreaped (its PID, the group ID, cannot
+                # have been reused); then the leader is reaped.
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(self.proc.pid, signal.SIGKILL)
                 self.proc.wait()
         if self.master >= 0:
             self.hang_up()
