@@ -8,6 +8,7 @@ list, never through a shell.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Mapping
 
 
 def run(
@@ -15,11 +16,14 @@ def run(
     *,
     stdin: str | None = None,
     timeout: float | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run ``argv`` without a shell and capture its text output."""
+    """Run ``argv`` without a shell and capture its text output. ``env`` replaces the whole
+    environment of the child (None: inherit this process's environment)."""
     return subprocess.run(
         argv,
         input=stdin,
+        env=None if env is None else dict(env),
         capture_output=True,
         text=True,
         timeout=timeout,

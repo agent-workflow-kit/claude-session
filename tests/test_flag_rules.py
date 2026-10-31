@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from claude_session import cli
 from claude_session.cli import main
+from claude_session.errors import UsageError
 
 from .schemas import validate
 
@@ -65,9 +68,58 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     (["exec", "--timeout", "0"], "--timeout must be positive"),
     (["exec", "--timeout", "0s"], "--timeout must be positive"),
     (["resume", SID, "--timeout", "0.0m"], "--timeout must be positive"),
-    (["start", "--json", "--timeout", "-5"], "--timeout must be positive"),
+    (["start", "--json", "--timeout", "-5"], "--timeout: invalid duration"),
     (["wait", SID, "--timeout", "0"], "--timeout must be positive"),
     (["wait", SID, "--timeout", "0ms"], "--timeout must be positive"),
+    # the full duration grammar (interface.md, Identifiers: Durations)
+    (["exec", "--timeout", ".5"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "5."], "--timeout: invalid duration"),
+    (["exec", "--timeout", "1e3"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "+5"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "1_000"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "5 m"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "5M"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "\u0665s"], "--timeout: invalid duration"),  # ARABIC-INDIC FIVE
+    (["exec", "--timeout", "NONE"], "--timeout: invalid duration"),
+    (["exec", "--timeout", ""], "--timeout: invalid duration"),
+    (["exec", "--timeout", "36501d"], "--timeout: invalid duration: must be at most 36500d"),
+    (["exec", "--timeout", "9" * 400], "--timeout: invalid duration: must be at most 36500d"),
+    (["resume", SID, "--timeout", "soon"], "--timeout: invalid duration"),
+    (["wait", SID, "--timeout", "5x"], "--timeout: invalid duration"),
+    (
+        ["exec", "--hook", "pre-launch=x", "--hook-timeout", "pre-launch=0"],
+        "--hook-timeout pre-launch must be positive",
+    ),
+    (
+        ["exec", "--hook", "pre-launch=x", "--hook-timeout", "pre-launch=none"],
+        "--hook-timeout pre-launch: invalid duration",
+    ),
+    (
+        ["exec", "--hook", "pre-launch=x", "--hook-timeout", "pre-launch="],
+        "--hook-timeout pre-launch: invalid duration",
+    ),
+    (["stop", SID, "--grace", "-1"], "--grace: invalid duration"),
+    (["stop", SID, "--grace", "none"], "--grace: invalid duration"),
+    (["stop", SID, "--grace", "1w"], "--grace: invalid duration"),
+    (["forget", "--older-than", "7 days"], "--older-than: invalid duration"),
+    (["forget", "--older-than", "none"], "--older-than: invalid duration"),
+    (["list", "--since", "yesterday"], "--since: expected an ISO 8601 time or a duration"),
+    (["list", "--since", "1e3"], "--since: expected an ISO 8601 time or a duration"),
+    (["list", "--since", "2026-13-01"], "--since: expected an ISO 8601 time or a duration"),
+    (["export", "--since", "5 m"], "--since: expected an ISO 8601 time or a duration"),
+    (["exec", "--env-allow", "*"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allow", "GH_*"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allow", "a b"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allow", "1X"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allow", "é"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allow", "A=B"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allowlist-only", "*"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allowlist-only", "GH_*"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allowlist-only", "a b"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allowlist-only", "1X"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allowlist-only", "é"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allowlist-only", "A=B"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allow", ""], "--env-allow: invalid variable name"),
     # bounds
     (["exec", "--max-turns", "0"], "--max-turns must be between 1 and 9007199254740991"),
     (
@@ -83,6 +135,8 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     (["exec", "--input-file", "a/x.txt", "--input-file", "b/x.txt"], "duplicate --input-file"),
     (["exec", "--input-file", "a b.txt"], "--input-file name 'a b.txt' must match"),
     (["start", "--json", "--input-file", "dir/"], "--input-file name '' must match"),
+    (["exec", "--input-file", "x.txt\n"], "--input-file name 'x.txt\\n' must match"),
+    (["exec", "--input-file", "a/.."], "--input-file name '..' must match"),
     # setting sources
     (["exec", "--setting-sources", "user,global"], "unknown source 'global'"),
     # report
@@ -103,6 +157,47 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     (["forget", "--state", "lost", "--kind", "review"], "forget needs a session id or"),
     # export
     (["export", "--action", "launch"], "--action: unknown action 'launch'"),
+    # session id prefixes: at least 4 characters after cs-
+    (["status", "abc"], "session id 'abc' is too short"),
+    (["status", "cs-abc", "--json"], "session id 'cs-abc' is too short"),
+    (["resume", "cs-"], "session id 'cs-' is too short"),
+    (["status", "CS-AB"], "session id 'CS-AB' is too short"),
+    (["stop", "ab"], "at least 4 characters"),
+    (["wait", "abc"], "at least 4 characters"),
+    (["label", "add", "abc", "a=b"], "at least 4 characters"),
+    (["label", "remove", "abc", "a=b"], "at least 4 characters"),
+    (["transcript", "abc"], "at least 4 characters"),
+    (["forget", "abc"], "at least 4 characters"),
+    (["exec", "--session-id", "abc"], "--session-id: session id 'abc' is too short"),
+    (["start", "--json", "--resume", "abc"], "--resume: session id 'abc' is too short"),
+    (["list", "--forked-from", "cs-ab"], "--forked-from: session id 'cs-ab' is too short"),
+    # kind names
+    (["exec", "--kind", "Review"], "--kind: invalid kind name 'Review'"),
+    (["start", "--json", "--kind=-x"], "--kind: invalid kind name '-x'"),
+    (["resume", SID, "--kind", "a b"], "--kind: invalid kind name"),
+    (["list", "--kind", "a.b"], "--kind: invalid kind name"),
+    (["list", "--launch-kind", "A"], "--launch-kind: invalid kind name"),
+    (["list", "--run-kind", "A"], "--run-kind: invalid kind name"),
+    (["kinds", "--kind", "k" * 65], "--kind: invalid kind name"),
+    (["forget", "--older-than", "7d", "--kind", "_k"], "--kind: invalid kind name"),
+    # skill names
+    (["exec", "--skill", ":plan"], "--skill: invalid skill name ':plan'"),
+    (["start", "--json", "--skill", "a b"], "--skill: invalid skill name"),
+    (["resume", SID, "--skill", "/review"], "--skill: invalid skill name"),
+    # repo ids
+    (["exec", "--repo", "https://example.org/r"], "--repo: invalid repo id"),
+    (["start", "--json", "--repo", "Example.org/r"], "--repo: invalid repo id"),
+    (["resume", SID, "--repo", "example.org"], "--repo: invalid repo id"),
+    (["list", "--repo", "example.org/../r"], "--repo: invalid repo id"),
+    (["kinds", "--repo", "example.org/r/"], "--repo: invalid repo id"),
+    # labels
+    (["exec", "--label", "novalue"], "--label: invalid label 'novalue'"),
+    (["start", "--json", "--label", "Key=v"], "--label: invalid label 'Key=v'"),
+    (["resume", SID, "--label", "k=a b"], "--label: invalid label"),
+    (["list", "--label", "k=$(x)"], "--label: invalid label"),
+    (["forget", "--older-than", "7d", "--label", "=v"], "--label: invalid label"),
+    (["label", "add", SID, "a=b", "c d=e"], "invalid label 'c d=e'"),
+    (["label", "remove", SID, "k"], "invalid label 'k'"),
 ]
 
 
@@ -117,6 +212,15 @@ def test_violation_exits_2(
     else:
         assert captured.out == ""
     assert message in captured.err
+
+
+def test_short_prefix_with_json_prints_golden_shaped_usage_envelope(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["status", "abc", "--json"]) == 2
+    envelope = json.loads(capsys.readouterr().out)
+    validate(envelope, "claude-session/cli/error.json")
+    assert envelope["error"]["code"] == "usage"
 
 
 def test_violation_with_json_prints_usage_envelope(capsys: pytest.CaptureFixture[str]) -> None:
@@ -146,6 +250,23 @@ ALLOWED: list[list[str]] = [
     ["resume", SID, "--fork", "--allow-tainted"],
     ["resume", SID, "--override-escalation"],
     ["wait", SID, "--timeout", "none"],
+    ["wait", SID, "--timeout", "90"],
+    ["exec", "--timeout", "36500d"],
+    ["exec", "--timeout", "500ms"],
+    ["exec", "--hook", "pre-launch=a", "--hook-timeout", "pre-launch=0.5"],
+    ["stop", SID, "--grace", "0"],
+    ["stop", SID, "--grace", "2.5s"],
+    ["forget", "--older-than", "0"],
+    ["forget", "--older-than", "30d"],
+    ["list", "--since", "2h"],
+    ["list", "--since", "3600"],
+    ["list", "--since", "2026-10-30"],
+    ["list", "--since", "2026-10-30T10:00:00+00:00"],
+    ["export", "--since", "2026-10-30T10:00:00Z"],
+    ["export", "--since", "7d"],
+    ["exec", "--env-allow", "GH_TOKEN", "--env-allow", "_x1"],
+    ["exec", "--env-allowlist-only", ""],
+    ["exec", "--env-allowlist-only", "A", "--env-allowlist-only", ""],
     ["report", "done", "--summary-file", "-"],
     ["report", "blocked", "--reason-file", "r.md"],
     ["transcript", SID, "--raw"],
@@ -156,6 +277,21 @@ ALLOWED: list[list[str]] = [
     ["cron", "install", "--interval", "1"],
     ["cron", "install", "--interval", "59"],
     ["export", "--action", "resume_tainted", "--action", "sandbox_lowered"],
+    ["status", "abcd"],
+    ["status", "cs-abcd"],
+    ["status", "CS-ABCD"],
+    ["status", "zzzzzzzzzz"],  # malformed but long enough: unknown (exit 10) at lookup
+    ["resume", "abcd", "--kind", "review-respond", "--skill", "plan:make"],
+    ["exec", "--session-id", "abcd"],
+    ["start", "--json", "--resume", "cs-abcd", "--label", "pr=example.org/g/r#42"],
+    ["list", "--forked-from", "abcd", "--launch-kind", "k_1", "--run-kind", "0"],
+    ["list", "--label", "a=", "--label", "expr=a=b", "--repo", "example.org:8443/g/r"],
+    ["kinds", "--kind", "review", "--repo", "example.org/g/r"],
+    ["exec", "--repo", "localhost/r", "--label", "owner=me@example.org"],
+    ["label", "add", "abcd", "a=b", "c="],
+    ["label", "remove", SID, "x.y_z-1=A,b+c:d"],
+    ["forget", "abcd"],
+    ["verify-secret", "abc"],  # needs the full id; mismatch is the handler's exit 11
 ]
 
 
@@ -163,8 +299,28 @@ ALLOWED: list[list[str]] = [
 def test_allowed_combination_reaches_the_handler(
     argv: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from claude_session import cli
-
     handler = cli.parse(cli.build_parser(), argv).handler
     monkeypatch.setitem(cli.HANDLERS, handler, lambda args: 77)
     assert main(argv) == 77, capsys.readouterr().err
+
+
+# --since threshold (interface.md, list): the duration grammar first, then an ISO 8601 time
+
+
+def test_since_threshold_reads_digits_as_seconds() -> None:
+    now = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
+    assert cli.since_threshold("20240101", now=now) == now - timedelta(seconds=20240101)
+    assert cli.since_threshold("2h", now=now) == now - timedelta(hours=2)
+
+
+def test_since_threshold_reads_iso_times() -> None:
+    now = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
+    offset = cli.since_threshold("2026-10-30T10:00:00+02:00", now=now)
+    assert offset == datetime(2026, 10, 30, 8, 0, tzinfo=UTC)
+    assert cli.since_threshold("2026-10-30", now=now) == datetime(2026, 10, 30, tzinfo=UTC)
+    assert cli.since_threshold("2026-10-30T10:00:00Z", now=now).utcoffset() == timedelta(0)
+
+
+def test_since_threshold_rejects_other_text() -> None:
+    with pytest.raises(UsageError):
+        cli.since_threshold("yesterday")
