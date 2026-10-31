@@ -137,7 +137,9 @@ class Terminal:
             self.hang_up()
         lines = self.outcome_lines()
         outcome = json.loads(lines[-1]) if lines else None
-        return self.proc.returncode, outcome, err.decode("utf-8", "replace")
+        code = self.proc.returncode
+        assert code is not None
+        return code, outcome, err.decode("utf-8", "replace")
 
     def fake_log(self) -> list[dict[str, Any]]:
         return read_jsonl(self.tmp_path / "fake.jsonl")
