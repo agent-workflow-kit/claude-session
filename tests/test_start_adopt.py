@@ -732,3 +732,16 @@ def test_the_adoption_dry_run_of_a_failed_start_is_refused(env: Env) -> None:
     assert (err["error"]["code"], err["error"]["reason"]) == ("refused", "expired")
     proc, err = env.adopt(sid)
     assert proc.returncode == 20 and err["error"]["reason"] == "expired"
+
+
+def test_a_relative_profile_file_is_resolved_against_starts_cwd(env: Env, tmp_path: Path) -> None:
+    # An isolated run: at adoption, a relative profile path must not be read against the
+    # adopting process's cwd (here the run's own, session-writable, cwd).
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    (prof / "p.json").write_text('{"permissions": {"allow": ["Read"]}}')
+    args = ("--mode", "headless", "--reads-third-party", "--sandbox", "off")
+    args += ("--permission-profile", "./p.json", "--cwd", str(env.work))
+    sid = env.started(*args, cwd=prof)["csession_id"]
+    proc, out = env.adopt(sid, cwd=env.work)
+    assert proc.returncode == 0, (out["end_reason"], out["message"])

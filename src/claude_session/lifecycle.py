@@ -37,6 +37,7 @@ compare-and-set (it stays pending).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -144,9 +145,14 @@ def spec_json(
     cfg: Config, req: launch.Request, resolved: launch.Resolved, v: launch.Validated
 ) -> dict[str, Any]:
     profile = v.profile
+    resolution = resolved.resolution
+    if resolution.permission_profile_file is not None:
+        # start read the file relative to its own cwd; the adopting exec runs elsewhere.
+        absolute = os.path.realpath(resolution.permission_profile_file)
+        resolution = dataclasses.replace(resolution, permission_profile_file=absolute)
     return {
         "version": SPEC_VERSION,
-        "resolution": resolution_json(resolved.resolution),
+        "resolution": resolution_json(resolution),
         "request": {
             "mode": req.mode,
             "skill": req.skill,
