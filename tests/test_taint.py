@@ -447,6 +447,102 @@ def test_an_audit_that_cannot_be_written_at_adoption_never_launches_the_run(env:
     assert not (env.tmp_path / "elsewhere.jsonl").exists()
 
 
+# The error follow-up of a launch-phase record whose run never spawned claude
+
+
+def results(env: Env, action: str) -> list[str]:
+    return [r["result"] for r in audit_records(env) if r["action"] == action]
+
+
+def failing_prepare(monkeypatch: pytest.MonkeyPatch, before: Any = None) -> None:
+    def prepare(*_args: Any, **_kwargs: Any) -> Any:
+        if before is not None:
+            before()
+        raise OSError("prepare failed")
+
+    monkeypatch.setattr(launch, "prepare", prepare)
+
+
+def test_a_run_that_fails_after_its_resume_tainted_record_gets_an_error_record(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = tainted_session(env)
+    failing_prepare(monkeypatch)
+    code, out = resume_in_process(
+        env, monkeypatch, capsys, sid, *TRUSTED, "--allow-tainted", *HUMAN, "--decision-id", "d-7"
+    )
+    assert code == 12, out
+    assert out["end_reason"] == "launch_interrupted"
+    ok, error = tainted_records(env)
+    assert (ok["result"], error["result"]) == ("ok", "error")
+    for key in ("actor", "target", "decision_id", "inputs"):
+        assert error[key] == ok[key], key
+    assert len(starts(env)) == 1
+
+
+def test_a_third_party_run_that_fails_after_its_sandbox_lowered_record_gets_an_error_record(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = exec_session(env)["csession_id"]
+    failing_prepare(monkeypatch)
+    code, out = resume_in_process(
+        env, monkeypatch, capsys, sid, "--reads-third-party", "--sandbox", "off"
+    )
+    assert code == 12, out
+    assert results(env, "sandbox_lowered") == ["ok", "error"]
+    ok, error = (r for r in audit_records(env) if r["action"] == "sandbox_lowered")
+    assert (error["target"], error["inputs"]) == (ok["target"], ok["inputs"])
+
+
+def test_a_spawn_that_fails_after_the_resume_tainted_record_gets_an_error_record(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from claude_session import supervisor
+
+    sid = tainted_session(env)
+
+    def spawn(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(supervisor, "spawn", spawn)
+    code, out = resume_in_process(
+        env, monkeypatch, capsys, sid, *TRUSTED, "--allow-tainted", *HUMAN
+    )
+    assert code == 12, out
+    assert results(env, "resume_tainted") == ["ok", "error"]
+    assert len(starts(env)) == 1
+
+
+def test_a_run_that_spawns_gets_no_error_record(env: Env) -> None:
+    sid = tainted_session(env)
+    proc, _out = resume(env, sid, *TRUSTED, "--allow-tainted", *HUMAN)
+    assert proc.returncode == 0, proc.stderr
+    proc, _out = resume(env, sid, "--reads-third-party", "--sandbox", "off")
+    assert proc.returncode == 0, proc.stderr
+    assert results(env, "resume_tainted") == ["ok"]
+    assert results(env, "sandbox_lowered") == ["ok", "ok"]
+
+
+def test_an_error_record_that_cannot_be_written_does_not_change_the_exit_code(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = tainted_session(env)
+    path = env.state / "audit.jsonl"
+
+    def block_the_audit() -> None:
+        path.rename(env.tmp_path / "audit.jsonl")
+        path.mkdir()
+
+    failing_prepare(monkeypatch, block_the_audit)
+    code, out = resume_in_process(
+        env, monkeypatch, capsys, sid, *TRUSTED, "--allow-tainted", *HUMAN
+    )
+    assert code == 12, out
+    assert (out["outcome"], out["end_reason"]) == ("not-started", "launch_interrupted")
+    moved = [json.loads(line) for line in (env.tmp_path / "audit.jsonl").read_text().splitlines()]
+    assert [r["result"] for r in moved if r["action"] == "resume_tainted"] == ["ok"]
+
+
 # Laundering
 
 
@@ -491,20 +587,69 @@ def test_a_launch_spec_edited_to_drop_reads_third_party_is_refused_at_adoption(e
     assert len(starts(env)) == 1
 
 
-def test_a_launch_spec_cannot_turn_the_flag_on(env: Env) -> None:
+@pytest.mark.parametrize(
+    "edit",
+    [
+        pytest.param(lambda r: r.update(actor="human:someone-else"), id="actor"),
+        pytest.param(lambda r: r.update(decision_ids=["d-other"]), id="decision-ids"),
+        pytest.param(lambda r: r.update(decision_ids=[]), id="no-decision-ids"),
+    ],
+)
+def test_a_launch_spec_edited_to_change_the_actor_or_decision_ids_is_refused_at_adoption(
+    env: Env, edit: Any
+) -> None:
     sid = tainted_session(env)
     proc, out = run_cs(
-        env, ["start", "--json", "--resume", sid, "--reads-third-party", "--sandbox", "off"]
+        env,
+        [
+            "start",
+            "--json",
+            "--resume",
+            sid,
+            *TRUSTED,
+            "--allow-tainted",
+            *HUMAN,
+            "--decision-id",
+            "d-7",
+        ],
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     spec = env.private_run(sid, 2) / "launch-spec.json"
     data = json.loads(spec.read_text())
-    data["request"]["allow_tainted"] = {"tty": True}
+    edit(data["request"])
     spec.write_text(json.dumps(data))
     proc, out = env.adopt(sid)
-    # An unknown request key makes the spec unusable; the run never launches.
-    assert proc.returncode == 12 and out["end_reason"] == "session_dir_unsafe", out
+    assert proc.returncode == 12, out
+    assert (out["outcome"], out["end_reason"]) == ("not-started", "session_dir_unsafe")
     assert tainted_records(env) == []
+    assert len(starts(env)) == 1
+
+
+def test_a_launch_spec_cannot_turn_the_flag_on(env: Env) -> None:
+    # A trusted pending run of a session that was untainted at start (so the row records no
+    # --allow-tainted) and is tainted before adoption.
+    sid = exec_session(env)["csession_id"]
+    proc, out = run_cs(env, ["start", "--json", "--resume", sid, *TRUSTED])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert store.ALLOW_TAINTED not in json.loads(env.run_row(sid, 2)["invocation_json"])
+    env.write_db(
+        "UPDATE sessions SET tainted = 1, tainted_at = '2026-01-01T00:00:00Z'"
+        " WHERE csession_id = ?",
+        (sid,),
+    )
+    spec = env.private_run(sid, 2) / "launch-spec.json"
+    data = json.loads(spec.read_text())
+    data["request"]["allow_tainted"] = {"tty": True}
+    data["allow_tainted"] = {"tty": True}
+    spec.write_text(json.dumps(data))
+    proc, out = env.adopt(sid)
+    assert proc.returncode in (12, 20), out
+    assert out.get("end_reason") in ("session_dir_unsafe", "launch_interrupted") or (
+        out["error"]["reason"] == "tainted"
+    ), out
+    assert tainted_records(env) == []
+    assert len(starts(env)) == 1
+    assert is_tainted(env, sid)
 
 
 def test_label_edits_and_resume_chains_never_clear_the_taint(env: Env) -> None:

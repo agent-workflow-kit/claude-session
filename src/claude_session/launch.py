@@ -1602,18 +1602,63 @@ def log_best_effort(log: logs.EventLog, event: str, **fields: Any) -> str | None
     return None
 
 
+@dataclass(frozen=True)
+class LaunchAudit:
+    """A launch-phase audit record written ``result: ok`` (``sandbox_lowered``,
+    ``resume_tainted``): what its ``result: error`` follow-up repeats when the run ends
+    before ``claude`` is spawned (``audit_launch_errors``)."""
+
+    action: str
+    actor: str
+    target: str
+    decision_ids: tuple[str, ...]
+    inputs: Mapping[str, Any]
+    secrets: tuple[str, ...]
+
+
+def audit_launch_errors(process: Process, written: Sequence[LaunchAudit]) -> None:
+    """The ``result: error`` follow-up of each launch-phase record of a run that ended
+    before ``claude`` was spawned: same action, actor, target, decision ids and inputs.
+    Best effort: a record that cannot be written is skipped (the run's own outcome stands)."""
+    for record in written:
+        try:
+            audit.append(
+                os.path.join(process.state_root, AUDIT_NAME),
+                actor=record.actor,
+                target=record.target,
+                action=record.action,
+                result="error",
+                decision_ids=record.decision_ids,
+                inputs=record.inputs,
+                secrets=record.secrets,
+            )
+        except (OSError, ValueError):
+            pass
+
+
+def _claude_spawned(st: store.Store, alloc: Allocated) -> bool:
+    """Whether the run's child was recorded (only a recorded child runs ``claude``:
+    ``started_at`` is set right before its gate is released, and cleared again when
+    ``claude`` could not be executed). A row that cannot be read counts as spawned: no
+    error record is then written."""
+    try:
+        return st.run_record(alloc.csession_id, alloc.run)["started_at"] is not None
+    except Exception:  # best effort: the run's own outcome stands
+        return True
+
+
 def audit_sandbox_lowered(
     process: Process,
     req: Request,
     resolution: kinds.Resolution,
     alloc: Allocated,
     secrets: Sequence[str],
-) -> None:
+) -> LaunchAudit | None:
     """A third-party-reading run below the ``required`` sandbox baseline: the
     ``sandbox_lowered`` audit record (raises when it cannot be written: the run must not
-    launch without it) and the matching log event."""
+    launch without it) and the matching log event. Returns the record written (None: none)."""
     if not resolution.sandbox_lowered():
-        return
+        return None
     inputs = settings_builder.sandbox_lowered_inputs(resolution, run=alloc.run)
     audit.append(
         os.path.join(process.state_root, AUDIT_NAME),
@@ -1632,6 +1677,14 @@ def audit_sandbox_lowered(
         csession_id=alloc.csession_id,
         run=alloc.run,
         message=f"sandbox {resolution.profile.sandbox} (baseline required)",
+    )
+    return LaunchAudit(
+        action="sandbox_lowered",
+        actor=req.actor,
+        target=alloc.csession_id,
+        decision_ids=tuple(req.decision_ids),
+        inputs=inputs,
+        secrets=tuple(secrets),
     )
 
 
@@ -2016,22 +2069,23 @@ def recheck_fork_taint(
     process: Process,
     req: Request,
     secrets: Sequence[str],
-) -> None:
-    """Right before step 7 of every run: the taint read again (``Store.recheck_fork_taint``):
-    the source's of a run that forks a conversation (``alloc.taint_source``; it may have been
-    tainted since allocation), and the session's own. Raises ``RefusedError`` (``tainted``)
-    for a run that is not third-party-reading without ``--allow-tainted``. A run that goes
-    ahead only because of ``--allow-tainted`` gets its ``resume_tainted`` audit record here,
+) -> LaunchAudit | None:
+    """Right before step 7 of every run (not only forks; the name is historical): the taint
+    read again (``Store.recheck_fork_taint``): the source's of a run that forks a
+    conversation (``alloc.taint_source``; it may have been tainted since allocation), and
+    the session's own. Raises ``RefusedError`` (``tainted``) for a run that is not
+    third-party-reading unless its row records ``--allow-tainted``. A run that goes ahead
+    only because of ``--allow-tainted`` gets its ``resume_tainted`` audit record here,
     before anything of step 7 (raises when it cannot be written: the run then ends
-    ``launch_interrupted`` and ``claude`` is never spawned)."""
+    ``launch_interrupted`` and ``claude`` is never spawned); it is returned (None: none)."""
     if not st.recheck_fork_taint(alloc.csession_id, alloc.run, alloc.taint_source):
-        return
+        return None
     allow = req.allow_tainted
     if allow is None:  # the row recorded the flag, but this process was not given it
         raise InternalError(
             f"run {alloc.run} of {alloc.csession_id} records --allow-tainted its request lacks"
         )
-    taint.audit_resume_tainted(
+    inputs = taint.audit_resume_tainted(
         process.state_root,
         AUDIT_NAME,
         actor=req.actor,
@@ -2042,6 +2096,14 @@ def recheck_fork_taint(
         forked_from=alloc.taint_source,
         allow=allow,
         secrets=secrets,
+    )
+    return LaunchAudit(
+        action=taint.ACTION,
+        actor=req.actor,
+        target=alloc.csession_id,
+        decision_ids=tuple(req.decision_ids),
+        inputs=inputs,
+        secrets=tuple(secrets),
     )
 
 
@@ -2084,6 +2146,8 @@ def run(
     v: Validated | None = None
     prepared: Prepared | None = None
     ending = False  # an inner handler is ending the launch: the outer one must not again
+    written: list[LaunchAudit] = []  # launch-phase audit records written (result: ok)
+    handed_over = False  # supervise was called: it may have spawned claude
     try:
         # The outer handler also takes a signal that arrives while a launch failure is being
         # handled, before the inner handler's defer() (the phase is still RAISE there).
@@ -2107,10 +2171,14 @@ def run(
                 # it), so it is redacted against the session's secret values only;
                 # prepared.secrets, used for the log from here on, is that set plus the run
                 # secret.
-                audit_sandbox_lowered(process, req, resolution, alloc, secrets)
+                if lowered := audit_sandbox_lowered(process, req, resolution, alloc, secrets):
+                    written.append(lowered)
                 st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
                 # TODO(#31): insert step 6 (pre-launch hooks) before this re-check.
-                recheck_fork_taint(st, alloc, resolution, process=process, req=req, secrets=secrets)
+                if lifted := recheck_fork_taint(
+                    st, alloc, resolution, process=process, req=req, secrets=secrets
+                ):
+                    written.append(lifted)
                 prepared = prepare(st, cfg, req, resolution, alloc, v, process)
                 st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
                 signals.defer()  # the supervisor raises a signal from here before the spawn
@@ -2137,6 +2205,7 @@ def run(
                 error = interrupted_by(st, alloc, exc)
                 end_launch(st, alloc, v, prepared, process, error, exc=exc, guard=guard)
             raise
+        handed_over = True
         return supervise(
             st,
             cfg,
@@ -2151,6 +2220,10 @@ def run(
             bound=resolution.timeout(req.mode),
         )
     finally:
+        # Every end of the run without claude spawned (any path above, or the spawn window
+        # in supervise) follows the launch-phase records up with result: error.
+        if written and (not handed_over or not _claude_spawned(st, alloc)):
+            audit_launch_errors(process, written)
         if v is not None:
             v.close_tmpdir_pin()
             v.dirs.close()

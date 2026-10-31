@@ -1252,16 +1252,17 @@ class Store:
             )
 
     def recheck_fork_taint(self, csession_id: str, run_no: int, source: str | None) -> bool:
-        """Right before step 7 of every run: the taint read again in one transaction, with
-        the run's own ``reads_third_party`` and ``--allow-tainted`` as its row records them
-        (never the launch spec file). For a run that forks ``source``'s conversation (a
-        fork's run 1, or a later run of a fork that never captured a Claude id), the
-        source's taint (it may have been tainted since the fork was allocated): a tainted
-        source that does not refuse the run copies its taint onto the fork. Then the
-        session's own taint. A tainted one with a run that is not third-party-reading is
-        refused ``tainted`` (``_refuse_tainted``, ``RefusedError``) unless the run recorded
-        ``--allow-tainted``. Returns whether only ``--allow-tainted`` lets the run go ahead
-        (its ``resume_tainted`` record is then due)."""
+        """Right before step 7 of every run (not only forks; the name is historical): the
+        taint read again in one transaction, with the run's own ``reads_third_party`` and
+        ``--allow-tainted`` as its row records them (never the launch spec file). For a run
+        that forks ``source``'s conversation (a fork's run 1, or a later run of a fork that
+        never captured a Claude id), the source's taint (it may have been tainted since the
+        fork was allocated): a tainted source that does not refuse the run copies its taint
+        onto the fork. Then the session's own taint. A tainted one with a run that is not
+        third-party-reading is refused ``tainted`` (``_refuse_tainted``, ``RefusedError``)
+        unless the run recorded ``--allow-tainted``. Returns whether only
+        ``--allow-tainted`` lets the run go ahead (its ``resume_tainted`` record is then
+        due)."""
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT r.reads_third_party, r.invocation_json FROM runs r "

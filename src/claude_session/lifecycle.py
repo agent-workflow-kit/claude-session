@@ -941,6 +941,13 @@ def _check_request(frozen: Frozen, data: Mapping[str, Any], record: Mapping[str,
     # with another profile would run a trusted profile where the store saw an isolated one.
     if frozen.resolution.profile.reads_third_party != bool(record["reads_third_party"]):
         raise ValueError("the launch spec's reads_third_party is not the run's")
+    # The audit records of the run (resume_tainted, sandbox_lowered) name the request's actor
+    # and decision ids: they must be those start recorded on the run row.
+    invocation = _invocation(record)
+    if _text(data["actor"]) != invocation.get("actor"):
+        raise ValueError("the launch spec's actor is not the run's")
+    if _texts(data["decision_ids"]) != invocation.get("decision_ids"):
+        raise ValueError("the launch spec's decision ids are not the run's")
     if _bool(data["has_prompt"]) != bool(record["has_prompt"]):
         raise ValueError("the launch spec's prompt presence is not the run's")
     flags = dict(_mapping(data["flags"]))

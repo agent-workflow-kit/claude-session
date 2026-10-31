@@ -19,7 +19,12 @@ compare-and-set and the check right before step 7. ``--allow-tainted`` lifts tha
   run that goes ahead only because of the flag, written right before step 7 (the adopting
   ``exec`` for ``start --resume``: "audited at adoption"), after the last taint check. A
   record that cannot be written ends the run ``not-started`` (``launch_interrupted``,
-  exit 12) before ``claude`` is spawned: the override never takes effect unaudited.
+  exit 12) before ``claude`` is spawned: the override never takes effect unaudited. A run
+  that then ends before ``claude`` is spawned (step 7 or the spawn fails, a signal) gets a
+  best-effort follow-up record of the same action with ``result: error``.
+- **Not audited**: a refusal. A human-only check that fails is a usage error (exit 2,
+  before the lookup), and a tainted refusal without the flag (exit 20) is not a use of the
+  override.
 """
 
 from __future__ import annotations
@@ -113,10 +118,18 @@ def audit_resume_tainted(
     forked_from: str | None,
     allow: AllowTainted,
     secrets: Sequence[str],
-) -> None:
+) -> dict[str, Any]:
     """The ``resume_tainted`` record of a run that goes ahead only because of
-    ``--allow-tainted``. Raises (``OSError``, ``ValueError``) when it cannot be written: the
-    run must not launch without it."""
+    ``--allow-tainted``; returns its inputs (an ``error`` follow-up repeats them when the run
+    then ends before ``claude`` is spawned: ``launch.audit_launch_errors``). Raises
+    (``OSError``, ``ValueError``) when it cannot be written: the run must not launch without
+    it."""
+    inputs: dict[str, Any] = {
+        "run_kind": run_kind,
+        "run": run,
+        "forked_from": forked_from,
+        "tty": allow.tty,
+    }
     audit.append(
         os.path.join(state_root, audit_name),
         actor=actor,
@@ -124,6 +137,7 @@ def audit_resume_tainted(
         action=ACTION,
         result="ok",
         decision_ids=decision_ids,
-        inputs={"run_kind": run_kind, "run": run, "forked_from": forked_from, "tty": allow.tty},
+        inputs=inputs,
         secrets=secrets,
     )
+    return inputs
