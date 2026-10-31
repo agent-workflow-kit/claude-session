@@ -21,12 +21,12 @@ the command exits 12 with the outcome object; only a ``KeyboardInterrupt`` (SIGI
 re-raised once the run is final.
 
 The step-5 helpers take every input explicitly and return values; the side effects of step 5
-are confined to ``open_dirs`` (the session's directories), ``create_write_dirs`` and
-``check_sandbox`` (the private tmpdir, created last), so a dry run can call the others as
-they are.
-
-TODO(#27): ``--dry-run`` runs ``read_request``, ``resolve_kind`` and the side-effect-free
-step-5 helpers (``self_check(create=False)``), never ``allocate`` or ``prepare``.
+are confined to ``open_dirs`` (the session's directories) and the ``Effects`` that
+``validate`` passes to ``checks`` (the run and session rows, ``create_write_dirs`` and the
+private tmpdir, created last by ``check_sandbox``). ``--dry-run`` (``dryrun``) runs
+``read_request``, ``resolve_kind`` and ``checks`` with effects that record and create
+nothing (``self_check(create=False)``), then ``generate`` for the settings and argv; never
+``allocate``, ``open_dirs`` or ``prepare``.
 TODO(#28): ``start`` stores the request and the resolved spec; adoption reruns ``validate``
 and ``prepare`` for the pending run.
 TODO(#29): resume and fork build their request from the previous run (carry-over).
@@ -277,7 +277,7 @@ def resolve_kind(req: Request, cfg: Config, process: Process) -> Resolved:
     resolution = kinds.resolve(
         cfg,
         req.kind,
-        mode="headless",
+        mode="headless" if req.mode == "headless" else "interactive",
         repo=req.repo,
         cwd=probe_cwd,
         flags=req.flags,
@@ -377,11 +377,10 @@ def allocate(st: store.Store, req: Request, resolved: Resolved, process: Process
 
 
 @dataclass
-class Validated:
-    """Everything step 5 resolved and checked, for step 7 and the supervisor."""
+class Checked:
+    """What ``checks`` resolved: everything ``Validated`` holds but the session
+    directories."""
 
-    dirs: SessionDirs
-    layout: sessiondir.RunLayout
     cwd: str
     git_dirs: gitinfo.GitDirs | None
     profile: permission_profiles.Profile
@@ -401,6 +400,15 @@ class Validated:
     credential_warnings: tuple[str, ...] = ()
 
 
+@dataclass
+class Validated(Checked):
+    """Everything step 5 resolved and checked, for step 7 and the supervisor: ``Checked``
+    plus the session directories ``open_dirs`` opened."""
+
+    dirs: SessionDirs = field(kw_only=True)
+    layout: sessiondir.RunLayout = field(kw_only=True)
+
+
 def open_dirs(
     alloc: Allocated, process: Process, *, isolated: bool
 ) -> tuple[SessionDirs, sessiondir.RunLayout]:
@@ -418,20 +426,32 @@ def open_dirs(
 
 
 def host_rules(
-    process: Process, resolution: kinds.Resolution, alloc: Allocated, cwd: str, tmp: str | None
+    process: Process,
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    cwd: str,
+    tmp: str | None,
+    *,
+    planned: bool = False,
 ) -> pathrules.PathRules:
     """The ``Host`` facts and the run's ``PathRules`` (after ``open_dirs``: the exceptions for
-    the run's own directories apply only to real directories that exist); for isolated runs
-    ``check_host`` first: the write checks assume a valid ``$HOME``. The private tmpdir does
-    not exist yet (the self-check creates it at the end of step 5), so an entry inside it is
-    refused here (conservative: nothing a profile needs lives there)."""
+    the run's own directories apply only to real directories that exist; a dry run, which
+    creates none, passes ``planned``); for isolated runs ``check_host`` first: the write
+    checks assume a valid ``$HOME``. The private tmpdir does not exist yet (the self-check
+    creates it at the end of step 5), so an entry inside it is refused here (conservative:
+    nothing a profile needs lives there)."""
     host = pathrules.Host.from_environ(
         process.environ,
         state_root=process.state_root,
         path_prepend=resolution.profile.env.path_prepend,
     )
     rules = pathrules.PathRules(
-        host, session_dir=alloc.session_dir, cwd=cwd, caller_cwd=process.caller_cwd, tmpdir=tmp
+        host,
+        session_dir=alloc.session_dir,
+        cwd=cwd,
+        caller_cwd=process.caller_cwd,
+        tmpdir=tmp,
+        planned=planned,
     )
     if resolution.isolated():
         rules.check_host()
@@ -441,8 +461,9 @@ def host_rules(
 def check_cwd(rules: pathrules.PathRules, resolution: kinds.Resolution) -> None:
     """The cwd must be a directory; isolated runs also write it into rules and may write in
     it, so it passes the cwd rules (``unsafe_cwd``), checked before the profile is expanded so
-    a bad cwd fails ``unsafe_cwd`` whatever the profile."""
-    if not os.path.isdir(rules.cwd):
+    a bad cwd fails ``unsafe_cwd`` whatever the profile. A dry run's ``work/`` that a launch
+    would create (``rules.planned``) counts as a directory."""
+    if not os.path.isdir(rules.cwd) and not rules.planned(rules.cwd):
         raise LaunchValidationError(
             f"cwd is not a directory: {rules.cwd!r}", end_reason="unsafe_cwd"
         )
@@ -754,11 +775,17 @@ def check_tmpdir(resolution: kinds.Resolution, alloc: Allocated) -> None:
 
 
 def check_sandbox(
-    resolution: kinds.Resolution, alloc: Allocated, tools: Tools, process: Process
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    tools: Tools,
+    process: Process,
+    *,
+    create: bool = True,
 ) -> selfcheck.SelfCheck:
     """``claude_args`` and setting sources, then the sandbox self-check, which creates the
     private tmpdir: the last action of step 5 (``unsafe_claude_args``,
-    ``unsafe_setting_sources``, ``sandbox_unavailable``, ``socket_path_too_long``)."""
+    ``unsafe_setting_sources``, ``sandbox_unavailable``, ``socket_path_too_long``). A dry run
+    passes ``create=False``: the same checks, nothing created."""
     profile = resolution.profile
     pathrules.check_claude_args(profile.claude_args, isolated=resolution.isolated())
     settings_builder.check_setting_sources(resolution)
@@ -768,7 +795,7 @@ def check_sandbox(
         bwrap=None if tools.bwrap is None else tools.bwrap.path,
         socat=None if tools.socat is None else tools.socat.path,
         gw=process.gateway,
-        create=True,
+        create=create,
     )
 
 
@@ -782,85 +809,141 @@ def check_hook_interpreter(process: Process, writable: pathrules.SessionWritable
     )
 
 
-def validate(
-    st: store.Store,
+class Effects:
+    """The side effects inside the launch validations (``checks``): what a launch records
+    and creates between the checks. ``validate`` passes ``Recording``; a dry run passes this
+    base class, which records and creates nothing.
+
+    - ``planned``: whether the run's own directories may not exist yet (dry run;
+      ``pathrules.PathRules``).
+    - ``git_cwd``: where git looks for the cwd's git directory (a dry run's ``work/`` that
+      does not exist yet: its nearest existing parent, which a new empty directory inherits
+      the git directory from).
+    """
+
+    planned = True
+
+    def record_cwd(self, cwd: str) -> None:
+        pass
+
+    def git_cwd(self, cwd: str) -> str:
+        current = cwd
+        while not os.path.isdir(current) and os.path.dirname(current) != current:
+            current = os.path.dirname(current)
+        return current
+
+    def record_git_dir(self, git_dirs: gitinfo.GitDirs | None) -> None:
+        pass
+
+    def create_write_dirs(self, write: pathrules.WriteDirs) -> None:
+        pass
+
+    def sandbox(
+        self, resolution: kinds.Resolution, alloc: Allocated, tools: Tools, process: Process
+    ) -> selfcheck.SelfCheck:
+        return check_sandbox(resolution, alloc, tools, process, create=False)
+
+
+class Recording(Effects):
+    """The effects of a real launch: the cwd and git directory recorded on the run and
+    session, the ``write_dirs`` inside ``$CSESSION_DIR`` created and the private tmpdir
+    created (and recorded) by the self-check."""
+
+    planned = False
+
+    def __init__(self, st: store.Store, alloc: Allocated, dirs: SessionDirs) -> None:
+        self.st = st
+        self.alloc = alloc
+        self.dirs = dirs
+
+    def record_cwd(self, cwd: str) -> None:
+        self.st.update_run(self.alloc.csession_id, self.alloc.run, cwd=cwd)
+
+    def git_cwd(self, cwd: str) -> str:
+        return cwd
+
+    def record_git_dir(self, git_dirs: gitinfo.GitDirs | None) -> None:
+        self.st.update_session(self.alloc.csession_id, git_dir=gitinfo.stored_value(git_dirs))
+
+    def create_write_dirs(self, write: pathrules.WriteDirs) -> None:
+        create_write_dirs(self.dirs, write)
+
+    def sandbox(
+        self, resolution: kinds.Resolution, alloc: Allocated, tools: Tools, process: Process
+    ) -> selfcheck.SelfCheck:
+        check = check_sandbox(resolution, alloc, tools, process)
+        if check.tmpdir is not None:
+            self.st.update_session(alloc.csession_id, tmp_dir=check.tmpdir)
+        return check
+
+
+def checks(
     cfg: Config,
     req: Request,
     resolved: Resolved,
     alloc: Allocated,
     process: Process,
-) -> Validated:
-    """Launch step 5, in the order interface.md (Launch order) lists: rule paths, the
-    session directories, ``$HOME``, the cwd, the permission profile read (its write entries
-    and ``write_dirs`` without ``${GIT_DIR}`` expanded), git and the git directory, the
-    profile expanded, ``read_dirs``/``write_dirs``, the profile file against the full set,
-    the profile's paths, plugin directories, the hook interpreter, the tmpdir, the tools
-    (``claude_bin``, ``git``, ``bwrap``, ``socat``), the session environment (``PATH``), the
-    generated read entries, ``claude_args``, setting sources and the sandbox self-check, which
-    creates the private tmpdir last. Raises ``LaunchValidationError``; the first failure
+    effects: Effects,
+) -> Checked:
+    """Launch step 5 after the rule paths and the session directories, in the order
+    interface.md (Launch order) lists: ``$HOME``, the cwd, the permission profile read (its
+    write entries and ``write_dirs`` without ``${GIT_DIR}`` expanded), git and the git
+    directory, the profile expanded, ``read_dirs``/``write_dirs``, the profile file against
+    the full set, the profile's paths, plugin directories, the hook interpreter, the tmpdir,
+    the tools (``claude_bin``, ``git``, ``bwrap``, ``socat``), the session environment
+    (``PATH``), the generated read entries, ``claude_args``, setting sources and the sandbox
+    self-check, which creates the private tmpdir last. What a launch records and creates in
+    between goes through ``effects``. Raises ``LaunchValidationError``; the first failure
     wins."""
     resolution = resolved.resolution
     isolated = resolution.isolated()
     home = os.path.realpath(process.environ.get("HOME", "/"))
     tmp = None if resolution.profile.sandbox == "off" else tmpdir.run_path(alloc.csession_id)
-    settings_builder.check_rule_paths(process.state_root, process.claude_session)
-    dirs, layout = open_dirs(alloc, process, isolated=isolated)
-    try:
-        cwd = os.path.realpath(
-            resolved.caller_cwd or os.path.join(alloc.session_dir, sessiondir.WORK)
+    cwd = os.path.realpath(resolved.caller_cwd or os.path.join(alloc.session_dir, sessiondir.WORK))
+    rules = host_rules(process, resolution, alloc, cwd, tmp, planned=effects.planned)
+    check_cwd(rules, resolution)
+    effects.record_cwd(cwd)
+    profile = select_profile(cfg, resolution, base_writable(resolution, alloc, cwd, home, tmp))
+    before_git = git_writable(resolution, alloc, cwd, home, tmp, profile)
+    entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
+    git_tool = pathrules.resolve_tool("git", entries, before_git)
+    git_dirs, credential = check_git(resolution, effects.git_cwd(cwd), git_tool, process)
+    warnings = list(credential)
+    effects.record_git_dir(git_dirs)
+    variables = profile_variables(alloc, cwd, home, git_dirs)
+    expanded = permission_profiles.expand(profile.content, variables)
+    read, write = resolve_run_dirs(resolution, variables, home, alloc)
+    warnings += write.warnings
+    effects.create_write_dirs(write)
+    writable = full_writable(resolution, alloc, cwd, home, tmp, write, expanded)
+    check_profile_file(resolution, writable)
+    check_paths(rules, writable, read, write, expanded)
+    plugins = check_plugins(rules, req.plugin_dirs, writable, process.caller_cwd)
+    check_hook_interpreter(process, writable)
+    check_tmpdir(resolution, alloc)
+    tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool)
+    session_env = build_env(resolution, cfg, process, alloc, cwd, git_dirs, tmp, writable)
+    generated = generated_entries(resolution, tools, git_dirs, process)
+    if isolated:
+        rules.check_generated(generated)
+    check = effects.sandbox(resolution, alloc, tools, process)
+    warnings += check.warnings
+    isolation = None
+    if isolated:
+        isolation = settings_builder.Isolation(
+            home=home,
+            tmpdir=check.tmpdir,
+            git_dir=None if git_dirs is None else git_dirs.common_dir,
+            worktree_git_dir=None if git_dirs is None else git_dirs.worktree_git_dir,
+            read_dirs=tuple(read),
+            write_dirs=write.dirs,
+            system_dirs=generated["system"],
+            tool_dirs=generated["tools"],
+            python_dirs=generated["python"],
+            path_prepend=generated["path_prepend"],
         )
-        rules = host_rules(process, resolution, alloc, cwd, tmp)
-        check_cwd(rules, resolution)
-        st.update_run(alloc.csession_id, alloc.run, cwd=cwd)
-        profile = select_profile(cfg, resolution, base_writable(resolution, alloc, cwd, home, tmp))
-        before_git = git_writable(resolution, alloc, cwd, home, tmp, profile)
-        entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
-        git_tool = pathrules.resolve_tool("git", entries, before_git)
-        git_dirs, credential = check_git(resolution, cwd, git_tool, process)
-        warnings = list(credential)
-        st.update_session(alloc.csession_id, git_dir=gitinfo.stored_value(git_dirs))
-        variables = profile_variables(alloc, cwd, home, git_dirs)
-        expanded = permission_profiles.expand(profile.content, variables)
-        read, write = resolve_run_dirs(resolution, variables, home, alloc)
-        warnings += write.warnings
-        create_write_dirs(dirs, write)
-        writable = full_writable(resolution, alloc, cwd, home, tmp, write, expanded)
-        check_profile_file(resolution, writable)
-        check_paths(rules, writable, read, write, expanded)
-        plugins = check_plugins(rules, req.plugin_dirs, writable, process.caller_cwd)
-        check_hook_interpreter(process, writable)
-        check_tmpdir(resolution, alloc)
-        tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool)
-        session_env = build_env(resolution, cfg, process, alloc, cwd, git_dirs, tmp, writable)
-        generated = generated_entries(resolution, tools, git_dirs, process)
-        if isolated:
-            rules.check_generated(generated)
-        check = check_sandbox(resolution, alloc, tools, process)
-        if check.tmpdir is not None:
-            st.update_session(alloc.csession_id, tmp_dir=check.tmpdir)
-        warnings += check.warnings
-        isolation = None
-        if isolated:
-            isolation = settings_builder.Isolation(
-                home=home,
-                tmpdir=check.tmpdir,
-                git_dir=None if git_dirs is None else git_dirs.common_dir,
-                worktree_git_dir=None if git_dirs is None else git_dirs.worktree_git_dir,
-                read_dirs=tuple(read),
-                write_dirs=write.dirs,
-                system_dirs=generated["system"],
-                tool_dirs=generated["tools"],
-                python_dirs=generated["python"],
-                path_prepend=generated["path_prepend"],
-            )
-        warnings += settings_builder.isolation_warnings(resolution)
-        warnings += layout.warnings
-    except BaseException:
-        dirs.close()
-        raise
-    return Validated(
-        dirs=dirs,
-        layout=layout,
+    warnings += settings_builder.isolation_warnings(resolution)
+    return Checked(
         cwd=cwd,
         git_dirs=git_dirs,
         profile=profile,
@@ -876,9 +959,32 @@ def validate(
         isolation=isolation,
         sandbox_active=check.sandbox_active,
         tmpdir=check.tmpdir,
-        warnings=list(dict.fromkeys(warnings)),
+        warnings=warnings,
         credential_warnings=tuple(credential),
     )
+
+
+def validate(
+    st: store.Store,
+    cfg: Config,
+    req: Request,
+    resolved: Resolved,
+    alloc: Allocated,
+    process: Process,
+) -> Validated:
+    """Launch step 5, in the order interface.md (Launch order) lists: rule paths, the
+    session directories (``open_dirs``), then ``checks`` with the effects of a real launch
+    (``Recording``). Raises ``LaunchValidationError``; the first failure wins."""
+    settings_builder.check_rule_paths(process.state_root, process.claude_session)
+    dirs, layout = open_dirs(alloc, process, isolated=resolved.resolution.isolated())
+    try:
+        checked = checks(cfg, req, resolved, alloc, process, Recording(st, alloc, dirs))
+    except BaseException:
+        dirs.close()
+        raise
+    values = {f.name: getattr(checked, f.name) for f in dataclasses.fields(checked)}
+    values["warnings"] = list(dict.fromkeys([*checked.warnings, *layout.warnings]))
+    return Validated(dirs=dirs, layout=layout, **values)
 
 
 # Audit and log
@@ -965,6 +1071,37 @@ def secret_index(values: frozenset[str]) -> bytes:
         ) from exc
 
 
+def generate(
+    req: Request,
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    v: Checked,
+    process: Process,
+    prompt_path: str | None,
+) -> settings_builder.Generated:
+    """The run's generated settings and ``claude`` argv (``settings_builder.build``), from
+    what step 5 resolved; ``prompt_path`` is the prompt's path in ``$CSESSION_DIR`` (None:
+    no prompt). Pure: ``prepare`` writes the result, a dry run prints it."""
+    paths = settings_builder.Paths(
+        state_root=process.state_root, csession_id=alloc.csession_id, run=alloc.run
+    )
+    tools = settings_builder.Tools(
+        interpreter=process.interpreter,
+        claude_session=process.claude_session,
+        claude=v.claude.path,
+    )
+    launch = settings_builder.Launch(
+        mode="headless",
+        cwd=v.cwd,
+        skill=req.skill,
+        prompt_path=prompt_path,
+        plugin_dirs=v.plugin_dirs,
+    )
+    return settings_builder.build(
+        resolution, v.expanded, paths, tools, launch, isolation=v.isolation
+    )
+
+
 def prepare(
     st: store.Store,
     cfg: Config,
@@ -1011,22 +1148,7 @@ def prepare(
     snapshot = None
     if v.profile.is_file:
         snapshot = dirs.write_private_run_file(run, PROFILE_SNAPSHOT, v.profile.snapshot_bytes())
-    paths = settings_builder.Paths(state_root=process.state_root, csession_id=sid, run=run)
-    tools = settings_builder.Tools(
-        interpreter=process.interpreter,
-        claude_session=process.claude_session,
-        claude=v.claude.path,
-    )
-    launch = settings_builder.Launch(
-        mode="headless",
-        cwd=v.cwd,
-        skill=req.skill,
-        prompt_path=prompt_path,
-        plugin_dirs=v.plugin_dirs,
-    )
-    generated = settings_builder.build(
-        resolution, v.expanded, paths, tools, launch, isolation=v.isolation
-    )
+    generated = generate(req, resolution, alloc, v, process, prompt_path)
     dirs.write_settings(run, settings_builder.settings_json(generated.settings))
     fields: dict[str, Any] = {
         "permission_profile": v.profile.label,
