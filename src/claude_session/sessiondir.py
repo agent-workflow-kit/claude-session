@@ -234,15 +234,16 @@ def _stream_fd(stream: Readable) -> int | None:
 
 def read_stream_capped(stream: Readable, cap: int, *, flag: str) -> bytes:
     """Read a binary stream (``--prompt-file -``: stdin) to its end, at most ``cap`` bytes.
-    Only end of file ends it: a non-blocking descriptor is switched to blocking, and a read
-    that returns ``None`` (no data yet) waits for more."""
+    Only end of file ends it: when a non-blocking descriptor has no data yet, wait for it
+    with ``select`` (its blocking mode is shared with other holders, so it is left alone)."""
     fd = _stream_fd(stream)
-    if fd is not None:
-        os.set_blocking(fd, True)
     chunks: list[bytes] = []
     size = 0
     while size <= cap:
-        chunk = stream.read(min(_READ_CHUNK, cap + 1 - size))
+        try:
+            chunk = stream.read(min(_READ_CHUNK, cap + 1 - size))
+        except BlockingIOError:
+            chunk = None
         if chunk is None:
             if fd is None:
                 raise UsageError(f"{flag} -: the stream has no data yet and cannot be waited on")

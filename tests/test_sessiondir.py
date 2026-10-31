@@ -930,8 +930,10 @@ def test_read_stream_capped_waits_on_a_non_blocking_pipe() -> None:
     thread.start()
     with open(read_fd, "rb") as stream:
         data = sessiondir.read_stream_capped(stream, 1000, flag="--prompt-file")
+        still_non_blocking = os.get_blocking(read_fd) is False
     thread.join()
     assert data == b"first part, second part"
+    assert still_non_blocking  # R2-1: the shared descriptor's mode is left alone
 
 
 def test_a_non_utf8_executable_path_fails(dirs: SessionDirs) -> None:
