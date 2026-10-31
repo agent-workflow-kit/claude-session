@@ -986,6 +986,134 @@ class Store:
         names = [column[0] for column in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
+    # Forget and retention (docs/design.md, Reconcile, salvage and retention)
+
+    def forget_candidates(
+        self,
+        older_than: datetime,
+        *,
+        states: Sequence[str] = (),
+        kind: str | None = None,
+        labels: Sequence[tuple[str, str]] = (),
+    ) -> list[tuple[str, str]]:
+        """``(csession_id, updated_at)`` of the sessions that are not forgotten and were last
+        updated before ``older_than``, matching the filters: ``states`` (ORed), the launch
+        ``kind`` and every ``label`` (ANDed). A read; ``forget_session`` decides."""
+        sql = "SELECT csession_id, updated_at FROM sessions WHERE forgotten_at IS NULL"
+        params: list[Any] = []
+        sql += " AND updated_at < ?"
+        params.append(format_ts(older_than))
+        if states:
+            sql += " AND state IN (" + ", ".join("?" for _ in states) + ")"
+            params += list(states)
+        if kind is not None:
+            sql += " AND launch_kind = ?"
+            params.append(kind)
+        for key, value in labels:
+            sql += (
+                " AND EXISTS (SELECT 1 FROM labels l WHERE l.csession_id = sessions.csession_id"
+                " AND l.key = ? AND l.value = ?)"
+            )
+            params += [key, value]
+        sql += " ORDER BY updated_at, csession_id"
+        return [(str(sid), str(at)) for sid, at in self.conn.execute(sql, params).fetchall()]
+
+    def has_open_run(self, csession_id: str) -> bool:
+        """Whether any run of the session is not final (a pending run included)."""
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM runs WHERE csession_id = ? AND ended_at IS NULL LIMIT 1",
+                (csession_id,),
+            ).fetchone()
+            is not None
+        )
+
+    def forget_session(
+        self,
+        csession_id: str,
+        *,
+        updated_at: str | None = None,
+        before_commit: Callable[[str], None] | None = None,
+    ) -> str:
+        """Forget the session in one transaction: ``"live"`` when any of its runs is not final
+        (a pending run included), ``"gone"`` when it is unknown or already forgotten,
+        ``"changed"`` when ``updated_at`` is given and no longer matches (the session changed
+        since the caller selected it), else ``"forgotten"`` with ``forgotten_at`` set.
+
+        Every allocation of a run checks ``forgotten_at`` in its own write transaction, so a
+        run cannot start between the check and the update. ``before_commit(forgotten_at)``
+        runs inside the transaction just before the update (the ``ok`` audit record); when it
+        raises, nothing is forgotten and the error propagates."""
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT forgotten_at, updated_at FROM sessions WHERE csession_id = ?",
+                (csession_id,),
+            ).fetchone()
+            if row is None or row[0] is not None:
+                return "gone"
+            if self.has_open_run(csession_id):
+                return "live"
+            if updated_at is not None and row[1] != updated_at:
+                return "changed"
+            now = format_ts(self.clock())
+            if before_commit is not None:
+                before_commit(now)
+            self.conn.execute(
+                "UPDATE sessions SET forgotten_at = ? WHERE csession_id = ? "
+                "AND forgotten_at IS NULL",
+                (now, csession_id),
+            )
+        return "forgotten"
+
+    def forgotten_since(self, csession_id: str) -> str | None:
+        """``forgotten_at`` of a forgotten session, else None."""
+        row = self.conn.execute(
+            "SELECT forgotten_at FROM sessions WHERE csession_id = ?", (csession_id,)
+        ).fetchone()
+        return None if row is None or row[0] is None else str(row[0])
+
+    def retention_due(self, forgotten_before: datetime) -> list[str]:
+        """Forgotten sessions with no run that is not final, forgotten before
+        ``forgotten_before``, oldest first. A read; ``delete_session_rows`` decides."""
+        rows = self.conn.execute(
+            "SELECT csession_id FROM sessions WHERE forgotten_at IS NOT NULL AND forgotten_at <= ? "
+            "AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.csession_id = sessions.csession_id "
+            "AND r.ended_at IS NULL) ORDER BY forgotten_at, csession_id",
+            (format_ts(forgotten_before),),
+        ).fetchall()
+        return [str(sid) for (sid,) in rows]
+
+    def has_undelivered_events(self, csession_id: str) -> bool:
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM events WHERE csession_id = ? AND delivered_at IS NULL LIMIT 1",
+                (csession_id,),
+            ).fetchone()
+            is not None
+        )
+
+    def delete_session_rows(self, csession_id: str, forgotten_before: datetime) -> bool:
+        """Delete a forgotten session's rows and keep its id in ``deleted_ids`` (so it is
+        never reused), in one transaction that checks again that the session is still
+        forgotten before ``forgotten_before``, has no run that is not final and no event left
+        to deliver. False (nothing changed) when it is not."""
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT forgotten_at FROM sessions WHERE csession_id = ?", (csession_id,)
+            ).fetchone()
+            if row is None or row[0] is None or row[0] > format_ts(forgotten_before):
+                return False
+            if self.has_open_run(csession_id) or self.has_undelivered_events(csession_id):
+                return False
+            self.conn.execute(
+                "INSERT OR IGNORE INTO deleted_ids (csession_id, deleted_at) VALUES (?, ?)",
+                (csession_id, format_ts(self.clock())),
+            )
+            for table in ("hook_groups", "requests", "events", "labels", "claude_ids", "runs"):
+                self.conn.execute(f"DELETE FROM {table} WHERE csession_id = ?", (csession_id,))
+            self.conn.execute("DELETE FROM sessions WHERE csession_id = ?", (csession_id,))
+        return True
+
     # Runs
 
     def record_run_files(

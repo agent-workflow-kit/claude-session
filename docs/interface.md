@@ -449,7 +449,7 @@ claude-session forget --older-than <duration> [--state <state>]... [--kind <kind
     [--actor <actor>] [--decision-id <id>]... [--dry-run] [--json]
 ```
 
-Hides sessions: later commands report them as not found (exit 10; adopting a forgotten session also exits 10). Audited (one record per session, also in bulk mode). The record, session directory and private directory are deleted by `reconcile` `retention_days` after `forget`. Prints `{"dry_run", "forgotten": [...], "skipped": [...]}` ([schemas/cli/forget.json](../schemas/cli/forget.json)).
+Hides sessions: later commands report them as not found (exit 10; adopting a forgotten session also exits 10). Audited (one record per session, also in bulk mode). The record, session directory and private directory are deleted by `reconcile` `retention_days` after `forget`. Prints `{"dry_run", "forgotten": [...], "skipped": [...]}` ([schemas/cli/forget.json](../schemas/cli/forget.json)). `reconcile` deletes a session's directories first (fd-based, never following a symlink), then its rows (the id is kept), and keeps a session that still has an event to deliver.
 
 - `forget` runs the inline [liveness check](#liveness) first (changes have `cause: forget`).
 - `forget <id>` refuses a live session (exit 20, `live`), including any session whose current run is pending (a pending resume or a pending new-session record): cancel it with [`stop`](#stop) first. Bulk-only flags with an id exit 2; `forget` requires an id or `--older-than` (exit 2 otherwise, also when only filters are given).
