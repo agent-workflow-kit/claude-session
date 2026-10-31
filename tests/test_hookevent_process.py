@@ -79,6 +79,22 @@ def test_session_start_prints_exactly_the_context_json(env: Env) -> None:
     assert log_records(env) == []
 
 
+def test_an_unknown_session_start_source_still_prints_the_context_json(env: Env) -> None:
+    env.add(inputs=["brief.md"])
+    proc = run_hook(env, "SessionStart", common("SessionStart", source="a-future-source"))
+    assert (proc.returncode, proc.stderr) == (0, b"")
+    assert json.loads(proc.stdout) == hookevent.session_start_output(
+        env.csession_dir, 1, ["brief.md"]
+    )
+    assert env.state() == ("working", None, "working")
+    (record,) = log_records(env)
+    assert (record["event"], record["level"], record["run"]) == (
+        "session_start_source_unknown",
+        "warn",
+        1,
+    )
+
+
 def test_the_backstop_blocks_through_stdout(env: Env) -> None:
     env.add(state="working", activity="working", started=True)
     proc = run_hook(env, "Stop", common("Stop", stop_hook_active=False, background_tasks=[]))
