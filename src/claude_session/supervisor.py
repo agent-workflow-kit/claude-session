@@ -738,7 +738,9 @@ def run_session(
             started_at=store.format_ts(st.clock()),
         )
         # Only a recorded child runs claude: until here it waits at its gate, and exits
-        # without running claude if this process dies first (interface.md, Liveness).
+        # without running claude if this process dies first (interface.md, Liveness). Dying
+        # from here to the release (or to the revert below) leaves a recorded child that
+        # never ran claude: liveness then salvages the run (wrapper-lost rules), as documented.
         try:
             child.release()
         except OSError as exc:  # claude could not be executed: the child exited at once

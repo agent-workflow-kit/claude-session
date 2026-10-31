@@ -5,17 +5,21 @@ interface.md, Signals)."""
 
 from __future__ import annotations
 
+import errno
 import signal
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from claude_session import ids, launch, logs, supervisor
+from claude_session.gateway import GATE_EXEC_FAILED
 from claude_session.signals import ExecSignals
 from claude_session.store import Holder, NewRun, Store
 
+from .fake_gateway import FakeChild, FakeGateway
 from .test_store_runs import add_event, new_run
 
 
@@ -818,3 +822,66 @@ def test_the_final_events_cause_follows_the_end_reason(end_reason: str, cause: s
     outcome = "timeout" if end_reason in ("timeout", "max_turns") else "done"
     final = supervisor._final(Mapped(outcome, end_reason), HeadlessResult())
     assert final.cause == cause
+
+
+def test_a_failed_release_reverts_to_the_launch_phase_and_ends_the_run_not_started(
+    st: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G3: claude could not be executed at the gate's release (a bad interpreter): the child
+    (which exited at once) is reaped, the recorded child is cleared back to a launch-phase run
+    without a child, and the run ends not-started, launch_interrupted (exit 12)."""
+    sid = st.allocate(new_run(mode="interactive"), new_id=ids.new_session_id)
+    alloc = launch.Allocated(
+        csession_id=sid, run=1, session_dir="/s", private_dir="/p", warnings=()
+    )
+    fake = FakeGateway()
+    error = FileNotFoundError(errno.ENOENT, "No such file or directory", "/opt/claude")
+    fake.on(["/opt/claude"], timeout=True, release_error=error)
+    prepared = SimpleNamespace(
+        argv=["/opt/claude"], executable=None, stdout_fd=None, stderr_fd=None, run_secret="s"
+    )
+    validated = SimpleNamespace(session_env=SimpleNamespace(env={"PATH": "/usr/bin"}), cwd="/")
+    recorded: list[dict[str, Any]] = []
+    ended: list[tuple[Any, ...]] = []
+    real_update = st.update_run
+
+    def recording_update(csession_id: str, run_no: int, **fields: Any) -> None:
+        real_update(csession_id, run_no, **fields)
+        recorded.append(dict(fields))
+
+    def end_launch(
+        st_: Store, alloc_: Any, v: Any, prep: Any, process: Any, err: Any, *, exc: Any = None
+    ) -> None:
+        ended.append((v, prep, err, exc, st_.run_record(sid, 1)))
+
+    monkeypatch.setattr(st, "update_run", recording_update)
+    monkeypatch.setattr(launch, "end_launch", end_launch)
+    result = supervisor.run_session(
+        st,
+        None,  # type: ignore[arg-type]  # unused before the release
+        alloc,
+        validated,  # type: ignore[arg-type]
+        prepared,  # type: ignore[arg-type]
+        SimpleNamespace(gateway=fake),  # type: ignore[arg-type]
+        mode="interactive",
+        implicit_done=True,
+        auto_exit=True,
+        signals=ExecSignals(),
+    )
+    assert result.exit_code == 12
+    (child,) = fake.children
+    assert isinstance(child, FakeChild) and fake.calls[0].gated
+    assert child.released and child.returncode == GATE_EXEC_FAILED
+    assert [r.get("phase") for r in recorded] == ["session", "launch"]
+    assert recorded[0]["child_pid"] == child.pid
+    assert recorded[1] == {
+        "phase": "launch",
+        "child_pid": None,
+        "child_start": None,
+        "started_at": None,
+    }
+    ((v, prep, err, exc, row),) = ended
+    assert (v, prep, exc) == (validated, None, error)
+    assert err.end_reason == "launch_interrupted"
+    assert str(err) == "claude could not be started: No such file or directory"
+    assert (row["phase"], row["child_pid"], row["started_at"]) == ("launch", None, None)
