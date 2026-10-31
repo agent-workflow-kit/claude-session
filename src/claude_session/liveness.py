@@ -53,8 +53,8 @@ nothing in a dry run (``dry_run``: the changes it would make, not applied).
 TODO(#16): ``views.check_liveness`` and ``views.check_liveness_all`` (``status``/``list``, on
 the #65 line) call ``check_session`` (and ``sessions_with_open_runs`` for ``list``) without
 delivering; ended runs keep their ``Store.known_liveness`` display.
-TODO(#32, #34): ``stop`` and ``forget`` run ``check_session`` (causes ``stop``/``forget`` for
-their own changes, ``liveness`` for this check's) and deliver what it changed.
+TODO(#32): ``stop`` runs ``check_session`` (cause ``stop`` for its own changes, ``liveness``
+for this check's) and delivers what it changed.
 TODO(#36): ``verify-secret`` keeps its fail-closed reading (a run is live only when its
 wrapper or child is confirmed alive by a non-empty token) and its constant-work probes; it may
 reuse ``open_run_live`` only with that reading.

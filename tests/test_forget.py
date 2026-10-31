@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import ids, sessiondir, store, tmpdir
+from claude_session import config, ids, liveness, sessiondir, store, tmpdir
 from claude_session.cli import main
 from claude_session.store import Store
 
@@ -472,3 +472,260 @@ def test_a_session_with_an_open_run_is_never_deleted(st: Store, root: str) -> No
     st.conn.execute("UPDATE sessions SET forgotten_at = ? WHERE csession_id = ?", (LONG_AGO, sid))
     assert st.retention_due(st.clock()) == []
     assert st.delete_session_rows(sid, st.clock()) is False
+
+
+# review round 1
+
+
+def dead_wrapper(st: Store, root: str, procs: Procs, **fields: Any) -> str:  # noqa: F811
+    """An old session whose run 1 is open with a wrapper that is gone (crash-left)."""
+    pid, token = procs.dead()
+    sid = make(st, root, final=False, **fields)
+    st.conn.execute(
+        "UPDATE runs SET wrapper_pid = ?, wrapper_start = ? WHERE csession_id = ?",
+        (pid, token, sid),
+    )
+    st.conn.execute("UPDATE sessions SET updated_at = ? WHERE csession_id = ?", (LONG_AGO, sid))
+    return sid
+
+
+def test_bulk_forgets_a_crash_left_session_and_the_dry_run_agrees(
+    st: Store,
+    root: str,
+    capsys: pytest.CaptureFixture[str],
+    procs: Procs,  # noqa: F811
+) -> None:
+    sid = dead_wrapper(st, root, procs)
+    code, dry, _ = forget(capsys, "--older-than", "1d", "--dry-run")
+    assert code == 0
+    code, real, _ = forget(capsys, "--older-than", "1d")
+    assert code == 0
+    assert [e["csession_id"] for e in dry["forgotten"]] == [sid]
+    assert [e["csession_id"] for e in real["forgotten"]] == [sid]
+    assert dry["skipped"] == real["skipped"] == []
+    assert forgotten_at(st, sid) is not None
+    assert [(r["target"], r["result"]) for r in audit_records(root)] == [(sid, "ok")]
+
+
+def test_bulk_state_filter_matches_the_state_after_the_check(
+    st: Store,
+    root: str,
+    capsys: pytest.CaptureFixture[str],
+    procs: Procs,  # noqa: F811
+) -> None:
+    sid = dead_wrapper(st, root, procs)
+    (before,) = st.conn.execute(
+        "SELECT state FROM sessions WHERE csession_id = ?", (sid,)
+    ).fetchone()
+    checked = liveness.check_session(st, config.load(None), sid, cause="forget", dry_run=True)
+    (after,) = {c.to_state for c in checked.changes if c.to_state is not None}
+    assert after != before
+    _, out, _ = forget(capsys, "--older-than", "1d", "--state", before, "--dry-run")
+    assert out["forgotten"] == []
+    _, out, _ = forget(capsys, "--older-than", "1d", "--state", after, "--dry-run")
+    assert [e["csession_id"] for e in out["forgotten"]] == [sid]
+    _, out, _ = forget(capsys, "--older-than", "1d", "--state", after)
+    assert [e["csession_id"] for e in out["forgotten"]] == [sid]
+    assert forgotten_at(st, sid) is not None
+
+
+def test_bulk_never_checks_sessions_its_filters_exclude(
+    st: Store,
+    root: str,
+    capsys: pytest.CaptureFixture[str],
+    procs: Procs,  # noqa: F811
+) -> None:
+    sid = dead_wrapper(st, root, procs, kind="review", labels=("team=y",))
+    events = st.conn.execute("SELECT count(*) FROM events WHERE csession_id = ?", (sid,)).fetchone()
+    for argv in (("--kind", "other"), ("--label", "team=x")):
+        _, out, _ = forget(capsys, "--older-than", "1d", *argv)
+        assert out == {"dry_run": False, "forgotten": [], "skipped": []}
+    assert st.has_open_run(sid)
+    assert (
+        st.conn.execute("SELECT count(*) FROM events WHERE csession_id = ?", (sid,)).fetchone()
+        == events
+    )
+
+
+def test_a_run_started_after_the_check_is_refused_and_audited(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = make(st, root)
+    monkeypatch.setattr(Store, "forget_session", lambda self, *a, **k: "live")
+    code, out, _ = forget(capsys, sid)
+    assert code == 20 and out["error"]["reason"] == "live"
+    assert [(r["target"], r["result"]) for r in audit_records(root)] == [(sid, "refused")]
+
+
+def test_a_refusal_that_cannot_be_audited_exits_1(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = make(st, root, final=False)
+    (Path(root) / "audit.jsonl").mkdir()
+    code, out, _ = forget(capsys, sid)
+    assert code == 1 and out["error"]["code"] == "internal"
+    assert forgotten_at(st, sid) is None
+
+
+def test_bulk_skips_are_not_audited(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    live = make(st, root, final=False)
+    _, out, _ = forget(capsys, "--older-than", "1d")
+    assert out["skipped"] == [{"csession_id": live, "reason": "live"}]
+    assert audit_records(root) == []
+
+
+def test_an_interrupt_after_the_ok_record_writes_the_error_record(
+    st: Store, root: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_session import audit, forgetting
+    from claude_session.gateway import SystemGateway
+
+    sid = make(st, root)
+    original = audit.append
+    calls = {"n": 0}
+
+    def interrupted(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        record = original(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyboardInterrupt
+        return record
+
+    monkeypatch.setattr(audit, "append", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        forgetting.forget_session(
+            st,
+            config.load(None),
+            sid,
+            gateway=SystemGateway(),  # nothing to deliver: never runs a subprocess
+            environ={},
+            actor="auto:test",
+        )
+    assert forgotten_at(st, sid) is None
+    assert [r["result"] for r in audit_records(root)] == ["ok", "error"]
+
+
+def test_retention_keeps_the_taint_of_a_deleted_source_on_its_unforked_forks(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str], cfg: str
+) -> None:
+    from claude_session.errors import RefusedError
+
+    src = make(st, root)
+    fork = st.allocate(
+        new_run(
+            state_root=root, wrapper_pid=os.getpid(), wrapper_start=store.start_time(os.getpid())
+        ),
+        new_id=ids.new_session_id,
+        forked_from=src,
+    )
+    captured = st.allocate(
+        new_run(
+            state_root=root, wrapper_pid=os.getpid(), wrapper_start=store.start_time(os.getpid())
+        ),
+        new_id=ids.new_session_id,
+        forked_from=src,
+    )
+    st.conn.execute(
+        "UPDATE sessions SET claude_session_id = 'c-1' WHERE csession_id = ?", (captured,)
+    )
+    st.conn.execute(
+        "UPDATE runs SET ended_at = ?, outcome = 'exited', end_reason = 'exit' "
+        "WHERE csession_id IN (?, ?)",
+        (LONG_AGO, fork, captured),
+    )
+    st.conn.execute("UPDATE events SET delivered_at = ?", (LONG_AGO,))
+    st.conn.execute(
+        "UPDATE sessions SET tainted = 1, tainted_at = '2021-01-01T00:00:00.000000Z' "
+        "WHERE csession_id = ?",
+        (src,),
+    )
+    assert st.forget_session(src) == "forgotten"
+    age_forget(st, src, 8)
+    out = reconcile(capsys, cfg)
+    assert [c["csession_id"] for c in out["changes"] if c["action"] == "deleted"] == [src]
+    row = st.conn.execute(
+        "SELECT tainted, tainted_at, tainted_by_run FROM sessions WHERE csession_id = ?", (fork,)
+    ).fetchone()
+    assert tuple(row) == (1, "2021-01-01T00:00:00.000000Z", None)
+    with pytest.raises(RefusedError):
+        st.recheck_fork_taint(fork, src, reads_third_party=False)
+    assert st.fork_source_taints(fork)  # the adoption dry run agrees
+    # A fork that captured its own Claude id never consults its source again.
+    assert (
+        st.conn.execute(
+            "SELECT tainted FROM sessions WHERE csession_id = ?", (captured,)
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def stuck(st: Store, root: str, days: float) -> str:
+    """A forgotten session past retention whose directory tree cannot be removed (deeper
+    than the patched depth cap)."""
+    sid = make(st, root)
+    with sessiondir.SessionDirs.open(root, sid):
+        pass
+    deep = Path(sessiondir.session_dir(root, sid))
+    for _ in range(10):
+        deep = deep / "d"
+        deep.mkdir()
+    st.forget_session(sid)
+    age_forget(st, sid, days)
+    return sid
+
+
+def test_sessions_that_cannot_be_deleted_never_starve_the_others(
+    st: Store,
+    root: str,
+    capsys: pytest.CaptureFixture[str],
+    cfg: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import random
+
+    from claude_session import fsutil
+    from claude_session import reconcile as reconciling
+
+    monkeypatch.setattr(reconciling, "DELETE_MAX", 2)
+    monkeypatch.setattr(reconciling, "_rng", random.Random(7))
+    monkeypatch.setattr(fsutil, "tree_depth_cap", lambda: 5)
+    blocked = [stuck(st, root, 30), stuck(st, root, 29)]
+    clean = make(st, root)
+    st.forget_session(clean)
+    age_forget(st, clean, 8)
+    for _ in range(20):
+        out = reconcile(capsys, cfg)
+        assert any("could not be deleted" in w for w in out["warnings"])
+        if forgotten_at(st, clean) is None:
+            break
+    else:
+        pytest.fail("the deletable session was starved")
+    for sid in blocked:
+        assert forgotten_at(st, sid) is not None  # kept, warned about every pass
+
+
+def test_sessions_with_events_to_deliver_take_no_deletion_slot(
+    st: Store,
+    root: str,
+    capsys: pytest.CaptureFixture[str],
+    cfg: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_session import reconcile as reconciling
+
+    monkeypatch.setattr(reconciling, "DELETE_MAX", 1)
+    held = make(st, root)
+    st.forget_session(held)
+    age_forget(st, held, 30)
+    st.conn.execute("UPDATE events SET delivered_at = NULL WHERE csession_id = ?", (held,))
+    clean = make(st, root)
+    st.forget_session(clean)
+    age_forget(st, clean, 8)
+    assert st.retention_due(st.clock() - timedelta(days=7)) == [clean]
+    monkeypatch.setattr(reconciling, "_deliver", lambda *a, **k: None)
+    out = reconcile(capsys, cfg)
+    assert [c["csession_id"] for c in out["changes"] if c["action"] == "deleted"] == [clean]
+    assert any("left to deliver" in w for w in out["warnings"])
+    assert forgotten_at(st, held) is not None

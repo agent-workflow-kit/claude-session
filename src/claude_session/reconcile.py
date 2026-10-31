@@ -39,9 +39,12 @@ Between the delivery and the tmpdir removal, forgotten sessions past ``retention
 and ``private/<id>``, fd-based, never following a symlink; ``sessiondir.delete_session_dirs``,
 with the lease heartbeat between entries), then the rows in one transaction that keeps the id in
 ``deleted_ids`` (``Store.delete_session_rows``); the tmpdir step that follows removes the
-tmpdir and ``.stale-*`` entries of the deleted id. A directory that cannot be removed leaves
-the rows, so the next pass retries; a session with an event left to deliver is kept (a
-warning). At most ``DELETE_MAX`` sessions per pass; the lease is checked between them.
+tmpdir and ``.stale-*`` entries of the deleted id (so retention runs before it). A directory
+that cannot be removed (a tree deeper than the depth cap, an entry of another owner) leaves
+the rows and a warning, every pass, so the next pass retries; a session with an event left
+to deliver or a run that is not final is not due (the first a warning with their count). At
+most ``DELETE_MAX`` sessions per pass, picked at random among those due so that sessions
+failing every pass cannot starve the rest; the lease is checked between them.
 TODO(#40): add ``upgrades.hook_interpreter_warning(run.hook_interpreter)`` to ``warnings``
 for every live run (on the #77 line).
 """
@@ -49,6 +52,7 @@ for every live run (on the #77 line).
 from __future__ import annotations
 
 import os
+import random
 import sqlite3
 import time
 from collections.abc import Mapping
@@ -72,8 +76,10 @@ RENEW_EVERY = store.LEASE_RENEW_INTERVAL.total_seconds()
 # is left for the next pass and reported).
 DISCARD_BATCH = 100
 DISCARD_MAX = 2000
-# Forgotten sessions deleted per pass at most (the rest waits for the next pass).
+# Forgotten sessions deleted per pass at most (the rest waits for the next pass), picked at
+# random among those due with ``_rng`` (tests seed it).
 DELETE_MAX = 100
+_rng = random.Random()
 
 
 class LeaseLost(Exception):
@@ -378,12 +384,21 @@ def _retention(
     lease: _Lease,
 ) -> None:
     cutoff = st.clock() - timedelta(days=cfg.retention_days)
+    held = st.retention_held(cutoff)
+    if held:
+        checked.warnings.append(
+            f"{held} forgotten session(s) past retention have events left to deliver;"
+            " their deletion waits"
+        )
     due = st.retention_due(cutoff)
     if len(due) > DELETE_MAX:
         checked.warnings.append(
             f"{len(due) - DELETE_MAX} forgotten session(s) past retention wait for the next pass"
         )
-        due = due[:DELETE_MAX]
+        # A random pick (kept oldest first): sessions that fail every pass cannot hold every
+        # slot forever and starve the others.
+        picked = sorted(_rng.sample(range(len(due)), DELETE_MAX))
+        due = [due[i] for i in picked]
     for sid in due:
         lease.heartbeat()
         if lease.lost:

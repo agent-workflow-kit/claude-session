@@ -20,12 +20,20 @@ For each session:
    ``forget`` audit record (``result: ok``) is written inside that transaction, just before
    the update: when it cannot be written nothing is forgotten and the command exits 1 (a
    bulk run stops there; sessions already forgotten keep their records). When the update
-   itself then fails, a best-effort ``result: error`` record follows.
+   itself then fails, or anything (a signal included) interrupts it after the record was
+   attempted, a best-effort ``result: error`` record follows and the error propagates.
 
-Bulk mode selects the sessions last updated before ``--older-than`` (``updated_at``), by
-launch ``--kind``, ``--state`` and ``--label``, after the liveness check of those with a run
-that is not final (so a state the check changes is matched as it is afterwards). A session
-that changed between the selection and its update (its ``updated_at`` moved) is left alone,
+``forget <id>`` records a refusal (``result: refused``) on both paths: refused after the
+check, or refused by ``Store.forget_session`` because a run started meanwhile. When that
+record cannot be written the command exits 1 (``InternalError``; interface.md, Audit and
+log). Bulk mode audits only the sessions it forgets; ``skipped`` entries get no record.
+
+Bulk mode selects the sessions once, before the liveness check: not forgotten, last updated
+before ``--older-than`` (``updated_at``), of launch ``--kind`` and with every ``--label``.
+Only those are checked. ``--state`` is then matched on the state after the check (in a dry
+run, the state the check would leave), live sessions are skipped, and the update is a
+compare-and-set on ``updated_at`` as read after the check (the session's own check does not
+count as a change): a session that changed between that read and its update is left alone,
 neither forgotten nor reported.
 
 ``--dry-run`` writes nothing (no audit record, no liveness change, no delivery) and reports
@@ -36,7 +44,6 @@ not live.
 from __future__ import annotations
 
 import os
-import sqlite3
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -112,6 +119,21 @@ class _Forgetter:
                     state_root=self.state_root,
                 )
 
+    def state_after(self, sid: str) -> tuple[str, str] | None:
+        """``(state, updated_at)`` of the session after the check (a dry run: the state the
+        check would leave), or None when it is gone or forgotten."""
+        row = self.st.conn.execute(
+            "SELECT state, updated_at FROM sessions WHERE csession_id = ? AND forgotten_at IS NULL",
+            (sid,),
+        ).fetchone()
+        if row is None:
+            return None
+        state = str(row[0])
+        for change in self.dry_changes.get(sid, []):
+            if change.to_state is not None:
+                state = change.to_state
+        return state, str(row[1])
+
     def live(self, sid: str) -> bool:
         if not self.st.has_open_run(sid):
             return False
@@ -147,6 +169,21 @@ class _Forgetter:
         except (OSError, ValueError):
             pass
 
+    def refused(self, sid: str) -> RefusedError:
+        """The ``live`` refusal of ``forget <id>``, its ``refused`` record written first
+        (fails closed: ``InternalError`` when it cannot be; a dry run writes nothing)."""
+        if not self.dry_run:
+            try:
+                self._record(sid, "refused")
+            except (OSError, ValueError) as exc:
+                raise InternalError(
+                    f"the audit record of the refused forget of {sid} could not be written"
+                    f" ({type(exc).__name__})"
+                ) from exc
+        return RefusedError(
+            f"{sid} is live or has a pending run; end it with stop first", reason=LIVE
+        )
+
     # Forgetting
 
     def forget_one(self, sid: str, updated_at: str | None = None) -> str | None:
@@ -155,15 +192,17 @@ class _Forgetter:
         cannot be written."""
         if self.dry_run:
             return store.format_ts(self.st.clock())
+        # Set before the ``ok`` record is attempted: an interruption inside the write may
+        # come after the record reached the file, so the ``error`` record follows it then too.
         audited = False
 
         def before_commit(_forgotten_at: str) -> None:
             nonlocal audited
+            audited = True
             try:
                 self._record(sid, "ok")
             except (OSError, ValueError) as exc:
                 raise _AuditFailed(type(exc).__name__) from exc
-            audited = True
 
         try:
             outcome = self.st.forget_session(
@@ -173,7 +212,9 @@ class _Forgetter:
             raise InternalError(
                 f"the audit record for {sid} could not be written ({exc}); it was not forgotten"
             ) from exc
-        except sqlite3.Error:
+        except BaseException:
+            # The update failed or was interrupted (a signal) after the ``ok`` record: the
+            # transaction rolled back, so nothing was forgotten.
             if audited:
                 self._best_effort(sid, "error")
             raise
@@ -220,20 +261,14 @@ def forget_session(
     )
     worker.check([csession_id])
     if worker.live(csession_id):
-        if not dry_run:
-            worker._best_effort(csession_id, "refused")
-        raise RefusedError(
-            f"{csession_id} is live or has a pending run; end it with stop first", reason=LIVE
-        )
+        raise worker.refused(csession_id)
     forgotten_at = worker.forget_one(csession_id)
     if forgotten_at is None:
         # Gone, forgotten or started a run meanwhile: the same answer the caller would get
         # asking again.
         if st.forgotten_since(csession_id) is not None:
             raise NotFoundError(f"unknown session: {csession_id}")
-        raise RefusedError(
-            f"{csession_id} is live or has a pending run; end it with stop first", reason=LIVE
-        )
+        raise worker.refused(csession_id)
     return {
         "dry_run": dry_run,
         "forgotten": [_entry(forgotten_at, csession_id, cfg.retention_days)],
@@ -268,15 +303,18 @@ def forget_older_than(
         dry_run=dry_run,
     )
     threshold = st.clock() - timedelta(seconds=seconds)
-    old = [sid for sid, _ in st.forget_candidates(threshold)]
-    worker.check(old)
+    selected = [sid for sid, _ in st.forget_candidates(threshold, kind=kind, labels=labels)]
+    worker.check(selected)
     forgotten: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
-    for sid, updated_at in st.forget_candidates(threshold, states=states, kind=kind, labels=labels):
+    for sid in selected:
+        after = worker.state_after(sid)
+        if after is None or (states and after[0] not in states):
+            continue
         if worker.live(sid):
             skipped.append({"csession_id": sid, "reason": LIVE})
             continue
-        forgotten_at = worker.forget_one(sid, updated_at)
+        forgotten_at = worker.forget_one(sid, after[1])
         if forgotten_at is not None:
             forgotten.append(_entry(forgotten_at, sid, cfg.retention_days))
         elif st.has_open_run(sid):  # a run started since the check

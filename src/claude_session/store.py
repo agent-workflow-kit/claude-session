@@ -1073,15 +1073,29 @@ class Store:
         return None if row is None or row[0] is None else str(row[0])
 
     def retention_due(self, forgotten_before: datetime) -> list[str]:
-        """Forgotten sessions with no run that is not final, forgotten before
-        ``forgotten_before``, oldest first. A read; ``delete_session_rows`` decides."""
+        """Forgotten sessions forgotten before ``forgotten_before`` with no run that is not
+        final and no event left to deliver, oldest first. A read; ``delete_session_rows``
+        decides."""
         rows = self.conn.execute(
             "SELECT csession_id FROM sessions WHERE forgotten_at IS NOT NULL AND forgotten_at <= ? "
             "AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.csession_id = sessions.csession_id "
-            "AND r.ended_at IS NULL) ORDER BY forgotten_at, csession_id",
+            "AND r.ended_at IS NULL) "
+            "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.csession_id = sessions.csession_id "
+            "AND e.delivered_at IS NULL) ORDER BY forgotten_at, csession_id",
             (format_ts(forgotten_before),),
         ).fetchall()
         return [str(sid) for (sid,) in rows]
+
+    def retention_held(self, forgotten_before: datetime) -> int:
+        """How many sessions forgotten before ``forgotten_before`` wait for an event to be
+        delivered before their deletion (``retention_due`` leaves them out)."""
+        row = self.conn.execute(
+            "SELECT count(*) FROM sessions WHERE forgotten_at IS NOT NULL AND forgotten_at <= ? "
+            "AND EXISTS (SELECT 1 FROM events e WHERE e.csession_id = sessions.csession_id "
+            "AND e.delivered_at IS NULL)",
+            (format_ts(forgotten_before),),
+        ).fetchone()
+        return int(row[0])
 
     def has_undelivered_events(self, csession_id: str) -> bool:
         return (
@@ -1096,15 +1110,26 @@ class Store:
         """Delete a forgotten session's rows and keep its id in ``deleted_ids`` (so it is
         never reused), in one transaction that checks again that the session is still
         forgotten before ``forgotten_before``, has no run that is not final and no event left
-        to deliver. False (nothing changed) when it is not."""
-        with self.transaction():
-            row = self.conn.execute(
-                "SELECT forgotten_at FROM sessions WHERE csession_id = ?", (csession_id,)
+        to deliver. False (nothing changed) when it is not.
+
+        A tainted session's taint outlives its rows (interface.md, Taint): in the same
+        transaction it is copied onto every fork of it that has not captured a Claude id (the
+        forks ``_recheck_fork_taint`` would still consult it for), as that re-check would."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT forgotten_at, tainted, tainted_at FROM sessions WHERE csession_id = ?",
+                (csession_id,),
             ).fetchone()
             if row is None or row[0] is None or row[0] > format_ts(forgotten_before):
                 return False
             if self.has_open_run(csession_id) or self.has_undelivered_events(csession_id):
                 return False
+            if row[1]:
+                conn.execute(
+                    "UPDATE sessions SET tainted = 1, tainted_at = ?, tainted_by_run = NULL "
+                    "WHERE forked_from = ? AND claude_session_id IS NULL AND tainted = 0",
+                    (row[2], csession_id),
+                )
             self.conn.execute(
                 "INSERT OR IGNORE INTO deleted_ids (csession_id, deleted_at) VALUES (?, ?)",
                 (csession_id, format_ts(self.clock())),
@@ -1388,9 +1413,11 @@ class Store:
     def fork_source_taints(self, csession_id: str) -> bool:
         """Whether adopting the session's current run now would be refused ``tainted`` by
         the fork re-check (``adopt``): the run forks its source's conversation, is not
-        third-party-reading, and the source is tainted. Reads only (a dry run)."""
+        third-party-reading, and the source is tainted (its rows gone: the fork, which
+        retention gave its taint). Reads only (a dry run)."""
         row = self.conn.execute(
-            "SELECT s.forked_from, s.claude_session_id, r.reads_third_party, src.tainted "
+            "SELECT s.forked_from, s.claude_session_id, r.reads_third_party, "
+            "COALESCE(src.tainted, s.tainted) "
             "FROM sessions s JOIN runs r "
             "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
             "LEFT JOIN sessions src ON src.csession_id = s.forked_from "
@@ -2337,12 +2364,20 @@ EXPECTABLE = frozenset({"wrapper_pid", "wrapper_start", "child_pid", "child_star
 def _recheck_fork_taint(
     conn: sqlite3.Connection, csession_id: str, source: str, reads_third_party: bool
 ) -> None:
-    """``Store.recheck_fork_taint`` inside the caller's transaction. An unknown source (its
-    rows deleted by retention) has nothing to re-check."""
+    """``Store.recheck_fork_taint`` inside the caller's transaction. When the source's rows
+    are gone (deleted by retention), its taint was copied onto the fork in that deletion's
+    transaction (``delete_session_rows``), so the fork's own taint stands in for it."""
     row = conn.execute(
         "SELECT tainted, tainted_at FROM sessions WHERE csession_id = ?", (source,)
     ).fetchone()
-    if row is None or not row[0]:
+    if row is None:
+        own = conn.execute(
+            "SELECT tainted FROM sessions WHERE csession_id = ?", (csession_id,)
+        ).fetchone()
+        if own is not None and own[0]:
+            _refuse_tainted(source, reads_third_party)
+        return
+    if not row[0]:
         return
     _refuse_tainted(source, reads_third_party)
     conn.execute(
