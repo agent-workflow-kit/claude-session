@@ -2,20 +2,26 @@
 Flags at start and adoption; design.md, Launch, adoption and pending runs).
 
 ``start`` performs launch steps 2 to 5 for a new session (``launch.read_request`` through
-``dryrun.request``, ``resolve_kind``, ``allocate`` with a ``Pending`` deadline,
-``validate``), then freezes the run: the prompt and input copies are staged
+``dryrun.request``, ``resolve_kind``, ``allocate`` with ``Pending`` and itself as the run's
+wrapper, ``validate``), then freezes the run: the prompt and input copies are staged
 (``SessionDirs.stage``), a file permission profile is snapshotted, and the launch spec
-(``SPEC_NAME``, below) is written to the run's private directory. The run is pending: no
-wrapper, ``expires_at`` = now + ``lost_grace``. A step-5 failure ends the run
-``not-started`` (``launch.end_launch``) and ``start`` exits 12 with ``launch_failed``.
+(``SPEC_NAME``, below) is written to the run's private directory. Only then does the run
+become pending (``Store.release_pending``: no wrapper, ``expires_at`` = now +
+``lost_grace``), so no adopter can take it before it is frozen. A step-5 failure ends the
+run ``not-started`` (``launch.end_launch``) and ``start`` exits 12 with ``launch_failed``.
+TODO(#33): a ``start`` that dies before the run is pending leaves a launch-phase run whose
+wrapper is gone; the liveness check ends it ``launch_interrupted``.
 
 The launch spec holds what the adopting ``exec`` must not take from anywhere else: the
 fully resolved kind profile with its origins (``env.set`` values included, which
 ``resolved_json`` leaves out), the resolved cwd and plugin directories, the permission
 profile (content, or a file profile's snapshot), the config values a session uses beyond
 those the adopting ``exec`` reads from the config again (``claude_auth_env``,
-``secret_env`` and the caps), and the per-invocation flags. It is private (never in the
-session directory) and 0600.
+``secret_env`` and the caps), the resolved ``read_dirs``, ``write_dirs`` and profile write
+paths, and the per-invocation flags. It is private (never in the session directory) and
+0600, and it may hold credentials (``env.set`` values): it is deleted once the adopting
+``exec`` has read it, when ``start`` fails after writing it, and when the run expires
+unadopted (``discard_spec``).
 
 The adopting ``exec`` (``adopt``) runs the compare-and-set (``Store.adopt``; refusals exit 20
 ``already_adopted`` or ``expired``, an expired pending run is finalized ``never_adopted``
@@ -24,14 +30,19 @@ stored path (``config_invalid`` when it is invalid; a changed hash warns), reads
 checks the TTY of an interactive run (``no_tty``) and reruns every step-5 check against its
 own environment through ``launch.run`` with ``Adopting`` effects: the cwd and plugin
 directories must resolve to the realpaths ``start`` stored (``unsafe_cwd``,
-``unsafe_plugin_dir``), the git directory must be the stored one (``git_dir_changed``), and
-the permission profile is the frozen one. Step 7 then moves the staged copies into place.
+``unsafe_plugin_dir``), and so must ``read_dirs``, ``write_dirs`` and the profile's write
+paths (``invalid_permission_profile``), the git directory must be the stored one
+(``git_dir_changed``), and the permission profile is the frozen one. Step 7 then moves the
+staged copies into place. The current config may only tighten what ``start`` froze: its
+``secret_env`` names (and ``claude_auth_env`` names ``start`` did not freeze) are stripped
+and indexed too, but only the frozen ``claude_auth_env`` names are passed.
 
 TODO(#29): ``start --resume`` (a pending run n, a fork) and its dry run.
 TODO(#31): the ``pre-launch`` hooks of the adopting ``exec`` (launch step 6).
 TODO(#17): interactive adoption (signal handlers before the compare-and-set, the TTY handed
-to ``claude``); until then an interactive pending run with a TTY is refused before the
-compare-and-set (it stays pending).
+to ``claude``); until then an adoptable interactive pending run with a TTY is refused before
+the compare-and-set (it stays pending).
+TODO(#32): ``stop`` canceling a pending run deletes its launch spec too (``discard_spec``).
 """
 
 from __future__ import annotations
@@ -41,6 +52,7 @@ import dataclasses
 import json
 import os
 import sys
+import typing
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -60,6 +72,7 @@ from . import (
 from .config import Config
 from .defaults import MAX_INTEGER
 from .errors import (
+    FailedError,
     InternalError,
     LaunchFailedError,
     LaunchValidationError,
@@ -73,6 +86,9 @@ SPEC_NAME = "launch-spec.json"
 SPEC_VERSION = 1
 SPEC_MAX_BYTES = 8 << 20
 # Config values frozen in the spec (the adopting exec reads the rest from the config again).
+# TODO(#38): decide whether notes_context_cmd, notes_context_max_bytes and
+# notes_context_sources are frozen at start (interface.md lists only the notes timeouts as
+# read again at adoption).
 FROZEN_CONFIG = (
     "claude_auth_env",
     "secret_env",
@@ -81,6 +97,53 @@ FROZEN_CONFIG = (
     "input_max_bytes",
 )
 NO_TTY_HINT = "place the start argv in a terminal (stdin and stdout must be TTYs)"
+SPEC_KEYS = frozenset(
+    {
+        "version",
+        "resolution",
+        "request",
+        "caller_cwd",
+        "cwd",
+        "plugin_dirs",
+        "read_dirs",
+        "write_dirs",
+        "profile_writes",
+        "profile",
+        "config",
+    }
+)
+RESOLUTION_KEYS = frozenset(
+    {
+        "kind",
+        "builtin",
+        "fallback",
+        "repo",
+        "profile",
+        "origins",
+        "warnings",
+        "env_allow",
+        "env_allowlist_only",
+        "permission_profile_file",
+    }
+)
+REQUEST_KEYS = frozenset(
+    {
+        "mode",
+        "skill",
+        "repo",
+        "labels",
+        "flags",
+        "actor",
+        "decision_ids",
+        "hooks",
+        "hook_timeouts",
+        "has_prompt",
+        "input_files",
+    }
+)
+PROFILE_KEYS = frozenset({"name", "content", "snapshot"})
+ORIGINS = frozenset(typing.get_args(kinds.Origin))
+MODES = ("interactive", "headless")
 
 
 # The launch spec
@@ -95,8 +158,9 @@ class Frozen:
     caller_cwd: str | None  # None: the session's work/ (cwd: session-dir)
     cwd: str  # the resolved cwd
     plugin_dirs: tuple[str, ...]  # resolved
+    dirs: launch.RunDirs  # resolved read_dirs, write_dirs and profile write paths
     profile_name: str | None  # None: a file profile
-    profile_content: dict[str, Any]
+    profile_content: dict[str, Any]  # a file profile's: parsed from its snapshot
     profile_snapshot: bytes | None
     config_values: dict[str, Any]
 
@@ -126,14 +190,18 @@ def resolution_json(resolution: kinds.Resolution) -> dict[str, Any]:
 
 
 def resolution_of(data: Mapping[str, Any]) -> kinds.Resolution:
+    _keys(data, RESOLUTION_KEYS)
     allowlist_only = data["env_allowlist_only"]
+    origins = {_text(k): _text(v) for k, v in _mapping(data["origins"]).items()}
+    if not set(origins.values()) <= ORIGINS:
+        raise ValueError("unknown origin")
     return kinds.Resolution(
         kind=_text(data["kind"]),
         builtin=_bool(data["builtin"]),
         fallback=_bool(data["fallback"]),
         repo=_optional_text(data["repo"]),
         profile=config.Kind.model_validate(data["profile"]),
-        origins={_text(k): v for k, v in _mapping(data["origins"]).items()},
+        origins=typing.cast(dict[str, kinds.Origin], origins),
         warnings=tuple(_texts(data["warnings"])),
         env_allow=tuple(_texts(data["env_allow"])),
         env_allowlist_only=None if allowlist_only is None else tuple(_texts(allowlist_only)),
@@ -142,7 +210,11 @@ def resolution_of(data: Mapping[str, Any]) -> kinds.Resolution:
 
 
 def spec_json(
-    cfg: Config, req: launch.Request, resolved: launch.Resolved, v: launch.Validated
+    cfg: Config,
+    req: launch.Request,
+    resolved: launch.Resolved,
+    v: launch.Validated,
+    dirs: launch.RunDirs,
 ) -> dict[str, Any]:
     profile = v.profile
     resolution = resolved.resolution
@@ -169,9 +241,13 @@ def spec_json(
         "caller_cwd": resolved.caller_cwd,
         "cwd": v.cwd,
         "plugin_dirs": list(v.plugin_dirs),
+        "read_dirs": list(dirs.read_dirs),
+        "write_dirs": list(dirs.write_dirs),
+        "profile_writes": list(dirs.profile_writes),
+        # A file profile is its snapshot only (its content is parsed from it).
         "profile": {
             "name": profile.name,
-            "content": profile.content,
+            "content": None if profile.is_file else profile.content,
             "snapshot": None if profile.snapshot is None else profile.snapshot.decode("utf-8"),
         },
         "config": {key: getattr(cfg, key) for key in FROZEN_CONFIG},
@@ -183,23 +259,44 @@ def spec_bytes(data: Mapping[str, Any]) -> bytes:
 
 
 def parse_spec(raw: bytes, where: str) -> Frozen:
-    """The spec read back. Anything unexpected is ``session_dir_unsafe``: the file is in the
-    private directory and only ``start`` writes it."""
+    """The spec read back, strictly: no unknown or missing key, absolute paths, known
+    origins, a file profile's content parsed from its snapshot. Anything unexpected is
+    ``session_dir_unsafe``: the file is in the private directory and only ``start`` writes
+    it."""
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = _mapping(json.loads(raw.decode("utf-8")))
         if data.get("version") != SPEC_VERSION:
             raise ValueError("unknown launch spec version")
+        _keys(data, SPEC_KEYS)
         profile = _mapping(data["profile"])
+        _keys(profile, PROFILE_KEYS)
         snapshot = _optional_text(profile["snapshot"])
+        name = _optional_text(profile["name"])
+        if snapshot is None:
+            if name is None:
+                raise ValueError("a named profile without a name")
+            content = dict(_mapping(profile["content"]))
+        else:
+            if name is not None or profile["content"] is not None:
+                raise ValueError("a file profile is its snapshot only")
+            content = dict(_mapping(json.loads(snapshot)))
         caller_cwd = _optional_text(data["caller_cwd"])
+        if caller_cwd is not None:
+            _absolute(caller_cwd)
+        dirs = launch.RunDirs(
+            read_dirs=_absolutes(data["read_dirs"]),
+            write_dirs=_absolutes(data["write_dirs"]),
+            profile_writes=_absolutes(data["profile_writes"]),
+        )
         return Frozen(
             resolution=resolution_of(_mapping(data["resolution"])),
             request=dict(_mapping(data["request"])),
             caller_cwd=caller_cwd,
-            cwd=_text(data["cwd"]),
-            plugin_dirs=tuple(_texts(data["plugin_dirs"])),
-            profile_name=_optional_text(profile["name"]),
-            profile_content=dict(_mapping(profile["content"])),
+            cwd=_absolute(data["cwd"]),
+            plugin_dirs=_absolutes(data["plugin_dirs"]),
+            dirs=dirs,
+            profile_name=name,
+            profile_content=content,
             profile_snapshot=None if snapshot is None else snapshot.encode("utf-8"),
             config_values=dict(_mapping(data["config"])),
         )
@@ -216,10 +313,28 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value
 
 
+def _keys(data: Mapping[str, Any], expected: frozenset[str]) -> None:
+    if set(data) != expected:
+        raise ValueError("unexpected or missing keys")
+
+
 def _text(value: Any) -> str:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or "\x00" in value:
         raise TypeError("expected a string")
     return value
+
+
+def _absolute(value: Any) -> str:
+    text = _text(value)
+    if not os.path.isabs(text):
+        raise ValueError("expected an absolute path")
+    return text
+
+
+def _absolutes(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise TypeError("expected a list")
+    return tuple(_absolute(item) for item in value)
 
 
 def _optional_text(value: Any) -> str | None:
@@ -261,6 +376,11 @@ def failed(error: LaunchValidationError, alloc: launch.Allocated) -> LaunchFaile
     )
 
 
+class RunTaken(FailedError):
+    """``start`` could not make its run pending: the run ended, or got another wrapper,
+    while ``start`` froze it (exit 12, ``failed``)."""
+
+
 def start(
     st: store.Store,
     args: argparse.Namespace,
@@ -268,11 +388,13 @@ def start(
     source: config.Source,
     process: launch.Process,
 ) -> dict[str, Any]:
-    """``start`` of a new session: launch steps 2 to 5, then the run is frozen (staged
-    prompt and inputs, profile snapshot, launch spec). Returns the ``start --json`` object
-    (schemas/cli/start.json). A step-5 failure (or an unsafe session directory while
-    freezing) ends the run ``not-started`` and raises ``LaunchFailedError``; any other error
-    ends it ``launch_interrupted`` and is re-raised."""
+    """``start`` of a new session: launch steps 2 to 5 with ``start`` as the run's wrapper,
+    then the run is frozen (staged prompt and inputs, profile snapshot, launch spec) and
+    made pending. Returns the ``start --json`` object (schemas/cli/start.json). A step-5
+    failure (or an unsafe session directory while freezing) ends the run ``not-started`` and
+    raises ``LaunchFailedError``; a run taken over while freezing raises ``RunTaken``; any
+    other error ends it ``launch_interrupted`` and is re-raised. The launch spec of a run
+    that does not become pending is deleted."""
     req = dryrun.request(args, cfg)  # start never checks the run's TTY (any mode)
     resolved = launch.resolve_kind(req, cfg, process)
     resolution = resolved.resolution
@@ -287,25 +409,29 @@ def start(
     try:
         try:
             v = launch.validate(st, cfg, req, resolved, alloc, process, effects=Starting)
-            warnings = freeze(st, cfg, req, resolved, alloc, v)
+            warnings, expires_at = freeze(st, cfg, req, resolved, alloc, v, process, pending)
+        except RunTaken:
+            discard_spec(alloc, v)
+            raise
         except LaunchValidationError as error:
+            discard_spec(alloc, v)
             launch.end_launch(st, alloc, v, None, process, error)
             raise failed(error, alloc) from None
         except BaseException as exc:
+            discard_spec(alloc, v)
             launch.end_launch(st, alloc, v, None, process, launch.interrupted(exc), exc=exc)
             raise
     finally:
         if v is not None:
             v.dirs.close()
     assert v is not None
-    record = st.run_record(alloc.csession_id, alloc.run)
     return {
         "csession_id": alloc.csession_id,
         "csession_dir": alloc.session_dir,
         "argv": [process.claude_session, "exec", "--session-id", alloc.csession_id],
         "run": alloc.run,
         "forked_from": None,
-        "expires_at": record["expires_at"],
+        "expires_at": expires_at,
         "required_env_names": list(dryrun.required_env_names(resolution, v.session_env)),
         "env_inherit": resolution.profile.env.inherit,
         "warnings": list(dict.fromkeys([*resolution.warnings, *warnings])),
@@ -319,10 +445,14 @@ def freeze(
     resolved: launch.Resolved,
     alloc: launch.Allocated,
     v: launch.Validated,
-) -> list[str]:
+    process: launch.Process,
+    pending: launch.Pending,
+) -> tuple[list[str], str]:
     """Stage the prompt and inputs, snapshot a file profile, write the launch spec, record
-    the profile label and the run's warnings, and remove the private tmpdir the self-check
-    created (the adopting ``exec`` creates it again). Returns the run's warnings."""
+    the profile label, remove the private tmpdir the self-check created (the adopting
+    ``exec`` creates it again) and record the run's warnings; then, last, make the run
+    pending (``Store.release_pending``: ``expires_at`` counts from now). Returns the run's
+    warnings and ``expires_at``; raises ``RunTaken`` when the run is no longer ``start``'s."""
     run, sid = alloc.run, alloc.csession_id
     v.dirs.stage(run, req.prompt, req.inputs)
     snapshot = None
@@ -330,7 +460,10 @@ def freeze(
         snapshot = v.dirs.write_private_run_file(
             run, launch.PROFILE_SNAPSHOT, v.profile.snapshot_bytes()
         )
-    v.dirs.write_private_run_file(run, SPEC_NAME, spec_bytes(spec_json(cfg, req, resolved, v)))
+    home = os.path.realpath(process.environ.get("HOME", "/"))
+    dirs = launch.run_dirs(v.read_dirs, v.write_dirs, v.expanded, v.cwd, home)
+    spec = spec_json(cfg, req, resolved, v, dirs)
+    v.dirs.write_private_run_file(run, SPEC_NAME, spec_bytes(spec))
     st.update_run(
         sid, run, permission_profile=v.profile.label, permission_profile_snapshot=snapshot
     )
@@ -340,10 +473,45 @@ def freeze(
             tmpdir.remove(sid)
         except tmpdir.TmpdirLeftover as exc:
             warnings.append(f"{exc}; {exc.hint}")
-        except OSError:
-            pass  # an empty directory of ours; the adopting exec recreates it either way
+        except OSError as exc:
+            path = tmpdir.run_path(sid)
+            warnings.append(f"could not remove the private temporary directory {path}: {exc}")
     st.add_run_warnings(sid, run, warnings)
-    return warnings
+    assert alloc.wrapper_start is not None
+    expires_at = st.release_pending(
+        sid,
+        run,
+        wrapper_pid=os.getpid(),
+        wrapper_start=alloc.wrapper_start,
+        pending_for=pending.expires_after,
+    )
+    if expires_at is None:
+        raise RunTaken(
+            f"run {run} of {sid} was ended or taken over while start froze it",
+            detail="the run did not become pending",
+        )
+    return warnings, expires_at
+
+
+def discard_spec(alloc: launch.Allocated, v: launch.Validated | None) -> None:
+    """Delete the run's launch spec, which may hold credentials, through the pinned private
+    directory (best effort; nothing to do before ``validate`` returned: it is written
+    later)."""
+    if v is None:
+        return
+    try:
+        v.dirs.remove_private_run_file(alloc.run, SPEC_NAME)
+    except (OSError, ValueError, LaunchValidationError):
+        pass
+
+
+def discard_spec_at(state_root: str, csession_id: str, run: int) -> None:
+    """``discard_spec`` without open session directories (an adopting ``exec`` that does
+    not own the run, or failed before it read the spec); best effort, creates nothing."""
+    try:
+        sessiondir.remove_private_run_file(state_root, csession_id, run, SPEC_NAME)
+    except (OSError, ValueError, LaunchValidationError):
+        pass
 
 
 # Adoption
@@ -360,6 +528,7 @@ class Adoption:
     resolved: launch.Resolved
     frozen: Frozen
     git_dir: str | None
+    profile_label: str | None  # runs.permission_profile, as start recorded it
     warnings: list[str]
     config_hash_changed: bool
 
@@ -370,6 +539,7 @@ class FrozenChecks:
 
     frozen: Frozen
     git_dir: str | None
+    profile_label: str | None
 
     def compare_cwd(self, cwd: str) -> None:
         if cwd != self.frozen.cwd:
@@ -388,13 +558,32 @@ class FrozenChecks:
         gitinfo.check_unchanged(self.git_dir, git_dirs)
 
     def frozen_profile(self, resolution: kinds.Resolution) -> permission_profiles.Profile:
-        """The profile ``start`` read, validated again for the run's isolation; a file
-        profile's snapshot must still have its label."""
+        """The profile ``start`` read, validated again for the run's isolation; its label
+        (a file profile's: from its snapshot) must be the one ``start`` recorded on the run
+        (``session_dir_unsafe`` otherwise)."""
         profile = self.frozen.profile()
+        if profile.label != self.profile_label:
+            raise sessiondir.SessionDirUnsafe(
+                "the launch spec's permission profile is not the one start recorded",
+                detail=f"{self.profile_label} -> {profile.label}",
+            )
         permission_profiles.validate(
             profile.content, isolated=resolution.isolated(), source="frozen permission profile"
         )
         return profile
+
+    def compare_dirs(self, dirs: Callable[[], launch.RunDirs]) -> None:
+        current, frozen = dirs(), self.frozen.dirs
+        for key, label in (
+            ("read_dirs", "a read_dirs entry"),
+            ("write_dirs", "a write_dirs entry"),
+            ("profile_writes", "a permission profile write path"),
+        ):
+            if getattr(current, key) != getattr(frozen, key):
+                raise LaunchValidationError(
+                    f"{label} resolves to another directory than at start",
+                    end_reason="invalid_permission_profile",
+                )
 
     def compare_plugin_dirs(self, plugin_dirs: Sequence[str]) -> None:
         if tuple(plugin_dirs) != self.frozen.plugin_dirs:
@@ -413,12 +602,12 @@ class Adopting(launch.Recording, FrozenChecks):
         st: store.Store,
         alloc: launch.Allocated,
         dirs: SessionDirs,
-        frozen: Frozen,
-        git_dir: str | None,
+        adoption: Adoption,
     ) -> None:
         super().__init__(st, alloc, dirs)
-        self.frozen = frozen
-        self.git_dir = git_dir
+        self.frozen = adoption.frozen
+        self.git_dir = adoption.git_dir
+        self.profile_label = adoption.profile_label
 
     def record_cwd(self, cwd: str) -> None:
         self.compare_cwd(cwd)
@@ -435,14 +624,18 @@ class Adopting(launch.Recording, FrozenChecks):
     def record_plugin_dirs(self, plugin_dirs: Sequence[str]) -> None:
         self.compare_plugin_dirs(plugin_dirs)
 
+    def record_dirs(self, dirs: Callable[[], launch.RunDirs]) -> None:
+        self.compare_dirs(dirs)
+
 
 class AdoptionDryRun(dryrun.DryRunEffects, FrozenChecks):
     """The adoption dry run's effects: nothing recorded or created, the same comparisons."""
 
-    def __init__(self, frozen: Frozen, git_dir: str | None) -> None:
+    def __init__(self, adoption: Adoption) -> None:
         super().__init__()
-        self.frozen = frozen
-        self.git_dir = git_dir
+        self.frozen = adoption.frozen
+        self.git_dir = adoption.git_dir
+        self.profile_label = adoption.profile_label
 
     def record_cwd(self, cwd: str) -> None:
         self.compare_cwd(cwd)
@@ -461,6 +654,9 @@ class AdoptionDryRun(dryrun.DryRunEffects, FrozenChecks):
 
     def record_plugin_dirs(self, plugin_dirs: Sequence[str]) -> None:
         self.compare_plugin_dirs(plugin_dirs)
+
+    def record_dirs(self, dirs: Callable[[], launch.RunDirs]) -> None:
+        self.compare_dirs(dirs)
 
 
 def lookup(st: store.Store, given: str) -> tuple[str, dict[str, Any]]:
@@ -497,8 +693,9 @@ def load_adoption(
     record: Mapping[str, Any], process: launch.Process, *, dry_run: bool = False
 ) -> Adoption:
     """The config reloaded from the stored path (an invalid one: ``config_invalid``), the
-    launch spec read back (``session_dir_unsafe`` when it is unusable) and the request and
-    resolution rebuilt from it. A changed config hash is a warning."""
+    launch spec read back (``session_dir_unsafe`` when it is unusable; the adopting
+    ``exec`` deletes it once read, a dry run only reads it) and the request and resolution
+    rebuilt from it. A changed config hash is a warning."""
     sid, run = record["csession_id"], record["run_no"]
     invocation = _invocation(record)
     path = record["config_path"]
@@ -522,14 +719,22 @@ def load_adoption(
             " the current config"
         )
     if dry_run:
+        # Read only, through the same descriptor walk as the adopting exec; creates nothing.
         sessiondir.check_dirs(process.state_root, sid)
-        raw = _read_spec_readonly(process.state_root, sid, run)
+        raw = sessiondir.read_private_run_file(
+            process.state_root, sid, run, SPEC_NAME, SPEC_MAX_BYTES
+        )
     else:
         with SessionDirs.open(process.state_root, sid) as dirs:
-            raw = dirs.read_private_run_file(run, SPEC_NAME, SPEC_MAX_BYTES)
+            try:
+                raw = dirs.read_private_run_file(run, SPEC_NAME, SPEC_MAX_BYTES)
+            finally:
+                # It may hold credentials; the run is this process's now and is never
+                # adopted again, whatever happens next.
+                dirs.remove_private_run_file(run, SPEC_NAME)
     where = os.path.join(sessiondir.private_dir(process.state_root, sid), "runs", str(run))
     frozen = parse_spec(raw, os.path.join(where, SPEC_NAME))
-    cfg = current.model_copy(update=_frozen_config(frozen))
+    cfg = current.model_copy(update=_adoption_config(frozen, current))
     req = _request(frozen, record)
     resolved = launch.Resolved(resolution=frozen.resolution, caller_cwd=frozen.caller_cwd)
     return Adoption(
@@ -538,37 +743,10 @@ def load_adoption(
         resolved=resolved,
         frozen=frozen,
         git_dir=record["session_git_dir"],
+        profile_label=record["permission_profile"],
         warnings=warnings,
         config_hash_changed=changed,
     )
-
-
-def _read_spec_readonly(state_root: str, sid: str, run: int) -> bytes:
-    """The launch spec for a dry run, which opens no ``SessionDirs`` (it would create
-    directories): the same checks on a no-follow descriptor."""
-    path = os.path.join(sessiondir.private_dir(state_root, sid), "runs", str(run), SPEC_NAME)
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError as exc:
-        raise sessiondir.SessionDirUnsafe(f"cannot read the launch spec {path}: {exc}") from None
-    try:
-        info = os.fstat(fd)
-        if not (
-            os.path.realpath(path) == path
-            and info.st_uid == os.geteuid()
-            and info.st_nlink == 1
-            and (info.st_mode & 0o170000) == 0o100000
-            and info.st_size <= SPEC_MAX_BYTES
-        ):
-            raise sessiondir.SessionDirUnsafe(f"unsafe launch spec {path}")
-        chunks: list[bytes] = []
-        while chunk := os.read(fd, 1 << 16):
-            chunks.append(chunk)
-            if sum(map(len, chunks)) > SPEC_MAX_BYTES:
-                raise sessiondir.SessionDirUnsafe(f"unsafe launch spec {path}")
-        return b"".join(chunks)
-    finally:
-        os.close(fd)
 
 
 def _invocation(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -598,11 +776,34 @@ def _frozen_config(frozen: Frozen) -> dict[str, Any]:
     return {key: values[key] for key in FROZEN_CONFIG}
 
 
+def _adoption_config(frozen: Frozen, current: Config) -> dict[str, Any]:
+    """The frozen config values, where the current config may only tighten: the
+    ``secret_env`` names are those of both, plus the current ``claude_auth_env`` names
+    ``start`` did not freeze (stripped and indexed, never passed); only the frozen
+    ``claude_auth_env`` names are passed."""
+    values = _frozen_config(frozen)
+    auth = values["claude_auth_env"]
+    values["secret_env"] = list(
+        dict.fromkeys(
+            [
+                *values["secret_env"],
+                *current.secret_env,
+                *(name for name in current.claude_auth_env if name not in auth),
+            ]
+        )
+    )
+    return values
+
+
 def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
-    """The request ``start`` read, rebuilt. The prompt and inputs are staged (moved into
+    """The request ``start`` read, rebuilt and checked again: no unknown key, the flag rules
+    and identifier grammars of ``start``'s argv (``cli.check_flag_rules``), and the mode, kind
+    and prompt presence the run row records. The prompt and inputs are staged (moved into
     place by step 7), so only their presence and names are known here."""
     data = frozen.request
     try:
+        _keys(data, REQUEST_KEYS)
+        _check_request(frozen, data, record)
         flags = dict(_mapping(data["flags"]))
         inputs = tuple(InputFile(name=name, data=b"") for name in _texts(data["input_files"]))
         return launch.Request(
@@ -622,10 +823,43 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
             hook_timeouts=tuple(_texts(data["hook_timeouts"])),
             outcome_file=record["outcome_file"],
         )
-    except (KeyError, TypeError) as exc:
+    except (KeyError, TypeError, ValueError, AttributeError, UsageError) as exc:
         raise sessiondir.SessionDirUnsafe(
             f"the launch spec's request cannot be read ({type(exc).__name__})"
         ) from None
+
+
+def _check_request(frozen: Frozen, data: Mapping[str, Any], record: Mapping[str, Any]) -> None:
+    """``start``'s argv rebuilt from the spec's request through the flag rules ``start`` ran
+    (``UsageError``), with the values ``argparse`` guarantees (strings and lists of
+    strings) checked first; the mode, kind and prompt presence must be the run row's."""
+    from . import cli  # the flag rules; not at import time (cli imports this module late)
+
+    mode = _text(data["mode"])
+    if mode not in MODES or mode != record["mode"]:
+        raise ValueError("the launch spec's mode is not the run's")
+    if frozen.resolution.kind != record["run_kind"]:
+        raise ValueError("the launch spec's kind is not the run's")
+    if _bool(data["has_prompt"]) != bool(record["has_prompt"]):
+        raise ValueError("the launch spec's prompt presence is not the run's")
+    flags = dict(_mapping(data["flags"]))
+    if set(flags) != set(kinds.FLAG_KEYS):
+        raise ValueError("unexpected or missing flags")
+    args = cli.build_parser().parse_args(["start", "--json"])
+    args.kind = frozen.resolution.kind
+    args.mode = mode
+    args.skill = _optional_text(data["skill"])
+    args.repo = _optional_text(data["repo"])
+    args.label = _texts(data["labels"])
+    args.actor = _text(data["actor"])
+    args.decision_id = _texts(data["decision_ids"])
+    args.hook = _texts(data["hooks"])
+    args.hook_timeout = _texts(data["hook_timeouts"])
+    args.input_file = _texts(data["input_files"])
+    args.prompt_file = SPEC_NAME if data["has_prompt"] else None  # any non-stdin name
+    for key, value in flags.items():
+        setattr(args, key, value)
+    cli.check_flag_rules(args)
 
 
 def log_config_warnings(
@@ -653,17 +887,26 @@ def adopt(
     """``exec --session-id <id>``: the compare-and-set, then the adopted run's launch (see
     the module docs). Returns the outcome object and the exit code. Refusals raise
     ``RefusedError`` (exit 20) or ``NotFoundError`` (exit 10) and change nothing (an expired
-    pending run is finalized ``never_adopted`` first)."""
+    pending run is finalized ``never_adopted`` first, and its launch spec deleted)."""
     sid, record = lookup(st, args.session_id)
     outcome_file = None if args.outcome_file is None else os.path.abspath(args.outcome_file)
     # TODO(#21): an isolated run's --outcome-file under a session-writable path exits 2 here,
     # before the compare-and-set, and the run stays pending.
-    if record["mode"] == "interactive" and record["wrapper_pid"] is None and has_tty():
-        # TODO(#17): interactive supervision; the run stays pending until it exists.
-        raise InternalError(
-            "adopting an interactive run is not implemented yet", detail="not_implemented"
-        )
+    if record["mode"] == "interactive" and has_tty():
+        # Refusals first: a final or expired run goes through the compare-and-set (which
+        # finalizes an expired one); a run that has a wrapper is refused as it stands (it
+        # may be start's, about to become pending).
+        found = refusal(record, st.past_deadline(record["expires_at"]))
+        if found == "already_adopted":
+            raise RefusedError(f"cannot adopt {sid}: already adopted", reason=found)
+        if found is None:
+            # TODO(#17): interactive supervision; the run stays pending until it exists.
+            raise InternalError(
+                "adopting an interactive run is not implemented yet", detail="not_implemented"
+            )
     # TODO(#17): install the signal handlers (interface.md, Signals) here, before the CAS.
+    # TODO(#33): start_time() gives "" when the token cannot be read (as for plain exec);
+    # the liveness check must never take an empty token as matching a live process.
     result = st.adopt(
         sid,
         wrapper_pid=os.getpid(),
@@ -674,10 +917,19 @@ def adopt(
     if result.outcome == "not_found":
         raise NotFoundError(f"unknown session: {args.session_id}")
     if result.outcome != "adopted":
+        if result.expired_now and result.run_no is not None:
+            discard_spec_at(process.state_root, sid, result.run_no)
+            # TODO(#21): write the run's outcome file with the never_adopted outcome.
+            # TODO(#20): the run's exactly one final post-state-change.
         reason = "already_adopted" if result.outcome == "already_adopted" else "expired"
         raise RefusedError(f"cannot adopt {sid}: {reason.replace('_', ' ')}", reason=reason)
     assert result.run_no is not None
     run = result.run_no
+    # TODO(#33): a wrapper that dies between here and the spawn leaves an adopted run in the
+    # launch phase; the liveness check's wrapper-lost rule must cover it (launch_interrupted).
+    launch.log_best_effort(
+        launch.event_log(process), "adopt", level="info", csession_id=sid, run=run
+    )
     alloc = launch.Allocated(
         csession_id=sid,
         run=run,
@@ -700,18 +952,23 @@ def adopt(
                 hint=NO_TTY_HINT,
             )
     except LaunchValidationError as error:
+        discard_spec_at(process.state_root, sid, run)
         launch.end_launch(st, alloc, None, None, process, error)
         return _outcome(st, sid, run)
     except Exception as exc:
+        discard_spec_at(process.state_root, sid, run)
         launch.end_launch(st, alloc, None, None, process, launch.interrupted(exc), exc=exc)
         return _outcome(st, sid, run)
     except BaseException as exc:
+        discard_spec_at(process.state_root, sid, run)
         launch.end_launch(st, alloc, None, None, process, launch.interrupted(exc), exc=exc)
         raise
 
     def effects(s: store.Store, a: launch.Allocated, dirs: SessionDirs) -> launch.Effects:
-        return Adopting(s, a, dirs, adoption.frozen, adoption.git_dir)
+        return Adopting(s, a, dirs, adoption)
 
+    # TODO(#19): pass bound= to supervisor.run_session from the frozen resolution's timeout
+    # for the run's mode, as a headless launch passes bound=resolution.timeout(req.mode).
     ended = launch.run(
         st,
         adoption.cfg,
@@ -749,8 +1006,9 @@ def adoption_plan(
     (``already_adopted``, ``expired``), ``config_hash_changed``, and the step-5 checks with
     the adoption's comparisons (``would_fail``). An invalid stored config exits 2 as an
     invalid config, as a dry run of a new session does. When the stored run cannot be read
-    back (no launch spec: a failed ``start``), a refused adoption exits 20 with the refusal
-    envelope and any other one 12 (``failed``): there is no plan to print."""
+    back (no usable launch spec: a failed ``start``, an adopted or expired run), there is
+    no plan to print (interface.md, Dry run): a refused adoption exits 20 with the refusal
+    envelope and any other one 12 (``failed``)."""
     sid, record = lookup(st, args.session_id)
     would_refuse = refusal(record, st.past_deadline(record["expires_at"]))
     try:
@@ -778,7 +1036,7 @@ def adoption_plan(
         private_dir=sessiondir.private_dir(process.state_root, sid),
         warnings=(),
     )
-    effects = AdoptionDryRun(adoption.frozen, adoption.git_dir)
+    effects = AdoptionDryRun(adoption)
     found = dryrun.run_checks(cfg, req, resolved, alloc, process, effects=effects)
     if req.mode == "interactive" and found.would_fail is None and not has_tty():
         found.would_fail = "no_tty"

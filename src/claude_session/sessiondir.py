@@ -446,6 +446,119 @@ def _inspect_dir(dir_fd: int, name: str, path: str, opened: list[int]) -> int | 
     return fd
 
 
+def _read_private_file_at(dir_fd: int, name: str, path: str, cap: int) -> bytes:
+    """``name`` in ``dir_fd`` opened without following a symlink: a regular file of ours with
+    one link and at most ``cap`` bytes, else ``SessionDirUnsafe`` (also when missing)."""
+    try:
+        fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd
+        )
+    except OSError as exc:
+        raise _failed(path, exc) from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SessionDirUnsafe(f"{path} is not a regular file")
+        if info.st_nlink != 1:
+            raise SessionDirUnsafe(f"{path} has {info.st_nlink} links")
+        if info.st_uid != os.geteuid():
+            raise SessionDirUnsafe(f"{path} is owned by uid {info.st_uid}")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= cap:
+            chunk = os.read(fd, cap + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as exc:
+        raise _failed(path, exc) from exc
+    finally:
+        os.close(fd)
+    if size > cap:
+        raise SessionDirUnsafe(f"{path} is larger than {cap} bytes")
+    return b"".join(chunks)
+
+
+def _unlink_at(dir_fd: int, name: str, path: str) -> None:
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise _failed(path, exc) from exc
+
+
+def _inspect_run_dir(state_root: str, csession_id: str, run: int) -> tuple[int | None, str]:
+    """The private ``runs/<run>/`` of a session reached read only, as ``SessionDirs.open``
+    reaches it (the state root resolved once, then each directory opened no-follow and owner
+    checked through its parent's descriptor; ``fsutil.inspect_private_dir_at``). Returns its
+    descriptor (the caller closes it), or None when a directory on the way is missing or its
+    mode denies searching it, and the run directory's path. Creates and changes nothing;
+    raises ``SessionDirUnsafe``."""
+    if not ids.is_session_id(csession_id):
+        raise ValueError(f"not a session id: {csession_id!r}")
+    _check_run(run)
+    root = os.path.realpath(state_root)
+    where = os.path.join(root, PRIVATE, csession_id, RUNS, str(run))
+    try:
+        fd = fsutil.open_dir_nofollow(root)
+    except OSError as exc:
+        raise _failed(root, exc) from exc
+    try:
+        fsutil.check_private_dir_fd(fd, root)
+    except OSError as exc:
+        os.close(fd)
+        raise _failed(root, exc) from exc
+    path = root
+    for name in (PRIVATE, csession_id, RUNS, str(run)):
+        path = os.path.join(path, name)
+        try:
+            try:
+                _exists, child = fsutil.inspect_private_dir_at(fd, name)
+            except OSError as exc:
+                raise _failed(path, exc) from exc
+        finally:
+            os.close(fd)
+        if child is None:
+            return None, where
+        fd = child
+    return fd, where
+
+
+def read_private_run_file(
+    state_root: str, csession_id: str, run: int, name: str, cap: int
+) -> bytes:
+    """``SessionDirs.read_private_run_file`` without opening (and so creating) the session's
+    directories (a dry run): the same checks, read only. Raises ``SessionDirUnsafe`` (also
+    when the file or a directory on the way is missing)."""
+    if not name or "/" in name or name in (".", ".."):
+        raise ValueError(f"not a file name: {name!r}")
+    run_fd, where = _inspect_run_dir(state_root, csession_id, run)
+    path = os.path.join(where, name)
+    if run_fd is None:
+        raise SessionDirUnsafe(f"cannot read {path}: its directory is missing or not searchable")
+    try:
+        return _read_private_file_at(run_fd, name, path, cap)
+    finally:
+        os.close(run_fd)
+
+
+def remove_private_run_file(state_root: str, csession_id: str, run: int, name: str) -> None:
+    """``SessionDirs.remove_private_run_file`` without opening (and so creating) the
+    session's directories: nothing to do when a directory on the way is missing. Raises
+    ``SessionDirUnsafe``."""
+    if not name or "/" in name or name in (".", ".."):
+        raise ValueError(f"not a file name: {name!r}")
+    run_fd, where = _inspect_run_dir(state_root, csession_id, run)
+    if run_fd is None:
+        return
+    try:
+        _unlink_at(run_fd, name, os.path.join(where, name))
+    finally:
+        os.close(run_fd)
+
+
 class SessionDirs:
     """The pinned session and private directories of one session.
 
@@ -701,39 +814,25 @@ class SessionDirs:
         if not name or "/" in name or name in (".", ".."):
             raise ValueError(f"not a file name: {name!r}")
         run_fd = self._run_private_dir(run)
-        path = os.path.join(self.private_path, RUNS, str(run), name)
         try:
-            try:
-                fd = os.open(
-                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=run_fd
-                )
-            except OSError as exc:
-                raise _failed(path, exc) from exc
+            return _read_private_file_at(
+                run_fd, name, os.path.join(self.private_path, RUNS, str(run), name), cap
+            )
         finally:
             os.close(run_fd)
+
+    def remove_private_run_file(self, run: int, name: str) -> None:
+        """Delete ``private/<id>/runs/<run>/<name>`` through the pinned private directory
+        (``unlinkat``, never following a symlink); a missing file is fine. Raises
+        ``SessionDirUnsafe`` when it cannot be deleted."""
+        _check_run(run)
+        if not name or "/" in name or name in (".", ".."):
+            raise ValueError(f"not a file name: {name!r}")
+        run_fd = self._run_private_dir(run)
         try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                raise SessionDirUnsafe(f"{path} is not a regular file")
-            if info.st_nlink != 1:
-                raise SessionDirUnsafe(f"{path} has {info.st_nlink} links")
-            if info.st_uid != os.geteuid():
-                raise SessionDirUnsafe(f"{path} is owned by uid {info.st_uid}")
-            chunks: list[bytes] = []
-            size = 0
-            while size <= cap:
-                chunk = os.read(fd, cap + 1 - size)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                size += len(chunk)
-        except OSError as exc:
-            raise _failed(path, exc) from exc
+            _unlink_at(run_fd, name, os.path.join(self.private_path, RUNS, str(run), name))
         finally:
-            os.close(fd)
-        if size > cap:
-            raise SessionDirUnsafe(f"{path} is larger than {cap} bytes")
-        return b"".join(chunks)
+            os.close(run_fd)
 
     def open_run_dir(self, run: int) -> int:
         """A descriptor of the private ``runs/<run>/`` (verified ours, no-follow) that the

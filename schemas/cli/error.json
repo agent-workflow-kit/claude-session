@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "claude-session/cli/error.json",
   "title": "Error envelope (any command with --json)",
-  "description": "Printed on stdout for exits 1, 2, 10, 20 and 21 (any command, including wait when the session is forgotten mid-wait), for exit 12 with code schema_newer or failed (any command), and by start for exit 12 with code launch_failed. Not printed by --dry-run, which prints the plan for exits 0, 12 and 20.",
+  "description": "Printed on stdout for exits 1, 2, 10, 20 and 21 (any command, including wait when the session is forgotten mid-wait), for exit 12 with code schema_newer or failed (any command), and by start for exit 12 with code launch_failed. Not printed by --dry-run, which prints the plan for exits 0, 12 and 20, except exec --session-id --dry-run of a record without a usable launch spec (refused, exit 20, or failed, exit 12).",
   "type": "object",
   "properties": {
     "error": {

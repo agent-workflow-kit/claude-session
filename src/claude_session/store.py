@@ -974,21 +974,16 @@ class Store:
         """Launch step 4: allocate a session id (``new_id`` is ``ids.new_session_id``, given
         ``session_id_used`` so the check and the insert share this transaction) and insert the
         session (state ``starting``), its run 1 (phase ``launch``), its labels and the
-        ``launch`` event. Plain ``exec`` performs every step itself, so its run has the
-        wrapper set already; ``start`` creates a pending run instead (no wrapper,
-        ``expires_at`` = now + ``run.pending_for``). A third-party-reading run taints the
-        session here (interface.md, Taint). Returns the session id."""
-        if (run.pending_for is None) == (run.wrapper_pid is None):
-            raise ValueError("a run has either a wrapper or a pending deadline")
+        ``launch`` event. The run has its wrapper set already: plain ``exec``, which performs
+        every step itself, or ``start``, which hands the run over to adoption only once it is
+        frozen (``release_pending``). A third-party-reading run taints the session here
+        (interface.md, Taint). Returns the session id."""
+        if run.wrapper_pid is None or run.wrapper_start is None:
+            raise ValueError("a run is allocated with its wrapper")
         with self.transaction() as conn:
             csession_id = new_id(self.session_id_used)
-            moment = self.clock()
-            now = format_ts(moment)
-            expires_at = (
-                None
-                if run.pending_for is None
-                else format_ts(moment + timedelta(seconds=run.pending_for))
-            )
+            now = format_ts(self.clock())
+            expires_at = None
             conn.execute(
                 "INSERT INTO sessions (csession_id, created_at, launch_kind, csession_dir, "
                 "private_dir, tainted, tainted_at, tainted_by_run, current_run, state, "
@@ -1253,6 +1248,8 @@ class Store:
                 return Adoption("already_adopted", run_no)
             if self.past_deadline(expires):
                 self._finalize(conn, csession_id, run_no, NEVER_ADOPTED)
+                # TODO(#21): write the run's outcome file with the never_adopted outcome.
+                # TODO(#20): the run's exactly one final post-state-change.
                 return Adoption("expired", run_no, expired_now=True)
             cursor = conn.execute(
                 "UPDATE runs SET wrapper_pid = ?, wrapper_start = ?, "
@@ -1272,7 +1269,10 @@ class Store:
         this call finalized it.
 
         TODO(#33): the liveness check and ``reconcile`` call this (``cause`` ``liveness`` or
-        ``reconcile``) for every pending run they see."""
+        ``reconcile``) for every pending run they see, and delete the launch spec
+        (``lifecycle.SPEC_NAME``) of each run this finalizes.
+        TODO(#21): write the run's outcome file with the never_adopted outcome.
+        TODO(#20): the run's exactly one final post-state-change."""
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT wrapper_pid, ended_at, expires_at FROM runs "
@@ -1287,14 +1287,39 @@ class Store:
                 conn, csession_id, run_no, dataclasses.replace(NEVER_ADOPTED, cause=cause)
             )
 
-    def past_deadline(self, expires_at: str | None) -> bool:
-        """Whether a pending run's ``expires_at`` has come (a missing or unreadable deadline
-        counts as passed: a pending run is never adoptable without one)."""
-        if expires_at is None:
+    def release_pending(
+        self,
+        csession_id: str,
+        run_no: int,
+        *,
+        wrapper_pid: int,
+        wrapper_start: str,
+        pending_for: float,
+    ) -> str | None:
+        """``start``'s last step: the run it allocated (and still wraps: ``wrapper_pid`` and
+        ``wrapper_start``) becomes pending, adoptable until ``expires_at`` = now +
+        ``pending_for``. One compare-and-set on the run still having this wrapper and not
+        being final. Returns the ``expires_at`` set, or None when it matched no row (the run
+        is final or has another wrapper: nothing changed)."""
+        with self.transaction() as conn:
+            expires_at = format_ts(self.clock() + timedelta(seconds=pending_for))
+            cursor = conn.execute(
+                "UPDATE runs SET wrapper_pid = NULL, wrapper_start = NULL, expires_at = ? "
+                "WHERE csession_id = ? AND run_no = ? AND wrapper_pid = ? "
+                "AND wrapper_start = ? AND ended_at IS NULL",
+                (expires_at, csession_id, run_no, wrapper_pid, wrapper_start),
+            )
+            return expires_at if cursor.rowcount == 1 else None
+
+    def past_deadline(self, expires_at: Any) -> bool:
+        """Whether a pending run's ``expires_at`` has come (a missing or unreadable deadline,
+        or one that is not text, counts as passed: a pending run is never adoptable without
+        one)."""
+        if not isinstance(expires_at, str):
             return True
         try:
             deadline = parse_ts(expires_at)
-        except ValueError:
+        except (ValueError, TypeError):
             return True
         return self.clock() >= deadline
 
@@ -1590,14 +1615,13 @@ class NewRun:
     invocation: dict[str, Any]
     hook_interpreter: str
     config_path: str | None
-    wrapper_pid: int | None  # None: a pending run (start)
+    # This process (plain exec, or start until release_pending).
+    wrapper_pid: int | None
     wrapper_start: str | None
     labels: tuple[str, ...] = ()
     decision_ids: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     outcome_file: str | None = None
-    # start: seconds until the pending run expires (lost_grace); None for a plain exec.
-    pending_for: float | None = None
 
 
 @dataclass(frozen=True)

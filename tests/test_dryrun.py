@@ -929,8 +929,11 @@ def test_unchecked_writable_uses_the_given_session_not_the_placeholder(tmp_path:
         cfg, proc, resolution, probe_cwd=None, caller_cwd=None, git=dryrun.GitDir(None), alloc=alloc
     )
     assert writable is not None
-    assert writable(os.path.join(alloc.session_dir, sessiondir.WORK, "x"))
-    assert writable(os.path.join(tmpdir.run_path(sid), "x"))
+    # Membership, not the predicate: the step-2 roots (<state>/sessions, the tmpdir root)
+    # already cover any session's paths.
+    known = set(writable.paths)
+    assert os.path.realpath(os.path.join(alloc.session_dir, sessiondir.WORK)) in known
+    assert os.path.realpath(tmpdir.run_path(sid)) in known
     placeholder = sessiondir.session_dir(proc.state_root, dryrun.PLACEHOLDER_ID)
     assert any(p.startswith(alloc.session_dir) for p in writable.paths)
     assert not any(p.startswith(placeholder) for p in writable.paths)

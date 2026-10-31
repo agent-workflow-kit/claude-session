@@ -28,7 +28,8 @@ private tmpdir, created last by ``check_sandbox``). ``--dry-run`` (``dryrun``) r
 nothing (``self_check(create=False)``), then ``generate`` for the settings and argv; never
 ``allocate``, ``open_dirs`` or ``prepare``.
 ``start`` and the adopting ``exec`` (``lifecycle``) reuse the same steps: ``start`` allocates
-a pending run (``allocate(..., pending=...)``) and runs ``validate``; the adopting ``exec``
+the run with itself as its wrapper (``allocate(..., pending=...)``), runs ``validate`` and
+makes the run pending once it is frozen (``Store.release_pending``); the adopting ``exec``
 runs ``run`` with its own effects (``Recording`` subclass comparing what ``start`` stored)
 and ``staged=True`` (step 7 moves ``start``'s staged prompt and inputs into place).
 TODO(#29): resume and fork build their request from the previous run (carry-over).
@@ -351,6 +352,8 @@ class Allocated:
     warnings: tuple[str, ...]
     # The ``cause`` of a launch-phase end of this run: ``adopt`` in the adopting exec.
     cause: str = "launch"
+    # The procinfo start-time token recorded as the run's wrapper_start (allocate).
+    wrapper_start: str | None = None
 
 
 def _resolved_record(resolution: kinds.Resolution) -> dict[str, Any]:
@@ -375,9 +378,9 @@ def _resolved_record(resolution: kinds.Resolution) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class Pending:
-    """What ``start`` records on its pending run besides the request: the adoption deadline
-    (``lost_grace`` seconds from now) and the config it froze (``config.Source`` and
-    ``config.config_hash``)."""
+    """What ``start`` records on its run besides the request: the config it froze
+    (``config.Source`` and ``config.config_hash``), and the adoption deadline set when the
+    frozen run becomes pending (``lost_grace`` seconds from then)."""
 
     expires_after: float
     config_hash: str
@@ -395,10 +398,13 @@ def allocate(
 ) -> Allocated:
     """Launch step 4: the session id (checked against every live, forgotten and deleted id in
     the inserting transaction) and the session and run rows, with this process as the run's
-    wrapper (plain ``exec`` performs every step), its labels and the ``launch`` event. With
-    ``pending`` (``start``) the run has no wrapper but a deadline, and the config hash and
-    path are frozen with it."""
+    wrapper (plain ``exec`` performs every step; ``start`` until the run is frozen), its
+    labels and the ``launch`` event. With ``pending`` (``start``) the config hash and path
+    are frozen with it."""
     resolution = resolved.resolution
+    # TODO(#33): start_time() gives "" when the token cannot be read (plain exec and start
+    # alike); the liveness check must never take an empty token as matching a live process.
+    wrapper_start = store.start_time(os.getpid())
     spec = {key: value for key, value in req.flags.items() if value is not None}
     if req.plugin_dirs:
         spec["plugin_dir"] = list(req.plugin_dirs)
@@ -429,9 +435,8 @@ def allocate(
         invocation=invocation,
         hook_interpreter=process.interpreter,
         config_path=None if pending is None else pending.config_path,
-        wrapper_pid=None if pending is not None else os.getpid(),
-        wrapper_start=None if pending is not None else store.start_time(os.getpid()),
-        pending_for=None if pending is None else pending.expires_after,
+        wrapper_pid=os.getpid(),
+        wrapper_start=wrapper_start,
         labels=req.labels,
         decision_ids=req.decision_ids,
         warnings=warnings,
@@ -444,6 +449,7 @@ def allocate(
         session_dir=sessiondir.session_dir(process.state_root, csession_id),
         private_dir=sessiondir.private_dir(process.state_root, csession_id),
         warnings=warnings,
+        wrapper_start=wrapper_start,
     )
 
 
@@ -773,6 +779,31 @@ def resolve_run_dirs(
     return read, write
 
 
+@dataclass(frozen=True)
+class RunDirs:
+    """A run's resolved directories as ``start`` freezes them: ``read_dirs`` and
+    ``write_dirs`` (realpaths) and the realpaths of the expanded profile's write paths."""
+
+    read_dirs: tuple[str, ...]
+    write_dirs: tuple[str, ...]
+    profile_writes: tuple[str, ...]
+
+
+def run_dirs(
+    read: Sequence[str],
+    write_dirs: Sequence[str],
+    expanded: Mapping[str, Any],
+    cwd: str,
+    home: str,
+) -> RunDirs:
+    writes = pathrules.profile_write_paths(expanded, cwd=cwd, home=home)
+    return RunDirs(
+        read_dirs=tuple(read),
+        write_dirs=tuple(write_dirs),
+        profile_writes=tuple(dict.fromkeys(os.path.realpath(path) for path in writes)),
+    )
+
+
 def create_write_dirs(dirs: SessionDirs, write: pathrules.WriteDirs) -> None:
     """Create the ``write_dirs`` inside ``$CSESSION_DIR`` before launch (no-follow, 0700)."""
     for path in write.create:
@@ -1017,6 +1048,11 @@ class Effects:
     def record_plugin_dirs(self, plugin_dirs: Sequence[str]) -> None:
         pass
 
+    def record_dirs(self, dirs: Callable[[], RunDirs]) -> None:
+        """The resolved ``read_dirs``, ``write_dirs`` and profile write paths (computed by
+        calling ``dirs``), once checked: the adopting ``exec`` compares them with what
+        ``start`` froze."""
+
     def warn(self, warnings: Sequence[str]) -> None:
         pass
 
@@ -1109,6 +1145,7 @@ def checks(
     writable = full_writable(resolution, alloc, cwd, home, tmp, write, expanded)
     check_profile_file(resolution, writable)
     check_paths(rules, writable, read, write, expanded)
+    effects.record_dirs(lambda: run_dirs(read, write.dirs, expanded, cwd, home))
     plugins = check_plugins(rules, req.plugin_dirs, writable, process.caller_cwd)
     effects.record_plugin_dirs(plugins)
     check_hook_interpreter(process, writable)

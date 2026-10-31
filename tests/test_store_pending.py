@@ -45,9 +45,8 @@ def new_run(**fields: Any) -> NewRun:
         "invocation": {"actor": "auto:unknown"},
         "hook_interpreter": "/usr/bin/python3",
         "config_path": "/cfg/config.yaml",
-        "wrapper_pid": None,
-        "wrapper_start": None,
-        "pending_for": 60.0,
+        "wrapper_pid": 7,
+        "wrapper_start": "s:7",
     }
     return NewRun(**{**base, **fields})
 
@@ -68,28 +67,54 @@ def st(db: str, clock: Clock) -> Any:
         yield s
 
 
-def pending(st: Store) -> str:
-    return st.allocate(new_run(), new_id=ids.new_session_id)
+def pending(st: Store, pending_for: float = 60.0, **fields: Any) -> str:
+    """A run as start leaves it: allocated with start as its wrapper, then released."""
+    sid = st.allocate(new_run(**fields), new_id=ids.new_session_id)
+    released = st.release_pending(
+        sid, 1, wrapper_pid=7, wrapper_start="s:7", pending_for=pending_for
+    )
+    assert released is not None
+    return sid
 
 
-def test_start_allocates_a_pending_run_with_its_deadline(st: Store) -> None:
-    sid = pending(st)
+def test_start_allocates_its_run_with_itself_as_the_wrapper_and_no_deadline(st: Store) -> None:
+    sid = st.allocate(new_run(), new_id=ids.new_session_id)
     row = st.run_record(sid, 1)
-    assert row["wrapper_pid"] is None and row["wrapper_start"] is None
+    assert (row["wrapper_pid"], row["wrapper_start"], row["expires_at"]) == (7, "s:7", None)
     assert row["ended_at"] is None and row["phase"] == "launch"
-    assert row["expires_at"] == format_ts(T0 + timedelta(seconds=60))
     assert (row["config_hash"], row["config_path"]) == ("ab" * 32, "/cfg/config.yaml")
     assert row["session_state"] == "starting"
+    # Not adoptable before it is released.
+    assert st.adopt(sid, wrapper_pid=11, wrapper_start="b:1").outcome == "already_adopted"
+
+
+def test_release_makes_the_run_pending_with_its_deadline(st: Store, clock: Clock) -> None:
+    sid = st.allocate(new_run(), new_id=ids.new_session_id)
+    clock.now = T0 + timedelta(seconds=5)
+    expires = st.release_pending(sid, 1, wrapper_pid=7, wrapper_start="s:7", pending_for=60.0)
+    assert expires == format_ts(T0 + timedelta(seconds=65))
+    row = st.run_record(sid, 1)
+    assert (row["wrapper_pid"], row["wrapper_start"], row["expires_at"]) == (None, None, expires)
 
 
 @pytest.mark.parametrize(
-    "fields",
-    [
-        {"wrapper_pid": 1, "wrapper_start": "x"},  # both a wrapper and a deadline
-        {"pending_for": None},  # neither
-    ],
+    ("pid", "token", "final"),
+    [(8, "s:7", False), (7, "s:8", False), (7, "s:7", True)],
 )
-def test_a_run_has_either_a_wrapper_or_a_deadline(st: Store, fields: dict[str, Any]) -> None:
+def test_release_matches_only_starts_own_open_run(
+    st: Store, pid: int, token: str, final: bool
+) -> None:
+    sid = st.allocate(new_run(), new_id=ids.new_session_id)
+    if final:
+        with st.transaction() as conn:
+            conn.execute("UPDATE runs SET ended_at = 'x'")
+    assert st.release_pending(sid, 1, wrapper_pid=pid, wrapper_start=token, pending_for=60) is None
+    row = st.run_record(sid, 1)
+    assert (row["wrapper_pid"], row["expires_at"]) == (7, None)
+
+
+@pytest.mark.parametrize("fields", [{"wrapper_pid": None}, {"wrapper_start": None}])
+def test_a_run_is_allocated_with_its_wrapper(st: Store, fields: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         st.allocate(new_run(**fields), new_id=ids.new_session_id)
 
@@ -108,10 +133,10 @@ def test_adoption_sets_the_wrapper_once(st: Store) -> None:
 
 
 def test_adoption_overrides_the_outcome_file_only_when_given(st: Store) -> None:
-    sid = st.allocate(new_run(outcome_file="/a/out.json"), new_id=ids.new_session_id)
+    sid = pending(st, outcome_file="/a/out.json")
     st.adopt(sid, wrapper_pid=11, wrapper_start="b:1")
     assert st.run_record(sid, 1)["outcome_file"] == "/a/out.json"
-    other = st.allocate(new_run(outcome_file="/a/out.json"), new_id=ids.new_session_id)
+    other = pending(st, outcome_file="/a/out.json")
     st.adopt(other, wrapper_pid=11, wrapper_start="b:1", outcome_file="/b/out.json")
     assert st.run_record(other, 1)["outcome_file"] == "/b/out.json"
 
@@ -146,14 +171,22 @@ def test_just_before_the_deadline_adoption_wins(st: Store, clock: Clock) -> None
     assert st.adopt(sid, wrapper_pid=11, wrapper_start="b:1").outcome == "adopted"
 
 
-@pytest.mark.parametrize("expires", [None, "not a time"])
+@pytest.mark.parametrize("expires", [None, "not a time", b"2999-01-01T00:00:00.000Z", 5])
 def test_a_pending_run_without_a_readable_deadline_is_never_adoptable(
-    st: Store, expires: str | None
+    st: Store, expires: object
 ) -> None:
     sid = pending(st)
     with st.transaction() as conn:
         conn.execute("UPDATE runs SET expires_at = ?", (expires,))
     assert st.adopt(sid, wrapper_pid=11, wrapper_start="b:1").outcome == "expired"
+
+
+def test_expire_pending_finalizes_a_run_whose_deadline_is_a_blob(st: Store) -> None:
+    sid = pending(st)
+    with st.transaction() as conn:
+        conn.execute("UPDATE runs SET expires_at = ?", (b"2999-01-01T00:00:00.000Z",))
+    assert st.expire_pending(sid, 1)
+    assert st.run_record(sid, 1)["end_reason"] == "never_adopted"
 
 
 def test_a_final_run_is_refused_expired(st: Store) -> None:
@@ -260,7 +293,7 @@ def test_concurrent_adopters_have_exactly_one_winner(tmp_path: Path, db: str, st
 def test_adoption_racing_expiry_has_one_consistent_result(tmp_path: Path, db: str) -> None:
     # The deadline has passed for both: whichever goes first finalizes, and nobody adopts.
     with Store.open(db) as real:
-        sid = real.allocate(new_run(pending_for=0.0), new_id=ids.new_session_id)
+        sid = pending(real, pending_for=0.0)
     results = race(tmp_path, db, sid, ["adopt", "expire", "adopt", "expire"])
     assert all(r[0] != "adopted" for r in results)
     with Store.open(db) as real:

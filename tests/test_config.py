@@ -1526,6 +1526,20 @@ def test_a_given_config_path_is_stored_absolute_and_read_alone(
     assert source.load(env={}).lost_grace == 7
 
 
+def test_a_given_config_path_through_a_symlink_and_dotdot_is_stored_as_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # base/L -> A/sub: L/../c.yaml opens A/c.yaml, not base/c.yaml.
+    write(tmp_path / "A" / "c.yaml", "lost_grace: 7\n")
+    write(tmp_path / "base" / "c.yaml", "lost_grace: 9\n")
+    (tmp_path / "A" / "sub").mkdir()
+    (tmp_path / "base" / "L").symlink_to(tmp_path / "A" / "sub")
+    monkeypatch.chdir(tmp_path / "base")
+    source = config.Source.of("L/../c.yaml", env={})
+    assert source.path == str((tmp_path / "A" / "c.yaml").resolve())
+    assert source.load(env={}).lost_grace == 7
+
+
 def test_the_default_source_reloads_with_its_dropins(cfg_dir: Path) -> None:
     write(cfg_dir / "config.yaml", "lost_grace: 7\n")
     write(cfg_dir / "config.d" / "a.yaml", "lost_grace: 9\n")

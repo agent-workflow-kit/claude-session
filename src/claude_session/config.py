@@ -444,10 +444,14 @@ class Source:
 
     @classmethod
     def of(cls, given: str | None, env: Mapping[str, str] | None = None) -> Source:
-        """The source of ``--config`` (made absolute against the current directory) or, when
-        not given, of the default path."""
+        """The source of ``--config`` (made absolute against the current directory, its
+        directory resolved as the file system resolves it: a symlink followed by ``..``
+        leaves the symlink's target, not the symlink's parent) or, when not given, of the
+        default path."""
         if given is not None:
-            return cls(path=os.path.abspath(given), default=False)
+            path = os.path.join(os.getcwd(), given)
+            parent = os.path.realpath(os.path.dirname(path))
+            return cls(path=os.path.join(parent, os.path.basename(path)), default=False)
         return cls(path=str(default_path(env)), default=True)
 
     def load(self, env: Mapping[str, str] | None = None) -> Config:

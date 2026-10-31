@@ -9,24 +9,27 @@ directory, the config and the staged files between ``start`` and adoption.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import select
 import sqlite3
 import stat
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker
 
-from claude_session import lifecycle
+from claude_session import lifecycle, store
 
 from .fakeclaude import claude_bin, read_jsonl, write_json
-from .test_exec_headless import claude_session_cmd, private_home, validate_exec
+from .test_exec_headless import SECRET_VALUE, claude_session_cmd, private_home, validate_exec
 from .test_schemas import registry
 
 FAST = "poll_interval: 0.05s\n"
@@ -132,10 +135,55 @@ class Env:
         proc = self.cs(["exec", "--session-id", sid, "--json", *extra], env=env, cwd=cwd)
         assert proc.stdout, proc.stderr
         out = json.loads(proc.stdout)
-        if "error" not in out and "dry_run" not in out:
+        if "error" in out:
+            validate(out, "claude-session/cli/error.json")
+        elif "dry_run" not in out:
             validate_exec(out)
             assert out["exit_code"] == proc.returncode
         return proc, out
+
+    def adopt_on_pty(self, sid: str) -> tuple[int, dict[str, Any]]:
+        """``exec --session-id`` with stdin and stdout on a pseudo-terminal."""
+        master, slave = os.openpty()
+        try:
+            proc = subprocess.Popen(
+                [*claude_session_cmd(), "exec", "--session-id", sid, "--json"],
+                cwd=self.work,
+                env=self.environ(),
+                stdin=slave,
+                stdout=slave,
+                stderr=subprocess.DEVNULL,
+            )
+        finally:
+            os.close(slave)
+        chunks: list[bytes] = []
+        deadline = time.monotonic() + 60
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([master], [], [], 1.0)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError as exc:  # EIO: the child closed the terminal
+                    assert exc.errno == errno.EIO
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            code = proc.wait(timeout=30)
+        finally:
+            os.close(master)
+        out = json.loads(b"".join(chunks).decode())
+        if "error" in out:
+            validate(out, "claude-session/cli/error.json")
+        return code, out
+
+    def edit_spec(self, sid: str, change: Callable[[dict[str, Any]], None]) -> None:
+        spec = self.private_run(sid) / lifecycle.SPEC_NAME
+        data = json.loads(spec.read_text())
+        change(data)
+        spec.write_text(json.dumps(data))
 
     def run_row(self, sid: str, run: int = 1) -> dict[str, Any]:
         db = sqlite3.connect(f"file:{self.state / 'state.db'}?mode=ro", uri=True)
@@ -272,6 +320,18 @@ def test_start_then_adopt_runs_the_session_with_the_staged_prompt(env: Env) -> N
     row = env.run_row(sid)
     assert row["wrapper_pid"] is not None
     assert row["cwd"] == str(env.work.resolve())
+    # The launch spec may hold credentials: deleted once the adopting exec read it.
+    assert not (env.private_run(sid) / lifecycle.SPEC_NAME).exists()
+
+
+def test_adoption_writes_an_adopt_log_record(env: Env) -> None:
+    sid = env.started()["csession_id"]
+    assert env.adopt(sid)[0].returncode == 0
+    records = read_jsonl(env.state / "log.jsonl")
+    for record in records:
+        validate(record, "claude-session/log.json")
+    adopts = [r for r in records if r["event"] == "adopt"]
+    assert [(r["csession_id"], r["run"], r["level"]) for r in adopts] == [(sid, 1, "info")]
 
 
 def test_a_finished_run_cannot_be_adopted_again(env: Env) -> None:
@@ -329,6 +389,7 @@ def test_an_expired_pending_run_is_finalized_never_adopted_and_refused(env: Env)
     assert row["wrapper_pid"] is None
     assert env.rows("SELECT cause FROM events WHERE final = 1") == [("adopt",)]
     assert not env.log.exists()
+    assert not (env.private_run(sid) / lifecycle.SPEC_NAME).exists()
 
 
 def test_unknown_and_forgotten_sessions_exit_10(env: Env) -> None:
@@ -745,3 +806,243 @@ def test_a_relative_profile_file_is_resolved_against_starts_cwd(env: Env, tmp_pa
     sid = env.started(*args, cwd=prof)["csession_id"]
     proc, out = env.adopt(sid, cwd=env.work)
     assert proc.returncode == 0, (out["end_reason"], out["message"])
+
+
+# The run is pending only once start has frozen it (R1-1)
+
+
+def in_process_start(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> tuple[int, dict[str, Any]]:
+    """``start`` run by ``cli.main`` in this process (so a test can patch ``freeze``), with
+    the environment ``Env.cs`` gives a subprocess."""
+    from claude_session.cli import main
+
+    for key, value in private_home(env.tmp_path).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.chdir(env.work)
+    prompt = env.tmp_path / "prompt.md"
+    prompt.write_text("Do the task.\n", encoding="utf-8")
+    argv = ["start", "--json", "--config", str(env.config), "--mode", "headless"]
+    code = main([*argv, "--prompt-file", str(prompt)])
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_a_run_being_frozen_is_not_adoptable_and_expires_from_its_release(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env.write_config("lost_grace: 30s\n")
+    original = lifecycle.freeze
+    seen: dict[str, Any] = {}
+
+    def freeze(*args: Any) -> Any:
+        sid = args[4].csession_id
+        proc, out = env.adopt(sid)
+        seen["adopt"] = (proc.returncode, out["error"]["reason"])
+        assert env.run_row(sid)["wrapper_pid"] == os.getpid()
+        time.sleep(1.0)
+        seen["frozen_from"] = datetime.now(UTC)
+        return original(*args)
+
+    monkeypatch.setattr(lifecycle, "freeze", freeze)
+    code, out = in_process_start(env, monkeypatch, capsys)
+    assert code == 0, out
+    validate(out, "claude-session/cli/start.json")
+    assert seen["adopt"] == (20, "already_adopted")
+    expires = store.parse_ts(out["expires_at"])
+    assert expires >= seen["frozen_from"] - timedelta(milliseconds=1) + timedelta(seconds=30)
+    row = env.run_row(out["csession_id"])
+    assert (row["wrapper_pid"], row["wrapper_start"], row["ended_at"]) == (None, None, None)
+    assert row["expires_at"] == out["expires_at"]
+    proc, outcome = env.adopt(out["csession_id"])
+    assert proc.returncode == 0, outcome
+
+
+def test_a_run_ended_while_start_froze_it_fails_start_and_drops_the_spec(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    original = lifecycle.freeze
+    seen: dict[str, str] = {}
+
+    def freeze(*args: Any) -> Any:
+        seen["sid"] = sid = args[4].csession_id
+        env.write_db(
+            "UPDATE runs SET ended_at = 'x', outcome = 'canceled', end_reason = 'canceled' "
+            "WHERE csession_id = ?",
+            (sid,),
+        )
+        return original(*args)
+
+    monkeypatch.setattr(lifecycle, "freeze", freeze)
+    code, out = in_process_start(env, monkeypatch, capsys)
+    assert code == 12
+    validate(out, "claude-session/cli/error.json")
+    assert out["error"]["code"] == "failed"
+    assert not (env.private_run(seen["sid"]) / lifecycle.SPEC_NAME).exists()
+    row = env.run_row(seen["sid"])
+    assert (row["end_reason"], row["wrapper_pid"]) == ("canceled", os.getpid())
+
+
+# Frozen directories (R1-2)
+
+
+@pytest.mark.parametrize("key", ["read_dirs", "write_dirs", "allowWrite"])
+def test_a_frozen_directory_swapped_for_a_symlink_fails_the_adoption(
+    env: Env, tmp_path: Path, key: str
+) -> None:
+    target, other = tmp_path / "d", tmp_path / "other"
+    target.mkdir()
+    other.mkdir()
+    if key == "allowWrite":
+        env.write_config(
+            "permission_profiles:\n  mine:\n"
+            f"    sandbox: {{filesystem: {{allowWrite: ['{target}']}}}}\n"
+            "kinds:\n  implement:\n    permission_profile: mine\n"
+        )
+    else:
+        env.write_config(f"kinds:\n  implement:\n    {key}: ['{target}']\n")
+    sid = env.started()["csession_id"]
+    target.rmdir()
+    target.symlink_to(other)
+    proc, out = env.adopt(sid)
+    assert_not_started(proc, out, "invalid_permission_profile")
+    assert "resolves to another directory than at start" in out["message"]
+
+
+# The current config only tightens what start froze (R1-6)
+
+
+@pytest.mark.parametrize("key", ["secret_env", "claude_auth_env"])
+def test_a_credential_name_added_after_start_is_stripped_and_indexed(env: Env, key: str) -> None:
+    env.scenario(
+        [
+            START,
+            {
+                "do": "bash",
+                "command": 'printf "%s" "${VAULT_TOKEN-unset}" > "$CSESSION_DIR/artifacts/v.txt"',
+            },
+            STOP,
+            result_step(f"the token is {SECRET_VALUE}!"),
+        ]
+    )
+    sid = env.started()["csession_id"]
+    env.write_config(f"{key}: [VAULT_TOKEN]\n")
+    proc, out = env.adopt(sid, env={"VAULT_TOKEN": SECRET_VALUE})
+    assert (env.state / "sessions" / sid / "artifacts" / "v.txt").read_text() == "unset"
+    # Indexed: the implicit result holding the value is rejected (contains_secret).
+    assert (proc.returncode, out["end_reason"]) == (14, "result_rejected")
+
+
+# Interactive runs: refusals before not_implemented (R1-7)
+
+
+def test_an_expired_interactive_run_on_a_terminal_is_refused_and_finalized(env: Env) -> None:
+    env.write_config("lost_grace: 0.2s\n")
+    sid = env.started("--mode", "interactive")["csession_id"]
+    time.sleep(0.5)
+    code, out = env.adopt_on_pty(sid)
+    assert (code, out["error"]["reason"]) == (20, "expired")
+    row = env.run_row(sid)
+    assert (row["outcome"], row["end_reason"]) == ("not-started", "never_adopted")
+
+
+def test_an_ended_interactive_run_on_a_terminal_is_refused(env: Env) -> None:
+    sid = env.started("--mode", "interactive")["csession_id"]
+    env.write_db("UPDATE runs SET ended_at = 'x', outcome = 'canceled', end_reason = 'canceled'")
+    code, out = env.adopt_on_pty(sid)
+    assert (code, out["error"]["reason"]) == (20, "expired")
+
+
+# The launch spec is strict (R1-13, R1-14)
+
+
+def test_a_file_profile_snapshot_that_lost_its_label_fails_the_adoption(env: Env) -> None:
+    (env.work / "p.json").write_text('{"permissions": {"allow": ["Read"]}}')
+    sid = env.started("--mode", "headless", "--permission-profile", "./p.json")["csession_id"]
+
+    def change(data: dict[str, Any]) -> None:
+        assert data["profile"]["content"] is None  # a file profile is its snapshot only
+        data["profile"]["snapshot"] = '{"permissions":{"allow":["Bash"]}}'
+
+    env.edit_spec(sid, change)
+    proc, out = env.adopt(sid)
+    assert_not_started(proc, out, "session_dir_unsafe")
+
+
+def _set_request(key: str, value: Any) -> Callable[[dict[str, Any]], None]:
+    def change(data: dict[str, Any]) -> None:
+        data["request"][key] = value
+
+    return change
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda data: data.update(extra=1),
+        _set_request("extra", 1),
+        lambda data: data.update(cwd="work"),
+        _set_request("actor", "auto:a\x00b"),
+        _set_request("mode", "interactive"),
+        _set_request("skill", "skill\n"),
+        _set_request("labels", ["Bad Label"]),
+        _set_request("hooks", ["nope=cmd"]),
+        _set_request("flags", {}),
+        lambda data: data["resolution"]["origins"].update(model="elsewhere"),
+    ],
+    ids=[
+        "unknown-key",
+        "unknown-request-key",
+        "relative-cwd",
+        "bad-actor",
+        "mode-mismatch",
+        "skill-newline",
+        "bad-label",
+        "bad-hook",
+        "missing-flags",
+        "bad-origin",
+    ],
+)
+def test_a_tampered_launch_spec_fails_the_adoption(
+    env: Env, change: Callable[[dict[str, Any]], None]
+) -> None:
+    sid = env.started()["csession_id"]
+    env.edit_spec(sid, change)
+    proc, out = env.adopt(sid)
+    assert_not_started(proc, out, "session_dir_unsafe")
+
+
+# The adoption dry run without a usable launch spec (R1-3) and through a symlink (R1-4)
+
+
+def test_the_adoption_dry_run_of_a_run_without_a_spec_prints_the_failed_envelope(
+    env: Env,
+) -> None:
+    sid = env.started()["csession_id"]
+    (env.private_run(sid) / lifecycle.SPEC_NAME).unlink()
+    proc, out = env.adopt(sid, "--dry-run")
+    assert proc.returncode == 12
+    assert out["error"]["code"] == "failed"
+    assert env.run_row(sid)["ended_at"] is None
+
+
+def test_the_adoption_dry_run_works_under_a_symlinked_state_directory(env: Env) -> None:
+    sid = env.started()["csession_id"]
+    link = env.tmp_path / "state-link"
+    link.symlink_to(env.state.parent)
+    proc, plan = env.adopt(sid, "--dry-run", env={"XDG_STATE_HOME": str(link)})
+    assert proc.returncode == 0, plan
+    validate(plan, "claude-session/cli/exec-dry-run.json")
+    assert plan["would_fail"] is None
+
+
+def test_the_adoption_dry_run_refuses_a_symlinked_run_directory(env: Env) -> None:
+    sid = env.started()["csession_id"]
+    run_dir = env.private_run(sid)
+    moved = env.tmp_path / "moved-run"
+    run_dir.rename(moved)
+    run_dir.symlink_to(moved)
+    proc, out = env.adopt(sid, "--dry-run")
+    assert proc.returncode == 12
+    assert out["error"]["code"] == "failed"
+    assert "session directory" in out["error"]["message"]
