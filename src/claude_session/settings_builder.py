@@ -26,7 +26,7 @@ give Isolation.tmpdir and sandbox_active. Step 7 (``launch.prepare``) calls buil
 writes the settings with SessionDirs.write_settings before claude is spawned. A
 LaunchValidationError ends the run not-started with its end_reason.
 TODO(#28): adoption reruns the step-5 checks.
-TODO(#27): the dry-run serializer reports build()'s settings and argv.
+``--dry-run`` reports build()'s settings and argv (``launch.generate``, ``dryrun``).
 """
 
 from __future__ import annotations

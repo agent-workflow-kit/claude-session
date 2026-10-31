@@ -48,13 +48,15 @@ from . import (
     tmpdir,
 )
 from .config import Config
-from .errors import LaunchValidationError
+from .errors import LaunchValidationError, UsageError
 from .gateway import Gateway
 
 # A new session's paths are shown with this id (valid grammar; ids are random, so a real
 # session with it is as unlikely as any other collision).
 PLACEHOLDER_ID = "cs-aaaaaaaa"
 DEFAULT_HOOK_TIMEOUT = 30.0
+# A run secret: 32 random bytes as hex (interface.md, Identifiers).
+RUN_SECRET_CHARS = 2 * sessiondir.SECRET_BYTES
 SANDBOX_LISTS = {
     "allow_read": "allowRead",
     "allow_write": "allowWrite",
@@ -436,8 +438,11 @@ def run_checks(
         sessiondir.check_dirs(process.state_root, alloc.csession_id)
         found.checked = launch.checks(cfg, req, resolved, alloc, process, launch.Effects())
         found.warnings += found.checked.warnings
-        values = envbuild.secret_values(found.checked.session_env, process.environ)
-        launch.secret_index(values)  # the size check of step 7 (config_invalid)
+        # The size check of step 7, with a run secret of the real length (never printed).
+        values = envbuild.secret_values(
+            found.checked.session_env, process.environ, run_secret="0" * RUN_SECRET_CHARS
+        )
+        launch.secret_index(values)
         prompt_path = (
             None if req.prompt is None else os.path.join(alloc.session_dir, sessiondir.PROMPT)
         )
@@ -446,6 +451,10 @@ def run_checks(
         )
         found.warnings += found.generated.warnings
     except LaunchValidationError as error:
+        if error.end_reason == "config_invalid":
+            # A launch ends config_invalid only for config that step 2 validates first; a
+            # dry run reports it as the invalid config it is (exit 2).
+            raise UsageError("invalid config", detail=error.message) from error
         found.generated = None
         found.would_fail = error.end_reason
         found.message = launch.failure_message(error)

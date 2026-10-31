@@ -225,6 +225,8 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 | `outbox` | `report`'s write side and the ingestion side. |
 | `supervisor` | `exec`/`resume`: version check, spawn, signals, polling, bounds, auto-exit, end mapping, lifecycle hook worker, `--outcome-file`, headless `stderr.log`. |
 | `launch` | The launch pipeline of a run, one function per launch step: the request, kind resolution, allocation, the step-5 validations in order (path rules, git, profile, tools, environment, tmpdir and self-check, hook interpreter) and the step-7 files (secret index, `hookconf.json`, settings); reusable by `--dry-run` without its side effects. |
+| `dryrun` | `--dry-run` of a new session and `kinds`: `launch`'s step-2 functions, `launch.checks` with effects that record and create nothing, and `launch.generate`; the plan and `kinds` serializers (`exec-dry-run.json`, `kinds.json`). |
+| `claude_version` | `claude --version` (through `gateway`) and the `min_claude_version` comparison, for `kinds` and the launch's version check. |
 | `endmap` | The end mapping: pure functions over the pending cause, the report, the parsed `stream-json` result and the exit status (headless and wrapper-lost tables). |
 | `liveness` | The single-session liveness check shared by the inline callers (`status`, `list`, `wait`, `resume`, `start --resume`, `stop`, `forget`) and `reconcile`. |
 | `toolhooks` | Runs `pre-launch` and `post-state-change` hooks (`sh -c`, own process group, timeouts with SIGTERM to the group, `kill_grace`, SIGKILL to the group; selectors; outcome rules). |

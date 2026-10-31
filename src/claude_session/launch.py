@@ -1091,7 +1091,7 @@ def generate(
         claude=v.claude.path,
     )
     launch = settings_builder.Launch(
-        mode="headless",
+        mode="headless" if req.mode == "headless" else "interactive",
         cwd=v.cwd,
         skill=req.skill,
         prompt_path=prompt_path,

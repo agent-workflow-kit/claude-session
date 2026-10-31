@@ -37,9 +37,8 @@ records ``sandbox_active`` on the run, adds the warnings to the run's warnings, 
 ``tmpdir`` to ``settings_builder.Isolation`` and ``envbuild``, and maps a
 ``LaunchValidationError`` (with its ``hint`` as the outcome message) to a not-started run.
 TODO(#28): adoption calls both again.
-TODO(#27): ``--dry-run`` calls ``tmpdir.check`` at the temporary-directory slot of launch
-step 5, then ``self_check(..., create=False)`` after the ``claude_args`` check, for
-``would_fail``, ``sandbox_active`` and ``warnings``.
+``--dry-run`` (``dryrun``, through ``launch.checks``) makes the same two calls with
+``create=False``, for ``would_fail``, ``sandbox_active`` and ``warnings``.
 """
 
 from __future__ import annotations

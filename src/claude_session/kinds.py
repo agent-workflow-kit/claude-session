@@ -207,9 +207,8 @@ def resolve(
     if fallback:
         warnings.append(f"unknown kind {name!r}: using the {FALLBACK_KIND} profile")
     base = cfg.kinds[base_name]
-    # TODO(#27): the dry-run serializer must rename env.set -> env.set_names (names only),
-    # add the profile's name, and take the top-level `timeout` origin from the mode's key
-    # (`timeout` or `interactive_timeout`).
+    # The dry-run serializer (dryrun.origins_json) renames env.set -> env.set_names and takes
+    # the top-level `timeout` origin from the mode's key.
     origins = _config_origins(base_name, base)
 
     repo_id, repo_origin = _resolve_repo(base, repo, cwd, previous, origin_url)

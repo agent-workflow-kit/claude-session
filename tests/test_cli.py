@@ -345,7 +345,7 @@ def test_json_after_double_dash_is_a_positional(
 def test_unimplemented_command_is_internal_not_implemented(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    code, envelope, err = run_json(["kinds", "--json"], capsys)
+    code, envelope, err = run_json(["export", "--json"], capsys)
     assert code == 1
     assert_golden(envelope, "error-not-implemented")
     assert "not implemented" in err
