@@ -74,6 +74,11 @@ def expected(v: Values, event: str, mode: str, started: bool) -> tuple[str, str 
         return before
     if event in ("permission", "question", "elicitation"):
         return "needs-input", event, "working"
+    if event == "permission_notification":
+        # A waiting question or elicitation is kept; otherwise as PermissionRequest.
+        if v.prompt in ("question", "elicitation"):
+            return "needs-input", v.prompt, "working"
+        return "needs-input", "permission", "working"
     if event == "post_tool_use":
         if v.escalation_open:
             return "needs-input", "escalation", "working"
@@ -91,6 +96,7 @@ def test_the_table_covers_exactly_the_interface_events() -> None:
         "session_start_other",
         "user_prompt_submit",
         "permission",
+        "permission_notification",
         "question",
         "elicitation",
         "post_tool_use",
@@ -124,6 +130,15 @@ def test_permission_and_elicitation_take_precedence_over_escalation() -> None:
         after = hookevent.transition(v, event, mode="interactive", session_started=True)
         assert hookevent.derive(after) == ("needs-input", event, "working")
         assert after.escalation_open  # still open underneath the prompt
+
+
+@pytest.mark.parametrize("pending", ["question", "elicitation"])
+def test_a_permission_prompt_notification_keeps_a_waiting_question(pending: str) -> None:
+    v = Values(activity="working", prompt=pending, escalation_open=False, has_report=False)
+    after = hookevent.transition(
+        v, "permission_notification", mode="interactive", session_started=True
+    )
+    assert hookevent.derive(after) == ("needs-input", pending, "working")
 
 
 def test_a_denied_prompt_stays_until_user_prompt_submit() -> None:

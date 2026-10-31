@@ -102,6 +102,7 @@ class Rule:
 
     activity: Any = KEEP  # "working", "idle", KEEP or BY_MODE
     prompt: Any = KEEP  # None (cleared), a prompt kind, or KEEP
+    keep_other_prompt: bool = False  # a waiting prompt of another kind is kept
     escalation_open: Any = KEEP  # True, False or KEEP
     report: bool = False  # sets has_report
     after_session_start: bool = False  # applies only after the run's first SessionStart
@@ -115,8 +116,20 @@ TABLE: dict[str, Rule] = {
     "session_start_other": Rule(),
     "user_prompt_submit": Rule(activity="working", prompt=None, escalation_open=False),
     "permission": Rule(activity="working", prompt="permission", after_session_start=True),
+    # Notification permission_prompt: it follows a PermissionRequest (about 6 s later, also
+    # for AskUserQuestion), so a waiting question or elicitation is kept.
+    "permission_notification": Rule(
+        activity="working",
+        prompt="permission",
+        keep_other_prompt=True,
+        after_session_start=True,
+    ),
     "question": Rule(activity="working", prompt="question", after_session_start=True),
     "elicitation": Rule(activity="working", prompt="elicitation", after_session_start=True),
+    # TODO(#41): a subagent's PostToolUse carries the parent's session id (spike A1/A2), so a
+    # background subagent's tool clears a pending permission prompt of the main agent. Check
+    # live whether PermissionRequest carries agent_id / tool_use_id; if so, clear only on the
+    # matching PostToolUse (design.md, State machine: accepted until then).
     "post_tool_use": Rule(activity="working", prompt=None, after_session_start=True),
     "stop_background": Rule(activity="working", after_session_start=True),
     # Stop without background tasks, Notification idle_prompt.
@@ -156,10 +169,13 @@ def transition(v: Values, event: str, *, mode: str, session_started: bool) -> Va
         activity = "working" if mode == "headless" else "idle"
     elif rule.activity is not KEEP:
         activity = rule.activity
+    prompt = v.prompt if rule.prompt is KEEP else rule.prompt
+    if rule.keep_other_prompt and v.prompt is not None:
+        prompt = v.prompt
     return replace(
         v,
         activity=activity,
-        prompt=v.prompt if rule.prompt is KEEP else rule.prompt,
+        prompt=prompt,
         escalation_open=v.escalation_open if rule.escalation_open is KEEP else rule.escalation_open,
         has_report=v.has_report or rule.report,
     )
@@ -280,7 +296,7 @@ def classify(cause: str, data: bytes | None) -> Hook | None:
         return Hook(cause, "question" if question else "permission")
     if cause == "Notification":
         event = {
-            "permission_prompt": "permission",
+            "permission_prompt": "permission_notification",
             "elicitation_dialog": "elicitation",
             "idle_prompt": "stop_idle",
         }.get(_text(payload, "notification_type"))
@@ -372,12 +388,17 @@ def _open_own_dir(name: str, dir_fd: int | None) -> int:
 
 def read_hookconf(private_dir: str, run_no: int) -> list[str]:
     """Read ``<private_dir>/runs/<run_no>/hookconf.json`` without following a symlink at any
-    step (the private directory is resolved once, then walked component by component); each
-    directory of the private run path and the file must be the user's own, the file a regular
-    single-link file no one else can access, of at most ``HOOKCONF_MAX_BYTES``. Returns the
-    run's input names."""
-    resolved = os.path.realpath(private_dir)
-    parts = [p for p in resolved.split("/") if p] + ["runs", str(run_no)]
+    step under the trusted ``private`` directory (only that parent is resolved; it is then
+    walked component by component, and ``<id>``, ``runs`` and ``<n>`` are opened without
+    following a symlink); each directory of the private run path and the file must be the
+    user's own, the file a regular single-link file no one else can access, of at most
+    ``HOOKCONF_MAX_BYTES``. Returns the run's input names."""
+    normalized = os.path.normpath(private_dir)
+    session_part = os.path.basename(normalized)
+    if not os.path.isabs(normalized) or session_part in ("", ".", ".."):
+        raise HookEventError("private directory is not an absolute session path")
+    trusted = os.path.realpath(os.path.dirname(normalized))
+    parts = [p for p in trusted.split("/") if p] + [session_part, "runs", str(run_no)]
     fd = os.open("/", _DIR_FLAGS)
     try:
         for index, part in enumerate(parts):
@@ -421,8 +442,11 @@ def backstop_output() -> dict[str, Any]:
 
 
 def session_start_output(csession_dir: str, run_no: int, inputs: list[str]) -> dict[str, Any]:
-    listed = ", ".join(inputs) if inputs else "none"
-    context = f"claude-session directory: {csession_dir}; run {run_no}; inputs: {listed}"
+    """The context line (interface.md, Launch order): input paths are relative to the session
+    directory, and the inputs part is omitted when the run has none."""
+    context = f"claude-session directory: {csession_dir}; run {run_no}"
+    if inputs:
+        context += "; inputs: " + ", ".join(f"inputs/{run_no}/{name}" for name in inputs)
     # TODO(#38): append "\n<notes block>" when a notes command is configured.
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
 
@@ -432,12 +456,11 @@ def session_start_output(csession_dir: str, run_no: int, inputs: list[str]) -> d
 
 def _escalation_open(store: Store, run: HookRun) -> bool:
     """An unanswered escalation: the run's report is ``needs-input`` and no
-    ``UserPromptSubmit`` event followed it (design.md, State machine)."""
+    ``UserPromptSubmit`` event of the run follows its latest ``report`` event, by event id,
+    never by timestamp (design.md, State machine)."""
     if run.report_status != "needs-input":
         return False
-    if run.reported_at is None:
-        return True  # cannot tell when it was filed: keep it open (the visible choice)
-    return not store.prompt_submitted_since(run, run.reported_at)
+    return not store.prompt_submitted_after_report(run)
 
 
 @dataclass(frozen=True)
@@ -457,6 +480,8 @@ def apply_hook(store: Store, csession_id: str, hook: Hook) -> Applied:
         run = store.hook_run(csession_id)
         if run is None:
             raise HookEventError("unknown session")
+        if run.forgotten:
+            return Applied(None)  # ignored silently (design.md, Input and configuration)
         if not run.adopted_and_open or run.state not in LIVE_STATES:
             return Applied(None)
         if hook.claude_session_id is not None:
@@ -508,8 +533,8 @@ def main(
     environ: Mapping[str, str] | None = None,
 ) -> int:
     """Handle one injected hook event (``hook-event --state-dir <abs> <Event>``)."""
+    data = read_payload(stdin)  # first: stdin is read to its end even for a rejected argv
     state_dir, cause = parse_argv(argv)
-    data = read_payload(stdin)
     csession_id = session_id_from(os.environ if environ is None else environ)
     hook = classify(cause, data)
     if hook is None:

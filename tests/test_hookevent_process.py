@@ -112,6 +112,49 @@ def test_an_unknown_session_exits_0_silently(env: Env) -> None:
     assert [r["event"] for r in log_records(env)] == ["hook_event_failed"]
 
 
+def test_a_forgotten_session_exits_0_silently_and_is_not_logged(env: Env) -> None:
+    env.add(forgotten=True, state="working", activity="working", started=True)
+    proc = run_hook(env, "PostToolUse", {})
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, b"", b"")
+    assert log_records(env) == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--state-dir", "{root}", "Stop", "--yes"],
+        ["--state-dir", "{root}", "SubagentStop"],
+        ["--state-dir", "relative", "Stop"],
+    ],
+)
+def test_a_rejected_argv_still_reads_stdin_to_its_end(env: Env, args: list[str]) -> None:
+    """The writer (Claude Code) never sees a broken pipe, even for a multi-MiB payload."""
+    env.add(state="working", activity="working", started=True)
+    argv = [a.format(root=env.root) for a in args]
+    command = [settings_builder.current_interpreter(), "-I", "-m", "claude_session"]
+    proc = subprocess.Popen(  # noqa: S603
+        [*command, "hook-event", *argv],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, "CSESSION_ID": SID},
+        cwd="/",
+    )
+    assert proc.stdin is not None
+    chunk = b" " * 65536
+    try:
+        for _ in range(4 * 16):  # 4 MiB, far beyond any pipe buffer
+            proc.stdin.write(chunk)
+        proc.stdin.flush()
+    except BrokenPipeError:
+        proc.kill()
+        proc.wait()
+        pytest.fail("hook-event closed stdin before reading it to its end")
+    stdout, stderr = proc.communicate(timeout=60)
+    assert (proc.returncode, stdout, stderr) == (0, b"", b"")
+    assert env.state() == ("working", None, "working")
+
+
 def test_hook_latency(env: Env) -> None:
     """The design's budget is ~50-80 ms per hook (design.md, Decisions). The bound here is
     loose so a loaded CI machine does not flake; the median is printed for the record."""

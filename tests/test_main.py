@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -52,10 +53,11 @@ def test_hook_event_receives_its_arguments(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_hook_event_refuses_extra_arguments_and_still_exits_0(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Only the injected argv is accepted (hookevent.parse_argv); anything else is a contained
-    error: logged, no output, exit 0."""
+    error: logged, no output, exit 0. stdin is read first (to its end), so it is given one."""
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"{}")))
     assert entry.main(["hook-event", "--state-dir", str(tmp_path), "Stop", "--yes"]) == 0
     assert capsys.readouterr() == ("", "")
     (record,) = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]

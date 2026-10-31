@@ -98,6 +98,20 @@ class Env:
                 )
         self.write_hookconf(run_no, inputs or [])
 
+    def ingest_report(self, status: str, reported_at: str | None, run_no: int = 1) -> None:
+        """What report ingestion (#14) stores: the run's report and a ``report`` event."""
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE runs SET report_status = ?, reported_at = ? "
+                "WHERE csession_id = ? AND run_no = ?",
+                (status, reported_at, SID, run_no),
+            )
+            conn.execute(
+                "INSERT INTO events (csession_id, run_no, event_ts, cause, labels_json) "
+                "VALUES (?, ?, ?, 'report', '[]')",
+                (SID, run_no, reported_at or T0),
+            )
+
     def write_hookconf(self, run_no: int, inputs: list[str]) -> None:
         run_dir = Path(self.private_dir) / "runs" / str(run_no)
         run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -276,19 +290,21 @@ def test_session_start_emits_the_context_line(env: Env) -> None:
     output = start(env)
     assert output.endswith("\n") and output.count("\n") == 1
     assert context_of(output) == (
-        f"claude-session directory: {env.csession_dir}; run 1; inputs: spec.md, data.csv"
+        f"claude-session directory: {env.csession_dir}; run 1; "
+        "inputs: inputs/1/spec.md, inputs/1/data.csv"
     )
 
 
-def test_context_line_without_inputs_says_none(env: Env) -> None:
+def test_context_line_without_inputs_omits_the_inputs_part(env: Env) -> None:
     env.add()
-    assert context_of(start(env)).endswith("; run 1; inputs: none")
+    assert context_of(start(env)) == f"claude-session directory: {env.csession_dir}; run 1"
 
 
 @pytest.mark.parametrize("source", ["startup", "resume", "fork", "clear", "compact"])
 def test_every_session_start_source_emits_the_context_line(env: Env, source: str) -> None:
     env.add(run_no=3, state="working", activity="working", started=True)
-    assert "; run 3; inputs: none" in context_of(start(env, source))
+    env.write_hookconf(3, ["a.md"])
+    assert context_of(start(env, source)).endswith("; run 3; inputs: inputs/3/a.md")
 
 
 def test_session_start_with_a_missing_hookconf_is_an_error_after_the_state_is_stored(
@@ -317,6 +333,15 @@ def test_a_symlinked_run_directory_is_refused(env: Env, tmp_path: Path) -> None:
     real = tmp_path / "elsewhere"
     (Path(env.private_dir) / "runs" / "1").rename(real)
     (Path(env.private_dir) / "runs" / "1").symlink_to(real)
+    with pytest.raises(OSError):
+        start(env)
+
+
+def test_a_symlinked_private_session_directory_is_refused(env: Env, tmp_path: Path) -> None:
+    env.add()
+    real = tmp_path / "elsewhere"
+    Path(env.private_dir).rename(real)
+    Path(env.private_dir).symlink_to(real)
     with pytest.raises(OSError):
         start(env)
 
@@ -482,6 +507,33 @@ def test_a_reason_change_alone_appends_an_event(env: Env) -> None:
     assert len(env.events()) == 1
 
 
+@pytest.mark.parametrize("pending", ["question", "elicitation"])
+def test_a_permission_prompt_notification_keeps_a_waiting_question(env: Env, pending: str) -> None:
+    env.add(
+        mode="interactive", state="needs-input", activity="working", reason=pending, started=True
+    )
+    env.hook("Notification", common("Notification", notification_type="permission_prompt"))
+    assert env.state() == ("needs-input", pending, "working")
+    assert env.events() == []
+
+
+def test_a_question_then_its_permission_prompt_notification_stays_a_question(env: Env) -> None:
+    env.add(mode="interactive", state="working", activity="working", started=True)
+    env.hook("PermissionRequest", common("PermissionRequest", tool_name="AskUserQuestion"))
+    env.hook("Notification", common("Notification", notification_type="permission_prompt"))
+    assert env.state() == ("needs-input", "question", "working")
+
+
+def test_a_permission_prompt_notification_after_a_permission_request_changes_nothing(
+    env: Env,
+) -> None:
+    env.add(mode="interactive", state="working", activity="working", started=True)
+    env.hook("PermissionRequest", common("PermissionRequest", tool_name="Bash"))
+    env.hook("Notification", common("Notification", notification_type="permission_prompt"))
+    assert env.state() == ("needs-input", "permission", "working")
+    assert len(env.events()) == 1
+
+
 def test_an_untracked_notification_type_changes_nothing(env: Env) -> None:
     env.add(state="working", activity="working", started=True)
     env.hook("Notification", common("Notification", notification_type="auth_success"))
@@ -521,16 +573,43 @@ def test_escalation_reverts_on_post_tool_use_until_user_prompt_submit(env: Env) 
     assert env.state() == ("reported", None, "working")
 
 
-def test_user_prompt_submit_before_the_report_keeps_the_escalation_open(env: Env) -> None:
+def test_a_report_after_user_prompt_submit_reopens_the_escalation(env: Env) -> None:
+    """Event order decides, not timestamps: this report's ``reported_at`` is older than the
+    prompt's event (a clock step), yet its event comes later."""
     env.add(mode="interactive", state="idle", activity="idle", started=True)
     env.hook("UserPromptSubmit", common("UserPromptSubmit"))
-    with env.connect() as conn:  # a needs-input report ingested afterwards
-        conn.execute(
-            "UPDATE runs SET report_status = 'needs-input', reported_at = ?",
-            ("2999-01-01T00:00:00.000000Z",),
-        )
+    env.ingest_report("needs-input", T0)
     env.hook("PostToolUse", common("PostToolUse"))
     assert env.state() == ("needs-input", "escalation", "working")
+
+
+@pytest.mark.parametrize("reported_at", [None, "2999-01-01T00:00:00.000000Z"])
+def test_user_prompt_submit_closes_an_escalation_whatever_its_reported_at(
+    env: Env, reported_at: str | None
+) -> None:
+    env.add(
+        mode="interactive",
+        state="needs-input",
+        activity="idle",
+        reason="escalation",
+        started=True,
+        report_status="needs-input",
+        reported_at=reported_at,
+    )
+    env.hook("UserPromptSubmit", common("UserPromptSubmit"))
+    assert env.state() == ("reported", None, "working")
+    env.hook("PostToolUse", common("PostToolUse"))
+    assert env.state() == ("reported", None, "working")
+
+
+def test_user_prompt_submit_after_the_report_event_closes_the_escalation(env: Env) -> None:
+    env.add(mode="interactive", state="idle", activity="idle", started=True)
+    env.ingest_report("needs-input", "2999-01-01T00:00:00.000000Z")
+    env.hook("PostToolUse", common("PostToolUse"))
+    assert env.state() == ("needs-input", "escalation", "working")
+    env.hook("UserPromptSubmit", common("UserPromptSubmit"))
+    env.hook("PostToolUse", common("PostToolUse"))
+    assert env.state() == ("reported", None, "working")
 
 
 def test_user_prompt_submit_payload_is_never_parsed(env: Env) -> None:
@@ -612,10 +691,14 @@ def test_an_unknown_session_is_an_error(env: Env) -> None:
         env.hook("PostToolUse", {})
 
 
-def test_a_forgotten_session_is_an_error(env: Env) -> None:
+def test_a_forgotten_session_is_ignored_silently(env: Env) -> None:
     env.add(forgotten=True, state="working", activity="working", started=True)
-    with pytest.raises(HookEventError):
-        env.hook("PostToolUse", {})
+    before = (env.session(), env.run())
+    assert env.hook("PostToolUse", {}) == ""
+    assert start(env) == ""
+    assert stop(env, []) == ""
+    assert (env.session(), env.run()) == before
+    assert env.events() == [] and env.claude_ids() == []
 
 
 # Malformed input: an error, and nothing is written

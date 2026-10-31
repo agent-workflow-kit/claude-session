@@ -890,15 +890,17 @@ class Store:
     # model: hook-event never migrates).
 
     def hook_run(self, csession_id: str) -> HookRun | None:
-        """The session's current run as the hook path sees it, or None when the session is
-        unknown or forgotten, or its current run row is missing."""
+        """The session's current run as the hook path sees it (``forgotten`` set for a
+        forgotten session), or None when the session is unknown or its current run row is
+        missing."""
         row = self.conn.execute(
             "SELECT s.csession_id, r.run_no, s.state, s.activity, s.needs_input_reason, "
             "r.mode, r.session_started_at, r.report_status, r.reported_at, r.backstop_used, "
-            "r.ended_at IS NULL AND r.wrapper_pid IS NOT NULL, s.csession_dir, s.private_dir "
+            "r.ended_at IS NULL AND r.wrapper_pid IS NOT NULL, s.csession_dir, s.private_dir, "
+            "s.forgotten_at IS NOT NULL "
             "FROM sessions s JOIN runs r "
             "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
-            "WHERE s.csession_id = ? AND s.forgotten_at IS NULL",
+            "WHERE s.csession_id = ?",
             (csession_id,),
         ).fetchone()
         if row is None:
@@ -917,15 +919,20 @@ class Store:
             adopted_and_open=bool(row[10]),
             csession_dir=row[11],
             private_dir=row[12],
+            forgotten=bool(row[13]),
         )
 
-    def prompt_submitted_since(self, run: HookRun, since: str) -> bool:
-        """Whether the run has a ``UserPromptSubmit`` event after ``since`` (an ISO timestamp
-        from ``format_ts``), which closes an escalation (design.md, State machine)."""
+    def prompt_submitted_after_report(self, run: HookRun) -> bool:
+        """Whether the run has a ``UserPromptSubmit`` event with an id greater than its latest
+        ``report`` event (any ``UserPromptSubmit`` event when it has none), which closes an
+        escalation (design.md, State machine). Ordered by event id, not by timestamp, so a
+        clock step cannot keep an escalation open."""
         row = self.conn.execute(
             "SELECT 1 FROM events WHERE csession_id = ? AND run_no = ? "
-            "AND cause = 'UserPromptSubmit' AND event_ts > ? LIMIT 1",
-            (run.csession_id, run.run_no, since),
+            "AND cause = 'UserPromptSubmit' AND id > COALESCE(("
+            "SELECT MAX(id) FROM events WHERE csession_id = ? AND run_no = ? "
+            "AND cause = 'report'), 0) LIMIT 1",
+            (run.csession_id, run.run_no, run.csession_id, run.run_no),
         ).fetchone()
         return row is not None
 
@@ -975,7 +982,13 @@ class Store:
     ) -> int | None:
         """Store the run's new state. When ``state``, ``activity`` or ``needs_input_reason``
         changed, also bump ``updated_at`` (and ``state_since`` for a new state) and append an
-        ``events`` row carrying the session's labels; returns its id, else None."""
+        ``events`` row carrying the session's labels; returns its id, else None.
+
+        TODO(#14): report ingestion must write a ``report``-caused event row whenever the
+        run's report status or ``reported_at`` changes, even when state, activity and reason
+        are unchanged (interface.md, State transitions); the escalation check
+        (``prompt_submitted_after_report``) and post-state-change rely on it.
+        """
         before = (run.state, run.activity, run.needs_input_reason)
         if (state, activity, needs_input_reason) == before:
             return None
@@ -1041,6 +1054,7 @@ class HookRun:
     adopted_and_open: bool
     csession_dir: str | None
     private_dir: str | None
+    forgotten: bool
 
 
 def open_state(**kwargs: Any) -> Store:
