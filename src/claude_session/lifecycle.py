@@ -38,8 +38,13 @@ staged copies into place. The current config may only tighten what ``start`` fro
 ``secret_env`` names (and ``claude_auth_env`` names ``start`` did not freeze) are stripped
 and indexed too, but only the frozen ``claude_auth_env`` names are passed.
 
-TODO(#29): ``start --resume`` (a pending run n, a fork) and its dry run.
-TODO(#31): the ``pre-launch`` hooks of the adopting ``exec`` (launch step 6).
+``start --resume`` (a pending run n, or a fork's run 1) reuses ``start`` with the request
+and allocation of ``resume``; its launch spec also freezes the conversation (``--resume``,
+``--fork-session``, ``--session-id``), and its adopting ``exec`` drains the previous run's
+outbox (a fork's run 1 places its inputs beside the copied ones). ``start --resume
+--dry-run`` is ``resume.plan``.
+TODO(#31): insert step 6 (the ``pre-launch`` hooks) of the adopting ``exec`` before its fork
+taint re-check (``launch.recheck_fork_taint``).
 TODO(#17): interactive adoption (signal handlers before the compare-and-set, the TTY handed
 to ``claude``); until then an adoptable interactive pending run with a TTY is refused before
 the compare-and-set (it stays pending).
@@ -54,6 +59,7 @@ import json
 import os
 import sys
 import typing
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -125,6 +131,7 @@ RESOLUTION_KEYS = frozenset(
         "env_allow",
         "env_allowlist_only",
         "permission_profile_file",
+        "permission_profile_label",
     }
 )
 REQUEST_KEYS = frozenset(
@@ -140,8 +147,10 @@ REQUEST_KEYS = frozenset(
         "hook_timeouts",
         "has_prompt",
         "input_files",
+        "conversation",
     }
 )
+CONVERSATION_KEYS = frozenset({"resume", "resume_from", "fork", "session_id"})
 PROFILE_KEYS = frozenset({"name", "content", "snapshot"})
 ORIGINS = frozenset(typing.get_args(kinds.Origin))
 MODES = ("interactive", "headless")
@@ -187,6 +196,7 @@ def resolution_json(resolution: kinds.Resolution) -> dict[str, Any]:
             None if resolution.env_allowlist_only is None else list(resolution.env_allowlist_only)
         ),
         "permission_profile_file": resolution.permission_profile_file,
+        "permission_profile_label": resolution.permission_profile_label,
     }
 
 
@@ -207,6 +217,7 @@ def resolution_of(data: Mapping[str, Any]) -> kinds.Resolution:
         env_allow=tuple(_texts(data["env_allow"])),
         env_allowlist_only=None if allowlist_only is None else tuple(_texts(allowlist_only)),
         permission_profile_file=_optional_text(data["permission_profile_file"]),
+        permission_profile_label=_optional_text(data["permission_profile_label"]),
     )
 
 
@@ -238,6 +249,7 @@ def spec_json(
             "hook_timeouts": list(req.hook_timeouts),
             "has_prompt": req.prompt is not None,
             "input_files": [item.name for item in req.inputs],
+            "conversation": dataclasses.asdict(req.conversation),
         },
         "caller_cwd": resolved.caller_cwd,
         "cwd": v.cwd,
@@ -395,17 +407,30 @@ def start(
     failure (or an unsafe session directory while freezing) ends the run ``not-started`` and
     raises ``LaunchFailedError``; a run taken over while freezing raises ``RunTaken``; any
     other error ends it ``launch_interrupted`` and is re-raised. The launch spec of a run
-    that does not become pending is deleted."""
-    req = dryrun.request(args, cfg)  # start never checks the run's TTY (any mode)
-    resolved = launch.resolve_kind(req, cfg, process)
-    resolution = resolved.resolution
+    that does not become pending is deleted.
+
+    ``start --resume`` (``resume.prepare`` and ``resume.allocate``) builds the request from
+    the previous run (carry-over) and allocates run n of the session (the refusal checks in
+    that transaction) or, with ``--fork``, the fork's run 1; the rest is the same."""
+    from . import resume
+
     pending = launch.Pending(
         expires_after=cfg.lost_grace,
         config_hash=config.config_hash(cfg),
         config_path=source.path,
         config_default=source.default,
     )
-    alloc = launch.allocate(st, req, resolved, process, pending=pending)
+    forked_from = None
+    if args.resume is not None:
+        planned = resume.prepare(st, args, cfg, process, any_mode=True)
+        req, resolved = planned.req, planned.resolved
+        alloc = resume.allocate(st, planned, process, pending=pending)
+        forked_from = planned.source.csession_id if planned.fork else None
+    else:
+        req = dryrun.request(args, cfg)  # start never checks the run's TTY (any mode)
+        resolved = launch.resolve_kind(req, cfg, process)
+        alloc = launch.allocate(st, req, resolved, process, pending=pending)
+    resolution = resolved.resolution
     v: launch.Validated | None = None
     try:
         try:
@@ -424,14 +449,18 @@ def start(
             raise
     finally:
         if v is not None:
+            v.close_tmpdir_pin()
             v.dirs.close()
     assert v is not None
     return {
         "csession_id": alloc.csession_id,
         "csession_dir": alloc.session_dir,
-        "argv": [process.claude_session, "exec", "--session-id", alloc.csession_id],
+        "argv": [
+            process.claude_session,
+            *("exec", "--session-id", alloc.csession_id, "--run", str(alloc.run)),
+        ],
         "run": alloc.run,
-        "forked_from": None,
+        "forked_from": forked_from,
         "expires_at": expires_at,
         "required_env_names": list(dryrun.required_env_names(resolution, v.session_env)),
         "env_inherit": resolution.profile.env.inherit,
@@ -449,13 +478,13 @@ def freeze(
     process: launch.Process,
     pending: launch.Pending,
 ) -> tuple[list[str], str]:
-    """Stage the prompt and inputs, snapshot a file profile, write the launch spec, record
+    """Snapshot a file profile (``validate`` staged the prompt and inputs), write the
+    launch spec, record
     the profile label, remove the private tmpdir the self-check created (the adopting
     ``exec`` creates it again) and record the run's warnings; then, last, make the run
     pending (``Store.release_pending``: ``expires_at`` counts from now). Returns the run's
     warnings and ``expires_at``; raises ``RunTaken`` when the run is no longer ``start``'s."""
     run, sid = alloc.run, alloc.csession_id
-    v.dirs.stage(run, req.prompt, req.inputs)
     snapshot = None
     if v.profile.is_file:
         snapshot = v.dirs.write_private_run_file(
@@ -469,9 +498,9 @@ def freeze(
         sid, run, permission_profile=v.profile.label, permission_profile_snapshot=snapshot
     )
     warnings = list(v.warnings)
-    if v.tmpdir is not None:
+    if v.tmpdir is not None and v.tmpdir_pin is not None:
         try:
-            tmpdir.remove(sid)
+            tmpdir.remove(sid, pin=v.tmpdir_pin)
         except tmpdir.TmpdirLeftover as exc:
             warnings.append(f"{exc}; {exc.hint}")
         except OSError as exc:
@@ -669,6 +698,17 @@ def lookup(st: store.Store, given: str) -> tuple[str, dict[str, Any]]:
     return sid, record
 
 
+def check_run(sid: str, record: Mapping[str, Any], run: int | None) -> None:
+    """The run ``--run`` names must be the current run (``record``); another one exits 20
+    ``expired``: it ended and a later run took its place, or it never existed. Without
+    ``--run`` (an argv printed before it existed) the current run is adopted."""
+    if run is not None and record["run_no"] != run:
+        raise RefusedError(
+            f"cannot adopt run {run} of {sid}: expired (the current run is {record['run_no']})",
+            reason="expired",
+        )
+
+
 def refusal(record: Mapping[str, Any], now_past: bool) -> str | None:
     """The refusal an adoption of ``record`` (the current run) would get, without changing
     anything: ``expired`` (final, or pending past its deadline) or ``already_adopted``."""
@@ -823,11 +863,34 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
             hooks=tuple(_texts(data["hooks"])),
             hook_timeouts=tuple(_texts(data["hook_timeouts"])),
             outcome_file=record["outcome_file"],
+            conversation=_conversation(data["conversation"], record),
         )
     except (KeyError, TypeError, ValueError, AttributeError, UsageError) as exc:
         raise sessiondir.SessionDirUnsafe(
             f"the launch spec's request cannot be read ({type(exc).__name__})"
         ) from None
+
+
+def _conversation(value: Any, record: Mapping[str, Any]) -> launch.Conversation:
+    """The conversation ``start`` froze: a new session's (run 1, not forked: none), a
+    resume's (run n > 1: ``--resume`` or a fresh ``--session-id``) or a fork's (its run 1,
+    or a later run of a fork that never captured a Claude id, which repeats the fork); the
+    ids must be canonical UUIDs (``settings_builder`` checks the combination)."""
+    data = _mapping(value)
+    _keys(data, CONVERSATION_KEYS)
+    talk = launch.Conversation(
+        resume=_bool(data["resume"]),
+        resume_from=_optional_text(data["resume_from"]),
+        fork=_bool(data["fork"]),
+        session_id=_optional_text(data["session_id"]),
+    )
+    for claude_id in (talk.resume_from, talk.session_id):
+        if claude_id is not None and str(uuid.UUID(claude_id)) != claude_id:
+            raise ValueError("not a canonical UUID")
+    forked = record["session_forked_from"] is not None
+    if talk.resume != (record["run_no"] > 1 or forked) or talk.fork and not forked:
+        raise ValueError("the launch spec's conversation is not the run's")
+    return talk
 
 
 def _check_request(frozen: Frozen, data: Mapping[str, Any], record: Mapping[str, Any]) -> None:
@@ -858,6 +921,8 @@ def _check_request(frozen: Frozen, data: Mapping[str, Any], record: Mapping[str,
     args.hook_timeout = _texts(data["hook_timeouts"])
     args.input_file = _texts(data["input_files"])
     args.prompt_file = SPEC_NAME if data["has_prompt"] else None  # any non-stdin name
+    if _mapping(data["conversation"]).get("resume") is True:
+        args.resume = record["csession_id"]  # a resumed or forked run: no new-session rules
     for key, value in flags.items():
         setattr(args, key, value)
     cli.check_flag_rules(args)
@@ -890,6 +955,7 @@ def adopt(
     ``RefusedError`` (exit 20) or ``NotFoundError`` (exit 10) and change nothing (an expired
     pending run is finalized ``never_adopted`` first, and its launch spec deleted)."""
     sid, record = lookup(st, args.session_id)
+    check_run(sid, record, args.run)
     outcome_file = None if args.outcome_file is None else os.path.abspath(args.outcome_file)
     # TODO(#21): an isolated run's --outcome-file under a session-writable path exits 2 here,
     # before the compare-and-set, and the run stays pending.
@@ -914,6 +980,7 @@ def adopt(
         wrapper_start=store.start_time(os.getpid()),
         outcome_file=outcome_file,
         hook_interpreter=process.interpreter,
+        run_no=args.run,
     )
     if result.outcome == "not_found":
         raise NotFoundError(f"unknown session: {args.session_id}")
@@ -922,6 +989,16 @@ def adopt(
             discard_spec_at(process.state_root, sid, result.run_no)
             # TODO(#21): write the run's outcome file with the never_adopted outcome.
             # TODO(#20): the run's exactly one final post-state-change.
+        if result.outcome == "tainted":
+            # A fork's source became tainted after start allocated the fork (interface.md,
+            # Taint): the run was finalized never_adopted.
+            assert result.run_no is not None
+            source = record["session_forked_from"]
+            raise RefusedError(
+                f"cannot adopt {sid}: its fork source {source} is tainted and run"
+                f" {result.run_no} is not third-party-reading; the run ended not-started",
+                reason="tainted",
+            )
         reason = "already_adopted" if result.outcome == "already_adopted" else "expired"
         raise RefusedError(f"cannot adopt {sid}: {reason.replace('_', ' ')}", reason=reason)
     assert result.run_no is not None
@@ -932,6 +1009,13 @@ def adopt(
     launch.log_best_effort(
         launch.event_log(process), "adopt", level="info", csession_id=sid, run=run
     )
+    # Any run of a fork may merge into an inputs/<run>/ the fork copy made.
+    forked_from = record["session_forked_from"]
+    forked = forked_from is not None
+    # A run that forks the source's conversation (a fork's run 1, or a later run of a fork
+    # that never captured a Claude id: it repeats the fork) re-checks the source's taint
+    # right before step 7, as a plain resume --fork does.
+    forks_conversation = forked and record["session_claude_session_id"] is None
     alloc = launch.Allocated(
         csession_id=sid,
         run=run,
@@ -939,6 +1023,11 @@ def adopt(
         private_dir=sessiondir.private_dir(process.state_root, sid),
         warnings=(),
         cause="adopt",
+        # A resumed run drains its previous run's outbox at step 7; a fork's run 1 places
+        # its inputs beside the ones start copied from the source.
+        previous_run=run - 1 if run > 1 else None,
+        forked=forked,
+        taint_source=forked_from if forks_conversation else None,
     )
     try:
         adopted = st.current_run(sid)
@@ -1012,7 +1101,10 @@ def adoption_plan(
     no plan to print (interface.md, Dry run): a refused adoption exits 20 with the refusal
     envelope and any other one 12 (``failed``)."""
     sid, record = lookup(st, args.session_id)
+    check_run(sid, record, args.run)
     would_refuse = refusal(record, st.past_deadline(record["expires_at"]))
+    if would_refuse is None and st.fork_source_taints(sid):
+        would_refuse = "tainted"
     try:
         adoption = load_adoption(record, process, dry_run=True)
     except LaunchValidationError as error:

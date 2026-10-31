@@ -33,6 +33,13 @@ VIOLATIONS: list[tuple[list[str], str]] = [
         "--[no-]auto-exit cannot be used with --session-id",
     ),
     (["exec", "--session-id", SID, "--label", "a=b"], "--label cannot be used with"),
+    (["exec", "--run", "2"], "--run requires --session-id"),
+    (["exec", "--mode", "headless", "--skill", "s", "--run", "1"], "--run requires --session-id"),
+    (["exec", "--session-id", SID, "--run", "0"], "--run must be a positive integer"),
+    (["exec", "--session-id", SID, "--run", "-1"], "--run must be a positive integer"),
+    (["exec", "--session-id", SID, "--run", "x"], "--run"),
+    (["exec", "--session-id", SID, "--run", "1.5"], "--run"),
+    (["exec", "--session-id", SID, "--run", "9007199254740992"], "--run must be a positive"),
     # exec new session
     (["exec", "--mode", "headless"], "a headless new session needs --skill or --prompt-file"),
     # --reset with the flag it resets
@@ -234,6 +241,8 @@ ALLOWED: list[list[str]] = [
     ["exec", "--session-id", SID, "--json", "--dry-run", "--outcome-file", "o"],
     ["exec", "--session-id", SID, "--verbose", "--yes"],
     ["exec", "--session-id", SID, "--quiet"],
+    ["exec", "--session-id", SID, "--run", "2", "--json", "--dry-run"],
+    ["exec", "--session-id", SID, "--run", "9007199254740991"],
     ["exec", "--mode", "headless", "--skill", "s"],
     ["exec", "--mode", "headless", "--prompt-file", "p.md"],
     ["exec", "--timeout", "none"],

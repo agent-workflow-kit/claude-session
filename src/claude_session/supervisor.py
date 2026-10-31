@@ -298,10 +298,12 @@ def _final(mapped: Mapped, parsed: HeadlessResult) -> store.Final:
 
 
 def _remove_tmpdir(alloc: launch.Allocated, v: launch.Validated, warnings: list[str]) -> None:
-    if v.tmpdir is None:
+    # Identity-checked: the run is final by now, and the next run of the session may have
+    # created its own tmpdir at the same path; that one is left alone.
+    if v.tmpdir is None or v.tmpdir_pin is None:
         return
     try:
-        tmpdir.remove(alloc.csession_id)
+        tmpdir.remove(alloc.csession_id, pin=v.tmpdir_pin)
     except tmpdir.TmpdirLeftover as exc:
         warnings.append(f"{exc}; {exc.hint}")
     except OSError as exc:

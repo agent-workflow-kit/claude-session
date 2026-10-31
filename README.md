@@ -38,7 +38,7 @@ Full reference: [docs/interface.md](docs/interface.md).
   claude-session forget <id> | forget --older-than <d>   hide one session, or in bulk (never a live or pending one)
   claude-session reconcile | cron install|uninstall
   claude-session export [--since <t>] [--action <a>]   print audit records
-  claude-session hook-event --state-dir <dir> <event>   (internal)
+  claude-session hook-event --state-dir <dir> --run <n> <event>   (internal)
   claude-session verify-secret <id>           (internal)
 ```
 

@@ -231,7 +231,7 @@ def env(tmp_path: Path, state: Path, work: Path) -> Env:
 def test_start_creates_a_pending_run_and_prints_the_start_object(env: Env) -> None:
     out = env.started()
     sid = out["csession_id"]
-    assert out["argv"][1:] == ["exec", "--session-id", sid]
+    assert out["argv"][1:] == ["exec", "--session-id", sid, "--run", "1"]
     assert os.path.isabs(out["argv"][0])
     assert (out["run"], out["forked_from"]) == (1, None)
     assert out["csession_dir"] == str(env.state / "sessions" / sid)
@@ -299,10 +299,11 @@ def test_a_usage_error_at_start_allocates_nothing(env: Env) -> None:
     assert env.rows("SELECT COUNT(*) FROM sessions") == [(0,)]
 
 
-def test_start_resume_is_not_implemented_here(env: Env) -> None:
+def test_start_resume_of_an_unknown_session_exits_10(env: Env) -> None:
     proc = env.cs(["start", "--json", "--resume", "cs-abcdefgh", "--config", str(env.config)])
-    assert proc.returncode == 1
-    assert json.loads(proc.stdout)["error"]["detail"] == "not_implemented"
+    assert proc.returncode == 10
+    assert json.loads(proc.stdout)["error"]["code"] == "not_found"
+    assert env.rows("SELECT COUNT(*) FROM runs") == [(0,)]
 
 
 # Adoption
@@ -340,6 +341,43 @@ def test_a_finished_run_cannot_be_adopted_again(env: Env) -> None:
     proc, out = env.adopt(sid)
     assert proc.returncode == 20
     assert (out["error"]["code"], out["error"]["reason"]) == ("refused", "expired")
+
+
+def test_the_printed_argv_adopts_its_run(env: Env) -> None:
+    out = env.started()
+    proc = env.cs([*out["argv"][1:], "--json"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (json.loads(proc.stdout)["run"], json.loads(proc.stdout)["outcome"]) == (1, "done")
+
+
+def test_an_argv_without_run_still_adopts_the_current_run(env: Env) -> None:
+    sid = env.started()["csession_id"]
+    proc, out = env.adopt(sid)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert out["run"] == 1
+
+
+def test_an_adoption_of_another_run_is_refused_expired_and_changes_nothing(env: Env) -> None:
+    sid = env.started()["csession_id"]
+    proc, out = env.adopt(sid, "--run", "2", "--outcome-file", str(env.tmp_path / "o.json"))
+    assert proc.returncode == 20
+    assert (out["error"]["code"], out["error"]["reason"]) == ("refused", "expired")
+    row = env.run_row(sid)
+    assert row["wrapper_pid"] is None and row["ended_at"] is None
+    assert row["outcome_file"] is None
+    assert not env.log.exists()
+    assert env.adopt(sid, "--run", "1")[0].returncode == 0
+
+
+def test_the_adoption_dry_run_of_another_run_is_refused_expired(env: Env) -> None:
+    sid = env.started()["csession_id"]
+    proc, out = env.adopt(sid, "--run", "2", "--dry-run")
+    assert proc.returncode == 20
+    assert (out["error"]["code"], out["error"]["reason"]) == ("refused", "expired")
+    proc, plan = env.adopt(sid, "--run", "1", "--dry-run")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (plan["run"], plan["would_refuse"]) == (1, None)
+    assert env.run_row(sid)["wrapper_pid"] is None
 
 
 def test_concurrent_adopters_have_exactly_one_winner(env: Env) -> None:

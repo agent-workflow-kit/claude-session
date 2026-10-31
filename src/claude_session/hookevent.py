@@ -214,16 +214,29 @@ def values_from(
 # Arguments, environment and payload
 
 
-def parse_argv(argv: list[str]) -> tuple[str, str]:
-    """Exactly ``--state-dir <absolute dir> <Event>``, as the injected hooks pass it."""
+_RUN_ARG = re.compile(r"[1-9][0-9]{0,8}")
+
+
+def parse_argv(argv: list[str]) -> tuple[str, str, int | None]:
+    """Exactly ``--state-dir <absolute dir> --run <n> <Event>``, as the injected hooks pass
+    it (the run whose generated settings hold the hook), or the older ``--state-dir
+    <absolute dir> <Event>`` without the run (hooks of a session launched by an earlier
+    version, kept working across an upgrade). Returns the state dir, the event and the run
+    (None for the older form)."""
+    run: int | None = None
+    if len(argv) == 5 and argv[0] == "--state-dir" and argv[2] == "--run":
+        if _RUN_ARG.fullmatch(argv[3]) is None:
+            raise HookEventError("--run must be a run number")
+        run = int(argv[3])
+        argv = [argv[0], argv[1], argv[4]]
     if len(argv) != 3 or argv[0] != "--state-dir":
-        raise HookEventError("usage: hook-event --state-dir <abs> <event>")
+        raise HookEventError("usage: hook-event --state-dir <abs> --run <n> <event>")
     state_dir, event = argv[1], argv[2]
     if not os.path.isabs(state_dir) or "\0" in state_dir:
         raise HookEventError("--state-dir must be an absolute path")
     if event not in EVENTS:
         raise HookEventError("unknown hook event")
-    return state_dir, event
+    return state_dir, event, run
 
 
 def session_id_from(environ: Mapping[str, str]) -> str:
@@ -546,13 +559,16 @@ def _drainable(run: HookRun | None) -> bool:
     )
 
 
-def prepare_drain(store: Store, csession_id: str, log: _Log) -> outbox.Drain | None:
+def prepare_drain(
+    store: Store, csession_id: str, log: _Log, *, run_no: int | None = None
+) -> outbox.Drain | None:
     """Claim and pre-check the current run's outbox requests, before the hook's transaction
-    (design.md, Hook-event fast path). None when there is nothing to drain. An ``outbox/``
-    that cannot be trusted is logged (``outside_dir``) and never drained; the hook's own
-    event still applies."""
+    (design.md, Hook-event fast path). None when there is nothing to drain, or when
+    ``run_no`` (the hook's run) is not the current run. An ``outbox/`` that cannot be
+    trusted is logged (``outside_dir``) and never drained; the hook's own event still
+    applies."""
     run = store.hook_run(csession_id)
-    if not _drainable(run):
+    if not _drainable(run) or (run is not None and run_no is not None and run.run_no != run_no):
         return None
     assert run is not None and run.private_dir is not None and run.csession_dir is not None
     assert run.secret_sha256 is not None
@@ -664,6 +680,7 @@ def apply_hook(
     drain: outbox.Drain | None = None,
     *,
     unchecked_requests: bool = False,
+    run_no: int | None = None,
 ) -> Applied:
     """In one transaction: load the session's current run, record SessionStart and SessionEnd
     facts, apply the table and append the event, then record the drained outbox requests
@@ -672,7 +689,8 @@ def apply_hook(
     drain failed with claimed requests it could not check (``outbox.DrainSetupError``), so a
     report may be pending and the backstop is not taken. A run that is not adopted, already
     ended or not in a live state is left alone (its claimed requests stay for the next
-    drain)."""
+    drain), and so is a hook of another run than the current one (``run_no``: a leftover
+    hook of an earlier run, whose settings named that run)."""
     with store.transaction():
         run = store.hook_run(csession_id)
         if run is None:
@@ -681,6 +699,8 @@ def apply_hook(
             return Applied(None)  # ignored silently (design.md, Input and configuration)
         if not run.adopted_and_open or run.state not in LIVE_STATES:
             return Applied(None)
+        if run_no is not None and run.run_no != run_no:
+            return Applied(None)  # a stale hook of an earlier run: ignored silently
         if drain is not None and drain.run_no != run.run_no:
             # A new run began after the drain was prepared: leave its requests. They stay in
             # the old run's claimed/, which that run's final drain (``final_drain``: every
@@ -853,9 +873,9 @@ def main(
     stdin: BinaryIO | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> int:
-    """Handle one injected hook event (``hook-event --state-dir <abs> <Event>``)."""
+    """Handle one injected hook event (``hook-event --state-dir <abs> --run <n> <Event>``)."""
     data = read_payload(stdin)  # first: stdin is read to its end even for a rejected argv
-    state_dir, cause = parse_argv(argv)
+    state_dir, cause, hook_run_no = parse_argv(argv)
     csession_id = session_id_from(os.environ if environ is None else environ)
     hook = classify(cause, data)
     if hook is None:
@@ -866,7 +886,7 @@ def main(
         unchecked = False
         if cause in DRAIN_CAUSES:
             try:
-                drain = prepare_drain(store, csession_id, log)
+                drain = prepare_drain(store, csession_id, log, run_no=hook_run_no)
             except outbox.DrainSetupError as exc:
                 # Claimed requests wait, unchecked, for a usable hookconf.json or
                 # secret-index: logged with the reason and the exception type only.
@@ -879,7 +899,14 @@ def main(
                 # its claimed requests stay for the next drain.
                 log.failure(csession_id, f"{cause}: outbox drain: {type(exc).__name__}")
         try:
-            applied = apply_hook(store, csession_id, hook, drain, unchecked_requests=unchecked)
+            applied = apply_hook(
+                store,
+                csession_id,
+                hook,
+                drain,
+                unchecked_requests=unchecked,
+                run_no=hook_run_no,
+            )
         except BaseException:
             if drain is not None:
                 drain.finish(committed=False)  # claimed requests stay for the next drain

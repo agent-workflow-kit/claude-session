@@ -675,7 +675,11 @@ def test_snapshot_is_carried_on_resume_and_the_file_is_never_re_read(
     original.write_text('{"permissions": {"allow": ["Bash"]}}')
     original.unlink()
 
-    previous = kinds.Previous(repo=None, flags={"permission_profile": str(snap1)})
+    previous = kinds.Previous(
+        repo=None,
+        flags={"permission_profile": str(snap1)},
+        permission_profile_label="file:recorded",
+    )
     resolution = resolve(cfg, "review", previous=previous)
     assert resolution.origins["permission_profile_file"] == "previous_run"
     run2 = pp.select(cfg, resolution, session_writable=NEVER, expected_label=run1.label)
@@ -692,7 +696,11 @@ def test_carried_snapshot_is_validated_again(tmp_path: Path, cfg_dir: Path) -> N
     cfg = load(cfg_dir)
     snapshot = tmp_path / pp.SNAPSHOT_NAME
     snapshot.write_text('{"sandbox": {"enabled": false}}')
-    previous = kinds.Previous(repo=None, flags={"permission_profile": str(snapshot)})
+    previous = kinds.Previous(
+        repo=None,
+        flags={"permission_profile": str(snapshot)},
+        permission_profile_label="file:recorded",
+    )
     refused(select, cfg, "review", previous=previous)
 
 
@@ -701,7 +709,11 @@ def test_carried_snapshot_is_checked_for_session_writable_paths(
 ) -> None:
     snapshot = tmp_path / pp.SNAPSHOT_NAME
     snapshot.write_text("{}")
-    previous = kinds.Previous(repo=None, flags={"permission_profile": str(snapshot)})
+    previous = kinds.Previous(
+        repo=None,
+        flags={"permission_profile": str(snapshot)},
+        permission_profile_label="file:recorded",
+    )
     refused(select, load(cfg_dir), "review", previous=previous, session_writable=lambda p: True)
 
 
@@ -804,7 +816,11 @@ def test_snapshot_matching_its_recorded_label_is_accepted(tmp_path: Path, cfg_di
     )
     snapshot = tmp_path / pp.SNAPSHOT_NAME
     pp.write_snapshot(profile, str(snapshot))
-    previous = kinds.Previous(repo=None, flags={"permission_profile": str(snapshot)})
+    previous = kinds.Previous(
+        repo=None,
+        flags={"permission_profile": str(snapshot)},
+        permission_profile_label="file:recorded",
+    )
     carried = select(load(cfg_dir), "review", previous=previous, expected_label=profile.label)
     assert carried.label == profile.label
 
@@ -818,7 +834,11 @@ def test_edited_snapshot_is_refused(tmp_path: Path, cfg_dir: Path) -> None:
     snapshot = tmp_path / pp.SNAPSHOT_NAME
     pp.write_snapshot(profile, str(snapshot))
     snapshot.write_text('{"permissions":{"allow":["Bash","Read"]}}')
-    previous = kinds.Previous(repo=None, flags={"permission_profile": str(snapshot)})
+    previous = kinds.Previous(
+        repo=None,
+        flags={"permission_profile": str(snapshot)},
+        permission_profile_label="file:recorded",
+    )
     error = refused(
         select, load(cfg_dir), "review", previous=previous, expected_label=profile.label
     )
