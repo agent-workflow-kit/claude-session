@@ -53,6 +53,7 @@ MIGRATE_WAIT = 2 * LEASE_TTL.total_seconds()
 MIGRATE_POLL = 0.05  # seconds
 # ``PRAGMA application_id`` of a claude-session database ("CSes"; design.md, Data model).
 APPLICATION_ID = 0x43536573
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # Held while state.db is checked and, when missing, created: closing the create descriptor
 # drops this process's POSIX locks, so no other thread may connect before that close. Any
 # thread that takes it after the creator finds the file and closed descriptor; it is never
@@ -816,6 +817,35 @@ class Store:
 
     # Sessions
 
+    def session_id_used(self, csession_id: str) -> bool:
+        """Whether ``csession_id`` belongs to a session (live or forgotten) or to a deleted one
+        (``deleted_ids``), so allocation never reuses it. Call it inside the transaction that
+        inserts the new session, so the check and the insert are one."""
+        row = self.conn.execute(
+            "SELECT 1 FROM sessions WHERE csession_id = ? "
+            "UNION ALL SELECT 1 FROM deleted_ids WHERE csession_id = ? LIMIT 1",
+            (csession_id, csession_id),
+        ).fetchone()
+        return row is not None
+
+    def session_id_candidates(self, prefix: str) -> list[tuple[str, bool]]:
+        """``(csession_id, forgotten)`` of every session whose id starts with ``prefix``.
+
+        A range comparison on the primary key (``prefix <= id < upper``, where ``upper`` is
+        ``prefix`` with its last character incremented), never ``LIKE``: wildcards in the
+        input match only themselves. Callers normalize and validate the prefix first
+        (``ids.lookup_session_id``).
+        """
+        if not prefix:
+            raise ValueError("empty session id prefix")
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        rows = self.conn.execute(
+            "SELECT csession_id, forgotten_at IS NOT NULL FROM sessions "
+            "WHERE csession_id >= ? AND csession_id < ? ORDER BY csession_id",
+            (prefix, upper),
+        ).fetchall()
+        return [(sid, bool(forgotten)) for sid, forgotten in rows]
+
     def list_sessions(self) -> list[dict[str, Any]]:
         """Sessions that are not forgotten, most recently updated first (raw ``sessions``
         rows)."""
@@ -826,6 +856,31 @@ class Store:
         )
         names = [column[0] for column in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+    # Runs
+
+    def record_run_files(
+        self,
+        csession_id: str,
+        run_no: int,
+        *,
+        secret_sha256: str,
+        outbox_dev_ino: str,
+        artifacts_dev_ino: str,
+    ) -> None:
+        """Record the run's secret digest (never the secret) and the ``<st_dev>:<st_ino>`` of
+        the ``outbox/`` and ``artifacts/`` directories ``exec`` prepared (design.md, Session
+        directories). ``InternalError`` when the run row does not exist."""
+        if _SHA256_HEX.fullmatch(secret_sha256) is None:
+            raise ValueError("secret_sha256 must be 64 lowercase hex characters")
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET secret_sha256 = ?, outbox_dev_ino = ?, artifacts_dev_ino = ? "
+                "WHERE csession_id = ? AND run_no = ?",
+                (secret_sha256, outbox_dev_ino, artifacts_dev_ino, csession_id, run_no),
+            )
+            if cursor.rowcount != 1:
+                raise InternalError(f"no run {run_no} of session {csession_id}")
 
 
 def open_state(**kwargs: Any) -> Store:

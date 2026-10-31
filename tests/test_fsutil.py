@@ -117,3 +117,117 @@ def test_cleanup_error_does_not_mask_the_original_error(
 def test_requires_an_absolute_path() -> None:
     with pytest.raises(ValueError):
         write_private_file("relative.json", b"x")
+
+
+# Descriptor-relative helpers (design.md, Session directories: writes relative to directory
+# descriptors, subdirectories verified before use)
+
+
+@pytest.fixture
+def dir_fd(tmp_path: Path):  # type: ignore[no-untyped-def]
+    fd = fsutil.open_dir_nofollow(str(tmp_path))
+    yield fd
+    os.close(fd)
+
+
+def test_write_at_writes_relative_to_the_descriptor(tmp_path: Path, dir_fd: int) -> None:
+    old_umask = os.umask(0o777)
+    try:
+        fsutil.write_private_file_at(dir_fd, "f", b"data")
+    finally:
+        os.umask(old_umask)
+    assert (tmp_path / "f").read_bytes() == b"data"
+    assert stat.S_IMODE((tmp_path / "f").stat().st_mode) == 0o600
+
+
+def test_write_at_follows_the_pinned_directory_after_a_rename(tmp_path: Path, dir_fd: int) -> None:
+    moved = tmp_path.parent / (tmp_path.name + "-moved")
+    tmp_path.rename(moved)
+    try:
+        tmp_path.mkdir()  # a new directory at the old path is never written
+        fsutil.write_private_file_at(dir_fd, "f", b"x")
+        assert (moved / "f").read_bytes() == b"x"
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        tmp_path.rmdir()
+        moved.rename(tmp_path)
+
+
+def test_write_at_replaces_a_planted_symlink(tmp_path: Path, dir_fd: int) -> None:
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"untouched")
+    (tmp_path / "f").symlink_to(victim)
+    fsutil.write_private_file_at(dir_fd, "f", b"new")
+    assert not (tmp_path / "f").is_symlink()
+    assert victim.read_bytes() == b"untouched"
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "/abs", "a\0b"])
+def test_write_at_refuses_names_that_are_not_one_segment(dir_fd: int, name: str) -> None:
+    with pytest.raises(ValueError):
+        fsutil.write_private_file_at(dir_fd, name, b"x")
+
+
+def test_ensure_dir_creates_0700_whatever_the_umask(tmp_path: Path, dir_fd: int) -> None:
+    old_umask = os.umask(0o777)
+    try:
+        fd = fsutil.ensure_private_dir_at(dir_fd, "sub")
+    finally:
+        os.umask(old_umask)
+    os.close(fd)
+    assert stat.S_IMODE((tmp_path / "sub").stat().st_mode) == 0o700
+
+
+def test_ensure_dir_tightens_an_existing_loose_directory(tmp_path: Path, dir_fd: int) -> None:
+    (tmp_path / "sub").mkdir(mode=0o755)
+    (tmp_path / "sub").chmod(0o777)
+    os.close(fsutil.ensure_private_dir_at(dir_fd, "sub"))
+    assert stat.S_IMODE((tmp_path / "sub").stat().st_mode) == 0o700
+
+
+def test_ensure_dir_refuses_a_symlink_to_a_directory(tmp_path: Path, dir_fd: int) -> None:
+    (tmp_path / "real").mkdir()
+    (tmp_path / "sub").symlink_to(tmp_path / "real")
+    with pytest.raises(OSError):
+        fsutil.ensure_private_dir_at(dir_fd, "sub")
+
+
+def test_ensure_dir_refuses_a_dangling_symlink_without_creating_its_target(
+    tmp_path: Path, dir_fd: int
+) -> None:
+    (tmp_path / "sub").symlink_to(tmp_path / "target")
+    with pytest.raises(OSError):
+        fsutil.ensure_private_dir_at(dir_fd, "sub")
+    assert not (tmp_path / "target").exists()
+
+
+def test_ensure_dir_refuses_a_regular_file(tmp_path: Path, dir_fd: int) -> None:
+    (tmp_path / "sub").write_bytes(b"x")
+    with pytest.raises(OSError):
+        fsutil.ensure_private_dir_at(dir_fd, "sub")
+
+
+def test_ensure_dir_refuses_a_fifo_without_blocking(tmp_path: Path, dir_fd: int) -> None:
+    os.mkfifo(tmp_path / "sub")
+    with pytest.raises(OSError):
+        fsutil.ensure_private_dir_at(dir_fd, "sub")
+
+
+def test_check_private_dir_refuses_another_owner(
+    dir_fd: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fsutil.os, "geteuid", lambda: os.getuid() + 1)
+    with pytest.raises(fsutil.UnsafePathError, match="owned by uid"):
+        fsutil.check_private_dir_fd(dir_fd, "x")
+
+
+def test_open_dir_at_does_not_create(tmp_path: Path, dir_fd: int) -> None:
+    with pytest.raises(FileNotFoundError):
+        fsutil.open_private_dir_at(dir_fd, "missing")
+    assert not (tmp_path / "missing").exists()
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "a/b"])
+def test_ensure_dir_refuses_names_that_are_not_one_segment(dir_fd: int, name: str) -> None:
+    with pytest.raises(ValueError):
+        fsutil.ensure_private_dir_at(dir_fd, name)

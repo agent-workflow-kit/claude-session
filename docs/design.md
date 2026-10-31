@@ -224,7 +224,7 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 | `procinfo` | Process start time and liveness (Linux `/proc/<pid>/stat`, macOS `ps -o lstart= -p`). |
 | `gateway` | The only module that starts subprocesses: `claude`, `git`, the notes command, sandbox prerequisite checks, `crontab`. Standard library only; runs every child with an absolute path, the sanitized `PATH` and, on Linux, `PR_SET_PDEATHSIG(SIGTERM)` for headless `claude`. Tests replace it. |
 | `audit`, `logs` | `audit.jsonl` and `log.jsonl` writers. |
-| `fsutil` | Standard library only: atomic private-file writes (temporary file plus rename relative to a parent-directory descriptor opened with `O_NOFOLLOW`, mode 0600), used for `--outcome-file`. |
+| `fsutil` | Standard library only: atomic private-file writes (temporary file plus rename relative to a parent-directory descriptor opened with `O_NOFOLLOW`, mode 0600) and no-follow private-directory helpers, used for `--outcome-file` and by `sessiondir`. |
 
 ### Session directories
 
