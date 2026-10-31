@@ -18,7 +18,12 @@
 
 SIGTSTP and SIGCONT are never touched (default action: job control applies to the foreground
 process group). The handlers are Python callables, never ``SIG_IGN``: an ignored signal would be
-inherited by ``claude`` across ``exec``, a caught one is reset to its default action there.
+inherited by ``claude`` across ``exec``, a caught one is reset to its default action there. A
+signal already ignored when ``exec`` starts (``nohup``, a shell's background job) stays ignored:
+no handler is installed for it, and ``claude`` inherits the ignore (interface.md, Signals).
+
+``install`` sets the handlers in a record-only phase and applies the before-allocation rule
+(``RAISE``) to a signal recorded meanwhile only once every handler is in place.
 
 The handler runs in the main thread between bytecodes; it only appends to a deque, so it never
 interrupts a store write in the ``DEFER`` and ``SESSION`` phases. Standard library only.
@@ -91,14 +96,22 @@ class ExecSignals:
     # Installation
 
     def install(self) -> bool:
-        """Install the handlers; False (nothing installed) off the main thread, where Python
-        cannot set handlers."""
+        """Install the handlers, except for a signal inherited as ignored (it stays ignored);
+        False (nothing installed) off the main thread, where Python cannot set handlers.
+        Signals are only recorded until every handler is installed; then a recorded one
+        raises ``LaunchInterrupted`` (the before-allocation rule)."""
+        self.phase = Phase.DEFER
         try:
             for sig in HANDLED:
+                if signal.getsignal(sig) == signal.SIG_IGN:
+                    continue  # inherited ignored: claude inherits the ignore too
                 self._previous[sig] = signal.signal(sig, self._handle)
         except ValueError:
             self.restore()
+            self.phase = Phase.RAISE
             return False
+        self.phase = Phase.RAISE
+        self.raise_pending()
         return True
 
     def restore(self) -> None:
@@ -113,9 +126,7 @@ class ExecSignals:
         if self.phase is Phase.RAISE:
             self.phase = Phase.DEFER  # a second signal during the cleanup is only recorded
             raise LaunchInterrupted(signum)
-        if self.phase is Phase.SESSION and self.interactive and signum == signal.SIGINT:
-            return  # claude has it from the terminal
-        self._pending.append(signum)
+        self._pending.append(signum)  # an interactive SIGINT is dropped by take()
 
     # Phase changes
 
@@ -140,17 +151,18 @@ class ExecSignals:
     def enter_session(self, *, interactive: bool) -> None:
         """``claude`` is spawned: record signals for the supervision loop. A SIGINT recorded
         while an interactive ``claude`` was being spawned is dropped (the terminal sent it to
-        ``claude`` too)."""
+        ``claude`` too). Only flags change here: the recorded signals are filtered by
+        ``take``, never by iterating the deque the handler appends to."""
         self.interactive = interactive
         self.phase = Phase.SESSION
-        if interactive and signal.SIGINT in self._pending:
-            kept = [s for s in self._pending if s != signal.SIGINT]
-            self._pending.clear()
-            self._pending.extend(kept)
 
     def take(self) -> list[int]:
-        """The signals recorded since the last call, in order."""
+        """The signals recorded since the last call, in order; in an interactive session
+        without SIGINT (``claude`` gets it from the terminal, during the spawn too)."""
         taken = []
         while self._pending:
-            taken.append(self._pending.popleft())
+            signum = self._pending.popleft()
+            if self.interactive and signum == signal.SIGINT:
+                continue
+            taken.append(signum)
         return taken

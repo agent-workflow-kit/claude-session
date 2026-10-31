@@ -19,8 +19,10 @@ run's outbox (and ``claimed/``), maps the end (``endmap.map_headless`` or
 ``endmap.map_interactive``, from the recorded ``pending_cause``), accepts or rejects an
 implicit done (``result.md``, headless only), finalizes the run (the compare-and-set, which
 also requires the report status the end was mapped from; a report that landed meanwhile is
-mapped again), deletes the secret index and removes the private tmpdir. Signals received
-after the child exited are recorded and dropped: the run is finalized either way.
+mapped again), deletes the secret index and removes the private tmpdir. A terminating signal
+received before the child was reaped (a terminal hangup also reaches ``claude``) still records
+its cause when the run has none, though nothing is sent; signals received after the reap are
+recorded and dropped: the run is finalized either way.
 
 Only the exact child is ever signaled: ``Child`` is the unreaped ``Popen``, so its PID cannot
 have been reused, and it signals nothing once reaped.
@@ -43,6 +45,7 @@ import hashlib
 import json
 import os
 import signal
+import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -114,17 +117,37 @@ def spawn(
                 os.close(fd)
 
 
+def _idle_stop(event: dict[str, Any]) -> bool:
+    """A Stop without background tasks (one with them keeps the activity ``working``)."""
+    return not event["final"] and event["cause"] == "Stop" and event["to_activity"] == "idle"
+
+
 def qualifying_stop(event: dict[str, Any] | None) -> bool:
-    """Whether ``event`` is a Stop without background tasks that left the run ``reported``:
-    the only event auto-exit acts on (a Stop with background tasks keeps the activity
-    ``working``; a waiting prompt or an open escalation is ``needs-input``)."""
-    return (
-        event is not None
+    """Whether ``event`` is a Stop without background tasks that left the run ``reported``
+    (a waiting prompt or an open escalation is ``needs-input``)."""
+    return event is not None and _idle_stop(event) and event["to_state"] == "reported"
+
+
+def auto_exit_candidate(latest: list[dict[str, Any]]) -> int | None:
+    """The id of the run's latest event when auto-exit acts on it (``latest``: the newest
+    events, newest first), else None: a qualifying Stop, or the ``report`` event of a report
+    the Stop's own hook ingested (that Stop, idle, is the event right before it, and the
+    report left the run ``reported`` and idle)."""
+    if not latest:
+        return None
+    event = latest[0]
+    if qualifying_stop(event):
+        return int(event["id"])
+    if (
+        len(latest) > 1
         and not event["final"]
-        and event["cause"] == "Stop"
-        and event["to_activity"] == "idle"
+        and event["cause"] == "report"
         and event["to_state"] == "reported"
-    )
+        and event["to_activity"] == "idle"
+        and _idle_stop(latest[1])
+    ):
+        return int(event["id"])
+    return None
 
 
 class Supervision:
@@ -154,7 +177,7 @@ class Supervision:
         self.monotonic = monotonic
         self.ended = False  # exec sent the child its terminating signal
         self.kill_at: float | None = None
-        self.candidate: int | None = None  # the qualifying Stop's event id
+        self.candidate: int | None = None  # the auto_exit_candidate event id
         self.due = 0.0
 
     def wait(self) -> int:
@@ -164,6 +187,8 @@ class Supervision:
         while True:
             code = self.child.wait(min(SIGNAL_SLICE, self.cfg.poll_interval))
             if code is not None:
+                for signum in self.signals.take():
+                    self.received_at_exit(signum)
                 return code
             for signum in self.signals.take():
                 self.forward(signum)
@@ -180,21 +205,36 @@ class Supervision:
     def forward(self, signum: int) -> None:
         """Forward a signal ``exec`` received, once, its cause recorded first."""
         if self.ended:
-            self._log_signal(signum, "not forwarded: the child was already signaled", pid=None)
+            self._log_not_sent(signum, "received; not forwarded: the child was already signaled")
             return
-        sid, run_no = self.alloc.csession_id, self.alloc.run
-        record = self.st.run_record(sid, run_no)
-        cause = stop_cause(signum, record["stop_requested_at"] is not None)
-        self.end(signum, cause)
+        self.end(signum, self._cause(signum))
 
-    def end(self, signum: int, cause: str) -> None:
-        """Record ``cause`` (unless the run has one), then send ``signum`` to the exact child
-        and arm the SIGKILL after ``kill_grace``."""
+    def received_at_exit(self, signum: int) -> None:
+        """A signal received before the child was reaped (e.g. a terminal hangup, which the
+        child got too): nothing is sent, but the first terminating one records its cause
+        (unless the run has one), as if it had been forwarded."""
+        if self.ended:
+            self._log_not_sent(signum, "received; not forwarded: the child was already signaled")
+            return
+        self.ended = True
+        cause = self._cause(signum)
         self.st.set_pending_cause(self.alloc.csession_id, self.alloc.run, cause)
+        self._log_not_sent(signum, f"received; {cause}; not sent: the child had exited")
+
+    def _cause(self, signum: int) -> str:
+        record = self.st.run_record(self.alloc.csession_id, self.alloc.run)
+        return stop_cause(signum, record["stop_requested_at"] is not None)
+
+    def end(self, signum: int, cause: str, *, recorded: bool = False) -> None:
+        """Record ``cause`` (unless the run has one, or ``recorded``: the caller's
+        compare-and-set just did), then send ``signum`` to the exact child and arm the
+        SIGKILL after ``kill_grace``."""
+        if not recorded:
+            self.st.set_pending_cause(self.alloc.csession_id, self.alloc.run, cause)
         self.ended = True
         self.kill_at = self.monotonic() + self.cfg.kill_grace
         self.child.send_signal(signum)
-        self._log_signal(signum, cause, pid=self.child.pid)
+        self._log_sent(signum, cause)
 
     def kill(self) -> None:
         """SIGKILL the same child after ``kill_grace`` (``Child`` signals nothing once it is
@@ -202,52 +242,63 @@ class Supervision:
         self.kill_at = None
         if self.child.poll() is None:
             self.child.send_signal(signal.SIGKILL)
-            self._log_signal(signal.SIGKILL, "kill_grace", pid=self.child.pid)
+            self._log_sent(signal.SIGKILL, "kill_grace")
 
     def check_auto_exit(self, now: float) -> None:
         """Auto-exit (design.md, Supervision): once the run has a ``done`` report and its
-        latest event is a qualifying Stop, wait ``auto_exit_delay``; then re-check that this
-        Stop is still the latest event and the report still ``done`` (in the same
-        compare-and-set that records ``auto_exit``) and SIGTERM the child. A newer event
-        resets the wait to the next qualifying Stop."""
+        latest event is a qualifying Stop (or the report the Stop's own hook ingested;
+        ``auto_exit_candidate``), wait ``auto_exit_delay``; then re-check that this event is
+        still the latest and the report still ``done`` (in the same compare-and-set that
+        records ``auto_exit``) and SIGTERM the child, with no further store write. A newer
+        event resets the wait to the next qualifying Stop; a busy store keeps the candidate
+        for the next poll."""
         sid, run_no = self.alloc.csession_id, self.alloc.run
         if self.st.run_record(sid, run_no)["report_status"] != "done":
             self.candidate = None
             return
-        event = self.st.latest_event(sid, run_no)
-        if not qualifying_stop(event):
+        event_id = auto_exit_candidate(self.st.latest_events(sid, run_no, 2))
+        if event_id is None:
             self.candidate = None
             return
-        assert event is not None
-        if self.candidate != event["id"]:
-            self.candidate = event["id"]
+        if self.candidate != event_id:
+            self.candidate = event_id
             self.due = now + self.cfg.auto_exit_delay
         if now < self.due:
             return
-        if self.st.set_auto_exit_cause(sid, run_no, event["id"]):
-            self.end(signal.SIGTERM, "auto_exit")
+        try:
+            recorded = self.st.set_auto_exit_cause(sid, run_no, event_id)
+        except sqlite3.OperationalError as exc:
+            self._log_not_sent(
+                signal.SIGTERM,
+                f"auto_exit; not sent: the store was busy ({exc}); retried",
+                level="warn",
+            )
+            return
+        if recorded:
+            self.end(signal.SIGTERM, "auto_exit", recorded=True)
         else:
             self.candidate = None
 
-    def _log_signal(self, signum: int, why: str, *, pid: int | None) -> None:
-        if pid is None:
-            # A signal exec received and did not forward: logged, nothing sent.
-            launch.log_best_effort(
-                self.log,
-                "signal_sent",
-                level="debug",
-                csession_id=self.alloc.csession_id,
-                run=self.alloc.run,
-                signal=signal_name(signum),
-                message=f"received; {why}",
-            )
-            return
+    def _log_sent(self, signum: int, why: str) -> None:
         launch.log_best_effort(
             self.log,
             "signal_sent",
             csession_id=self.alloc.csession_id,
             run=self.alloc.run,
-            pid=pid,
+            pid=self.child.pid,
+            signal=signal_name(signum),
+            message=why,
+        )
+
+    def _log_not_sent(self, signum: int, why: str, *, level: str = "debug") -> None:
+        """A signal ``exec`` did not send (received and dropped, or held back): never
+        ``signal_sent``."""
+        launch.log_best_effort(
+            self.log,
+            "signal_not_sent",
+            level=level,
+            csession_id=self.alloc.csession_id,
+            run=self.alloc.run,
             signal=signal_name(signum),
             message=why,
         )
@@ -533,8 +584,8 @@ def run_session(
         error = launch.interrupted_by(st, alloc, exc)
         launch.end_launch(st, alloc, v, None, process, error, exc=exc)
         raise
-    signals.enter_session(interactive=mode == "interactive")
     try:
+        signals.enter_session(interactive=mode == "interactive")
         st.update_run(
             sid,
             run_no,
@@ -606,16 +657,16 @@ def _internal_error(
     child: Child | None,
 ) -> None:
     """``exec`` must exit after an internal error: with SIGINT ignored, record
-    ``internal_error`` before any signal, end the child, and finalize directly (``killed``,
+    ``internal_error`` before any signal (unless the run already has a cause, which stands),
+    end the child, and finalize directly (``killed``,
     or the report's outcome when one exists; cost null), then delete the secret index and
     remove the tmpdir on every path. Best effort: a failure here is left to the liveness
     check (#33), which finds the wrapper dead."""
     sid, run_no = alloc.csession_id, alloc.run
     previous = _ignore_sigint()
     try:
-        try:
-            if st.run_record(sid, run_no)["ended_at"] is None:
-                st.update_run(sid, run_no, pending_cause="internal_error")
+        try:  # unless the run is final or already has a cause (e.g. auto_exit), which stands
+            st.set_pending_cause(sid, run_no, "internal_error")
         except Exception:  # the child is ended either way
             pass
         if child is not None:

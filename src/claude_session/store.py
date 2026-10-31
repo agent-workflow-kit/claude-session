@@ -680,9 +680,11 @@ class Store:
         """One ``BEGIN IMMEDIATE`` transaction: committed on success, rolled back on error.
 
         Waits up to the busy timeout for the write lock (``sqlite3.OperationalError`` after).
+        BEGIN is inside the ``try``: an exception raised asynchronously (a signal handler)
+        right after it still rolls the transaction back.
         """
-        self.conn.execute("BEGIN IMMEDIATE")
         try:
+            self.conn.execute("BEGIN IMMEDIATE")
             yield self.conn
             self.conn.execute("COMMIT")
         except BaseException:
@@ -711,6 +713,14 @@ class Store:
                     self.conn.execute(f"RELEASE {name}")
             raise
         self.conn.execute(f"RELEASE {name}")
+
+    def rollback_open_transaction(self) -> None:
+        """Roll back a transaction an asynchronous exception (a signal handler raising between
+        ``BEGIN`` and the helper's ``try``) left open, so the next write can begin. A no-op
+        when none is open."""
+        if self.conn.in_transaction:
+            with suppress(sqlite3.Error):
+                self.conn.execute("ROLLBACK")
 
     # Schema version
 
@@ -1083,22 +1093,28 @@ class Store:
         return cursor.rowcount == 1
 
     def latest_event(self, csession_id: str, run_no: int) -> dict[str, Any] | None:
-        """The run's latest event (``id``, ``cause``, ``to_state``, ``to_activity``,
-        ``final``), by id; None when it has none."""
-        row = self.conn.execute(
+        """The run's latest event (see ``latest_events``); None when it has none."""
+        latest = self.latest_events(csession_id, run_no, 1)
+        return latest[0] if latest else None
+
+    def latest_events(self, csession_id: str, run_no: int, count: int) -> list[dict[str, Any]]:
+        """The run's ``count`` latest events (``id``, ``cause``, ``to_state``,
+        ``to_activity``, ``final``), newest first, by id."""
+        rows = self.conn.execute(
             "SELECT id, cause, to_state, to_activity, final FROM events "
-            "WHERE csession_id = ? AND run_no = ? ORDER BY id DESC LIMIT 1",
-            (csession_id, run_no),
-        ).fetchone()
-        if row is None:
-            return None
-        return {
-            "id": row[0],
-            "cause": row[1],
-            "to_state": row[2],
-            "to_activity": row[3],
-            "final": bool(row[4]),
-        }
+            "WHERE csession_id = ? AND run_no = ? ORDER BY id DESC LIMIT ?",
+            (csession_id, run_no, count),
+        ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "cause": row[1],
+                "to_state": row[2],
+                "to_activity": row[3],
+                "final": bool(row[4]),
+            }
+            for row in rows
+        ]
 
     def update_session(self, csession_id: str, **fields: Any) -> None:
         """Set columns of a session row (only ``SESSION_FIELDS``)."""

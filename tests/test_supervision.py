@@ -153,12 +153,13 @@ def test_only_the_first_signal_is_forwarded_then_sigkill_after_kill_grace(
     r.sup.kill()  # what the loop does once kill_at is reached
     assert r.child.sent[-1][0] == signal.SIGKILL
     records = logs_of(r)
-    assert [(x.get("pid"), x["signal"]) for x in records] == [
-        (4321, "SIGTERM"),
-        (None, "SIGHUP"),
-        (None, "SIGTERM"),
-        (4321, "SIGKILL"),
+    assert [(x["event"], x.get("pid"), x["signal"]) for x in records] == [
+        ("signal_sent", 4321, "SIGTERM"),
+        ("signal_not_sent", None, "SIGHUP"),
+        ("signal_not_sent", None, "SIGTERM"),
+        ("signal_sent", 4321, "SIGKILL"),
     ]
+    assert all("pid" in x for x in records if x["event"] == "signal_sent")
 
 
 def test_no_sigkill_to_a_child_that_already_exited(st: Store, tmp_path: Path) -> None:
@@ -170,9 +171,70 @@ def test_no_sigkill_to_a_child_that_already_exited(st: Store, tmp_path: Path) ->
 
 
 def logs_of(r: Rig) -> list[dict[str, Any]]:
+    """The ``signal_sent`` and ``signal_not_sent`` records, each valid per the log schema."""
     from .fakeclaude import read_jsonl
+    from .schemas import validate
+    from .test_logs import LOG_SCHEMA
 
-    return [x for x in read_jsonl(r.log) if x["event"] == "signal_sent"]
+    records = [x for x in read_jsonl(r.log) if x["event"] in ("signal_sent", "signal_not_sent")]
+    for record in records:
+        validate(record, LOG_SCHEMA)
+    return records
+
+
+# Signals queued when the child exits (R1-09)
+
+
+def exits_with(r: Rig, code: int, *queued: int) -> int:
+    """The loop's wait for a child that exits with ``code`` while ``queued`` signals wait in
+    the deque (received before the reap, not yet taken)."""
+
+    def wait(timeout: float | None = None) -> int | None:
+        for sig in queued:
+            r.signals._handle(sig, None)
+        r.child.returncode = code
+        return code
+
+    r.child.wait = wait  # type: ignore[method-assign]
+    return r.sup.wait()
+
+
+def test_a_signal_queued_when_the_child_exits_records_its_cause_and_sends_nothing(
+    st: Store, tmp_path: Path
+) -> None:
+    """A terminal hangup reaches claude and exec together: claude may be reaped before the
+    loop takes exec's SIGHUP. Its cause is still recorded, and nothing is sent."""
+    r = rig(st, tmp_path)
+    assert exits_with(r, -signal.SIGHUP, signal.SIGHUP, signal.SIGTERM) == -signal.SIGHUP
+    assert st.run_record(r.sid, 1)["pending_cause"] == "forwarded_hup"
+    assert r.child.sent == []
+    assert [(x["event"], x.get("pid"), x["signal"]) for x in logs_of(r)] == [
+        ("signal_not_sent", None, "SIGHUP"),
+        ("signal_not_sent", None, "SIGTERM"),
+    ]
+
+
+def test_a_signal_queued_at_exit_after_a_stop_request_is_stopped(st: Store, tmp_path: Path) -> None:
+    r = rig(st, tmp_path)
+    st.conn.execute("UPDATE runs SET stop_requested_at = 'x' WHERE csession_id = ?", (r.sid,))
+    exits_with(r, -signal.SIGTERM, signal.SIGTERM)
+    assert st.run_record(r.sid, 1)["pending_cause"] == "stopped"
+
+
+def test_an_interactive_sigint_queued_at_exit_records_nothing(st: Store, tmp_path: Path) -> None:
+    r = rig(st, tmp_path)
+    exits_with(r, 0, signal.SIGINT)
+    assert st.run_record(r.sid, 1)["pending_cause"] is None
+
+
+def test_a_signal_queued_at_exit_after_the_forward_keeps_the_first_cause(
+    st: Store, tmp_path: Path
+) -> None:
+    r = rig(st, tmp_path)
+    receive(r, signal.SIGTERM)
+    exits_with(r, -signal.SIGTERM, signal.SIGHUP)
+    assert st.run_record(r.sid, 1)["pending_cause"] == "forwarded_term"
+    assert [s for s, _ in r.child.sent] == [signal.SIGTERM]
 
 
 # Auto-exit
@@ -220,14 +282,14 @@ def test_the_recheck_fails_when_an_event_lands_after_the_delay(st: Store, tmp_pa
     r = rig(st, tmp_path, auto_exit_delay=0.0)
     done(st, r.sid)
     add_event(st, r.sid, "Stop", "reported", "idle")
-    real = st.latest_event
+    real = st.latest_events
 
-    def racing(sid: str, run_no: int) -> Any:
-        event = real(sid, run_no)
+    def racing(sid: str, run_no: int, count: int) -> Any:
+        events = real(sid, run_no, count)
         add_event(st, sid, "UserPromptSubmit", "reported", "working")
-        return event
+        return events
 
-    st.latest_event = racing  # type: ignore[method-assign]
+    st.latest_events = racing  # type: ignore[method-assign]
     r.sup.check_auto_exit(100.0)
     assert r.child.sent == []
     assert st.run_record(r.sid, 1)["pending_cause"] is None
@@ -240,7 +302,7 @@ def test_the_recheck_fails_when_an_event_lands_after_the_delay(st: Store, tmp_pa
         (("Stop", "reported", "working"), "done"),  # background tasks: still working
         (("Stop", "needs-input", "idle"), "done"),  # a prompt waiting
         (("Notification", "reported", "idle"), "done"),  # idle_prompt, not a Stop
-        (("report", "reported", "idle"), "done"),  # the report came after the Stop
+        (("report", "reported", "idle"), "done"),  # a report after a non-Stop event
     ],
 )
 def test_no_auto_exit_without_a_done_report_and_a_qualifying_stop(
@@ -249,10 +311,112 @@ def test_no_auto_exit_without_a_done_report_and_a_qualifying_stop(
     r = rig(st, tmp_path, auto_exit_delay=0.0)
     if report is not None:
         done(st, r.sid)
+    add_event(st, r.sid, "PostToolUse", "working", "working")
     add_event(st, r.sid, *event)
     for now in (100.0, 200.0, 300.0):
         r.sup.check_auto_exit(now)
     assert r.child.sent == []
+
+
+def test_a_report_drained_by_the_stops_own_hook_auto_exits(st: Store, tmp_path: Path) -> None:
+    """R1-02: the Stop hook drains the report: Stop(idle, idle), then report(reported, idle).
+    The report event is the candidate, re-checked in the compare-and-set."""
+    r = rig(st, tmp_path, auto_exit_delay=2.0)
+    done(st, r.sid)
+    add_event(st, r.sid, "Stop", "idle", "idle")
+    report_event = add_event(st, r.sid, "report", "reported", "idle")
+    r.sup.check_auto_exit(100.0)
+    assert r.sup.candidate == report_event and r.child.sent == []
+    r.sup.check_auto_exit(102.0)
+    assert r.child.sent == [(signal.SIGTERM, "auto_exit")]
+
+
+@pytest.mark.parametrize(
+    "stop",
+    [
+        ("Stop", "idle", "working"),  # background tasks
+        ("PostToolUse", "idle", "idle"),  # not a Stop
+    ],
+)
+def test_a_report_after_anything_but_an_idle_stop_does_not_auto_exit(
+    st: Store, tmp_path: Path, stop: tuple[str, str, str]
+) -> None:
+    r = rig(st, tmp_path, auto_exit_delay=0.0)
+    done(st, r.sid)
+    add_event(st, r.sid, *stop)
+    add_event(st, r.sid, "report", "reported", "idle")
+    for now in (100.0, 200.0):
+        r.sup.check_auto_exit(now)
+    assert r.child.sent == []
+
+
+def test_auto_exit_sends_sigterm_with_no_further_store_write(st: Store, tmp_path: Path) -> None:
+    """R1-03: after the compare-and-set, SIGTERM goes out even while another connection holds
+    the write lock (no second write in between)."""
+    import sqlite3
+
+    r = rig(st, tmp_path, auto_exit_delay=0.0)
+    done(st, r.sid)
+    add_event(st, r.sid, "Stop", "reported", "idle")
+    other = sqlite3.connect(str(tmp_path / "state.db"), isolation_level=None, timeout=0)
+    real = st.set_auto_exit_cause
+
+    def then_lock(sid: str, run_no: int, event_id: int) -> bool:
+        won = real(sid, run_no, event_id)
+        other.execute("BEGIN IMMEDIATE")  # a hook's write lands right after the re-check
+        return won
+
+    st.set_auto_exit_cause = then_lock  # type: ignore[method-assign]
+    try:
+        r.sup.check_auto_exit(100.0)
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+    assert r.child.sent == [(signal.SIGTERM, "auto_exit")]
+
+
+def test_a_busy_store_at_the_auto_exit_recheck_retries_at_the_next_poll(
+    st: Store, tmp_path: Path
+) -> None:
+    """R1-05: a busy timeout in the compare-and-set is logged, the candidate kept."""
+    import sqlite3
+
+    r = rig(st, tmp_path, auto_exit_delay=0.0)
+    done(st, r.sid)
+    stop = add_event(st, r.sid, "Stop", "reported", "idle")
+    real = st.set_auto_exit_cause
+    calls: list[int] = []
+
+    def busy_once(sid: str, run_no: int, event_id: int) -> bool:
+        calls.append(event_id)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(sid, run_no, event_id)
+
+    st.set_auto_exit_cause = busy_once  # type: ignore[method-assign]
+    r.sup.check_auto_exit(100.0)
+    assert r.child.sent == [] and r.sup.candidate == stop
+    assert [(x["event"], x["level"]) for x in logs_of(r)] == [("signal_not_sent", "warn")]
+    r.sup.check_auto_exit(100.5)
+    assert calls == [stop, stop]
+    assert r.child.sent == [(signal.SIGTERM, "auto_exit")]
+
+
+def test_an_internal_error_keeps_a_recorded_cause(st: Store, tmp_path: Path) -> None:
+    """R1-04: internal_error is recorded only when the run has no cause."""
+    from types import SimpleNamespace
+
+    r = rig(st, tmp_path)
+    assert st.set_pending_cause(r.sid, 1, "auto_exit")
+
+    def no_run_dir(_run: int) -> int:
+        raise OSError("no run directory here")
+
+    v = SimpleNamespace(dirs=SimpleNamespace(open_run_dir=no_run_dir), tmpdir=None)
+    supervisor._internal_error(st, Cfg(), r.sup.alloc, v, None)  # type: ignore[arg-type]
+    row = st.run_record(r.sid, 1)
+    assert row["pending_cause"] == "auto_exit"
+    assert (row["outcome"], row["end_reason"]) == ("killed", "internal_error")
 
 
 def test_auto_exit_off_never_checks(st: Store, tmp_path: Path) -> None:

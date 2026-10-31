@@ -48,7 +48,9 @@ C function behind ``signal.pthread_sigmask``, not through its Python wrapper: a 
 raises then does so only after the mask is restored, never before (Python 3.13 runs pending
 handlers on entry to a Python function). Residuals: signals to the forking thread wait until the
 child has exec'd (or failed to); a handler (for a signal another thread took) that raises inside
-``Popen`` after the fork, before ``spawn`` holds the ``Popen``, leaves that child running.
+``Popen`` after the fork, before ``spawn`` holds the ``Popen``, leaves that child running. ``run``
+(Linux) starts its child the same way, without the death signal, so a handler that raises in
+``exec``'s launch phase does so only once ``run`` holds the ``Popen`` and ends its child.
 
 ``run`` reads the child's output with its own loop rather than ``Popen.communicate``, which
 reaps the child when a ``KeyboardInterrupt`` interrupts it: on Linux the child stays unreaped
@@ -308,14 +310,15 @@ def _libc() -> _Libc:
 
 
 def _pdeathsig_preexec(
-    child_mask: set[int], parent: int | None = None
+    child_mask: set[int], parent: int | None = None, *, death_signal: bool = True
 ) -> Callable[[], None] | None:
     """A ``preexec_fn`` setting ``PR_SET_PDEATHSIG(SIGTERM)``, or ``None`` off Linux.
 
-    The fork happens with every signal blocked (``spawn``); the child resets
+    The fork happens with every signal blocked (``spawn``, ``run``); the child resets
     the signals that have a Python handler here, and SIGTERM, to their default action, then
     sets ``child_mask`` (the caller's mask) without SIGTERM. ``parent`` is the PID the child
-    must see as its parent (default: this process)."""
+    must see as its parent (default: this process). Without ``death_signal`` (``run``) only
+    the handlers and the mask are reset."""
     if not sys.platform.startswith("linux"):
         return None
     libc = _libc()  # resolved before the fork
@@ -330,6 +333,8 @@ def _pdeathsig_preexec(
         for sig in reset:
             libc.signal(sig, _SIG_DFL)
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        if not death_signal:
+            return
         if libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
             raise OSError(libc.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
         if os.getppid() != expected:  # the parent died before the flag was set
@@ -540,6 +545,32 @@ def _kill_and_reap(popen: subprocess.Popen[bytes]) -> None:
         popen.wait()
 
 
+def _start_blocked(
+    start: Callable[[Callable[[], None] | None], subprocess.Popen[bytes]],
+    preexec: Callable[[set[int]], Callable[[], None] | None],
+) -> subprocess.Popen[bytes]:
+    """``start(preexec(caller_mask))`` with every signal blocked in this thread (see the
+    module docstring): a handler that raises does so only once the mask is restored, and then
+    the child it started is killed and reaped here, or the caller holds it."""
+    # Read the mask without changing it; block inside the try, so the finally restores the
+    # mask even when a pending handler raises from the blocking call itself.
+    sigmask = _c_pthread_sigmask()
+    saved_mask = {int(sig) for sig in sigmask(signal.SIG_BLOCK, [])}
+    popen = None
+    try:
+        sigmask(signal.SIG_BLOCK, signal.valid_signals())
+        popen = start(preexec(saved_mask))
+    finally:
+        try:
+            sigmask(signal.SIG_SETMASK, saved_mask)
+        except BaseException:
+            if popen is not None:  # started, but the caller never gets it
+                _kill_and_reap(popen)
+            raise
+    assert popen is not None  # start() returned or raised
+    return popen
+
+
 class _PopenChild:
     def __init__(self, popen: subprocess.Popen[bytes]) -> None:
         self._popen = popen
@@ -581,24 +612,43 @@ class SystemGateway:
         check_kill_grace(kill_grace, new_process_group=new_process_group)
         args = tuple(argv)
         data = None if stdin is None else stdin.encode("utf-8", "replace")
-        with subprocess.Popen(
-            args,
-            executable=executable,
-            stdin=DEVNULL if stdin is None else subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_child_env(env, extra_env),
-            cwd=cwd,
-            process_group=0 if new_process_group else None,
-        ) as popen:
+
+        def start(preexec: Callable[[], None] | None) -> subprocess.Popen[bytes]:
             try:
-                out, err = _exchange(popen, data, timeout)
-            except subprocess.TimeoutExpired:
+                return subprocess.Popen(
+                    args,
+                    executable=executable,
+                    stdin=DEVNULL if stdin is None else subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=_child_env(env, extra_env),
+                    cwd=cwd,
+                    process_group=0 if new_process_group else None,
+                    preexec_fn=preexec,
+                )
+            except subprocess.SubprocessError as exc:  # preexec_fn failed in the child
+                raise OSError(f"could not start {argv[0]!r}: {exc}") from exc
+
+        if sys.platform.startswith("linux"):
+            # A signal handler that raises (exec's launch phase) does so only once run()
+            # holds the Popen, so the child is ended (see the module docstring).
+            popen = _start_blocked(start, lambda mask: _pdeathsig_preexec(mask, death_signal=False))
+        else:
+            popen = start(None)
+        try:
+            with popen:
+                try:
+                    out, err = _exchange(popen, data, timeout)
+                except subprocess.TimeoutExpired:
+                    _end(popen, group=new_process_group, kill_grace=kill_grace)
+                    raise GatewayTimeout(args, timeout) from None
+                except BaseException:
+                    _end(popen, group=new_process_group, kill_grace=kill_grace)
+                    raise
+        except BaseException:
+            if popen.returncode is None:  # raised before the inner handler (entering with)
                 _end(popen, group=new_process_group, kill_grace=kill_grace)
-                raise GatewayTimeout(args, timeout) from None
-            except BaseException:
-                _end(popen, group=new_process_group, kill_grace=kill_grace)
-                raise
+            raise
         return Result(args, popen.returncode, _text(out), _text(err))
 
     def spawn(
@@ -636,20 +686,4 @@ class SystemGateway:
 
         if not (die_with_parent and sys.platform.startswith("linux")):
             return _PopenChild(start(None))
-        # Read the mask without changing it; block inside the try, so the finally restores the
-        # mask even when a pending handler raises from the blocking call itself.
-        sigmask = _c_pthread_sigmask()  # see the module docstring
-        saved_mask = {int(sig) for sig in sigmask(signal.SIG_BLOCK, [])}
-        popen = None
-        try:
-            sigmask(signal.SIG_BLOCK, signal.valid_signals())
-            popen = start(_pdeathsig_preexec(saved_mask))
-        finally:
-            try:
-                sigmask(signal.SIG_SETMASK, saved_mask)
-            except BaseException:
-                if popen is not None:  # started, but the caller never gets it
-                    _kill_and_reap(popen)
-                raise
-        assert popen is not None  # start() returned or raised
-        return _PopenChild(popen)
+        return _PopenChild(_start_blocked(start, _pdeathsig_preexec))

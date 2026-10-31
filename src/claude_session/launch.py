@@ -74,6 +74,7 @@ from .errors import (
     UsageError,
 )
 from .gateway import Gateway
+from .kinds import Mode
 from .sessiondir import InputFile, SessionDirs
 from .signals import STOP_SIGNALS, ExecSignals, LaunchInterrupted
 
@@ -137,7 +138,7 @@ class Request:
     """What ``exec`` was asked to launch, read and usage-checked (launch step 2)."""
 
     kind: str | None
-    mode: str
+    mode: Mode
     skill: str | None
     prompt: bytes | None = field(repr=False)
     inputs: tuple[InputFile, ...]
@@ -188,11 +189,20 @@ def check_tty(mode: str, prompt_file: str | None) -> None:
         raise UsageError("--prompt-file - cannot read the prompt from a terminal stdin")
 
 
+def _mode(given: str | None) -> Mode:
+    """``--mode`` (argparse choices), ``interactive`` by default."""
+    if given is None or given == "interactive":
+        return "interactive"
+    if given == "headless":
+        return "headless"
+    raise UsageError(f"unknown mode {given!r}")
+
+
 def read_request(args: argparse.Namespace, cfg: Config) -> Request:
     """Launch step 2 for ``exec``: the TTY check of interactive mode, the flags (already
     checked by ``cli``'s flag rules), the prompt and the input files read into memory (each
     at most ``input_max_bytes``; a bad file is a ``UsageError``, exit 2)."""
-    mode = args.mode or "interactive"
+    mode = _mode(args.mode)
     check_tty(mode, args.prompt_file)
     cap = cfg.input_max_bytes
     prompt = None
@@ -295,7 +305,7 @@ def resolve_kind(req: Request, cfg: Config, process: Process) -> Resolved:
     resolution = kinds.resolve(
         cfg,
         req.kind,
-        mode=req.mode,  # type: ignore[arg-type]  # argparse choices
+        mode=req.mode,
         repo=req.repo,
         cwd=probe_cwd,
         flags=req.flags,
@@ -1037,7 +1047,7 @@ def prepare(
         claude=v.claude.path,
     )
     launch = settings_builder.Launch(
-        mode=req.mode,  # type: ignore[arg-type]  # argparse choices
+        mode=req.mode,
         cwd=v.cwd,
         skill=req.skill,
         prompt_path=prompt_path,
@@ -1152,8 +1162,10 @@ def end_launch(
     """A launch-phase end: finalize the run (``fail_launch``), then, whatever happens, close
     the output descriptors, delete the secret index, remove the private tmpdir and log the
     failure (``launch`` with the end reason; ``launch_interrupted`` with the exception type
-    for an ``exc``)."""
+    for an ``exc``). A transaction an interrupted store write left open is rolled back
+    first."""
     try:
+        st.rollback_open_transaction()
         fail_launch(st, alloc, error)
     finally:
         if prepared is not None:
@@ -1254,27 +1266,31 @@ def run(
     v: Validated | None = None
     prepared: Prepared | None = None
     try:
+        # The outer handler also takes a signal that arrives while a launch failure is being
+        # handled, before the inner handler's defer() (the phase is still RAISE there).
         try:
-            signals.enter_launch()
-            v = validate(st, cfg, req, resolved, alloc, process)
-            secrets = sorted(envbuild.secret_values(v.session_env, process.environ))
-            log_credential_warnings(process, alloc, v.credential_warnings, secrets)
-            # The audit record is written before the run secret exists (prepare rotates it),
-            # so it is redacted against the session's secret values only; prepared.secrets,
-            # used for the log from here on, is that set plus the run secret.
-            audit_sandbox_lowered(process, req, resolution, alloc, secrets)
-            st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
-            prepared = prepare(st, cfg, req, resolution, alloc, v, process)
-            st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
-            signals.defer()  # the supervisor raises a signal from here right before the spawn
-        except LaunchValidationError as error:
-            signals.defer()  # a signal during the cleanup is only recorded
-            end_launch(st, alloc, v, prepared, process, error)
-            return None
-        except Exception as exc:
-            signals.defer()
-            end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc)
-            return None
+            try:
+                signals.enter_launch()
+                v = validate(st, cfg, req, resolved, alloc, process)
+                secrets = sorted(envbuild.secret_values(v.session_env, process.environ))
+                log_credential_warnings(process, alloc, v.credential_warnings, secrets)
+                # The audit record is written before the run secret exists (prepare rotates
+                # it), so it is redacted against the session's secret values only;
+                # prepared.secrets, used for the log from here on, is that set plus the run
+                # secret.
+                audit_sandbox_lowered(process, req, resolution, alloc, secrets)
+                st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
+                prepared = prepare(st, cfg, req, resolution, alloc, v, process)
+                st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
+                signals.defer()  # the supervisor raises a signal from here before the spawn
+            except LaunchValidationError as error:
+                signals.defer()  # a signal during the cleanup is only recorded
+                end_launch(st, alloc, v, prepared, process, error)
+                return None
+            except Exception as exc:
+                signals.defer()
+                end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc)
+                return None
         except BaseException as exc:
             signals.defer()  # a second signal during the cleanup is only recorded
             end_launch(st, alloc, v, prepared, process, interrupted_by(st, alloc, exc), exc=exc)

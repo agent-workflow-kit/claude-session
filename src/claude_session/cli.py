@@ -25,6 +25,7 @@ from .errors import CliError, InternalError, RefusedError, UsageError
 
 if TYPE_CHECKING:
     from .config import Config
+    from .launch import Allocated, Process
 
 PROG = "claude-session"
 DESCRIPTION = "Runs and supervises Claude Code sessions (terminal-agnostic)."
@@ -161,7 +162,8 @@ def _exec(args: argparse.Namespace) -> int:
     """``exec`` of a new session: launch steps 2 to 7, then supervision (interface.md, Launch
     order, exec and Signals). A launch-phase end exits 12 with the outcome object, also when a
     signal interrupted the launch; a signal before allocation ends ``exec`` by that signal.
-    The signal handlers are installed before allocation and restored on the way out."""
+    The signal handlers are installed before allocation and restored once the outcome is
+    printed (until then a late signal is only recorded)."""
     if args.session_id is not None:
         # TODO(#28): adoption of a pending run created by start.
         raise InternalError("exec --session-id is not implemented yet", detail="not_implemented")
@@ -174,42 +176,62 @@ def _exec(args: argparse.Namespace) -> int:
 
     cfg = load_config(args)
     signals = ExecSignals()
-    signals.install()  # before allocation (interface.md, Signals)
-    try:
-        with store.open_state() as st:
-            process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
-            req = launch.read_request(args, cfg)
-            resolved = launch.resolve_kind(req, cfg, process)
-            signals.defer()  # a signal during allocation acts once the run exists
-            alloc = launch.allocate(st, req, resolved, process)
-            try:
-                ended = launch.run(
-                    st,
-                    cfg,
-                    req,
-                    resolved,
-                    alloc,
-                    process,
-                    supervise=supervisor.run_session,
-                    signals=signals,
-                )
-            except LaunchInterrupted:
-                ended = None  # the run ended not-started: its outcome is in the store
-            outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
-    except LaunchInterrupted as exc:  # before allocation: nothing to record
-        _die_of(exc.signum)
-    except KeyboardInterrupt:  # handlers not installed (not the main thread)
-        _die_of(signal.SIGINT)
+    try:  # entered first: a signal during the install is handled and the handlers restored
+        try:
+            signals.install()  # before allocation (interface.md, Signals)
+            with store.open_state() as st:
+                process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+                req = launch.read_request(args, cfg)
+                resolved = launch.resolve_kind(req, cfg, process)
+                signals.defer()  # a signal during allocation acts once the run exists
+                alloc = launch.allocate(st, req, resolved, process)
+                try:
+                    ended = launch.run(
+                        st,
+                        cfg,
+                        req,
+                        resolved,
+                        alloc,
+                        process,
+                        supervise=supervisor.run_session,
+                        signals=signals,
+                    )
+                except LaunchInterrupted as exc:
+                    ended = None  # the run ended not-started: its outcome is in the store
+                    signals.defer()
+                    _end_interrupted_launch(st, alloc, process, exc)
+                outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
+        except LaunchInterrupted as exc:  # before allocation: nothing to record
+            _die_of(exc.signum)
+        except KeyboardInterrupt:  # handlers not installed (not the main thread)
+            _die_of(signal.SIGINT)
+        signals.defer()  # until the outcome is printed, a signal is only recorded
+        try:
+            _print_outcome(outcome, args.json)
+        except OSError as exc:
+            # A terminal that hung up (interactive SIGHUP) cannot take the outcome: the run
+            # is final and stored, and the exit code still carries it.
+            if exc.errno != errno.EIO:
+                raise
     finally:
         signals.restore()
-    try:
-        _print_outcome(outcome, args.json)
-    except OSError as exc:
-        # A terminal that hung up (interactive SIGHUP) cannot take the outcome: the run is
-        # final and stored, and the exit code still carries it.
-        if exc.errno != errno.EIO:
-            raise
-    return int(outcome["exit_code"]) if ended is None else ended.exit_code
+    if ended is not None:
+        return ended.exit_code
+    if outcome["exit_code"] is None:  # a run that is still not final: never read as a code
+        raise InternalError("the run has no outcome after its launch was interrupted")
+    return int(outcome["exit_code"])
+
+
+def _end_interrupted_launch(
+    st: store.Store, alloc: Allocated, process: Process, exc: BaseException
+) -> None:
+    """Backstop: a ``LaunchInterrupted`` that reached ``exec`` with the run not final (it
+    escaped the launch's own handling) ends the run ``not-started`` here."""
+    from . import launch
+
+    if st.run_record(alloc.csession_id, alloc.run)["ended_at"] is None:
+        error = launch.interrupted_by(st, alloc, exc)
+        launch.end_launch(st, alloc, None, None, process, error, exc=exc)
 
 
 def _die_of(signum: int) -> NoReturn:

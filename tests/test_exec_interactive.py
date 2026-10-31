@@ -37,8 +37,10 @@ from .test_exec_headless import (
     START,
     claude_session_cmd,
     gone,
+    ignored_signals,
     private_home,
     run_row_of,
+    script,
     validate_exec,
 )
 
@@ -148,8 +150,19 @@ class Terminal:
         return read_jsonl(self.state / "log.jsonl")
 
 
-def _controlling_tty() -> None:  # pragma: no cover - runs in the child
-    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+def _child_setup(controlling: bool, ignore: Sequence[int]) -> Any:
+    """The ``preexec_fn`` of exec: take the terminal as the controlling one, and ignore
+    ``ignore`` (``nohup``)."""
+    if not controlling and not ignore:
+        return None
+
+    def setup() -> None:  # pragma: no cover - runs in the child
+        if controlling:
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        for sig in ignore:
+            signal.signal(sig, signal.SIG_IGN)
+
+    return setup
 
 
 def start_terminal(
@@ -162,15 +175,29 @@ def start_terminal(
     config: str = FAST,
     controlling: str | None = None,
     env: Mapping[str, str] | None = None,
+    patch: str = "",
+    ignore: Sequence[int] = (),
+    status_to: Path | None = None,
 ) -> Terminal:
     """``controlling``: None (the terminal is only exec's stdin and stdout), ``"exec"`` (it
     is exec's controlling terminal, exec the session leader) or ``"leader"`` (``LEADER`` is
-    the session leader, exec in its foreground process group)."""
+    the session leader, exec in its foreground process group). ``patch``: Python run in
+    exec's process before its entry point (a fault injected into exec). ``ignore``: signals
+    exec inherits as ignored. ``status_to``: claude first copies its ``/proc`` status there
+    (a shell wrapper that then execs the fake, same PID)."""
     scenario = write_json(tmp_path / "scenario.json", {"steps": steps})
     fake = claude_bin(tmp_path / "fakebin", scenario, tmp_path / "fake.jsonl")
+    if status_to is not None:
+        fake = script(
+            tmp_path / "wrapbin" / "claude",
+            f'#!/bin/sh\n/bin/cat /proc/self/status > "{status_to}"\nexec "{fake}" "$@"\n',
+        )
     cfg = tmp_path / "config.yaml"
     cfg.write_text(f"claude_bin: {fake}\n{config}", encoding="utf-8")
-    argv = [*claude_session_cmd(), "exec", "--json", "--config", str(cfg), *args]
+    command = claude_session_cmd()
+    if patch:
+        command = [*command[:-1], patch + "\n" + command[-1]]
+    argv = [*command, "exec", "--json", "--config", str(cfg), *args]
     if controlling == "leader":
         argv = [sys.executable, "-I", "-c", LEADER, *argv]
     master, slave = pty.openpty()
@@ -183,7 +210,7 @@ def start_terminal(
             stdout=slave,
             stderr=subprocess.PIPE,
             start_new_session=True,
-            preexec_fn=_controlling_tty if controlling == "exec" else None,
+            preexec_fn=_child_setup(controlling == "exec", ignore),
         )
     finally:
         os.close(slave)
@@ -228,6 +255,14 @@ def signals_sent(term: Terminal) -> list[tuple[Any, ...]]:
         (r.get("pid"), r["signal"], r.get("message"))
         for r in term.exec_log()
         if r["event"] == "signal_sent"
+    ]
+
+
+def signals_not_sent(term: Terminal) -> list[tuple[Any, ...]]:
+    return [
+        (r.get("pid"), r["signal"], r.get("message"))
+        for r in term.exec_log()
+        if r["event"] == "signal_not_sent"
     ]
 
 
@@ -564,7 +599,8 @@ def test_a_child_ignoring_sigterm_is_sigkilled_after_kill_grace_and_signaled_onc
     sent_records = signals_sent(term)
     assert sent_records[0] == (pid, "SIGTERM", "forwarded_term")
     assert sent_records[-1] == (pid, "SIGKILL", "kill_grace")
-    assert {r[0] for r in sent_records[1:-1]} == {None}  # received, not forwarded
+    assert len(sent_records) == 2  # the others were received, not forwarded
+    assert [r[1] for r in signals_not_sent(term)] == ["SIGHUP", "SIGTERM"]
     assert gone(pid)
 
 
@@ -598,3 +634,132 @@ def test_prompt_from_stdin_on_a_terminal_is_a_usage_error(
     assert code == 2
     assert outcome is not None and outcome["error"]["code"] == "usage"
     assert not (state / "sessions").exists() or not any((state / "sessions").iterdir())
+
+
+# Review round 1 (R1-02, R1-06, R1-09, R1-16)
+
+
+def test_a_done_report_drained_by_the_stops_own_hook_auto_exits(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """R1-02: no PostToolUse for the report call, so the Stop hook drains it: the latest
+    event is the report (reported, idle) right after the idle Stop, and auto-exit acts."""
+    term = start_terminal(
+        tmp_path,
+        state,
+        work,
+        [
+            START,
+            {"do": "user_prompt_submit", "prompt": "go"},
+            report("done", post_tool_use="never"),
+            STOP,
+            HANG,
+        ],
+    )
+    code, outcome, err = term.finish()
+    outcome = check_outcome(code, outcome, err)
+    assert (code, outcome["outcome"], outcome["end_reason"]) == (0, "done", "auto_exit")
+    changes = events(state)
+    assert changes[-3:-1] == [
+        ("Stop", "idle", "idle", None, 0),
+        ("report", "reported", "idle", None, 0),
+    ]
+    assert fake_signals(term) == [("signal", "TERM")]
+
+
+def test_an_inherited_ignored_sighup_stays_ignored_for_exec_and_claude(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """R1-06: nohup: exec sends nothing on SIGHUP, and claude inherits the ignore."""
+    marker = tmp_path / "running"
+    status = tmp_path / "claude-status"
+    term = start_terminal(
+        tmp_path,
+        state,
+        work,
+        [START, touch(marker), HANG],
+        ignore=[signal.SIGHUP],
+        status_to=status,
+    )
+    try:
+        wait_marker(term, marker)
+        assert ignored_signals(status) & (1 << (signal.SIGHUP - 1))
+        term.proc.send_signal(signal.SIGHUP)  # the exact exec: ignored
+        term.proc.send_signal(signal.SIGTERM)
+    finally:
+        code, outcome, err = term.finish()
+    outcome = check_outcome(code, outcome, err)
+    assert (code, outcome["end_reason"]) == (15, "forwarded_term")
+    assert fake_signals(term) == [("signal", "TERM")]
+    assert signals_not_sent(term) == []
+
+
+def test_sighup_to_the_whole_group_ends_the_run_forwarded_hup(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """R1-09: a hangup reaches exec and claude together (the process group this test created
+    for exec, while its leader is unreaped); claude may be reaped before exec takes its
+    SIGHUP: the run still ends forwarded_hup, with nothing sent."""
+    marker = tmp_path / "running"
+    term = start_terminal(tmp_path, state, work, [START, touch(marker), HANG])
+    try:
+        wait_marker(term, marker)
+        os.killpg(term.proc.pid, signal.SIGHUP)
+    finally:
+        code, outcome, err = term.finish()
+    outcome = check_outcome(code, outcome, err)
+    assert (code, outcome["outcome"], outcome["end_reason"]) == (15, "killed", "forwarded_hup")
+    assert run_row_of(state)["pending_cause"] == "forwarded_hup"
+    received = fake_signals(term)  # from the group signal, and exec's forward if it was first
+    assert received and set(received) == {("signal", "HUP")}
+    assert len(signals_sent(term)) + len(signals_not_sent(term)) == 1
+
+
+# Faults injected into the interactive exec (its process, before the entry point)
+SIGNAL_IN_VALIDATE = """\
+import os, signal
+from claude_session import launch
+_real_validate = launch.validate
+def _validate(*args, **kwargs):
+    os.kill(os.getpid(), signal.SIGTERM)
+    return _real_validate(*args, **kwargs)
+launch.validate = _validate
+"""
+SIGINT_IN_SPAWN = """\
+import os, signal
+from claude_session import gateway
+_real_spawn = gateway.SystemGateway.spawn
+def _spawn(self, *args, **kwargs):
+    os.kill(os.getpid(), signal.SIGINT)
+    return _real_spawn(self, *args, **kwargs)
+gateway.SystemGateway.spawn = _spawn
+"""
+
+
+def test_a_signal_in_the_interactive_launch_phase_ends_the_run_launch_interrupted(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    term = start_terminal(tmp_path, state, work, [START, HANG], patch=SIGNAL_IN_VALIDATE)
+    code, outcome, err = term.finish()
+    outcome = check_outcome(code, outcome, err)
+    assert (code, outcome["phase"], outcome["outcome"], outcome["end_reason"]) == (
+        12,
+        "launch",
+        "not-started",
+        "launch_interrupted",
+    )
+    assert not (tmp_path / "fake.jsonl").exists()  # claude was never spawned
+
+
+def test_a_sigint_during_the_interactive_spawn_is_dropped(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    term = start_terminal(
+        tmp_path, state, work, [START, {"do": "exit", "code": 0}], patch=SIGINT_IN_SPAWN
+    )
+    code, outcome, err = term.finish()
+    outcome = check_outcome(code, outcome, err)
+    assert (code, outcome["outcome"], outcome["end_reason"]) == (14, "exited-unreported", "normal")
+    assert run_row_of(state)["pending_cause"] is None
+    assert fake_signals(term) == []
+    assert signals_sent(term) == [] and signals_not_sent(term) == []

@@ -11,6 +11,7 @@ import pytest
 from claude_session import ids, store
 from claude_session.errors import InternalError
 from claude_session.outbox import Frozen
+from claude_session.signals import LaunchInterrupted
 from claude_session.store import Final, Holder, NewRun, Store
 
 ME = Holder(pid=1000, start="100")
@@ -235,6 +236,60 @@ def test_latest_event_is_by_id(st: Store) -> None:
         "final": False,
     }
     assert st.latest_event(sid, 2) is None
+
+
+def test_latest_events_are_newest_first(st: Store) -> None:
+    sid = st.allocate(new_run(), new_id=ids.new_session_id)
+    stop = add_event(st, sid, "Stop", "idle", "idle")
+    rep = add_event(st, sid, "report", "reported", "idle")
+    assert [e["id"] for e in st.latest_events(sid, 1, 2)] == [rep, stop]
+    assert [e["cause"] for e in st.latest_events(sid, 1, 5)] == ["report", "Stop", "launch"]
+    assert st.latest_events(sid, 2, 2) == []
+
+
+def test_a_transaction_left_open_by_an_interrupted_write_does_not_block_the_end(
+    st: Store, tmp_path: Path
+) -> None:
+    """R1-08: a signal handler raising between BEGIN and the helper's try leaves the
+    connection in a transaction; the launch-phase end still finalizes the run."""
+    from claude_session import launch
+
+    sid = st.allocate(new_run(), new_id=ids.new_session_id)
+    st.conn.execute("BEGIN IMMEDIATE")  # what the interrupted write left behind
+    alloc = launch.Allocated(
+        csession_id=sid, run=1, session_dir="/s", private_dir="/p", warnings=()
+    )
+    process = launch.Process.current(None, str(tmp_path / "state"))  # type: ignore[arg-type]
+    error = launch.interrupted(LaunchInterrupted(15))
+    launch.end_launch(st, alloc, None, None, process, error)
+    assert not st.conn.in_transaction
+    row = st.run_record(sid, 1)
+    assert (row["outcome"], row["end_reason"]) == ("not-started", "launch_interrupted")
+
+
+def test_the_transaction_helper_rolls_back_when_begin_is_interrupted(st: Store) -> None:
+    """BEGIN is inside the helper's try: an exception right after it rolls back."""
+    calls: list[str] = []
+    real = st.conn
+
+    class Conn:
+        in_transaction = property(lambda self: real.in_transaction)
+
+        def execute(self, sql: str, *args: Any) -> Any:
+            calls.append(sql)
+            result = real.execute(sql, *args)
+            if sql == "BEGIN IMMEDIATE":
+                raise KeyboardInterrupt  # a handler raising right after BEGIN
+            return result
+
+    st.conn = Conn()  # type: ignore[assignment]
+    try:
+        with pytest.raises(KeyboardInterrupt), st.transaction():
+            pass
+    finally:
+        st.conn = real
+    assert calls == ["BEGIN IMMEDIATE", "ROLLBACK"]
+    assert not real.in_transaction
 
 
 def test_set_auto_exit_cause_rechecks_report_event_and_cause(st: Store) -> None:

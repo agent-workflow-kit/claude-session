@@ -7,7 +7,9 @@ from __future__ import annotations
 import os
 import signal
 import threading
+from collections import deque
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -128,6 +130,83 @@ def test_a_sigint_recorded_during_a_headless_spawn_is_kept(sigs: ExecSignals) ->
     own(signal.SIGINT)
     sigs.enter_session(interactive=False)
     assert sigs.take() == [signal.SIGINT]
+
+
+def test_a_signal_recorded_while_entering_the_session_is_neither_lost_nor_an_error(
+    sigs: ExecSignals,
+) -> None:
+    """R1-01: the handler appends to the deque while a SIGINT recorded during the spawn is
+    being dropped (simulated at the worst point: mid-iteration, if anything iterates it)."""
+
+    class Racing(deque[int]):
+        fired = False
+
+        def __iter__(self) -> Iterator[int]:
+            items = list(super().__iter__())
+            for index, item in enumerate(items):
+                yield item
+                if index == 0 and not self.fired:
+                    self.fired = True
+                    sigs._handle(signal.SIGHUP, None)  # the handler, mid-iteration
+
+        def clear(self) -> None:
+            if not self.fired:
+                self.fired = True
+                sigs._handle(signal.SIGHUP, None)  # the handler, before the clear
+            super().clear()
+
+    sigs.defer()
+    sigs._pending = Racing([signal.SIGINT, signal.SIGTERM])
+    sigs.enter_session(interactive=True)
+    if not sigs._pending.fired:  # nothing iterated or cleared: the handler fires now
+        sigs._handle(signal.SIGHUP, None)
+    assert sigs.take() == [signal.SIGTERM, signal.SIGHUP]
+
+
+@pytest.mark.parametrize("sig", HANDLED)
+def test_an_inherited_ignored_signal_stays_ignored(sig: int) -> None:
+    """R1-06: nohup (SIGHUP) or a background job (SIGINT): no handler, claude inherits it."""
+    previous = signal.signal(sig, signal.SIG_IGN)
+    try:
+        handlers = ExecSignals()
+        assert handlers.install()
+        try:
+            assert signal.getsignal(sig) == signal.SIG_IGN
+            others = [s for s in HANDLED if s != sig]
+            assert all(signal.getsignal(s) == handlers._handle for s in others)
+            own(sig)  # ignored: no LaunchInterrupted, nothing recorded
+            assert handlers.take() == []
+        finally:
+            handlers.restore()
+        assert signal.getsignal(sig) == signal.SIG_IGN
+    finally:
+        signal.signal(sig, previous)
+
+
+def test_a_signal_during_the_install_raises_only_once_every_handler_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1-11: a signal right after the first handler is set is recorded; install raises it
+    (the before-allocation rule) with all handlers in place, and restore puts them back."""
+    before = {sig: signal.getsignal(sig) for sig in HANDLED}
+    real = signal.signal
+    handlers = ExecSignals()
+
+    def setting(sig: int, handler: Any) -> Any:
+        previous = real(sig, handler)
+        if sig == HANDLED[0] and handler == handlers._handle:
+            own(sig)  # its handler is set, the others not yet
+        return previous
+
+    monkeypatch.setattr(signal, "signal", setting)
+    try:
+        with pytest.raises(LaunchInterrupted) as info:
+            handlers.install()
+        assert info.value.signum == HANDLED[0]
+        assert all(signal.getsignal(s) == handlers._handle for s in HANDLED)
+    finally:
+        handlers.restore()
+    assert {sig: signal.getsignal(sig) for sig in HANDLED} == before
 
 
 @pytest.mark.parametrize(
