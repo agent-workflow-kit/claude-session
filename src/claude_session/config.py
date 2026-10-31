@@ -15,6 +15,7 @@ Never imported by the hook path (design.md, Hook-event fast path): it needs Pyda
 from __future__ import annotations
 
 import copy
+import math
 import os
 import re
 import stat
@@ -279,8 +280,7 @@ class KindEnv(_Model):
 class Kind(_Model):
     """A kind profile; every field is present once merged over a built-in kind."""
 
-    # TODO(#22): check that permission_profile names a configured profile (or is a file).
-    permission_profile: ProfileName
+    permission_profile: ProfileName  # names a built-in or configured profile (``load``)
     sandbox: Sandbox
     reads_third_party: bool
     implicit_done: bool
@@ -314,7 +314,7 @@ class EnvOverride(_Model):
 class RepoKindOverride(_Model):
     """Per-repo override of a kind; only the fields that were given apply (``exclude_unset``)."""
 
-    # TODO(#22): check that permission_profile names a configured profile (or is a file).
+    # Names a built-in or configured profile (``load``).
     permission_profile: Annotated[ProfileName | None, NotNull] = None
     sandbox: Annotated[Sandbox | None, NotNull] = None
     env: Annotated[EnvOverride | None, NotNull] = None
@@ -473,7 +473,28 @@ def load(
                     f" (in {where})"
                 )
                 raise UsageError("invalid config", detail=detail)
+    _check_profile_references(cfg, lambda loc: _source(loc, sources, from_env))
     return cfg
+
+
+def _check_profile_references(cfg: Config, source: Callable[[tuple[str | int, ...]], str]) -> None:
+    """Every kind's and per-repo override's ``permission_profile`` names a built-in or
+    configured profile (config kinds hold names only; files are a flag form)."""
+    refs: list[tuple[tuple[str, ...], str | None]] = [
+        (("kinds", name, "permission_profile"), kind.permission_profile)
+        for name, kind in cfg.kinds.items()
+    ]
+    for repo_id, repo in cfg.repos.items():
+        for name, override in repo.kinds.items():
+            loc = ("repos", repo_id, "kinds", name, "permission_profile")
+            refs.append((loc, override.permission_profile))
+    for loc, profile in refs:
+        if profile is not None and profile not in cfg.permission_profiles:
+            detail = (
+                f"{'.'.join(loc)}: names no built-in or configured permission profile"
+                f" (in {source(loc)})"
+            )
+            raise UsageError("invalid config", detail=detail)
 
 
 def merge(base: dict[str, Any], over: Mapping[str, Any], path: tuple[str, ...] = ()) -> None:
@@ -538,7 +559,7 @@ class _Refused(yaml.constructor.ConstructorError):
 _INT, _FLOAT = "tag:yaml.org,2002:int", "tag:yaml.org,2002:float"
 _MERGE = "tag:yaml.org,2002:merge"
 # YAML types with no JSON counterpart: loaded as ``_Unsupported`` (nothing built), refused by
-# ``_check_tree`` with the key path.
+# ``check_tree`` with the key path.
 _UNSUPPORTED = ("timestamp", "binary", "set", "omap", "pairs")
 
 
@@ -639,6 +660,16 @@ def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
     raw = _read_bytes(path, required=required)
     if raw is None:
         return None
+    return parse_yaml(raw, path)
+
+
+def parse_yaml(raw: bytes, path: Path, *, empty: bool = True) -> dict[str, Any]:
+    """A YAML document (``raw``, read from ``path``) with every config-file rule: UTF-8, the
+    safe loader (no duplicate or merge keys, JSON types only), the node and depth limits and a
+    mapping at the top level (an empty document or ``null`` is ``{}`` when ``empty``, else
+    refused). Raises ``UsageError("invalid config")``
+    whose ``detail`` names ``path`` and the problem, never the content. Also used for
+    permission-profile files."""
     # Errors are raised after the handlers, so the original exception (which may hold or quote
     # the file's content) is never their ``__context__``.
     problem: str | None = None
@@ -666,7 +697,7 @@ def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
         problem = f"{path}: invalid YAML"
     if problem is not None:
         raise UsageError("invalid config", detail=problem)
-    if data is None:
+    if data is None and empty:
         return {}
     if isinstance(data, _Unsupported):
         raise _unsupported(data, "top level", path)
@@ -674,7 +705,7 @@ def _read(path: Path, *, required: bool) -> dict[str, Any] | None:
         found = type(data).__name__
         detail = f"top level: expected a mapping, got {found} (in {path})"
         raise UsageError("invalid config", detail=detail)
-    _check_tree(data, path)
+    check_tree(data, path)
     return data
 
 
@@ -693,7 +724,7 @@ def _problem(exc: yaml.YAMLError) -> str:
 
 
 def _check_nesting(text: str, path: Path) -> None:
-    """Refuse nesting deeper than ``_check_tree`` allows from the event stream, before composing:
+    """Refuse nesting deeper than ``check_tree`` allows from the event stream, before composing:
     libyaml's composer recurses once per level without limit. The parser is not recursive, and
     scanning stops at the first event that is too deep."""
     depth = 0
@@ -744,9 +775,11 @@ def _read_bytes(path: Path, *, required: bool) -> bytes | None:
     return b"".join(chunks)
 
 
-def _check_tree(data: dict[str, Any], path: Path) -> None:
-    """Refuse trees over ``MAX_NODES`` nodes (aliases expanded) or ``MAX_DEPTH`` levels, and
-    non-string mapping keys. Shared (aliased) nodes are walked once (memoized by identity)."""
+def check_tree(data: dict[str, Any], path: Path) -> None:
+    """Refuse (``UsageError``) trees over ``MAX_NODES`` nodes (aliases expanded) or
+    ``MAX_DEPTH`` levels, non-string mapping keys and non-finite numbers (``.inf``, ``.nan``,
+    ``1e400``: not JSON). Shared (aliased) nodes are walked once (memoized by identity). Also
+    applied to JSON permission-profile files."""
     seen: dict[int, tuple[int, int]] = {}  # id -> (nodes, height)
 
     def too_deep() -> UsageError:
@@ -757,6 +790,9 @@ def _check_tree(data: dict[str, Any], path: Path) -> None:
         if depth > MAX_DEPTH:
             raise too_deep()
         if not isinstance(node, (dict, list)):
+            if isinstance(node, float) and not math.isfinite(node):
+                detail = f"{where or 'top level'}: not a finite number (in {path})"
+                raise UsageError("invalid config", detail=detail)
             if node is None or isinstance(node, (str, int, float)):  # bool is an int
                 return 1, 0
             if isinstance(node, _Unsupported):

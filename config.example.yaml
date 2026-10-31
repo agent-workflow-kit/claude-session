@@ -279,7 +279,10 @@ kinds:
 # CLAUDE.local.md; Edit/Write denies for those and for //${CWD}/**/.claude/**,
 # //${CWD}/**/.mcp.json, //${CWD}/**/CLAUDE.md and //${CWD}/**/CLAUDE.local.md.
 # Isolated profiles may not set sandbox.enabled, sandbox.failIfUnavailable,
-# sandbox.allowUnsandboxedCommands, sandbox.excludedCommands or
+# sandbox.allowUnsandboxedCommands, sandbox.excludedCommands,
+# sandbox.enableWeakerNestedSandbox, sandbox.ignoreViolations, sandbox.network.allowUnixSockets,
+# sandbox.network.allowAllUnixSockets, sandbox.network.allowLocalBinding,
+# sandbox.network.httpProxyPort, sandbox.network.socksProxyPort or
 # permissions.additionalDirectories, sandbox.autoAllowBashIfSandboxed: true, and their defaultMode is ignored (always dontAsk). A profile
 # rule whose variable expands empty fails the launch. A path a profile makes writable is checked
 # against the unsafe write targets (docs/interface.md, Path rules).
