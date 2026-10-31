@@ -121,8 +121,8 @@ def _hook_event(argv: list[str]) -> int:
     if failed:
         _silence_output(saved)
         return 0
-    # captured_stderr is dropped. TODO(#13): decide whether hook-event's own stderr reaches the
-    # log; schemas/log.json has no event for it and the text may carry payload data.
+    # captured_stderr is dropped, never logged: the text may carry payload data (prompt text,
+    # tool output) and schemas/log.json has no event for it (design.md, Hook-event fast path).
     try:
         _drop_stray_output(real_stdout, real_stderr)
         _restore_output(saved)

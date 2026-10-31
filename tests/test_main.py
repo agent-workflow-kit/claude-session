@@ -51,9 +51,15 @@ def test_hook_event_receives_its_arguments(monkeypatch: pytest.MonkeyPatch) -> N
     assert seen == [["--state-dir", "/s", "Stop"]]
 
 
-def test_hook_event_accepts_yes() -> None:
-    """Placeholder until #13 parses hook-event's argv: the stub ignores its arguments."""
-    assert entry.main(["hook-event", "--state-dir", "/nonexistent", "Stop", "--yes"]) == 0
+def test_hook_event_refuses_extra_arguments_and_still_exits_0(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Only the injected argv is accepted (hookevent.parse_argv); anything else is a contained
+    error: logged, no output, exit 0."""
+    assert entry.main(["hook-event", "--state-dir", str(tmp_path), "Stop", "--yes"]) == 0
+    assert capsys.readouterr() == ("", "")
+    (record,) = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert (record["event"], record["message"]) == ("hook_event_failed", "Stop: HookEventError")
 
 
 def test_other_commands_go_to_cli(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -27,6 +27,7 @@ the hook path may import it (design.md, Hook-event fast path), but never migrate
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -883,6 +884,163 @@ class Store:
             )
             if cursor.rowcount != 1:
                 raise InternalError(f"no run {run_no} of session {csession_id}")
+
+    # The hook path (hookevent). Call these inside one ``transaction()``; they read and write
+    # only columns of schema 1.0, so a newer additive schema keeps working (design.md, Data
+    # model: hook-event never migrates).
+
+    def hook_run(self, csession_id: str) -> HookRun | None:
+        """The session's current run as the hook path sees it, or None when the session is
+        unknown or forgotten, or its current run row is missing."""
+        row = self.conn.execute(
+            "SELECT s.csession_id, r.run_no, s.state, s.activity, s.needs_input_reason, "
+            "r.mode, r.session_started_at, r.report_status, r.reported_at, r.backstop_used, "
+            "r.ended_at IS NULL AND r.wrapper_pid IS NOT NULL, s.csession_dir, s.private_dir "
+            "FROM sessions s JOIN runs r "
+            "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
+            "WHERE s.csession_id = ? AND s.forgotten_at IS NULL",
+            (csession_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return HookRun(
+            csession_id=row[0],
+            run_no=row[1],
+            state=row[2],
+            activity=row[3],
+            needs_input_reason=row[4],
+            mode=row[5],
+            session_started_at=row[6],
+            report_status=row[7],
+            reported_at=row[8],
+            backstop_used=bool(row[9]),
+            adopted_and_open=bool(row[10]),
+            csession_dir=row[11],
+            private_dir=row[12],
+        )
+
+    def prompt_submitted_since(self, run: HookRun, since: str) -> bool:
+        """Whether the run has a ``UserPromptSubmit`` event after ``since`` (an ISO timestamp
+        from ``format_ts``), which closes an escalation (design.md, State machine)."""
+        row = self.conn.execute(
+            "SELECT 1 FROM events WHERE csession_id = ? AND run_no = ? "
+            "AND cause = 'UserPromptSubmit' AND event_ts > ? LIMIT 1",
+            (run.csession_id, run.run_no, since),
+        ).fetchone()
+        return row is not None
+
+    def record_session_start(
+        self,
+        run: HookRun,
+        *,
+        claude_session_id: str,
+        source: str,
+        transcript_path: str | None,
+    ) -> None:
+        """Record a SessionStart: a ``claude_ids`` row (an id already recorded keeps its first
+        row), the session's current Claude id and, on the run's first SessionStart,
+        ``session_started_at``."""
+        now = format_ts(self.clock())
+        self.conn.execute(
+            "INSERT INTO claude_ids (csession_id, claude_session_id, run_no, source, "
+            "transcript_path, seen_at) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (csession_id, claude_session_id) DO NOTHING",
+            (run.csession_id, claude_session_id, run.run_no, source, transcript_path, now),
+        )
+        self.conn.execute(
+            "UPDATE sessions SET claude_session_id = ? WHERE csession_id = ?",
+            (claude_session_id, run.csession_id),
+        )
+        self.conn.execute(
+            "UPDATE runs SET session_started_at = ? "
+            "WHERE csession_id = ? AND run_no = ? AND session_started_at IS NULL",
+            (now, run.csession_id, run.run_no),
+        )
+
+    def record_session_end_reason(self, run: HookRun, reason: str) -> None:
+        """Record the reason of the run's latest SessionEnd, verbatim."""
+        self.conn.execute(
+            "UPDATE runs SET session_end_reason = ? WHERE csession_id = ? AND run_no = ?",
+            (reason, run.csession_id, run.run_no),
+        )
+
+    def apply_state(
+        self,
+        run: HookRun,
+        *,
+        state: str,
+        activity: str | None,
+        needs_input_reason: str | None,
+        cause: str,
+    ) -> int | None:
+        """Store the run's new state. When ``state``, ``activity`` or ``needs_input_reason``
+        changed, also bump ``updated_at`` (and ``state_since`` for a new state) and append an
+        ``events`` row carrying the session's labels; returns its id, else None."""
+        before = (run.state, run.activity, run.needs_input_reason)
+        if (state, activity, needs_input_reason) == before:
+            return None
+        now = format_ts(self.clock())
+        self.conn.execute(
+            "UPDATE sessions SET state = ?, activity = ?, needs_input_reason = ?, "
+            "state_since = CASE WHEN state IS ? THEN state_since ELSE ? END, updated_at = ? "
+            "WHERE csession_id = ?",
+            (state, activity, needs_input_reason, state, now, now, run.csession_id),
+        )
+        labels = [
+            f"{key}={value}"
+            for key, value in self.conn.execute(
+                "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+                (run.csession_id,),
+            )
+        ]
+        cursor = self.conn.execute(
+            "INSERT INTO events (csession_id, run_no, event_ts, from_state, to_state, "
+            "from_activity, to_activity, needs_input_reason, cause, final, labels_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            (
+                run.csession_id,
+                run.run_no,
+                now,
+                run.state,
+                state,
+                run.activity,
+                activity,
+                needs_input_reason,
+                cause,
+                json.dumps(labels, ensure_ascii=False),
+            ),
+        )
+        return cursor.lastrowid
+
+    def take_backstop(self, run: HookRun) -> bool:
+        """Mark the run's Stop backstop used, once per run, while it has no report. Returns
+        whether this call took it."""
+        cursor = self.conn.execute(
+            "UPDATE runs SET backstop_used = 1 WHERE csession_id = ? AND run_no = ? "
+            "AND backstop_used = 0 AND report_status IS NULL",
+            (run.csession_id, run.run_no),
+        )
+        return cursor.rowcount == 1
+
+
+@dataclass(frozen=True)
+class HookRun:
+    """The fields of a session and its current run that ``hook-event`` reads."""
+
+    csession_id: str
+    run_no: int
+    state: str
+    activity: str | None
+    needs_input_reason: str | None
+    mode: str | None
+    session_started_at: str | None
+    report_status: str | None
+    reported_at: str | None
+    backstop_used: bool
+    # Adopted (wrapper set: claude can have been spawned) and not ended.
+    adopted_and_open: bool
+    csession_dir: str | None
+    private_dir: str | None
 
 
 def open_state(**kwargs: Any) -> Store:
