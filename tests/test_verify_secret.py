@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -484,6 +485,27 @@ def test_every_answer_does_the_same_work(run_verify: Any, monkeypatch: pytest.Mo
         assert lookups == {"procinfo": 2, "secret_run": 1, "compare": 1}, sid
         assert len(fake.calls) == 2, sid
         assert all(start != "" for _, start in fake.calls), sid
+        # No probe names this process: a live PID would take a longer path than a dead one.
+        assert all(pid != os.getpid() for pid, _ in fake.calls), sid
+    fake.calls.clear()
+    run_verify(SECRET.encode(), OTHER, "--json")
+    stand_in = (secretcheck._STAND_IN_PID, secretcheck._STAND_IN_START)
+    assert fake.calls == [stand_in, stand_in]
+
+
+def test_the_stand_in_names_no_process() -> None:
+    """The stand-in PID passes every range check yet can never exist, so probing it takes the
+    same "no such process" path as a dead wrapper or child, and it can never match."""
+    pid = secretcheck._STAND_IN_PID
+    assert 0 < pid <= store.MAX_PID
+    if sys.platform.startswith("linux"):
+        # PID_MAX_LIMIT: pid_max can be at most 2**22, and PIDs are below pid_max.
+        with open("/proc/sys/kernel/pid_max") as fh:
+            assert pid >= int(fh.read())
+        assert not os.path.exists(f"/proc/{pid}")
+    assert not store.pid_exists(pid)
+    assert store.system_procinfo().start_time(pid) is None
+    assert not store.pid_known_alive(pid, secretcheck._STAND_IN_START)
 
 
 def test_the_secret_is_never_printed(st: Store, run_verify: Any) -> None:

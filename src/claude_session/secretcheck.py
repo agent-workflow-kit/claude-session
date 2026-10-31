@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import os
 import re
 from typing import BinaryIO
 
@@ -32,8 +31,11 @@ _NO_DIGEST = "0" * 64
 # Looked up for an id that is not a full id, so the lookup always runs; it can never be a
 # session id ("0" is not in the base32 alphabet), and the result is discarded anyway.
 _NO_SESSION = "cs-00000000"
-# The start-time token probed (with this process's PID) when there is no process to probe: it
-# goes through the same liveness path and is never alive.
+# Probed when there is no process to probe. The PID passes every range check but names no
+# process: Linux PIDs are below pid_max, which is at most PID_MAX_LIMIT (2**22), and macOS
+# PIDs stay below 100000. So the probe takes the same "no such process" path as a dead
+# wrapper or child, and the token never matches a real one.
+_STAND_IN_PID = 2**22
 _STAND_IN_START = "verify-secret:stand-in"
 
 
@@ -56,7 +58,7 @@ def _probe(st: Store, pid: int | None, start: str | None) -> bool:
     if pid is not None and 0 < pid <= MAX_PID and start is not None and start != "":
         usable, target = True, (pid, start)
     else:
-        usable, target = False, (os.getpid(), _STAND_IN_START)
+        usable, target = False, (_STAND_IN_PID, _STAND_IN_START)
     alive = bool(st.known_liveness(*target))
     return usable & alive
 
