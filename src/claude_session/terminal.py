@@ -30,11 +30,34 @@ def display(value: object, extra: str = "") -> str:
     Escaped as ``\\xNN``, ``\\uNNNN`` or ``\\UNNNNNNNN``: C0 controls (TAB, CR and LF
     included), DEL, C1 controls (NEL included), line and paragraph separators, bidi controls,
     lone surrogates, every format (Cf) character (zero-width characters, BOM, soft hyphen,
-    word joiner, invisible operators) and a few invisible fillers. A backslash becomes
+    word joiner, invisible operators), a few invisible fillers, and a variation selector
+    that does not directly follow a character printed as is (one after a base character, as
+    in an emoji, stays; a run of them could hide data). A backslash becomes
     ``\\\\``, so an escape in the output was always written here. ``extra`` lists more
     (ASCII) characters to escape, such as a column separator."""
     text = "-" if value is None else str(value)
-    return "".join(_escape(char, extra) for char in text)
+    out: list[str] = []
+    after_base = False  # the previous character was printed unescaped, not a selector
+    for char in text:
+        shown = _escape(char, extra)
+        if _is_variation_selector(char):
+            if not after_base:
+                shown = _code_escape(char)
+            after_base = False
+        else:
+            after_base = shown == char
+        out.append(shown)
+    return "".join(out)
+
+
+def _is_variation_selector(char: str) -> bool:
+    code = ord(char)
+    return 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF or 0x180B <= code <= 0x180F
+
+
+def _code_escape(char: str) -> str:
+    code = ord(char)
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
 
 
 def _escape(char: str, extra: str) -> str:
@@ -46,7 +69,7 @@ def _escape(char: str, extra: str) -> str:
     if code < 0xA0:
         return char
     if char in _ALWAYS_ESCAPED or 0xD800 <= code <= 0xDFFF or unicodedata.category(char) == "Cf":
-        return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+        return _code_escape(char)
     return char
 
 

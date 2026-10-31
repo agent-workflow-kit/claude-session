@@ -1,0 +1,54 @@
+{
+  "csession_id": "cs-aaaaaaaa",
+  "files": [
+    {
+      "claude_session_id": "11111111-1111-4111-8111-111111111111",
+      "exists": true,
+      "path": "$HOME/.claude/projects/-work-project/11111111-1111-4111-8111-111111111111.jsonl",
+      "run": 1,
+      "source": "startup",
+      "subagents": [
+        {
+          "agent_id": "a1",
+          "agent_type": "Explore",
+          "description": "dig around",
+          "exists": true,
+          "path": "$HOME/.claude/projects/-work-project/11111111-1111-4111-8111-111111111111/subagents/agent-a1.jsonl",
+          "tool_use_id": "toolu_1"
+        },
+        {
+          "agent_id": "b2",
+          "agent_type": null,
+          "description": null,
+          "exists": true,
+          "path": "$HOME/.claude/projects/-work-project/11111111-1111-4111-8111-111111111111/subagents/agent-b2.jsonl",
+          "tool_use_id": null
+        },
+        {
+          "agent_id": "c3",
+          "agent_type": "general",
+          "description": null,
+          "exists": false,
+          "path": "$HOME/.claude/projects/-work-project/11111111-1111-4111-8111-111111111111/subagents/agent-c3.jsonl",
+          "tool_use_id": null
+        }
+      ]
+    },
+    {
+      "claude_session_id": "22222222-2222-4222-8222-222222222222",
+      "exists": false,
+      "path": "$HOME/.claude/projects/-work-project/22222222-2222-4222-8222-222222222222.jsonl",
+      "run": 1,
+      "source": "clear",
+      "subagents": []
+    },
+    {
+      "claude_session_id": "33333333-3333-4333-8333-333333333333",
+      "exists": true,
+      "path": "$HOME/.claude/projects/-work-fork/33333333-3333-4333-8333-333333333333.jsonl",
+      "run": 2,
+      "source": "fork",
+      "subagents": []
+    }
+  ]
+}
