@@ -236,14 +236,14 @@ def test_entry_module_does_not_import_re() -> None:
     assert loaded == "0"
 
 
-def test_notes_does_not_import_secrets() -> None:
-    """``notes`` is imported on every hook: its nonce comes from ``os.urandom``, since
-    importing ``secrets`` costs milliseconds. (``outbox``, also on the hook path, still
-    imports it.)"""
+def test_hook_event_does_not_import_secrets() -> None:
+    """``hookevent`` (with ``notes``, ``outbox`` and ``fsutil``) is imported on every hook:
+    nonces and temporary names come from ``os.urandom``, since importing ``secrets`` costs
+    milliseconds."""
     script = (
         "import sys\n"
         "preloaded = 'secrets' in sys.modules\n"
-        "import claude_session.notes\n"
+        "import claude_session.hookevent\n"
         "print(int(preloaded), int('secrets' in sys.modules))\n"
     )
     proc = subprocess.run(

@@ -28,7 +28,6 @@ import hmac
 import json
 import os
 import re
-import secrets
 import stat
 import time
 import uuid
@@ -202,7 +201,7 @@ def is_request_name(name: str) -> bool:
 
 def temp_name() -> str:
     """A fresh reserved temporary name for ``report``'s request file in ``outbox/``."""
-    return f".tmp-{secrets.token_hex(8)}"
+    return f".tmp-{fsutil.token_hex(8)}"
 
 
 def is_temp_name(name: str) -> bool:
@@ -1097,7 +1096,7 @@ class Drain:
             return "artifact_missing"
         except _BadFile as exc:
             return exc.reason
-        copy_name = f"{item.request_id}.{secrets.token_hex(8)}.tmp"
+        copy_name = f"{item.request_id}.{fsutil.token_hex(8)}.tmp"
         scan_fd = self._fds["scan"]
         try:
             fd = os.open(copy_name, _CREATE_FLAGS, 0o600, dir_fd=scan_fd)

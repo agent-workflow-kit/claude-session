@@ -76,6 +76,14 @@ _VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 # Line and paragraph separators: line breaks to a reader, so kept as newlines.
 _SEPARATORS = str.maketrans({"\u2028": "\n", "\u2029": "\n"})
+# Default_Ignorable_Code_Point characters outside category Cf (Cf is stripped separately):
+# U+034F, the Hangul fillers, the Khmer inherent vowels, the Mongolian variation selectors,
+# the variation selectors and their supplement, and the reserved default-ignorable ranges
+# (U+2065, U+FFF0-U+FFF8, U+E0000-U+E0FFF), so a later Unicode version cannot add one.
+_IGNORABLE = re.compile(
+    "[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180f\u2065\u3164\ufe00-\ufe0f\uffa0"
+    "\ufff0-\ufff8\U000e0000-\U000e0fff]"
+)
 # A closing tag, also with whitespace around the slash (after NFKC and stripping).
 _CLOSING = re.compile(r"<\s*/\s*(untrusted)", re.IGNORECASE)
 _KEYS = frozenset({"argv", "executable", "env", "timeout", "max_bytes", "sources"})
@@ -218,13 +226,15 @@ def _utf16_prefix(text: str, units: int) -> str:
 
 def sanitize(output: str) -> str:
     """The command's output made safe to fence: NFKC-normalized (fullwidth and other
-    compatibility forms become their plain characters), format characters (category ``Cf``)
-    and control characters stripped, U+2028/U+2029 turned into newlines, and only then (last,
-    so nothing after it can assemble a tag) every closing-tag look-alike neutralized."""
+    compatibility forms become their plain characters), format characters (category ``Cf``),
+    the other default-ignorable characters and control characters stripped, U+2028/U+2029
+    turned into newlines, and only then (last, so nothing after it can assemble a tag) every
+    closing-tag look-alike neutralized."""
     import unicodedata  # lazy: only hooks that show notes load it
 
     text = unicodedata.normalize("NFKC", output)
     text = "".join(char for char in text if unicodedata.category(char) != "Cf")
+    text = _IGNORABLE.sub("", text)
     text = _CONTROL.sub("", text.translate(_SEPARATORS))
     return _CLOSING.sub(r"&lt;/\1", text)
 
