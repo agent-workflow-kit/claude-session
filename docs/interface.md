@@ -421,6 +421,11 @@ claude-session transcript <id> [--raw | --paths] [--subagents] [--run <n>] [--js
 
 All transcript content is untrusted. claude-session never copies transcripts; files Claude Code has deleted are reported with `exists: false`. A read error exits 12 (`failed`).
 
+- A recorded transcript path (from a `SessionStart` payload) is used only when it is `<root>/<project>/<claude session id>.jsonl` for a root `$HOME/.claude/projects` or `$CLAUDE_CONFIG_DIR/projects` (as written or resolved), in normal form and printable unchanged. Any other is listed with `path: null` and a warning on stderr, and never read.
+- Files are opened below the root one component at a time without following symlinks. A transcript, subagent or meta file that is not a regular file with one link owned by the user, or a directory on the way that is a symlink or not a directory owned by the user, exits 12 (`failed`). A file is read up to its size when opened (a live session keeps appending); reading stops with exit 12 after 300 seconds.
+- `--paths` prints the existing files, each main file followed by its subagent files (as `--json` lists them, with or without `--subagents`); missing files are warned about on stderr. `--raw` skips missing files the same way.
+- `--run <n>` selects the Claude session ids first seen in run `n`: a plain resume keeps its Claude id, so what it appends stays in the file of the run that started that id.
+
 ### `forget`
 
 ```text

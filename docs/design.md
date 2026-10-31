@@ -641,6 +641,8 @@ What is carried, reset and refused on resume and fork is normative in [interface
 
 `transcripts` knows Claude Code's layout: the main file is the recorded `transcript_path`; subagents are `<dir>/<claude_session_id>/subagents/agent-<id>.jsonl` with `agent-<id>.meta.json` (`agentType`, `description`, `toolUseId`); offloaded tool output is `<dir>/<claude_session_id>/tool-results/`. The renderer is tolerant: unknown record types are skipped, missing files are reported, never fatal. Layout changes in Claude Code are absorbed here only.
 
+The record format the renderer reads (`type` `user` or `assistant`, `message.content` as a string or a list of `text`, `tool_use` and `tool_result` blocks; offloaded results named in tool-result text as `tool-results/<name>`; the main file named `<claude session id>.jsonl`) is not yet live-verified (#41). Recorded paths, files and records are untrusted: the allowed location, the no-follow opens and the read caps are in [interface.md, transcript](interface.md#transcript).
+
 Human-readable output of untrusted fields (transcript text, summaries, reasons, descriptions) strips or escapes C0 and C1 control characters; `--raw` output is unchanged and documented as raw.
 
 ### Reconcile, salvage and retention

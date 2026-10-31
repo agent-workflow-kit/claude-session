@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 from . import durations, fsutil, ids, outbox, store
 from .defaults import MAX_INTEGER
-from .errors import CliError, InternalError, RefusedError, UsageError
+from .errors import CliError, InternalError, NotFoundError, RefusedError, UsageError
 from .terminal import display
 
 if TYPE_CHECKING:
@@ -256,6 +256,41 @@ def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
         print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
 
 
+def _transcript(args: argparse.Namespace) -> int:
+    """``transcript <id>`` (interface.md, transcript): rendered text by default, ``--raw``
+    bytes, ``--paths`` or ``--json`` file lists. state.db is closed before any file is read."""
+    from . import transcripts
+
+    with store.open_state() as state:
+        sid = ids.lookup_session_id(args.id, state.session_id_candidates)
+        record = state.status_record(sid)
+    if record is None or record.session.get("forgotten_at") is not None:
+        raise NotFoundError(f"unknown session: {args.id}")
+    if args.run is not None and not 1 <= args.run <= record.runs:
+        raise NotFoundError(f"session {sid} has no run {args.run}")
+    reader = transcripts.Reader()
+    roots = transcripts.projects_roots(os.environ)
+    listing = transcripts.discover(sid, record.claude_ids, roots, reader, run_no=args.run)
+    warnings = list(listing.warnings)
+    if args.json:
+        print(json.dumps(listing.as_json(), allow_nan=False))
+    elif args.paths:
+        warnings += transcripts.missing_warnings(listing)
+        for line in transcripts.path_lines(listing):
+            print(line)
+    elif args.raw:
+        warnings += transcripts.missing_warnings(listing)
+        sys.stdout.flush()
+        transcripts.write_raw(listing, reader, sys.stdout.buffer, subagents=args.subagents)
+        sys.stdout.buffer.flush()
+    else:
+        for line in transcripts.Renderer(reader, subagents=args.subagents).lines(listing):
+            print(line)
+    for warning in warnings:
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
+    return 0
+
+
 # Command name (as typed, nested commands joined by a space) -> handler.
 HANDLERS: dict[str, Handler] = {
     "exec": _exec,
@@ -269,7 +304,7 @@ HANDLERS: dict[str, Handler] = {
     "kinds": _not_implemented,
     "label add": _not_implemented,
     "label remove": _not_implemented,
-    "transcript": _not_implemented,
+    "transcript": _transcript,
     "forget": _not_implemented,
     "reconcile": _not_implemented,
     "export": _not_implemented,
