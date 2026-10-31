@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from claude_session import config, kinds, launch, pathrules
-from claude_session.errors import LaunchValidationError, UsageError
+from claude_session.errors import InternalError, LaunchValidationError, UsageError
 from claude_session.gateway import SystemGateway
 
 from .fake_gateway import FakeGateway
@@ -72,8 +72,9 @@ def args(**given: Any) -> argparse.Namespace:
 
 
 def test_interactive_exec_is_not_implemented_yet(tmp_path: Path) -> None:
-    with pytest.raises(UsageError, match="--mode headless"):
+    with pytest.raises(InternalError, match="--mode headless") as info:
         launch.read_request(args(), load(tmp_path))
+    assert info.value.detail == "not_implemented"
 
 
 def test_read_request_reads_the_prompt_and_inputs_capped(tmp_path: Path) -> None:
@@ -107,6 +108,26 @@ def test_the_repo_is_derived_with_git_run_by_name_from_its_realpath(tmp_path: Pa
     (call,) = gw.calls
     assert call.argv[0] == "git" and call.executable == os.path.realpath(call.executable or "")
     assert resolved.caller_cwd == os.path.realpath(tmp_path)
+
+
+def test_step_2_never_runs_a_git_the_session_could_have_planted(tmp_path: Path) -> None:
+    executable(tmp_path / "bin" / "git")
+    cfg = load(tmp_path)
+    proc = process(tmp_path, PATH=f"{tmp_path / 'bin'}:/usr/bin:/bin")
+    gw = proc.gateway
+    assert isinstance(gw, FakeGateway)
+    gw.on(["git"], stdout="https://example.com/group/project.git\n")
+    resolved = launch.resolve_kind(launch.read_request(args(mode="headless"), cfg), cfg, proc)
+    assert gw.calls == []
+    assert resolved.resolution.repo is None
+    assert any("session-writable" in w for w in resolved.resolution.warnings)
+
+
+def test_step_2_git_under_the_tmp_root_or_the_sessions_is_never_run(tmp_path: Path) -> None:
+    proc = process(tmp_path)
+    for path in (pathrules.tmp_parent(), os.path.join(proc.state_root, "sessions")):
+        assert launch.step2_writable(proc, str(tmp_path / "cwd"))(os.path.join(path, "x", "git"))
+    assert not launch.step2_writable(proc, None)("/usr/bin/git")
 
 
 # Tools
@@ -222,7 +243,17 @@ def test_secret_values_over_the_index_limit_fail_the_launch() -> None:
     with pytest.raises(LaunchValidationError) as info:
         launch.secret_index(values)
     assert info.value.end_reason == "config_invalid"
+    assert "secret values exceed 256 KiB" in launch.failure_message(info.value)
     assert launch.secret_index(frozenset({"b" * 64})).startswith(secretindex.MAGIC)
+
+
+def test_the_failure_message_is_the_error_its_detail_and_the_hint() -> None:
+    error = LaunchValidationError("bad\x07 thing", detail="at /x", end_reason="unsafe_path")
+    assert launch.failure_message(error) == "bad thing: at /x"
+    error = LaunchValidationError("no claude", end_reason="claude_not_found")
+    assert launch.failure_message(error) == f"no claude; {launch.HINTS['claude_not_found']}"
+    long = LaunchValidationError("x" * 5000, end_reason="unsafe_path")
+    assert len(launch.failure_message(long)) == 2048
 
 
 def test_fail_launch_records_the_hint_as_the_message(tmp_path: Path) -> None:
@@ -241,6 +272,6 @@ def test_fail_launch_records_the_hint_as_the_message(tmp_path: Path) -> None:
         "not-started",
         "sandbox_unavailable",
         12,
-        "install",
+        "no bwrap; install",
     )
     assert row["phase"] == "launch" and row["session_state"] == "not-started"

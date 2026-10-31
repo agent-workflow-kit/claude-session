@@ -157,6 +157,19 @@ def test_a_run_with_a_report_ends_exited(st: Store) -> None:
     assert row["session_state"] == "exited"
 
 
+def test_finalize_can_require_the_report_status_it_mapped_from(st: Store) -> None:
+    sid = st.allocate(new_run(), new_id=ids.new_session_id)
+    frozen = Frozen(name="result.md", path="/p/result.md", sha256="0" * 64, size=1, ingest_seq=1)
+    assert st.set_implicit_report(sid, 1, frozen)
+    # Mapped without a report: the report committed since must not be overwritten.
+    assert not st.finalize_run(sid, 1, FINAL, report_status=None)
+    assert st.run_record(sid, 1)["ended_at"] is None
+    assert st.finalize_run(
+        sid, 1, Final("session", "done", "normal", 0, "exited", "exit"), report_status="done"
+    )
+    assert st.run_record(sid, 1)["outcome"] == "done"
+
+
 def test_finalize_keeps_a_message_set_earlier_when_given_none(st: Store) -> None:
     sid = st.allocate(new_run(), new_id=ids.new_session_id)
     st.update_run(sid, 1, message="earlier")

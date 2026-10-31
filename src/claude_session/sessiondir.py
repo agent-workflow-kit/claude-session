@@ -735,9 +735,8 @@ class SessionDirs:
         """``start``: stage the prompt and inputs in ``private/<id>/runs/<run>/staged/``
         (which must not exist yet), so the caller may delete its files afterwards.
 
-        TODO(#28): decide and specify the launch end reason for a session-directory failure
-        during staging (no current launch_end_reason covers it; candidate: a new validation
-        reason such as `session_dir_unsafe`, exit 12).
+        TODO(#28): a session-directory failure during staging ends the launch
+        ``session_dir_unsafe`` (``start``: ``launch_failed``, exit 12), as in exec's step 7.
         """
         _check_run(run)
         check_input_names([item.name for item in inputs])

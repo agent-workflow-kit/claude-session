@@ -87,7 +87,10 @@ class HeadlessResult:
 def _cost(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:  # an integer too large for a float
+        return None
     return number if math.isfinite(number) and number >= 0 else None
 
 
@@ -135,23 +138,31 @@ class _Parser:
 
 
 def parse_stream_json(chunks: Iterable[bytes]) -> HeadlessResult:
-    """Parse ``stream-json`` output given in chunks of any size (see the module docs)."""
+    """Parse ``stream-json`` output given in chunks of any size (see the module docs). Only
+    each new chunk is split; the partial line is kept in parts, so a long line costs linear
+    time. A summed cost that is not finite is unknown (None)."""
     parser = _Parser()
-    pending = b""
+    partial: list[bytes] = []
     for chunk in chunks:
-        pending += chunk
-        *lines, pending = pending.split(b"\n")
-        for raw in lines:
-            parser.line(raw)
-    truncated = pending.strip() != b""
+        *lines, rest = chunk.split(b"\n")
+        if lines:
+            partial.append(lines[0])
+            parser.line(b"".join(partial))
+            for raw in lines[1:]:
+                parser.line(raw)
+            partial = []
+        if rest:
+            partial.append(rest)
+    truncated = b"".join(partial).strip() != b""
     complete = parser.count > 0 and parser.last_is_result and not truncated
     if parser.count == 0:
         return HeadlessResult()
+    cost = parser.cost
     return HeadlessResult(
         complete=complete,
         final=parser.final,
         result_count=parser.count,
-        cost_usd=parser.cost,
+        cost_usd=cost if cost is None or math.isfinite(cost) else None,
         num_turns=parser.turns,
     )
 
@@ -177,20 +188,24 @@ def read_result_file(run_fd: int, name: str = RESULT_FILE) -> HeadlessResult:
         os.close(fd)
 
 
+SIGNAL_MAX = 64  # the highest signal number an exit status 128+n is read as
+
+
 def signal_end_reason(returncode: int) -> str | None:
     """``signal_<name>`` for a ``claude`` killed by a signal (a negative return code, or exit
-    128+n for a signal n), else None."""
+    128+n for a signal n of 1 to 64), else None. A signal without a Python name (a real-time
+    signal such as 35) is ``signal_<n>``."""
     if returncode < 0:
         number = -returncode
-    elif returncode > 128:
+    elif 128 < returncode <= 128 + SIGNAL_MAX:
         number = returncode - 128
     else:
         return None
     try:
-        name = signal.Signals(number).name
+        name = signal.Signals(number).name.removeprefix("SIG").lower()
     except ValueError:
-        return None
-    return "signal_" + name.removeprefix("SIG").lower()
+        name = str(number)
+    return "signal_" + name
 
 
 @dataclass(frozen=True)

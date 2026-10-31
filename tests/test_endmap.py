@@ -150,11 +150,37 @@ def test_read_result_file_missing_is_empty(tmp_path: Path) -> None:
         (1, None),
         (128, None),
         (255, None),  # 128 + 127: not a signal
-        (-200, None),
+        (-35, "signal_35"),  # a real-time signal: no Python name
+        (163, "signal_35"),  # 128 + 35
+        (192, "signal_rtmax"),  # 128 + 64
+        (193, None),  # 128 + 65: not a signal
+        (-200, "signal_200"),
     ],
 )
 def test_signal_end_reason(code: int, reason: str | None) -> None:
     assert endmap.signal_end_reason(code) == reason
+
+
+def test_a_cost_too_large_for_a_float_is_not_counted() -> None:
+    parsed = parse(line(result(total_cost_usd=10**400)), line(result(total_cost_usd=0.5)))
+    assert parsed.complete and parsed.cost_usd == 0.5
+
+
+def test_a_cost_sum_that_overflows_is_unknown() -> None:
+    parsed = parse(line(result(total_cost_usd=1.5e308)), line(result(total_cost_usd=1.5e308)))
+    assert parsed.complete and parsed.cost_usd is None
+
+
+def test_a_long_single_line_parses_in_linear_time() -> None:
+    import time
+
+    text = "x" * (32 << 20)
+    data = line(result(result=text))
+    chunks = [data[i : i + (1 << 16)] for i in range(0, len(data), 1 << 16)]
+    start = time.monotonic()
+    parsed = parse(*chunks)
+    assert time.monotonic() - start < 3.0
+    assert parsed.complete and parsed.final is not None and len(parsed.final["result"]) == len(text)
 
 
 def test_outcome_exit_codes_and_states() -> None:

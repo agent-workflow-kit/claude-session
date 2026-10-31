@@ -1253,14 +1253,14 @@
             "number",
             "null"
           ],
-          "description": "Headless: the sum of total_cost_usd over all result objects of the run; null for interactive runs and launch-phase ends."
+          "description": "Headless: the sum of total_cost_usd over all result objects of the run (values that are not finite non-negative numbers left out); null for interactive runs, launch-phase ends, and a headless run with no result object, no usable cost or a sum that is not finite."
         },
         "message": {
           "type": [
             "string",
             "null"
           ],
-          "description": "Human-readable detail: launch-phase hint, or a pre-launch hook's stderr (control characters stripped, capped at 2 KiB). Never agent text."
+          "description": "Human-readable detail: a launch failure's message (the error, its detail such as the refused path or git's first error line, then the hint when there is one), or a pre-launch hook's stderr (control characters stripped, capped at 2 KiB). Never agent text."
         },
         "warnings": {
           "type": "array",

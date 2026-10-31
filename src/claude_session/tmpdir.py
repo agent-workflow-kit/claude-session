@@ -28,10 +28,11 @@ symlink or FIFO in its place, or create it with a mode that lets them in.
   type for the message only (a root another user created is reported as such even when it
   cannot be opened); the no-follow open and ``fstat`` checks stay authoritative.
 
-``exec`` (``launch.check_sandbox``) calls ``check`` at the temporary-directory slot of launch
-step 5 and ``create`` (through ``selfcheck.self_check``, after the ``claude_args`` check),
+``exec`` (``launch.check_tmpdir``) calls ``check`` at the temporary-directory slot of launch
+step 5 and ``create`` (through ``selfcheck.self_check`` in ``launch.check_sandbox``, the last
+action of step 5),
 passes the path as ``Isolation.tmpdir`` and ``envbuild``'s ``tmpdir``, and calls ``remove``
-when the run ends (``supervisor.finish``; a not-started run's in ``launch.run``).
+when the run ends (``supervisor.finish``; a not-started run's in ``launch.end_launch``).
 TODO(#28): adoption calls ``check`` and ``create`` again.
 TODO(#29): reconcile calls ``remove`` for leftover tmpdirs of final runs and of deleted
 sessions.

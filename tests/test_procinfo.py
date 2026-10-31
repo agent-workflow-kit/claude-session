@@ -121,6 +121,16 @@ def test_linux_zombie_or_dead_counts_as_gone(
     assert info.is_alive(42, f"{BOOT_ID}:555") is False
 
 
+def test_linux_an_unreaped_zombie_has_a_start_time_when_asked(
+    fake_proc: Callable[..., ProcInfo],
+) -> None:
+    assert (
+        fake_proc(p42=stat_line(42, "claude", "Z", 555)).start_time(42, zombie=True)
+        == f"{BOOT_ID}:555"
+    )
+    assert fake_proc(p42=stat_line(42, "claude", "X", 555)).start_time(42, zombie=True) is None
+
+
 def test_pid_reuse_same_pid_different_start_time_is_not_alive(
     fake_proc: Callable[..., ProcInfo],
 ) -> None:
@@ -251,6 +261,7 @@ def test_real_zombie_then_reaped_child_is_not_alive() -> None:
     while info.start_time(child.pid) is not None and time.monotonic() < deadline:
         time.sleep(0.02)
     assert not info.is_alive(child.pid, token)
+    assert info.start_time(child.pid, zombie=True) == token  # unreaped: the PID is pinned
     child.wait(timeout=30)
     assert info.start_time(child.pid) is None
 
@@ -311,6 +322,7 @@ def test_macos_zombie_counts_as_gone() -> None:
     fake = FakeGateway()
     fake.on([*PS, "42"], stdout="Z    Thu Oct 30 17:08:12 2026\n")
     assert mac(fake).is_alive(42, "Thu Oct 30 17:08:12 2026") is False
+    assert mac(fake).start_time(42, zombie=True) == "Thu Oct 30 17:08:12 2026"
 
 
 def test_macos_pid_reuse_is_not_alive() -> None:

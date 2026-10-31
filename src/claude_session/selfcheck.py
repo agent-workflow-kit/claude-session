@@ -28,8 +28,9 @@ command that removes it.
 Prerequisite probes run through the #51 ``Gateway`` (a fake one in tests), by absolute path
 and with a fixed minimal environment.
 
-``exec`` (``launch.check_sandbox``) calls ``tmpdir.check`` at the temporary-directory slot of
-launch step 5 and ``self_check`` after the ``claude_args`` check with ``bwrap`` and ``socat``
+``exec`` (``launch.check_tmpdir``) calls ``tmpdir.check`` at the temporary-directory slot of
+launch step 5 and (``launch.check_sandbox``) ``self_check`` after the ``claude_args`` check,
+as the last action of step 5, with ``bwrap`` and ``socat``
 resolved by ``pathrules.resolve_tool`` (outside session-writable paths; this module only
 checks that they are absolute, executable regular files, and probes them by their realpath),
 records ``sandbox_active`` on the run, adds the warnings to the run's warnings, passes

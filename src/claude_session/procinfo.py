@@ -72,10 +72,13 @@ class ProcInfo:
         self._proc_root = proc_root
         self._boot_id_cache: str | None = None
 
-    def start_time(self, pid: int) -> str | None:
-        """The start-time token of a running process, or ``None`` if it is gone or a zombie."""
+    def start_time(self, pid: int, *, zombie: bool = False) -> str | None:
+        """The start-time token of a running process, or ``None`` if it is gone or a zombie.
+        With ``zombie``, a zombie's token too: for a child the caller has not reaped yet (its
+        PID cannot be reused), such as one that exited right after it was spawned."""
         _check_pid(pid)
-        return self._linux_start(pid) if self._linux else self._ps_start(pid)
+        dead = ("X",) if zombie else _DEAD_STATES
+        return self._linux_start(pid, dead) if self._linux else self._ps_start(pid, dead)
 
     def is_alive(self, pid: int, start: str) -> bool:
         """True only if ``pid`` is running, not a zombie, and its start-time token is ``start``.
@@ -85,14 +88,14 @@ class ProcInfo:
         token = self.start_time(pid)
         return token is not None and bool(start) and token == start
 
-    def _linux_start(self, pid: int) -> str | None:
+    def _linux_start(self, pid: int, dead: tuple[str, ...] = _DEAD_STATES) -> str | None:
         try:
             with open(os.path.join(self._proc_root, str(pid), "stat"), "rb") as fh:
                 data = fh.read()
         except (FileNotFoundError, ProcessLookupError):
             return None
         state, ticks = parse_proc_stat(data)
-        if state in _DEAD_STATES:
+        if state in dead:
             return None
         return f"{self._boot_id()}:{ticks}"
 
@@ -113,7 +116,7 @@ class ProcInfo:
         self._boot_id_cache = data.decode("ascii", "replace").strip()
         return self._boot_id_cache
 
-    def _ps_start(self, pid: int) -> str | None:
+    def _ps_start(self, pid: int, dead: tuple[str, ...] = _DEAD_STATES) -> str | None:
         proc = self._gateway.run(
             [PS, "-o", "stat=", "-o", "lstart=", "-p", str(pid)],
             env=_ps_env(),
@@ -124,8 +127,10 @@ class ProcInfo:
             return None  # no such process
         if proc.returncode != 0:
             raise ProcInfoError(f"ps failed ({proc.returncode}): {proc.stderr.strip()[:200]}")
-        if out and out[0][0] in _DEAD_STATES:
+        if out and out[0][0] in dead:
             return None
+        if out and out[0][0] in _DEAD_STATES and len(out) != 6:
+            return None  # a zombie's short line
         # stat, then lstart: weekday, month, day, time, year.
         if len(out) != 6:
             raise ProcInfoError(f"unparsable ps output: {proc.stdout[:200]!r}")

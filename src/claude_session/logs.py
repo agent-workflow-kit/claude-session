@@ -352,8 +352,9 @@ class EventLog:
     ``MIN_SECRET_CHARS`` are ignored.
     """
 
-    # TODO(#3): callers build secrets with secret_values from config's secret_env and
-    # claude_auth_env names (and the run secret where they have one).
+    # Callers pass the values of the configured secret_env and claude_auth_env variables
+    # (envbuild.secret_values; exec's launch and supervisor do) and the run secret where they
+    # have one.
     def __init__(self, path: str, *, secrets: Iterable[str] = ()) -> None:
         self.path = path
         self.secrets = usable_secrets(secrets)

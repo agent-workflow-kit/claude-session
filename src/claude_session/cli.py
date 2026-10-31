@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
 import traceback
 from collections.abc import Callable, Sequence
@@ -164,27 +165,51 @@ def _exec(args: argparse.Namespace) -> int:
     if args.dry_run:
         # TODO(#27): the dry-run plan.
         raise InternalError("exec --dry-run is not implemented yet", detail="not_implemented")
+    if args.mode != "headless":
+        # TODO(#17): interactive supervision (exec's default mode).
+        raise InternalError(
+            "interactive exec is not implemented yet; pass --mode headless",
+            detail="not_implemented",
+        )
     from . import launch, supervisor
     from .gateway import SystemGateway
 
     cfg = load_config(args)
-    with store.open_state() as st:
-        process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
-        req = launch.read_request(args, cfg)
-        resolved = launch.resolve_kind(req, cfg, process)
-        alloc = launch.allocate(st, req, resolved, process)
-        ended = launch.run(
-            st, cfg, req, resolved, alloc, process, supervise=supervisor.run_headless
-        )
-        outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
+    # TODO(#17): install the signal handlers (interface.md, Signals) here, before allocation.
+    try:
+        with store.open_state() as st:
+            process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+            req = launch.read_request(args, cfg)
+            resolved = launch.resolve_kind(req, cfg, process)
+            alloc = launch.allocate(st, req, resolved, process)
+            ended = launch.run(
+                st, cfg, req, resolved, alloc, process, supervise=supervisor.run_headless
+            )
+            outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
+    except KeyboardInterrupt:
+        # TODO(#17): SIGINT is then forwarded and mapped forwarded_int (headless) or ignored
+        # (interactive); exec exits with the run's stored exit_code instead of dying by it.
+        _die_of_sigint()
     _print_outcome(outcome, args.json)
     return int(outcome["exit_code"]) if ended is None else ended.exit_code
+
+
+def _die_of_sigint() -> NoReturn:
+    """Exit by SIGINT (the run is already final) without a traceback: restore the default
+    action and signal this process itself."""
+    try:
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGINT)
+    raise KeyboardInterrupt  # not reached: SIGINT ends the process
 
 
 def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
     """``--json``: the outcome object on stdout; otherwise a one-line summary on stderr."""
     if json_mode:
-        print(json.dumps(outcome, ensure_ascii=False))
+        print(json.dumps(outcome, ensure_ascii=False, allow_nan=False))
         return
     line = (
         f"{outcome['csession_id']} run {outcome['run']}: {outcome['outcome']}"

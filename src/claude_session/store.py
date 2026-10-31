@@ -80,6 +80,8 @@ Version = tuple[int, int]
 Clock = Callable[[], datetime]
 # (pid, process start time) -> whether that exact process is still alive.
 Liveness = Callable[[int, str], bool]
+# ``finalize_run``'s ``report_status`` when the report status is not compared.
+ANY: Any = object()
 
 
 @dataclass(frozen=True)
@@ -267,14 +269,15 @@ def system_procinfo() -> Any:
     return _procinfo
 
 
-def start_time(pid: int) -> str:
-    """The procinfo start-time token of ``pid`` (``""``: gone, a zombie, or unknown). Stored
-    as data: changing the token format would make every live run look dead."""
+def start_time(pid: int, *, zombie: bool = False) -> str:
+    """The procinfo start-time token of ``pid`` (``""``: gone, a zombie unless ``zombie``,
+    or unknown). Stored as data: changing the token format would make every live run look
+    dead."""
     from .gateway import GatewayTimeout
     from .procinfo import ProcInfoError
 
     try:
-        return system_procinfo().start_time(pid) or ""
+        return system_procinfo().start_time(pid, zombie=zombie) or ""
     except (ProcInfoError, OSError, ValueError, GatewayTimeout):
         return ""
 
@@ -1111,18 +1114,24 @@ class Store:
             )
             return cursor.rowcount == 1
 
-    def finalize_run(self, csession_id: str, run_no: int, final: Final) -> bool:
-        """The finalization compare-and-set (design.md, Data model): on ``ended_at IS NULL``,
-        record the outcome, set the session's final state (``exited`` when the run has a
-        report, else the outcome's state) and append the one final event. Returns whether
-        this call won (False: the run was already final, nothing changed)."""
+    def finalize_run(
+        self, csession_id: str, run_no: int, final: Final, *, report_status: Any = ANY
+    ) -> bool:
+        """The finalization compare-and-set (design.md, Data model): on ``ended_at IS NULL``
+        (and, unless ``report_status`` is ``ANY``, the run's report status still being the
+        one the end was mapped from, None for none), record the outcome, set the session's
+        final state (``exited`` when the run has a report, else the outcome's state) and
+        append the one final event. Returns whether this call won (False: the run was
+        already final or its report status differs, nothing changed)."""
+        report_check = "" if report_status is ANY else " AND report_status IS ?"
+        report_param = () if report_status is ANY else (report_status,)
         with self.transaction() as conn:
             now = format_ts(self.clock())
             cursor = conn.execute(
                 "UPDATE runs SET ended_at = ?, phase = ?, outcome = ?, end_reason = ?, "
                 "exit_code = ?, cost_usd = ?, num_turns = ?, is_error = ?, "
                 "message = COALESCE(?, message) "
-                "WHERE csession_id = ? AND run_no = ? AND ended_at IS NULL",
+                "WHERE csession_id = ? AND run_no = ? AND ended_at IS NULL" + report_check,
                 (
                     now,
                     final.phase,
@@ -1135,6 +1144,7 @@ class Store:
                     final.message,
                     csession_id,
                     run_no,
+                    *report_param,
                 ),
             )
             if cursor.rowcount != 1:
@@ -1418,6 +1428,7 @@ class Store:
 RUN_FIELDS = frozenset(
     {
         "cwd",
+        "phase",
         "permission_profile",
         "permission_profile_snapshot",
         "sandbox_active",

@@ -351,6 +351,15 @@ def test_unimplemented_command_is_internal_not_implemented(
     assert "not implemented" in err
 
 
+def test_exec_without_mode_headless_is_internal_not_implemented(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code, envelope, _ = run_json(["exec", "--json"], capsys)
+    assert code == 1
+    assert envelope["error"]["code"] == "internal"
+    assert envelope["error"]["detail"] == "not_implemented"
+
+
 # --json error envelopes
 
 

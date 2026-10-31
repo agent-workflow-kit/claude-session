@@ -174,7 +174,7 @@
         "string",
         "null"
       ],
-      "description": "Launch hint or pre-launch hook stderr (control characters stripped, capped at 2 KiB); never agent text."
+      "description": "Launch failure message (the error, its detail, then the hint when there is one) or pre-launch hook stderr (control characters stripped, capped at 2 KiB); never agent text."
     },
     "cause": {
       "$ref": "../cli/outcome.json#/$defs/cause"
