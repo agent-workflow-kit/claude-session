@@ -22,12 +22,16 @@ are shown with the placeholder id ``PLACEHOLDER_ID``, and its own ``work/``, ``o
 (``pathrules.PathRules(planned=True)``).
 
 ``kinds`` resolves every kind (or one) without a session and without the session-writable
-checks of a launch (it has no session); it probes ``claude --version`` (minimal environment,
-``claude_version.probe``) and the sandbox prerequisites, never running a binary under a path
-a session could write without a session context (``launch.step2_writable``) or under the
-kind's ``write_dirs`` and permission profile write paths (``unchecked_writable``); it never
-knows the git directory, so an isolated kind with a ``${GIT_DIR}`` write entry probes
-nothing.
+checks of a launch (it has no session); it probes ``claude --version`` (minimal environment
+whose ``PATH`` holds no session-writable entry, ``claude_version.probe``) and the sandbox
+prerequisites, never running a binary under a path a session could write without a session
+context (``launch.step2_writable``) or under a kind's ``write_dirs`` and permission profile
+write paths (``unchecked_writable``; without ``--repo``, also every per-repo override's:
+``kind_writable``). ``bwrap`` and ``socat`` are checked against their row's kind,
+``claude_bin`` (shared by every kind) against every built-in and configured kind and every
+per-repo override of it (``_every_kind``). It never knows the git directory, so a kind
+with a ``${GIT_DIR}`` write entry has paths that are not known: its row probes nothing,
+and ``claude`` is not run at all.
 
 ``exec --session-id <id> --dry-run`` (``lifecycle.adoption_plan``) reuses ``run_checks``,
 ``unchecked_writable``, ``plan_sandbox``, ``plan_preview`` and ``plan_json`` with the pending
@@ -41,7 +45,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -67,9 +70,8 @@ from .errors import LaunchValidationError, UsageError
 from .gateway import Gateway
 from .permission_profiles import Profile
 
-# A new session's paths are shown with this id (valid grammar; ids are random, so a real
-# session with it is as unlikely as any other collision).
-PLACEHOLDER_ID = "cs-aaaaaaaa"
+# A new session's paths are shown with this id.
+PLACEHOLDER_ID = launch.PLACEHOLDER_ID
 DEFAULT_HOOK_TIMEOUT = 30.0
 # A run secret: 32 random bytes as hex (interface.md, Identifiers).
 RUN_SECRET_CHARS = 2 * sessiondir.SECRET_BYTES
@@ -82,8 +84,6 @@ SANDBOX_LISTS = {
 # Profile variables that need a session; read_dirs/write_dirs entries using them are shown
 # as written by ``kinds``.
 _SESSION_VARIABLES = ("${CSESSION_DIR}", "${CWD}", "${GIT_DIR}")
-# The tool name of a permission rule (``Tool`` or ``Tool(content)``).
-_RULE_TOOL = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 
 
 # Shared pieces
@@ -259,47 +259,28 @@ def unchecked_writable(
 ) -> pathrules.SessionWritable | None:
     """The session-writable paths known without a session (a dry run whose checks failed,
     and ``kinds``): the step-2 set (``probe_cwd``, ``<state>/sessions``, the tmp root;
-    ``launch.step2_writable``) plus, for an isolated kind, the placeholder session's paths,
-    ``write_dirs`` and the permission profile's write paths: once the dry run's checks found
-    the git directory (``git``), the full set the launch checks its tools against
-    (``launch.full_writable``, ``${GIT_DIR}`` expanded); before that, the set the launch
-    resolves git against (``launch.git_writable``), which is the whole set only when no
-    ``write_dirs`` entry or profile write entry uses ``${GIT_DIR}``. For a trusted kind (a
-    launch checks none): its ``write_dirs`` that resolve without a session. None when the
-    profile or the ``write_dirs`` cannot be known (a profile file that was not read, an entry
-    that does not expand, a ``${GIT_DIR}`` write entry while the git directory is not known):
-    nothing may be probed. ``caller_cwd`` is the run's (None: ``work/``). ``alloc`` is the
-    session's (default: the placeholder of a new session)."""
+    ``launch.step2_writable``) plus the kind's paths known without a session
+    (``launch.known_write_paths``, computed alike for trusted and isolated kinds: the
+    placeholder session's paths, ``write_dirs`` and the permission profile's write paths;
+    their ``${GIT_DIR}`` entries once the dry run's checks found the git directory,
+    ``git``). None when the profile or the ``write_dirs`` cannot be known (a profile file
+    that was not read, an entry that does not expand, a ``${GIT_DIR}`` write entry while
+    the git directory is not known): nothing may be probed. ``caller_cwd`` is the run's
+    (None: ``work/``). ``alloc`` is the session's (default: the placeholder of a new
+    session)."""
     step2 = launch.step2_writable(process, probe_cwd).paths
-    home = os.path.realpath(process.environ.get("HOME", "/"))
-    if not resolution.isolated():
-        write = [
-            entry
-            for entry in _expanded_dirs(resolution.profile.write_dirs, home, "write_dirs")
-            if os.path.isabs(entry) and not any(v in entry for v in _SESSION_VARIABLES)
-        ]
-        return pathrules.SessionWritable([*step2, *write])
-    profile = _kind_profile(cfg, resolution, recorded)
-    if profile is None:
+    known = launch.known_write_paths(
+        resolution,
+        _kind_profile(cfg, resolution, recorded),
+        process,
+        caller_cwd=caller_cwd,
+        git_dirs=None if git is None else git.dirs,
+        git_known=git is not None,
+        alloc=alloc,
+    )
+    if known is None:
         return None
-    alloc = alloc or placeholder_alloc(process, resolution)
-    tmp = None if resolution.profile.sandbox == "off" else tmpdir.run_path(alloc.csession_id)
-    cwd = os.path.realpath(caller_cwd or os.path.join(alloc.session_dir, sessiondir.WORK))
-    try:
-        if git is not None:
-            variables = launch.profile_variables(alloc, cwd, home, git.dirs)
-            expanded = permission_profiles.expand(profile.content, variables)
-            _, write = launch.resolve_run_dirs(resolution, variables, home, alloc)
-            full = launch.full_writable(resolution, alloc, cwd, home, tmp, write, expanded)
-            assert full is not None
-            return pathrules.SessionWritable([*step2, *full.paths])
-        if _uses_git_dir(resolution, profile):
-            return None
-        before_git = launch.git_writable(resolution, alloc, cwd, home, tmp, profile)
-    except LaunchValidationError:
-        return None
-    assert isinstance(before_git, pathrules.SessionWritable)
-    return pathrules.SessionWritable([*step2, *before_git.paths])
+    return pathrules.SessionWritable([*step2, *known.paths])
 
 
 @dataclass(frozen=True)
@@ -307,45 +288,6 @@ class GitDir:
     """The git directory the launch checks found (``dirs`` None: the cwd has none)."""
 
     dirs: gitinfo.GitDirs | None
-
-
-def _uses_git_dir(resolution: kinds.Resolution, profile: Profile) -> bool:
-    """Whether a ``write_dirs`` entry or a profile write entry (sandbox ``allowWrite``, an
-    ``Edit``/``Write`` allow rule) uses ``${GIT_DIR}``: the session-writable paths are then
-    not known until git found the git directory."""
-    variable = launch.GIT_DIR_VARIABLE
-    if any(variable in entry for entry in resolution.profile.write_dirs):
-        return True
-    content = profile.content
-    sandbox = content.get("sandbox")
-    filesystem = sandbox.get("filesystem") if isinstance(sandbox, dict) else None
-    allow_write = filesystem.get("allowWrite") if isinstance(filesystem, dict) else None
-    if isinstance(allow_write, list) and any(
-        isinstance(entry, str) and variable in entry for entry in allow_write
-    ):
-        return True
-    permissions = content.get("permissions")
-    rules = permissions.get("allow") if isinstance(permissions, dict) else None
-    if not isinstance(rules, list):
-        return False
-    for rule in rules:
-        if not isinstance(rule, str) or variable not in rule:
-            continue
-        tool = _RULE_TOOL.match(rule)
-        if tool is None or tool.group(0) in pathrules.WRITE_TOOLS:
-            return True
-    return False
-
-
-def placeholder_alloc(process: launch.Process, resolution: kinds.Resolution) -> launch.Allocated:
-    """A new session as the dry run shows it (``PLACEHOLDER_ID``)."""
-    return launch.Allocated(
-        csession_id=PLACEHOLDER_ID,
-        run=1,
-        session_dir=sessiondir.session_dir(process.state_root, PLACEHOLDER_ID),
-        private_dir=sessiondir.private_dir(process.state_root, PLACEHOLDER_ID),
-        warnings=resolution.warnings,
-    )
 
 
 def not_probed(resolution: kinds.Resolution) -> Sandbox | None:
@@ -481,26 +423,21 @@ def kinds_report(
     prerequisites: Prerequisites | None = None,
 ) -> dict[str, Any]:
     """``kinds --json`` (schemas/cli/kinds.json). Per-repo overrides apply when ``repo``
-    is given (never derived: ``cwd=None``)."""
+    is given (never derived: ``cwd=None``); without it, a kind's session-writable paths
+    include those of every per-repo override of it (``kind_writable``)."""
     probes = prerequisites or Prerequisites(process.gateway)
     default = kinds.resolve(cfg, None, mode="headless", repo=repo, cwd=None)
     names = [kind] if kind is not None else list(cfg.kinds)
     resolutions = [kinds.resolve(cfg, name, mode="headless", repo=repo, cwd=None) for name in names]
-    sets = [
-        unchecked_writable(
-            cfg,
-            process,
-            resolution,
-            probe_cwd=process.caller_cwd,
-            caller_cwd=_kinds_cwd(process, resolution),
-        )
-        for resolution in resolutions
-    ]
-    lookup = _claude_lookup(cfg, process, default, resolutions, sets)
+    sets = [kind_writable(cfg, process, name, repo) for name in names]
+    every = _every_kind(cfg, process)
+    lookup = _claude_lookup(cfg, process, default, every)
     claude = lookup.tool
-    version = (
-        None if claude is None else claude_version.probe(claude, process.environ, process.gateway)
-    )
+    version = None
+    if claude is not None and every is not None:
+        version = claude_version.probe(
+            claude, process.environ, process.gateway, writable=every.union
+        )
     warnings: list[str] = []
     if lookup.refused is not None:
         warnings.append(f"claude: {lookup.refused}")
@@ -509,16 +446,16 @@ def kinds_report(
     elif version is None:
         warnings.append(f"could not run {claude.path} --version")
     profiles = []
-    for resolution, kind_writable in zip(resolutions, sets, strict=True):
+    for resolution, writable in zip(resolutions, sets, strict=True):
         warnings += resolution.warnings
-        sandbox = probes.check(process, resolution, kind_writable)
+        sandbox = probes.check(process, resolution, writable)
         claude_path = None if claude is None else claude.path
         profiles.append(
             profile_json(
                 resolution,
                 permission_profile=resolution.profile.permission_profile,
                 sandbox=sandbox,
-                preview=preview(cfg, resolution, process, claude_path, kind_writable),
+                preview=preview(cfg, resolution, process, claude_path, writable),
                 warnings=[*resolution.warnings, *_sandbox_warnings(resolution, sandbox)],
             )
         )
@@ -540,29 +477,82 @@ def _kinds_cwd(process: launch.Process, resolution: kinds.Resolution) -> str | N
     return None if resolution.profile.cwd == "session-dir" else process.caller_cwd
 
 
+def _variants(cfg: Config, name: str, repo: str | None) -> list[kinds.Resolution]:
+    """Kind ``name`` as ``repo`` makes it, or (no ``repo``) as configured and as every
+    per-repo override makes it."""
+    repos = [repo] if repo is not None else [None, *cfg.repos]
+    return [kinds.resolve(cfg, name, mode="headless", repo=r, cwd=None) for r in repos]
+
+
+def _writable_of(
+    cfg: Config, process: launch.Process, resolution: kinds.Resolution
+) -> pathrules.SessionWritable | None:
+    return unchecked_writable(
+        cfg,
+        process,
+        resolution,
+        probe_cwd=process.caller_cwd,
+        caller_cwd=_kinds_cwd(process, resolution),
+    )
+
+
+def kind_writable(
+    cfg: Config, process: launch.Process, name: str, repo: str | None
+) -> pathrules.SessionWritable | None:
+    """A ``kinds`` row's session-writable paths known without a session
+    (``unchecked_writable``): with ``repo``, those of the kind as that repo makes it;
+    without, the union over the kind as configured and every per-repo override of it.
+    None when any of them is not known."""
+    paths: list[str] = []
+    for resolution in _variants(cfg, name, repo):
+        writable = _writable_of(cfg, process, resolution)
+        if writable is None:
+            return None
+        paths += writable.paths
+    return pathrules.SessionWritable(paths)
+
+
+@dataclass(frozen=True)
+class Every:
+    """The session-writable paths of every kind (``_every_kind``): ``union`` of all of them,
+    ``isolated`` of the isolated ones only."""
+
+    union: pathrules.SessionWritable
+    isolated: pathrules.SessionWritable
+
+
+def _every_kind(cfg: Config, process: launch.Process) -> Every | None:
+    """The session-writable paths, known without a session, of every built-in and
+    configured kind, each as configured and as every per-repo override makes it, whatever
+    ``--kind`` and ``--repo`` name: ``claude_bin`` is shared by all of them. None when any
+    of them is not known."""
+    union: list[str] = []
+    isolated: list[str] = []
+    for name in cfg.kinds:
+        for resolution in _variants(cfg, name, None):
+            writable = _writable_of(cfg, process, resolution)
+            if writable is None:
+                return None
+            union += writable.paths
+            if resolution.isolated():
+                isolated += writable.paths
+    return Every(pathrules.SessionWritable(union), pathrules.SessionWritable(isolated))
+
+
 def _claude_lookup(
-    cfg: Config,
-    process: launch.Process,
-    default: kinds.Resolution,
-    resolutions: Sequence[kinds.Resolution],
-    sets: Sequence[pathrules.SessionWritable | None],
+    cfg: Config, process: launch.Process, default: kinds.Resolution, every: Every | None
 ) -> Lookup:
     """``claude_bin`` on the default kind's ``PATH``, checked against the step-2 set and the
-    union of the reported kinds' sets; never run when a set is not known. A refusal is the
-    launch's own when an isolated kind's set holds it."""
-    known = [writable for writable in sets if writable is not None]
-    if len(known) != len(sets):
+    session-writable paths of every kind (``every``: ``claude_bin`` is shared by all of
+    them); never run when any kind's paths are not known. A refusal is the launch's own
+    when an isolated kind's paths hold it."""
+    if every is None:
         return Lookup(None, f"{cfg.claude_bin!r}: {UNKNOWN}")
     entries = _entries(process, default)
-    step2 = launch.step2_writable(process, process.caller_cwd).paths
-    union = pathrules.SessionWritable([*step2, *(p for writable in known for p in writable.paths)])
-    found = _tool(cfg.claude_bin, entries, union, launch_refuses=False)
+    found = _tool(cfg.claude_bin, entries, every.union, launch_refuses=False)
     if found.refused is None:
         return found
-    isolated = pathrules.SessionWritable(
-        [p for r, w in zip(resolutions, known, strict=True) if r.isolated() for p in w.paths]
-    )
-    by_launch = _tool(cfg.claude_bin, entries, isolated)
+    by_launch = _tool(cfg.claude_bin, entries, every.isolated)
     return by_launch if by_launch.refused is not None else found
 
 
@@ -777,7 +767,7 @@ def new_session_plan(
     req = request(args, cfg)
     resolved = launch.resolve_kind(req, cfg, process)
     resolution = resolved.resolution
-    alloc = placeholder_alloc(process, resolution)
+    alloc = launch.placeholder_alloc(process, resolution)
     found = run_checks(cfg, req, resolved, alloc, process)
     writable = unchecked_writable(
         cfg,

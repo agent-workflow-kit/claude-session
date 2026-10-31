@@ -409,3 +409,33 @@ def test_a_resolved_git_runs_from_its_path_with_argv0_its_name(tmp_path: Path) -
     for call in run.calls:
         assert call["argv"][0] == "git"
         assert call["executable"] == "/opt/real/git"
+
+
+def test_candidate_dirs_are_found_without_git(tmp_path: Path) -> None:
+    """S2: ``.git`` directories, ``.git`` files and ``commondir``, at every ancestor."""
+    top = tmp_path / "top"
+    (top / ".git").mkdir(parents=True)
+    common = tmp_path / "main" / ".git"
+    own = common / "worktrees" / "wt"
+    own.mkdir(parents=True)
+    (own / "commondir").write_text("../..\n", encoding="utf-8")
+    work = top / "wt"
+    work.mkdir()
+    (work / ".git").write_text(f"gitdir: {own}\n", encoding="utf-8")
+    found = gitinfo.candidate_dirs(str(work))
+    for path in (own, common, top / ".git"):
+        assert os.path.realpath(path) in found
+
+
+@pytest.mark.parametrize("content", ["not a gitfile\n", "gitdir: \n"])
+def test_candidate_dirs_of_a_bad_git_file_are_not_known(tmp_path: Path, content: str) -> None:
+    (tmp_path / ".git").write_text(content, encoding="utf-8")
+    with pytest.raises(LaunchValidationError) as caught:
+        gitinfo.candidate_dirs(str(tmp_path))
+    assert caught.value.end_reason == "unsafe_cwd"
+
+
+def test_candidate_dirs_of_a_dangling_git_link_are_not_known(tmp_path: Path) -> None:
+    (tmp_path / ".git").symlink_to(tmp_path / "missing")
+    with pytest.raises(LaunchValidationError):
+        gitinfo.candidate_dirs(str(tmp_path))

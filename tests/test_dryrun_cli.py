@@ -680,7 +680,33 @@ def test_kinds_words_a_trusted_kinds_unrun_claude_as_not_probed(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
     """A launch of a trusted kind checks no session-writable path, so it would not refuse a
-    ``claude`` under the caller's cwd; ``kinds`` still never runs it, and says so."""
+    ``claude`` under a trusted kind's ``write_dirs``; ``kinds`` still never runs it, and says
+    so."""
+    marker = tmp_path / "ran"
+    planted = home() / "td" / "bin"
+    plant(planted, marker)
+    proc = cli(
+        ["kinds", "--json", "--kind", "implement"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config="kinds:\n  implement:\n    write_dirs: ['~/td']\n",
+        env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists()
+    report = json.loads(proc.stdout)
+    validate(report, KINDS)
+    claude = [w for w in report["warnings"] if w.startswith("claude:")]
+    assert claude and all("not probed by a dry run" in w for w in claude), claude
+    assert not any("a launch refuses it" in w for w in claude)
+
+
+def test_kinds_refuses_a_claude_under_any_isolated_kinds_cwd(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """S4: ``claude_bin`` under the caller's cwd is refused by a launch of an isolated kind
+    whose cwd is the caller's (``respond``), also when ``--kind`` names a trusted kind."""
     marker = tmp_path / "ran"
     plant(work / "bin", marker)
     proc = cli(
@@ -693,10 +719,7 @@ def test_kinds_words_a_trusted_kinds_unrun_claude_as_not_probed(
     assert proc.returncode == 0, proc.stderr
     assert not marker.exists()
     report = json.loads(proc.stdout)
-    validate(report, KINDS)
-    claude = [w for w in report["warnings"] if w.startswith("claude:")]
-    assert claude and all("not probed by a dry run" in w for w in claude), claude
-    assert not any("a launch refuses it" in w for w in claude)
+    assert any("a launch refuses it" in w for w in report["warnings"]), report["warnings"]
 
 
 # Tools under a ${GIT_DIR} write path (G1, G2)
@@ -1050,3 +1073,391 @@ def test_a_dry_run_in_a_non_utf8_cwd_would_fail_with_valid_json(
     )
     assert human.returncode == 12, human.stderr
     assert "a launch would fail (unsafe_cwd)" in human.stdout
+
+
+# Planted binaries under session-writable paths (S1-S7): a marker-writing binary planted on
+# PATH under a path a session could write never runs.
+
+
+def plant_git(directory: Path, marker: Path) -> None:
+    """A ``git`` that records that it ran (and fails, as a broken git would)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "git"
+    path.write_text(f'#!/bin/sh\necho "git $*" >> {marker}\nexit 1\n', encoding="utf-8")
+    path.chmod(0o755)
+
+
+def home() -> Path:
+    return Path(os.environ["HOME"])
+
+
+def headless_exec(**kw: Any) -> subprocess.CompletedProcess[str]:
+    return cli(
+        ["exec", "--json", "--kind", "respond", "--mode", "headless", "--prompt-file", "prompt.md"],
+        **kw,
+    )
+
+
+REPO_OVERRIDE = (
+    "repos:\n  example.com/o/r:\n    kinds:\n      respond:\n        write_dirs: ['~/rw']\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("config", "where"),
+    [
+        ("kinds:\n  respond:\n    write_dirs: ['~/wd']\n", "wd"),
+        (REPO_OVERRIDE, "rw"),
+        (
+            "permission_profiles:\n  wide: {sandbox: {filesystem: {allowWrite: ['~/aw']}}}\n"
+            "kinds:\n  respond:\n    permission_profile: wide\n",
+            "aw",
+        ),
+    ],
+)
+@pytest.mark.parametrize("launch", [False, True])
+def test_step2_never_runs_a_git_under_the_kinds_write_paths(
+    config: str, where: str, launch: bool, tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """S1: the git that derives the repo at step 2 is checked against the kind's
+    ``write_dirs`` and profile write paths (every per-repo override's too: the repo is not
+    known yet), in a dry run and in a real launch."""
+    git_repo(work)
+    marker = tmp_path / "ran"
+    planted = home() / where / "bin"
+    plant_git(planted, marker)
+    env = {"PATH": f"{planted}:{tools}:/usr/bin:/bin"}
+    if launch:
+        proc = headless_exec(cwd=work, tools=tools, tmp_path=tmp_path, config=config, env=env)
+        assert proc.returncode == 12, proc.stdout + proc.stderr
+    else:
+        _, plan = dry_run(
+            "respond", cwd=work, tools=tools, tmp_path=tmp_path, config=config, env=env
+        )
+        assert plan["repo"] is None
+        assert any("repo not derived" in w for w in plan["warnings"]), plan["warnings"]
+    ran = marker.read_text(encoding="utf-8") if marker.exists() else ""
+    assert "get-url" not in ran  # step 2 never ran it
+    if where != "rw":
+        # The run's own write path: step 5 refuses it too. (A per-repo override's path is
+        # not the repo-less run's: step 5 checks only the run's own set.)
+        assert ran == ""
+
+
+@pytest.mark.parametrize("entry", GIT_DIR_ENTRIES)
+def test_step2_derives_no_repo_with_a_git_dir_write_entry(
+    entry: str, tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """S1: a ``${GIT_DIR}`` write entry is not known at step 2: no repo is derived, with a
+    warning (git is not run then)."""
+    git_repo(work)
+    subprocess.run(
+        ["git", "-C", str(work), "remote", "add", "origin", "https://example.com/o/r.git"],
+        check=True,
+        timeout=30,
+        env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+    _, plan = dry_run(
+        "respond", cwd=work, tools=tools, tmp_path=tmp_path, config=git_dir_config("respond", entry)
+    )
+    assert plan["repo"] is None
+    assert any("repo not derived" in w for w in plan["warnings"]), plan["warnings"]
+
+
+def test_step2_still_derives_the_repo_when_git_is_safe(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    git_repo(work)
+    subprocess.run(
+        ["git", "-C", str(work), "remote", "add", "origin", "https://example.com/o/r.git"],
+        check=True,
+        timeout=30,
+        env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+    _, plan = dry_run(
+        "respond",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config="kinds:\n  respond:\n    write_dirs: ['~/wd']\n" + REPO_OVERRIDE,
+    )
+    assert plan["repo"] == "example.com/o/r"
+    assert plan["origins"]["repo"] == "derived"
+
+
+def secret_logging_git(directory: Path, log: Path) -> None:
+    """A ``git`` that logs its environment, then runs the real git."""
+    real = subprocess.run(
+        ["sh", "-c", "command -v git"], capture_output=True, text=True, timeout=15, check=True
+    ).stdout.strip()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "git"
+    path.write_text(f'#!/bin/sh\nenv >> {log}\nexec {real} "$@"\n', encoding="utf-8")
+    path.chmod(0o755)
+
+
+def test_git_gets_a_minimal_environment(tmp_path: Path, tools: Path, work: Path) -> None:
+    """S1: every git call gets ``PATH``, ``HOME``, ``LC_ALL=C`` and
+    ``GIT_CONFIG_NOSYSTEM=1`` only: no secret of the caller reaches it."""
+    git_repo(work)
+    log = tmp_path / "git-env"
+    secret_logging_git(tmp_path / "gitbin", log)
+    _, plan = dry_run(
+        "respond",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        env={"PATH": f"{tmp_path / 'gitbin'}:{tools}:/usr/bin:/bin", "MY_TOKEN": SECRET},
+    )
+    assert plan["would_fail"] is None, plan["warnings"]
+    text = log.read_text(encoding="utf-8")
+    assert SECRET not in text
+    names = {line.partition("=")[0] for line in text.splitlines() if "=" in line}
+    # sh itself adds PWD (and may add SHLVL, _).
+    assert names - {"PWD", "SHLVL", "_", "OLDPWD"} == {
+        "PATH",
+        "HOME",
+        "LC_ALL",
+        "GIT_CONFIG_NOSYSTEM",
+    }
+
+
+def linked_worktree(main: Path, work: Path) -> None:
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(["git", "init", "-q", str(main)], check=True, timeout=30, env=env)
+    subprocess.run(
+        ["git", "-C", str(main), "-c", "user.email=a@b", "-c", "user.name=a"]
+        + ["commit", "-q", "--allow-empty", "-m", "x"],
+        check=True,
+        timeout=30,
+        env=env,
+    )
+    subprocess.run(
+        ["git", "-C", str(main), "worktree", "add", "-q", str(work)],
+        check=True,
+        timeout=30,
+        env=env,
+    )
+    (work / "prompt.md").write_text("Do it.\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("layout", ["separate", "worktree", "bare_parent"])
+@pytest.mark.parametrize("launch", [False, True])
+def test_step5_never_runs_a_git_under_a_git_dir_write_path(
+    layout: str, launch: bool, tmp_path: Path, tools: Path
+) -> None:
+    """S2: with a ``${GIT_DIR}`` write entry, the candidate git directories are found without
+    running git (``.git`` directories and files, ``commondir``) and git is resolved against
+    them: a git planted there is refused (``unsafe_path``), never run."""
+    work = tmp_path / "work"
+    if layout == "separate":
+        work.mkdir()
+        (work / "prompt.md").write_text("Do it.\n", encoding="utf-8")
+        git_dir = tmp_path / "gd"
+        separate_git_dir(work, git_dir)
+    elif layout == "worktree":
+        linked_worktree(tmp_path / "main", work)
+        git_dir = tmp_path / "main" / ".git"
+    else:  # the cwd is inside a bare repository's directory
+        git_dir = tmp_path / "bare.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(git_dir)],
+            check=True,
+            timeout=30,
+            env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"},
+        )
+        work = git_dir / "work"
+        work.mkdir()
+        (work / "prompt.md").write_text("Do it.\n", encoding="utf-8")
+    marker = tmp_path / "ran"
+    planted = git_dir / "tools" / "bin"
+    plant_git(planted, marker)
+    config = git_dir_config("respond", "write_dirs")
+    env = {"PATH": f"{planted}:{tools}:/usr/bin:/bin"}
+    if launch:
+        proc = headless_exec(cwd=work, tools=tools, tmp_path=tmp_path, config=config, env=env)
+        assert proc.returncode == 12, proc.stdout + proc.stderr
+        assert json.loads(proc.stdout)["end_reason"] == "unsafe_path"
+    else:
+        _, plan = dry_run(
+            "respond", cwd=work, tools=tools, tmp_path=tmp_path, config=config, env=env
+        )
+        assert plan["would_fail"] == "unsafe_path", plan["warnings"]
+    assert not marker.exists()
+
+
+def test_step5_runs_no_git_when_the_git_dir_cannot_be_found_without_it(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """S2: a ``.git`` file that names no git directory leaves the candidates unknown: no git
+    runs and the launch fails ``unsafe_cwd`` (git itself could not determine it either)."""
+    (work / ".git").write_text("not a gitfile\n", encoding="utf-8")
+    log = tmp_path / "git-env"
+    secret_logging_git(tmp_path / "gitbin", log)
+    _, plan = dry_run(
+        "respond",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=git_dir_config("respond", "write_dirs"),
+        env={"PATH": f"{tmp_path / 'gitbin'}:{tools}:/usr/bin:/bin"},
+    )
+    assert plan["would_fail"] == "unsafe_cwd", plan["warnings"]
+    assert not log.exists()
+
+
+def test_kinds_without_repo_never_runs_a_tool_under_a_repo_override_write_path(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """S3: without ``--repo`` every per-repo override's write paths count."""
+    marker = tmp_path / "ran"
+    planted = home() / "rw" / "bin"
+    plant(planted, marker)
+    env = {"PATH": f"{planted}:{tools}:/usr/bin:/bin"}
+    proc = cli(
+        ["kinds", "--json", "--kind", "respond"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=REPO_OVERRIDE,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    validate(report, KINDS)
+    assert report["claude_bin_resolved"] is None
+    (respond,) = report["kinds"]
+    assert respond["sandbox_available"] is False
+    assert any("a launch refuses it" in p for p in respond["sandbox_problems"])
+    assert not marker.exists()
+    # Every kind: claude is checked against respond's override too. (bwrap and socat are
+    # checked against each row's own kind, so only claude is planted here.)
+    for name in ("bwrap", "socat"):
+        (planted / name).unlink()
+    proc = cli(
+        ["kinds", "--json"], cwd=work, tools=tools, tmp_path=tmp_path, config=REPO_OVERRIDE, env=env
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["claude_bin_resolved"] is None
+    assert not marker.exists()
+
+
+def test_kinds_checks_claude_against_every_kind(tmp_path: Path, tools: Path, work: Path) -> None:
+    """S4: ``claude_bin`` is shared by every kind: it is checked against every kind's write
+    paths, whatever ``--kind`` names."""
+    marker = tmp_path / "ran"
+    planted = home() / "wd" / "bin"
+    plant(planted, marker)
+    proc = cli(
+        ["kinds", "--json", "--kind", "implement"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config="kinds:\n  respond:\n    write_dirs: ['~/wd']\n",
+        env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert report["claude_bin_resolved"] is None
+    assert any("a launch refuses it" in w for w in report["warnings"]), report["warnings"]
+    assert not marker.exists()
+
+
+def test_kinds_probes_nothing_when_any_kinds_paths_are_unknown(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """S4: one kind with unknowable write paths (``${GIT_DIR}``) means ``claude`` is not
+    run, also for ``--kind`` naming another kind."""
+    log = tmp_path / "claude-ran"
+    (tools / "claude").write_text(f"#!/bin/sh\necho claude >> {log}\nexit 0\n", encoding="utf-8")
+    proc = cli(
+        ["kinds", "--json", "--kind", "implement"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=git_dir_config("respond", "write_dirs"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert report["claude_bin_resolved"] is None
+    assert any("not probed by a dry run" in w for w in report["warnings"])
+    assert not log.exists()
+
+
+def test_the_version_probe_never_runs_an_interpreter_from_a_writable_path(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """S5: ``claude`` may be a ``#!/usr/bin/env node`` script: the probe's ``PATH`` holds no
+    entry under a session-writable path, so a planted ``node`` never runs."""
+    marker = tmp_path / "ran"
+    planted = home() / "wd" / "bin"
+    planted.mkdir(parents=True)
+    node = planted / "node"
+    node.write_text(f"#!/bin/sh\necho node >> {marker}\necho '9.9.9'\n", encoding="utf-8")
+    node.chmod(0o755)
+    (tools / "claude").write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    proc = cli(
+        ["kinds", "--json"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config="kinds:\n  respond:\n    write_dirs: ['~/wd']\n",
+        env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["claude_bin_resolved"] == str(tools / "claude")
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("config", "where"),
+    [
+        (
+            "permission_profiles:\n  wide: {sandbox: {filesystem: {allowWrite: ['~/aw']}}}\n"
+            "kinds:\n  implement:\n    permission_profile: wide\n",
+            "aw",
+        ),
+        (
+            "permission_profiles:\n  wide: {permissions: {allow: ['Edit(~/ed/**)']}}\n"
+            "kinds:\n  implement:\n    permission_profile: wide\n",
+            "ed",
+        ),
+    ],
+)
+def test_a_trusted_kinds_profile_write_paths_count(
+    config: str, where: str, tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """S6: a trusted kind's set holds its profile write paths, as ``git_writable`` computes
+    them."""
+    marker = tmp_path / "ran"
+    planted = home() / where / "bin"
+    plant(planted, marker)
+    proc = cli(
+        ["kinds", "--json", "--kind", "implement"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=config,
+        env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["claude_bin_resolved"] is None
+    assert not marker.exists()
+
+
+def test_a_trusted_kinds_git_dir_write_entry_probes_nothing(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """S6: a trusted kind's ``${GIT_DIR}`` write entry leaves its paths unknown."""
+    log = tmp_path / "claude-ran"
+    (tools / "claude").write_text(f"#!/bin/sh\necho claude >> {log}\nexit 0\n", encoding="utf-8")
+    proc = cli(
+        ["kinds", "--json", "--kind", "implement"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=git_dir_config("implement", "write_dirs"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["claude_bin_resolved"] is None
+    assert not log.exists()

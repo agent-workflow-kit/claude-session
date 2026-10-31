@@ -51,6 +51,9 @@ from .test_isolated_settings import (
 DRY_RUN = "claude-session/cli/exec-dry-run.json"
 KINDS = "claude-session/cli/kinds.json"
 SECRET = "do-not-print-this-value-0123456789"
+# The probe's session-writable paths: none (unit tests of the probe itself).
+NOTHING = pathrules.SessionWritable([])
+PATH_ONLY = {"PATH": "/usr/bin"}
 
 
 @pytest.fixture(scope="module")
@@ -385,7 +388,10 @@ def test_version_probe_runs_the_realpath_with_the_tool_name() -> None:
     gw = FakeGateway()
     gw.on(["claude", "--version"], stdout="2.1.314 (Claude Code)\nmore\n")
     tool = pathrules.ResolvedTool("/opt/claude/bin/claude-real", "claude")
-    assert claude_version.probe(tool, {"PATH": "/usr/bin"}, gw) == "2.1.314 (Claude Code)"
+    assert (
+        claude_version.probe(tool, {"PATH": "/usr/bin"}, gw, writable=NOTHING)
+        == "2.1.314 (Claude Code)"
+    )
     assert gw.calls[0].executable == "/opt/claude/bin/claude-real"
 
 
@@ -402,13 +408,20 @@ def test_version_probe_runs_the_realpath_with_the_tool_name() -> None:
 def test_version_probe_failures_are_none(answer: dict[str, Any]) -> None:
     gw = FakeGateway()
     gw.on(["claude", "--version"], **answer)
-    assert claude_version.probe(pathrules.ResolvedTool("/x/claude", "claude"), {}, gw) is None
+    assert (
+        claude_version.probe(
+            pathrules.ResolvedTool("/x/claude", "claude"), PATH_ONLY, gw, writable=NOTHING
+        )
+        is None
+    )
 
 
 def test_version_probe_strips_control_characters_and_caps_length() -> None:
     gw = FakeGateway()
     gw.on(["claude"], stdout="\x1b[31m2.1.314" + "x" * 500 + "\n")
-    text = claude_version.probe(pathrules.ResolvedTool("/x/claude", "claude"), {}, gw)
+    text = claude_version.probe(
+        pathrules.ResolvedTool("/x/claude", "claude"), PATH_ONLY, gw, writable=NOTHING
+    )
     assert text is not None and "\x1b" not in text and len(text) == claude_version.MAX_TEXT
 
 
@@ -693,11 +706,41 @@ def test_version_probe_gets_a_minimal_environment_in_its_own_group() -> None:
         "ANTHROPIC_API_KEY": SECRET,
         "MY_SECRET": SECRET,
     }
-    claude_version.probe(pathrules.ResolvedTool("/x/claude", "claude"), environ, gw)
+    claude_version.probe(
+        pathrules.ResolvedTool("/x/claude", "claude"), environ, gw, writable=NOTHING
+    )
     (call,) = gw.calls
     assert call.env == {"PATH": "/usr/bin", "HOME": "/home/x", "LANG": "C.UTF-8", "LC_ALL": "C"}
     assert call.cwd == "/"
     assert call.new_process_group and call.kill_grace is not None
+    assert call.kill_group_on_exit
+
+
+def test_version_probe_path_drops_relative_and_session_writable_entries(tmp_path: Path) -> None:
+    """S5: ``claude`` may be ``#!/usr/bin/env node``: the probe's ``PATH`` has no entry a
+    session could write (checked hop by hop), so a planted interpreter is never found."""
+    safe, unsafe = tmp_path / "safe", tmp_path / "unsafe"
+    safe.mkdir()
+    (unsafe / "bin").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(unsafe / "bin")
+    gw = FakeGateway()
+    gw.on(["claude", "--version"], stdout="2.1.314 (Claude Code)\n")
+    environ = {"PATH": f"rel:{unsafe / 'bin'}::{link}:{safe}"}
+    writable = pathrules.SessionWritable([str(unsafe)])
+    claude_version.probe(
+        pathrules.ResolvedTool("/x/claude", "claude"), environ, gw, writable=writable
+    )
+    (call,) = gw.calls
+    assert call.env is not None and call.env["PATH"] == str(safe)
+
+
+def test_version_probe_with_no_safe_path_entry_runs_nothing(tmp_path: Path) -> None:
+    gw = FakeGateway()
+    writable = pathrules.SessionWritable([str(tmp_path)])
+    found = pathrules.ResolvedTool("/x/claude", "claude")
+    assert claude_version.probe(found, {"PATH": str(tmp_path)}, gw, writable=writable) is None
+    assert gw.calls == []
 
 
 def _gone(pid: int) -> bool:
@@ -717,7 +760,9 @@ def test_a_hanging_version_probe_leaves_no_process(tmp_path: Path) -> None:
     claude.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {pid_file}\nwait\n")
     environ = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
     found = pathrules.ResolvedTool(str(claude), "claude")
-    assert claude_version.probe(found, environ, SystemGateway(), timeout=0.5) is None
+    assert (
+        claude_version.probe(found, environ, SystemGateway(), writable=NOTHING, timeout=0.5) is None
+    )
     pid = int(pid_file.read_text())
     deadline = time.monotonic() + 10
     while not _gone(pid) and time.monotonic() < deadline:

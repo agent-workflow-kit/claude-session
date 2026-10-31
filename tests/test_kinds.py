@@ -955,18 +955,20 @@ def test_git_origin_url_ignores_the_callers_git_environment(
         monkeypatch.setenv(name, "/elsewhere")
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "0")
     monkeypatch.setenv("LC_ALL", "de_DE.ISO-8859-1")
-    monkeypatch.setenv("CSESSION_KEEP_ME", "1")
+    monkeypatch.setenv("MY_TOKEN", "secret")
+    monkeypatch.setenv("PATH", "rel::/usr/bin")
+    monkeypatch.setenv("HOME", "/home/someone")
     gw = FakeGateway()
     gw.on([GIT], stdout="https://example.com/a/b\n")
     origin(gw)
     (call,) = gw.calls
-    env = call.env
-    assert env is not None
-    for name in GIT_DISCOVERY_VARIABLES:
-        assert name not in env
-    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
-    assert env["LC_ALL"] == "C"
-    assert env["CSESSION_KEEP_ME"] == "1"
+    # S1: a minimal environment; nothing else of the caller's (no secret) reaches git.
+    assert call.env == {
+        "PATH": "/usr/bin",
+        "HOME": "/home/someone",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
 
 
 def test_real_git_lookup_ignores_git_dir(
