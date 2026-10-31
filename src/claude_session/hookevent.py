@@ -640,7 +640,8 @@ def _record_report(store: Store, csession_id: str, drain: outbox.Drain) -> None:
         before, event, mode=run.mode or "", session_started=run.session_started_at is not None
     )
     state, reason, activity = derive(after)
-    # TODO(#20): post-state-change delivery picks up the appended event (cause report).
+    # Never delivered here (the fast path): exec's worker or the next delivering command
+    # delivers the appended event (cause report) through toolhooks.
     store.apply_state(
         run,
         state=state,
@@ -667,7 +668,8 @@ def _apply_own_row(store: Store, run: HookRun, hook: Hook) -> None:
     started = run.session_started_at is not None
     after = transition(before, hook.event, mode=run.mode or "", session_started=started)
     state, reason, activity = derive(after)
-    # TODO(#20): post-state-change delivery picks up the appended event.
+    # Never delivered here (the fast path): exec's worker or the next delivering command
+    # delivers the appended event through toolhooks.
     store.apply_state(
         run, state=state, activity=activity, needs_input_reason=reason, cause=hook.cause
     )
@@ -705,7 +707,7 @@ def apply_hook(
             # A new run began after the drain was prepared: leave its requests. They stay in
             # the old run's claimed/, which that run's final drain (``final_drain``: every
             # Drain.prepare picks up its run's claimed/ first) or its salvage processes.
-            # TODO(#33): salvage of a run whose wrapper is lost calls final_drain for it.
+            # (A run whose wrapper is lost: its salvage, liveness, calls final_drain.)
             drain = None
         if hook.claude_session_id is not None:
             assert hook.source is not None
@@ -759,8 +761,8 @@ def final_drain(store: Store, csession_id: str, run_no: int, state_dir: str) -> 
     a hook drain. Returns whether a drain was recorded; a drain that cannot run is logged
     (``hook_event_failed`` with the exception type only) and its requests stay claimed."""
     log = _Log(state_dir)
-    try:
-        drain = prepare_drain(store, csession_id, log)
+    try:  # only while run_no is the current run: never claims a later run's requests
+        drain = prepare_drain(store, csession_id, log, run_no=run_no)
     except Exception as exc:
         log.failure(csession_id, f"final drain: {type(exc).__name__}")
         return False

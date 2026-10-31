@@ -326,6 +326,27 @@ def test_hooks_report_selection_and_source(tmp_path: Path) -> None:
     assert [e["selected"] for e in other] == [False, True, False]
 
 
+def test_hook_selection_agrees_with_the_runner_on_an_unparsable_label(tmp_path: Path) -> None:
+    """The dry run decides ``selected`` with the runner's own match: a label that does not
+    parse never matches, though the same string is among the session's labels."""
+    from claude_session import toolhooks
+
+    cfg = load_cfg(tmp_path, HOOKS)
+    hook = cfg.hooks.post_state_change[0].model_copy(update={"labels": ["not a label"]})
+    cfg = cfg.model_copy(
+        update={"hooks": cfg.hooks.model_copy(update={"post_state_change": [hook]})}
+    )
+    labels = ["not a label", "team=a"]
+    (entry,) = [
+        e
+        for e in dryrun.hooks_json(cfg, request("review"), "review", labels)
+        if e["hook"] == "post-state-change"
+    ]
+    (runner,) = toolhooks.config_entries(cfg)
+    assert entry["selected"] is toolhooks.selected(runner, run_kind="review", labels=labels)
+    assert entry["selected"] is False
+
+
 # required_env_names
 
 
@@ -748,7 +769,7 @@ def _gone(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8") as stat:
             return stat.read().rpartition(")")[2].split()[0] == "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # gone before open, or mid-read
         return True
 
 

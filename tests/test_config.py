@@ -450,6 +450,8 @@ INVALID: list[tuple[str, str]] = [
         "hooks.post-state-change.0.states",
     ),
     ("hooks: {on-exit: []}\n", "hooks.on-exit"),
+    ('hooks: {pre-launch: [{cmd: "a\\0b"}]}\n', "hooks.pre-launch.0.cmd"),
+    ('hooks: {post-state-change: [{cmd: "a\\0b"}]}\n', "hooks.post-state-change.0.cmd"),
     ("repos: {Example.com/x: {}}\n", "repos.<invalid repo id>"),
     ("repos: {example.com/../x: {}}\n", "repos.<invalid repo id>"),
     (

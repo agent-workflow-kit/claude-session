@@ -10,9 +10,9 @@ the hook path may import it (design.md, Hook-event fast path), but never migrate
   version it brings the database to, so an interrupted migration resumes where it stopped.
 - A database whose schema is newer than this code is refused with ``schema_newer`` (exit 12)
   before claude-session writes any data to it (interface.md, Launch order and Upgrades).
-- Leases (``migrate``, ``reconcile``, ``delivery:<id>``) record the holder's PID, process
-  start time and a per-``Store`` token, and expire ``LEASE_TTL`` after their last renewal; a
-  dead holder's lease may be taken over at once.
+- Leases (``migrate``, ``reconcile``, ``delivery:<id>``, ``outcome-file:<id>:<run>``) record
+  the holder's PID, process start time and a per-``Store`` token, and expire ``LEASE_TTL``
+  after their last renewal; a dead holder's lease may be taken over at once.
 - Open refuses, with ``FailedError`` (exit 12), a state directory or ``state.db`` that is
   unsafe (a symlink, not ours, hard-linked, not a regular file), unusable or not a
   claude-session database (``PRAGMA application_id``); claude-session writes no data to such
@@ -37,7 +37,7 @@ import threading
 import time
 import urllib.parse
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -234,9 +234,10 @@ def _connect(path: str, busy_timeout: float) -> sqlite3.Connection:
     )
 
 
-def _is_busy(exc: sqlite3.OperationalError) -> bool:
+def is_busy(exc: sqlite3.OperationalError) -> bool:
     """Whether ``exc`` is SQLITE_BUSY or SQLITE_LOCKED (any extended code)."""
-    return exc.sqlite_errorcode & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    code = getattr(exc, "sqlite_errorcode", None) or 0
+    return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
 # Time and process identity
@@ -484,7 +485,39 @@ def _migration_1_0(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX events_undelivered ON events (delivered_at, id)")
 
 
-MIGRATIONS: tuple[Migration, ...] = (Migration((1, 0), _migration_1_0),)
+def _migration_1_1(conn: sqlite3.Connection) -> None:
+    """``runs.writable_json``: the run's session-writable paths, stored for the outcome-file
+    writers (design.md, Data model)."""
+    conn.execute("ALTER TABLE runs ADD COLUMN writable_json TEXT")
+
+
+def _migration_1_2(conn: sqlite3.Connection) -> None:
+    """``hook_groups``: the process group of each running ``post-state-change`` hook, with
+    its leader's start-time token and the deliverer (lease holder) that runs it, so the next
+    deliverer or ``reconcile`` can end the exact group a dead deliverer left behind before
+    the event is delivered again (design.md, Lifecycle hooks)."""
+    conn.execute(
+        """
+        CREATE TABLE hook_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            csession_id TEXT NOT NULL,
+            event_id INTEGER NOT NULL,
+            pgid INTEGER NOT NULL,
+            leader_start TEXT NOT NULL,
+            holder_pid INTEGER NOT NULL,
+            holder_start TEXT NOT NULL,
+            started_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX hook_groups_session ON hook_groups (csession_id)")
+
+
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration((1, 0), _migration_1_0),
+    Migration((1, 1), _migration_1_1),
+    Migration((1, 2), _migration_1_2),
+)
 
 
 def code_version(migrations: Sequence[Migration] | None = None) -> Version:
@@ -543,7 +576,7 @@ def _enable_wal(conn: sqlite3.Connection, busy_timeout: float) -> None:
             (mode,) = conn.execute("PRAGMA journal_mode=WAL").fetchone()
             break
         except sqlite3.OperationalError as exc:
-            if not _is_busy(exc) or time.monotonic() >= deadline:
+            if not is_busy(exc) or time.monotonic() >= deadline:
                 raise
             time.sleep(MIGRATE_POLL)
     if mode != "wal":
@@ -681,9 +714,11 @@ class Store:
         """One ``BEGIN IMMEDIATE`` transaction: committed on success, rolled back on error.
 
         Waits up to the busy timeout for the write lock (``sqlite3.OperationalError`` after).
+        BEGIN is inside the ``try``: an exception raised asynchronously (a signal handler)
+        right after it still rolls the transaction back.
         """
-        self.conn.execute("BEGIN IMMEDIATE")
         try:
+            self.conn.execute("BEGIN IMMEDIATE")
             yield self.conn
             self.conn.execute("COMMIT")
         except BaseException:
@@ -712,6 +747,14 @@ class Store:
                     self.conn.execute(f"RELEASE {name}")
             raise
         self.conn.execute(f"RELEASE {name}")
+
+    def rollback_open_transaction(self) -> None:
+        """Roll back a transaction an asynchronous exception (a signal handler raising between
+        ``BEGIN`` and the helper's ``try``) left open, so the next write can begin. A no-op
+        when none is open."""
+        if self.conn.in_transaction:
+            with suppress(sqlite3.Error):
+                self.conn.execute("ROLLBACK")
 
     # Schema version
 
@@ -781,7 +824,7 @@ class Store:
                     if self.take_lease(MIGRATE_LEASE):
                         return
                 except sqlite3.OperationalError as exc:
-                    if not _is_busy(exc):
+                    if not is_busy(exc):
                         raise
                 if time.monotonic() >= deadline:
                     raise FailedError(
@@ -823,7 +866,7 @@ class Store:
                         detail=f"{path}: migrate lease taken over",
                     )
         except sqlite3.OperationalError as exc:
-            if not _is_busy(exc):
+            if not is_busy(exc):
                 raise
             raise FailedError(
                 "state.db stayed locked while migrating", detail=f"{path}: {exc}"
@@ -1072,9 +1115,8 @@ class Store:
                     reason="live",
                 )
             if ended is None:
-                # TODO(#33): a run whose wrapper died after allocation (before or after the
-                # spawn) stays "live" here until the liveness check finalizes it as
-                # wrapper-lost; until then every resume is refused (--fork still works).
+                # The caller's inline liveness check (liveness.check_session) ran first: a
+                # run still open here has a live wrapper (or child), or is pending.
                 raise RefusedError(
                     f"cannot resume {csession_id}: it is live; {LIVE_HINT}", reason="live"
                 )
@@ -1237,6 +1279,66 @@ class Store:
             and bool(source_tainted)
         )
 
+    def set_pending_cause(self, csession_id: str, run_no: int, cause: str) -> bool:
+        """Record ``exec``'s intended cause before it signals the child, unless the run is
+        final or already has one (an earlier cause, such as a ``stop`` request's, stands).
+        Returns whether this call recorded it."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET pending_cause = ? WHERE csession_id = ? AND run_no = ? "
+                "AND pending_cause IS NULL AND ended_at IS NULL",
+                (cause, csession_id, run_no),
+            )
+        return cursor.rowcount == 1
+
+    def set_auto_exit_cause(self, csession_id: str, run_no: int, event_id: int) -> bool:
+        """The auto-exit re-check and its ``pending_cause`` in one compare-and-set: recorded
+        only while the run is live with no cause, its report is ``done`` and ``event_id`` is
+        still its latest event (design.md, Supervision). Returns whether it was recorded."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET pending_cause = 'auto_exit' WHERE csession_id = ? "
+                "AND run_no = ? AND pending_cause IS NULL AND ended_at IS NULL "
+                "AND report_status = 'done' AND (SELECT MAX(id) FROM events "
+                "WHERE csession_id = ? AND run_no = ?) = ?",
+                (csession_id, run_no, csession_id, run_no, event_id),
+            )
+        return cursor.rowcount == 1
+
+    def run_state(self, csession_id: str, run_no: int) -> str:
+        """The run's own state: the session's while it is the current run, else its latest
+        event's (``starting`` before any): a superseded run never shows a later run's."""
+        row = self.conn.execute(
+            "SELECT state, current_run FROM sessions WHERE csession_id = ?", (csession_id,)
+        ).fetchone()
+        if row is not None and row[1] == run_no:
+            return str(row[0])
+        return _run_latest_state(self.conn, csession_id, run_no)[0]
+
+    def latest_event(self, csession_id: str, run_no: int) -> dict[str, Any] | None:
+        """The run's latest event (see ``latest_events``); None when it has none."""
+        latest = self.latest_events(csession_id, run_no, 1)
+        return latest[0] if latest else None
+
+    def latest_events(self, csession_id: str, run_no: int, count: int) -> list[dict[str, Any]]:
+        """The run's ``count`` latest events (``id``, ``cause``, ``to_state``,
+        ``to_activity``, ``final``), newest first, by id."""
+        rows = self.conn.execute(
+            "SELECT id, cause, to_state, to_activity, final FROM events "
+            "WHERE csession_id = ? AND run_no = ? ORDER BY id DESC LIMIT ?",
+            (csession_id, run_no, count),
+        ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "cause": row[1],
+                "to_state": row[2],
+                "to_activity": row[3],
+                "final": bool(row[4]),
+            }
+            for row in rows
+        ]
+
     def update_session(self, csession_id: str, **fields: Any) -> None:
         """Set columns of a session row (only ``SESSION_FIELDS``)."""
         unknown = sorted(set(fields) - SESSION_FIELDS)
@@ -1270,6 +1372,36 @@ class Store:
                 (json.dumps(merged, ensure_ascii=False), csession_id, run_no),
             )
 
+    # Outcome file (interface.md, Outcome file; design.md, Data model)
+
+    def unwritten_outcome_files(self, csession_id: str | None = None) -> list[tuple[str, int]]:
+        """``(csession_id, run_no)`` of the final runs (of ``csession_id``, or of every
+        session) that have an ``outcome_file`` and no ``outcome_file_written_at``: the ones
+        the outcome-file backfill writes."""
+        sql = (
+            "SELECT csession_id, run_no FROM runs WHERE ended_at IS NOT NULL "
+            "AND outcome_file IS NOT NULL AND outcome_file_written_at IS NULL"
+        )
+        params: tuple[Any, ...] = ()
+        if csession_id is not None:
+            sql += " AND csession_id = ?"
+            params = (csession_id,)
+        rows = self.conn.execute(sql + " ORDER BY csession_id, run_no", params).fetchall()
+        return [(str(sid), int(run_no)) for sid, run_no in rows]
+
+    def claim_outcome_file(self, csession_id: str, run_no: int) -> bool:
+        """Claim the one write of a final run's outcome file: set ``outcome_file_written_at``
+        (compare-and-set on it being unset) before the file is written. Returns whether this
+        call claimed it; only the claimant writes."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET outcome_file_written_at = ? WHERE csession_id = ? "
+                "AND run_no = ? AND ended_at IS NOT NULL AND outcome_file IS NOT NULL "
+                "AND outcome_file_written_at IS NULL",
+                (format_ts(self.clock()), csession_id, run_no),
+            )
+        return cursor.rowcount == 1
+
     def set_implicit_report(self, csession_id: str, run_no: int, artifact: Frozen) -> bool:
         """Store an implicit done (headless ``result`` accepted as done): status ``done``,
         ``report_implicit`` 1, no summary or reason, the frozen ``result.md`` as artifact.
@@ -1296,16 +1428,26 @@ class Store:
             return cursor.rowcount == 1
 
     def finalize_run(
-        self, csession_id: str, run_no: int, final: Final, *, report_status: Any = ANY
+        self,
+        csession_id: str,
+        run_no: int,
+        final: Final,
+        *,
+        report_status: Any = ANY,
+        expect: Mapping[str, Any] | None = None,
     ) -> bool:
         """The finalization compare-and-set (design.md, Data model): on ``ended_at IS NULL``
         (and, unless ``report_status`` is ``ANY``, the run's report status still being the
-        one the end was mapped from, None for none), record the outcome, set the session's
-        final state (``exited`` when the run has a report, else the outcome's state) and
-        append the one final event. Returns whether this call won (False: the run was
-        already final or its report status differs, nothing changed)."""
+        one the end was mapped from, None for none; and each ``expect`` column, one of
+        ``EXPECTABLE``, still holding its value: the wrapper and child a liveness check found
+        dead), record the outcome, set the session's final state (``exited`` when the run has
+        a report, else the outcome's state) and append the one final event. Returns whether
+        this call won (False: the run was already final or a checked value differs, nothing
+        changed)."""
         with self.transaction() as conn:
-            return self._finalize(conn, csession_id, run_no, final, report_status=report_status)
+            return self._finalize(
+                conn, csession_id, run_no, final, report_status=report_status, expect=expect
+            )
 
     def _finalize(
         self,
@@ -1315,10 +1457,16 @@ class Store:
         final: Final,
         *,
         report_status: Any = ANY,
+        expect: Mapping[str, Any] | None = None,
     ) -> bool:
         """``finalize_run`` inside the caller's transaction."""
         report_check = "" if report_status is ANY else " AND report_status IS ?"
-        report_param = () if report_status is ANY else (report_status,)
+        report_param: tuple[Any, ...] = () if report_status is ANY else (report_status,)
+        for column, value in sorted((expect or {}).items()):
+            if column not in EXPECTABLE:
+                raise ValueError(f"not a column a finalization may check: {column!r}")
+            report_check += f" AND {column} IS ?"
+            report_param += (value,)
         now = format_ts(self.clock())
         cursor = conn.execute(
             "UPDATE runs SET ended_at = ?, phase = ?, outcome = ?, end_reason = ?, "
@@ -1342,14 +1490,18 @@ class Store:
         )
         if cursor.rowcount != 1:
             return False
+        self._record_with_final(conn, csession_id, run_no, final)
         row = conn.execute(
-            "SELECT s.state, s.activity, r.report_status FROM sessions s JOIN runs r "
-            "ON r.csession_id = s.csession_id AND r.run_no = ? WHERE s.csession_id = ?",
+            "SELECT s.state, s.activity, r.report_status, s.current_run FROM sessions s "
+            "JOIN runs r ON r.csession_id = s.csession_id AND r.run_no = ? "
+            "WHERE s.csession_id = ?",
             (run_no, csession_id),
         ).fetchone()
         if row is None:
             raise InternalError(f"no run {run_no} of session {csession_id}")
-        before_state, before_activity, report_status = row
+        before_state, before_activity, report_status, current_run = row
+        if current_run != run_no:  # a superseded run: its own state, never a later run's
+            before_state, before_activity = _run_latest_state(conn, csession_id, run_no)
         state = "exited" if report_status is not None else final.state
         conn.execute(
             "UPDATE sessions SET state = ?, activity = NULL, needs_input_reason = NULL, "
@@ -1432,9 +1584,9 @@ class Store:
             if wrapper is not None:
                 return Adoption("already_adopted", current)
             if self.past_deadline(expires):
+                # The caller writes the outcome file and delivers the final event
+                # (lifecycle.ended_unadopted).
                 self._finalize(conn, csession_id, current, NEVER_ADOPTED)
-                # TODO(#21): write the run's outcome file with the never_adopted outcome.
-                # TODO(#20): the run's exactly one final post-state-change.
                 return Adoption("expired", current, expired_now=True)
             if forked_from is not None and claude_id is None:
                 try:
@@ -1446,8 +1598,6 @@ class Store:
                         " not third-party-reading is refused",
                     )
                     self._finalize(conn, csession_id, current, final)
-                    # TODO(#21): write the run's outcome file with the never_adopted outcome.
-                    # TODO(#20): the run's exactly one final post-state-change.
                     return Adoption("tainted", current, expired_now=True)
             cursor = conn.execute(
                 "UPDATE runs SET wrapper_pid = ?, wrapper_start = ?, "
@@ -1466,11 +1616,10 @@ class Store:
         pending (no wrapper, not final) and at or past its ``expires_at``. Returns whether
         this call finalized it.
 
-        TODO(#33): the liveness check and ``reconcile`` call this (``cause`` ``liveness`` or
-        ``reconcile``) for every pending run they see, and delete the launch spec
-        (``lifecycle.SPEC_NAME``) of each run this finalizes.
-        TODO(#21): write the run's outcome file with the never_adopted outcome.
-        TODO(#20): the run's exactly one final post-state-change."""
+        The liveness check and ``reconcile`` call this (``cause`` ``liveness`` or
+        ``reconcile``) for every pending run they see. The caller deletes the launch spec
+        (``lifecycle.SPEC_NAME``), writes the outcome file and delivers the final event of a
+        run this finalizes."""
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT wrapper_pid, ended_at, expires_at FROM runs "
@@ -1585,6 +1734,32 @@ class Store:
             record["run1_invocation_json"] = None if row is None else row[0]
         return record
 
+    @staticmethod
+    def _record_with_final(
+        conn: sqlite3.Connection, csession_id: str, run_no: int, final: Final
+    ) -> None:
+        """The parts of ``final`` recorded with the compare-and-set (see ``Final``)."""
+        key = (csession_id, run_no)
+        if final.drop_outcome_file:
+            conn.execute(
+                "UPDATE runs SET outcome_file = NULL WHERE csession_id = ? AND run_no = ?", key
+            )
+        if final.writable is not None:
+            conn.execute(
+                "UPDATE runs SET writable_json = COALESCE(writable_json, ?) "
+                "WHERE csession_id = ? AND run_no = ?",
+                (json.dumps(list(final.writable), ensure_ascii=False), *key),
+            )
+        if final.warnings:
+            (current,) = conn.execute(
+                "SELECT warnings_json FROM runs WHERE csession_id = ? AND run_no = ?", key
+            ).fetchone()
+            merged = list(dict.fromkeys([*json.loads(current or "[]"), *final.warnings]))
+            conn.execute(
+                "UPDATE runs SET warnings_json = ? WHERE csession_id = ? AND run_no = ?",
+                (json.dumps(merged, ensure_ascii=False), *key),
+            )
+
     def run_record(self, csession_id: str, run_no: int) -> dict[str, Any]:
         """The run row joined with its session's ``forked_from``, ``claude_session_id`` and
         ``state`` (for the outcome object). ``InternalError`` when it does not exist."""
@@ -1600,6 +1775,142 @@ class Store:
             raise InternalError(f"no run {run_no} of session {csession_id}")
         names = [column[0] for column in cursor.description]
         return dict(zip(names, row, strict=True))
+
+    def waited_run(self, csession_id: str, run_no: int | None) -> dict[str, Any] | None:
+        """For ``wait``: the run row ``run_no`` (None: the session's current run) of a session
+        that is not forgotten, in one read (never a write, so a waiter holds no lock between
+        polls); None when the session is forgotten or gone, or has no such run."""
+        cursor = self.conn.execute(
+            "SELECT r.* FROM runs r JOIN sessions s ON s.csession_id = r.csession_id "
+            "WHERE r.csession_id = ? AND r.run_no = COALESCE(?, s.current_run) "
+            "AND s.forgotten_at IS NULL",
+            (csession_id, run_no),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        names = [column[0] for column in cursor.description]
+        return dict(zip(names, row, strict=True))
+
+    # Liveness and reconcile (liveness, reconcile)
+
+    def open_runs(self, csession_id: str) -> list[dict[str, Any]]:
+        """``run_record`` of every run of the session that is not final, oldest first (the
+        current run, and a superseded run a crash left open)."""
+        rows = self.conn.execute(
+            "SELECT run_no FROM runs WHERE csession_id = ? AND ended_at IS NULL ORDER BY run_no",
+            (csession_id,),
+        ).fetchall()
+        records = []
+        for (run_no,) in rows:
+            try:
+                records.append(self.run_record(csession_id, int(run_no)))
+            except InternalError:  # gone meanwhile
+                continue
+        return records
+
+    def sessions_with_open_runs(self) -> list[str]:
+        """Every session (forgotten ones included) with a run that is not final."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT csession_id FROM runs WHERE ended_at IS NULL ORDER BY csession_id"
+        ).fetchall()
+        return [str(sid) for (sid,) in rows]
+
+    def final_runs(self) -> list[tuple[str, int]]:
+        """``(csession_id, run_no)`` of every final run, by session id and run."""
+        rows = self.conn.execute(
+            "SELECT csession_id, run_no FROM runs WHERE ended_at IS NOT NULL "
+            "ORDER BY csession_id, run_no"
+        ).fetchall()
+        return [(str(sid), int(run_no)) for sid, run_no in rows]
+
+    def sessions_with_undelivered(self) -> list[str]:
+        """Every session with an event whose ``delivered_at`` is unset."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT csession_id FROM events WHERE delivered_at IS NULL "
+            "ORDER BY csession_id"
+        ).fetchall()
+        return [str(sid) for (sid,) in rows]
+
+    def session_ids(self) -> list[str]:
+        """Every session id in ``sessions`` (forgotten ones included)."""
+        rows = self.conn.execute("SELECT csession_id FROM sessions ORDER BY csession_id")
+        return [str(sid) for (sid,) in rows.fetchall()]
+
+    def tmpdir_owner(self, csession_id: str) -> tuple[int, bool] | None:
+        """What decides whether a private tmpdir of ``csession_id`` may be removed: the
+        session's current run and whether it is final; ``(0, True)`` for a deleted session
+        (``deleted_ids``: no run of it ever starts again); None for an id this database does
+        not know (another state directory's: never touched)."""
+        row = self.conn.execute(
+            "SELECT s.current_run, r.ended_at FROM sessions s LEFT JOIN runs r "
+            "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
+            "WHERE s.csession_id = ?",
+            (csession_id,),
+        ).fetchone()
+        if row is not None:
+            return int(row[0]), row[1] is not None
+        deleted = self.conn.execute(
+            "SELECT 1 FROM deleted_ids WHERE csession_id = ?", (csession_id,)
+        ).fetchone()
+        return (0, True) if deleted is not None else None
+
+    def record_discarded(
+        self, conn: sqlite3.Connection, csession_id: str, run_no: int, request_ids: Sequence[str]
+    ) -> None:
+        """Record outbox requests discarded under run ``run_no`` (``discarded``), inside the
+        caller's transaction."""
+        now = format_ts(self.clock())
+        for request_id in request_ids:
+            conn.execute(
+                "INSERT INTO requests (request_id, csession_id, run_no, result, ingested_at) "
+                "VALUES (?, ?, ?, 'discarded', ?) ON CONFLICT (request_id) DO NOTHING",
+                (request_id, csession_id, run_no, now),
+            )
+
+    # Hook process groups (toolhooks; schema 1.2)
+
+    def add_hook_group(
+        self, csession_id: str, event_id: int, pgid: int, leader_start: str, holder: Holder
+    ) -> int:
+        """Record a ``post-state-change`` hook's process group as it starts (``holder``: the
+        deliverer running it). Returns the row id (``remove_hook_group``)."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO hook_groups (csession_id, event_id, pgid, leader_start, "
+                "holder_pid, holder_start, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    csession_id,
+                    event_id,
+                    pgid,
+                    leader_start,
+                    holder.pid,
+                    holder.start,
+                    format_ts(self.clock()),
+                ),
+            )
+            return int(cursor.lastrowid or 0)
+
+    def remove_hook_group(self, row_id: int) -> None:
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM hook_groups WHERE id = ?", (row_id,))
+
+    def hook_groups(self, csession_id: str | None = None) -> list[dict[str, Any]]:
+        """The recorded hook process groups (of ``csession_id``, or every session's)."""
+        sql = "SELECT * FROM hook_groups"
+        params: tuple[Any, ...] = ()
+        if csession_id is not None:
+            sql += " WHERE csession_id = ?"
+            params = (csession_id,)
+        cursor = self.conn.execute(sql + " ORDER BY id", params)
+        names = [column[0] for column in cursor.description]
+        return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+    def holder_alive(self, pid: int, start: str) -> bool:
+        """Whether a recorded holder (a lease's, a hook group's deliverer) still runs; an
+        unknown start (``""``) is checked by PID only (it counts as alive while that PID
+        exists)."""
+        return self._holder_alive(pid, start)
 
     # The hook path (hookevent). Call these inside one ``transaction()``; they read and write
     # only columns of schema 1.0, so a newer additive schema keeps working (design.md, Data
@@ -1820,8 +2131,79 @@ class Store:
         )
         return cursor.rowcount == 1
 
+    # post-state-change delivery (toolhooks). Delivery holds the session's lease
+    # ``delivery:<id>`` (DELIVERY_LEASE_PREFIX); events are marked under it, in id order.
+
+    def undelivered_events(self, csession_id: str, limit: int) -> list[dict[str, Any]]:
+        """The session's events with ``delivered_at`` NULL, oldest first by id (at most
+        ``limit``), every run's: delivery is in order per session."""
+        cursor = self.conn.execute(
+            "SELECT id, run_no, event_ts, from_state, to_state, from_activity, to_activity, "
+            "needs_input_reason, cause, final, labels_json FROM events "
+            "WHERE csession_id = ? AND delivered_at IS NULL ORDER BY id LIMIT ?",
+            (csession_id, limit),
+        )
+        names = [column[0] for column in cursor.description]
+        return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+    def has_undelivered(self, csession_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM events WHERE csession_id = ? AND delivered_at IS NULL LIMIT 1",
+            (csession_id,),
+        ).fetchone()
+        return row is not None
+
+    def delivery_record(self, csession_id: str, run_no: int) -> dict[str, Any] | None:
+        """The run row with its session's ``launch_kind``, ``forked_from``, ``tainted`` and
+        ``claude_session_id`` (prefixed ``session_``), for a ``post-state-change`` payload;
+        None when the run row is gone."""
+        cursor = self.conn.execute(
+            "SELECT r.*, s.launch_kind AS session_launch_kind, "
+            "s.forked_from AS session_forked_from, s.tainted AS session_tainted, "
+            "s.claude_session_id AS session_claude_session_id "
+            "FROM runs r JOIN sessions s ON s.csession_id = r.csession_id "
+            "WHERE r.csession_id = ? AND r.run_no = ?",
+            (csession_id, run_no),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        names = [column[0] for column in cursor.description]
+        return dict(zip(names, row, strict=True))
+
+    def mark_delivered(self, event_id: int, lease: str) -> bool:
+        """In one transaction, while this store still holds ``lease``: set the event's
+        ``delivered_at`` (once) and renew the lease. Returns False, changing nothing, when the
+        lease was lost (taken over or released): the event stays undelivered and its next
+        deliverer runs it again (at least once)."""
+        with self.transaction() as conn:
+            now = self.clock()
+            cursor = conn.execute(
+                "UPDATE leases SET expires_at = ? WHERE name = ? AND holder_pid = ? "
+                "AND holder_start = ? AND holder_token = ?",
+                (
+                    format_ts(now + LEASE_TTL),
+                    lease,
+                    self.holder.pid,
+                    self.holder.start,
+                    self.token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            conn.execute(
+                "UPDATE events SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL",
+                (format_ts(now), event_id),
+            )
+        return True
+
+
+DELIVERY_LEASE_PREFIX = "delivery:"
+
 
 LIVE_HINT = "resume --fork still works"
+# The run columns a finalization compare-and-set may also require unchanged (``expect``).
+EXPECTABLE = frozenset({"wrapper_pid", "wrapper_start", "child_pid", "child_start"})
 
 
 def _recheck_fork_taint(
@@ -1869,6 +2251,7 @@ RUN_FIELDS = frozenset(
         "backstop_used",
         "pending_cause",
         "message",
+        "writable_json",
     }
 )
 SESSION_FIELDS = frozenset({"tmp_dir", "git_dir"})
@@ -1917,6 +2300,13 @@ class Final:
     num_turns: int | None = None
     is_error: bool | None = None
     message: str | None = None
+    # Recorded in the same transaction as the compare-and-set (design.md, Data model):
+    # warnings known before it (merged into ``warnings_json``, so the outcome file carries
+    # them), the run's session-writable paths when none are stored yet (``writable_json``),
+    # and the drop of an ``--outcome-file`` launch step 5 rejected.
+    warnings: tuple[str, ...] = ()
+    writable: tuple[str, ...] | None = None
+    drop_outcome_file: bool = False
 
 
 # A pending run not adopted before ``expires_at`` (interface.md, Outcome mapping: launch).
@@ -1970,3 +2360,14 @@ class HookRun:
 def open_state(**kwargs: Any) -> Store:
     """Open ``state.db`` in the default state directory (see ``Store.open``)."""
     return Store.open(db_path(state_dir()), **kwargs)
+
+
+def _run_latest_state(conn: sqlite3.Connection, csession_id: str, run_no: int) -> tuple[str, Any]:
+    """The state and activity of the run's latest event; ``starting`` (no activity) before
+    any event."""
+    row = conn.execute(
+        "SELECT to_state, to_activity FROM events WHERE csession_id = ? AND run_no = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (csession_id, run_no),
+    ).fetchone()
+    return ("starting", None) if row is None else (str(row[0]), row[1])

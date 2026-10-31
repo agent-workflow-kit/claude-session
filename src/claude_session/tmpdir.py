@@ -46,8 +46,11 @@ it with the pin and removes it under the aside name, so run n + 1 creating its d
 any moment in between is never affected; an entry that is not the pinned one is renamed
 back when the session's name is still free (else left aside, like other ``.stale-*``
 entries). The caller closes the pin after the removal.
-TODO(#33): reconcile calls ``remove`` for leftover tmpdirs of final runs and of deleted
-sessions.
+``reconcile`` (and the liveness check, for a run it finalizes) removes the tmpdir of a session
+whose current run is final, or of a deleted session, with ``remove_checked`` (no pin: the entry
+is moved aside, then the store is read again before it is removed), and the ``.stale-*`` entries
+of such sessions (``remove_stale``); entries of ids this state directory does not know (another
+state directory's) are never touched.
 """
 
 from __future__ import annotations
@@ -56,6 +59,7 @@ import errno
 import os
 import secrets
 import stat
+from collections.abc import Callable
 from typing import NamedTuple
 
 from . import fsutil, ids, pathrules
@@ -259,6 +263,111 @@ def remove(csession_id: str, *, base: str | None = None, pin: int | None = None)
     return True
 
 
+def remove_checked(
+    csession_id: str, still_removable: Callable[[], bool], *, base: str | None = None
+) -> bool:
+    """Remove the session's private temporary directory without a pin (``reconcile`` and the
+    liveness check, for a session whose current run is final), never one a next run of the
+    session made: the entry is renamed aside first, then ``still_removable()`` (the store
+    read again: the same current run, still final) decides; when it says no, the entry is
+    renamed back (when its name is free; else it stays aside, a ``.stale-*`` entry). A new
+    run creates its directory only after it is allocated, so an entry moved aside before a
+    read that still sees no new run cannot be that run's. Returns whether it was removed.
+    Raises ``OSError`` as ``remove`` does (``TmpdirLeftover`` when it could not be removed:
+    it stays aside for ``remove_stale``)."""
+    path = run_path(csession_id, base)
+    root = os.path.dirname(path)
+    base_fd = _open_base(os.path.dirname(root))
+    try:
+        root_fd = _open_root(base_fd, root, create=False)
+    finally:
+        os.close(base_fd)
+    if root_fd is None:
+        return False
+    try:
+        try:
+            name = _rename_aside(root_fd, csession_id)
+        except FileNotFoundError:
+            return False
+        if not still_removable():
+            _put_back(root_fd, name, csession_id)
+            return False
+        try:
+            fsutil.remove_tree_at(root_fd, name)
+        except OSError as exc:
+            stale_path = os.path.join(root, name)
+            raise TmpdirLeftover(
+                f"private temporary directory {path} could not be removed ({_reason(exc)});"
+                f" it was moved aside to {stale_path}",
+                path=path,
+                stale_path=stale_path,
+                hint=_leftover_hint(stale_path),
+            ) from exc
+    finally:
+        os.close(root_fd)
+    return True
+
+
+def session_entries(*, base: str | None = None) -> tuple[list[str], list[str]]:
+    """The names in the per-uid root (none when it is missing): the entries named like a
+    session id, and the ``.stale-*`` entries. Read only. Raises ``OSError`` for an unsafe
+    base or root."""
+    root = root_path(base)
+    base_fd = _open_base(os.path.dirname(root))
+    try:
+        root_fd = _open_root(base_fd, root, create=False)
+    finally:
+        os.close(base_fd)
+    if root_fd is None:
+        return [], []
+    try:
+        names = sorted(os.listdir(root_fd))
+    finally:
+        os.close(root_fd)
+    sessions = [name for name in names if ids.is_session_id(name)]
+    stale = [name for name in names if stale_session(name) is not None]
+    return sessions, stale
+
+
+def stale_session(name: str) -> str | None:
+    """The session id of a ``.stale-<id>-<hex>`` entry name, or None for any other name."""
+    if not name.startswith(STALE_PREFIX):
+        return None
+    sid, sep, token = name[len(STALE_PREFIX) :].rpartition("-")
+    if (
+        not sep
+        or not ids.is_session_id(sid)
+        or not token
+        or not all(c in "0123456789abcdef" for c in token)
+    ):
+        return None
+    return sid
+
+
+def remove_stale(name: str, *, base: str | None = None) -> bool:
+    """Remove the ``.stale-*`` entry ``name`` from the per-uid root (fd-based, never
+    following a symlink). The caller decides it is abandoned (``reconcile``: its session's
+    current run was final after the entry was listed). Returns False when it is gone already.
+    Raises ``OSError`` when it cannot be removed."""
+    if stale_session(name) is None:
+        raise ValueError(f"not a stale entry: {name!r}")
+    root = root_path(base)
+    base_fd = _open_base(os.path.dirname(root))
+    try:
+        root_fd = _open_root(base_fd, root, create=False)
+    finally:
+        os.close(base_fd)
+    if root_fd is None:
+        return False
+    try:
+        if _identity_at(root_fd, name) is None:
+            return False
+        fsutil.remove_tree_at(root_fd, name)
+    finally:
+        os.close(root_fd)
+    return True
+
+
 def _check_id(csession_id: str) -> None:
     # The id becomes a path segment: only the session id grammar (no "/", "..", NUL).
     if not ids.is_session_id(csession_id):
@@ -371,7 +480,7 @@ def _clear_leftover(root_fd: int, root: str, name: str) -> str | None:
             f" aside ({_reason(rename_error)})",
             _leftover_hint(path),
         ) from removal_error
-    # TODO(#33): reconcile removes .stale-* entries under the per-uid root.
+    # reconcile removes what is left (remove_stale).
     try:
         fsutil.remove_tree_at(root_fd, stale)
     except OSError:
@@ -390,7 +499,7 @@ def _rename_aside(root_fd: int, name: str) -> str:
 def _put_back(root_fd: int, stale: str, name: str) -> None:
     """Rename the entry ``stale`` that ``remove`` moved aside but did not create back to
     ``name`` when that name is still free; otherwise (or when the rename fails) it stays
-    aside, a ``.stale-*`` entry like any other (TODO(#33): reconcile removes those)."""
+    aside, a ``.stale-*`` entry like any other (``reconcile`` removes those)."""
     if _exists_at(root_fd, name):
         return
     try:

@@ -265,6 +265,36 @@ def test_run_handles_large_output_on_both_streams_with_input(gw: SystemGateway) 
     assert proc.stderr == "e" * size
 
 
+def test_run_output_limit_keeps_a_prefix_and_drains_the_rest(gw: SystemGateway) -> None:
+    size = 3 * 1024 * 1024  # far above a pipe buffer: a child left unread would block
+    proc = gw.run(
+        py(
+            f"""
+            import sys
+            sys.stdout.write("o" * {size})
+            sys.stderr.write("é" * {size})
+            sys.stdout.write("tail")
+            """
+        ),
+        timeout=60,
+        output_limit=5,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout == "ooooo"
+    assert proc.stderr == "éé\ufffd"  # 5 bytes: two whole characters, then half of one
+
+
+def test_run_output_limit_zero_discards_everything(gw: SystemGateway) -> None:
+    proc = gw.run(py("print('out'); import sys; print('err', file=sys.stderr)"), output_limit=0)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+
+
+@pytest.mark.parametrize("limit", [-1, True, 1.5])
+def test_run_output_limit_must_be_a_non_negative_int(gw: SystemGateway, limit: Any) -> None:
+    with pytest.raises((ValueError, TypeError)):
+        gw.run([PY, "-c", "pass"], output_limit=limit)
+
+
 def test_run_timeout_raises_gateway_timeout_and_reaps_the_child(
     gw: SystemGateway, tmp_path: Path
 ) -> None:
@@ -706,6 +736,101 @@ def test_run_survives_a_child_that_does_not_read_its_stdin(gw: SystemGateway) ->
     assert proc.returncode == 0
 
 
+# --- discard_output, on_started, canceled and long timeouts ------------------------------
+
+
+@linux_only
+def test_discard_output_waits_only_for_the_child_not_a_descendant_holding_its_output(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    pidfile = tmp_path / "pid"
+    start = time.monotonic()
+    proc = gw.run(
+        ["/bin/sh", "-c", f"/bin/sleep 30 & echo $! > {pidfile}; echo out; exit 3"],
+        new_process_group=True,
+        timeout=10,
+        kill_grace=1,
+        discard_output=True,
+    )
+    assert time.monotonic() - start < 5
+    assert (proc.returncode, proc.stdout, proc.stderr) == (3, "", "")
+    pid = _read_pid(pidfile, grandchildren)  # ended by the fixture (exact recorded PID)
+    assert _alive(pid)
+
+
+def test_on_started_is_called_once_stdin_is_written_and_closed(gw: SystemGateway) -> None:
+    seen: list[str] = []
+    started = threading.Event()
+
+    def on_started() -> None:
+        seen.append("started")
+        started.set()
+
+    code = "import sys, time; sys.stdin.read(); time.sleep(0.3); print('done')"
+    result: list[Any] = []
+    thread = threading.Thread(
+        target=lambda: result.append(
+            gw.run(py(code), stdin="x" * 200000, timeout=30, on_started=on_started)
+        )
+    )
+    thread.start()
+    assert started.wait(10)
+    assert thread.is_alive()  # started before the child exited
+    thread.join(30)
+    assert seen == ["started"] and result[0].stdout == "done\n"
+
+
+def test_on_started_without_stdin_is_called_at_once(gw: SystemGateway) -> None:
+    seen: list[str] = []
+    gw.run(["/bin/true"], on_started=lambda: seen.append("started"))
+    assert seen == ["started"]
+
+
+def test_on_started_is_not_called_for_a_program_that_cannot_start(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    seen: list[str] = []
+    with pytest.raises(OSError):
+        gw.run([str(tmp_path / "missing")], stdin="x", on_started=lambda: seen.append("x"))
+    assert seen == []
+
+
+@linux_only
+def test_canceled_ends_the_group_and_raises(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    pidfile = tmp_path / "pid"
+    flag = threading.Event()
+    threading.Timer(0.5, flag.set).start()
+    start = time.monotonic()
+    with pytest.raises(gateway.GatewayCanceled):
+        gw.run(
+            ["/bin/sh", "-c", f"/bin/sleep 30 & echo $! > {pidfile}; wait"],
+            new_process_group=True,
+            timeout=60,
+            kill_grace=1,
+            discard_output=True,
+            canceled=flag.is_set,
+        )
+    assert time.monotonic() - start < 5
+    assert _wait_dead(_read_pid(pidfile, grandchildren), 5)
+
+
+def test_a_timeout_longer_than_one_wait_runs_normally(gw: SystemGateway) -> None:
+    # 30 days: one select/poll of that length overflows its millisecond argument.
+    month = 30 * 86400.0
+    assert month > gateway.MAX_WAIT
+    proc = gw.run(["/bin/sh", "-c", "echo ok"], stdin="x", timeout=month)
+    assert proc.stdout == "ok\n"
+    proc = gw.run(
+        ["/bin/sh", "-c", "exec >&- 2>&-; /bin/sleep 0.2"],
+        new_process_group=True,
+        timeout=month,
+        kill_grace=1,
+    )
+    assert proc.returncode == 0
+
+
 # --- group scan and grace polling --------------------------------------------------------
 
 
@@ -1046,6 +1171,68 @@ def test_signal_between_fork_and_exec_never_runs_our_python_handler(
 
 
 @linux_only
+def test_run_starts_its_child_with_every_signal_blocked_and_restores_both_masks(
+    gw: SystemGateway, monkeypatch: pytest.MonkeyPatch, usr1_blocked: None
+) -> None:
+    """R1-12: ``run`` builds its Popen with signals blocked (a handler raising in exec's
+    launch phase then waits until run holds the child); the caller's mask is restored, and
+    the child gets it (SIGUSR1 here) without the block, no death signal."""
+    masks: list[set[int]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        masks.append(_sigmask())
+        return real_popen(*args, **kwargs)
+
+    before = _sigmask()
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    result = gw.run(["/bin/cat", "/proc/self/status"])
+    monkeypatch.undo()
+    assert _sigmask() == before
+    assert len(masks) == 1
+    assert {signal.SIGINT, signal.SIGTERM, signal.SIGHUP} <= masks[0]
+    status = dict(line.split(":", 1) for line in result.stdout.splitlines() if ":" in line)
+    blocked = int(status["SigBlk"].strip(), 16)
+    assert blocked == 1 << (signal.SIGUSR1 - 1)
+
+
+@linux_only
+def test_a_handler_raising_while_run_starts_its_child_ends_that_child(
+    gw: SystemGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1-12: a signal arriving inside Popen (sent to this thread, so it waits for the mask):
+    its handler raises only once run holds the Popen, and run ends and reaps the child."""
+    started: list[subprocess.Popen[Any]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        popen: subprocess.Popen[Any] = real_popen(*args, **kwargs)
+        started.append(popen)
+        signal.pthread_kill(threading.get_ident(), signal.SIGUSR1)  # pending until restored
+        return popen
+
+    def on_usr1(signum: int, frame: object) -> None:
+        del signum, frame
+        raise Interrupted
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    previous = signal.signal(signal.SIGUSR1, on_usr1)
+    try:
+        with pytest.raises(Interrupted):
+            gw.run(["/bin/sleep", "30"])
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+        monkeypatch.undo()
+        leftover = [p for p in started if p.returncode is None]
+        for p in leftover:  # the exact child this test started
+            p.kill()
+            p.wait()
+    assert len(started) == 1
+    assert leftover == []
+    assert started[0].returncode == -signal.SIGKILL
+
+
+@linux_only
 def test_prctl_failure_surfaces_as_oserror(
     gw: SystemGateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1086,3 +1273,197 @@ def test_kill_group_on_exit_ends_descendants_left_by_a_leader_that_exited(
 def test_kill_group_on_exit_needs_a_process_group(gw: SystemGateway) -> None:
     with pytest.raises(ValueError, match="kill_group_on_exit needs new_process_group"):
         gw.run(["/bin/true"], kill_group_on_exit=True)
+
+
+# --- gated spawn (the child execs only once released) -------------------------------------
+
+# An intermediate process spawns a gated child that would create a marker, prints its PID and
+# SIGKILLs itself without releasing it: the child must exit without running the program.
+GATED_INTERMEDIATE = """
+import os, signal, sys
+from claude_session.gateway import DEVNULL, SystemGateway
+child = SystemGateway().spawn(
+    ["/bin/sh", "-c", "echo ran > " + sys.argv[1]],
+    stdout=DEVNULL,
+    stderr=DEVNULL,
+    die_with_parent=sys.argv[2] == "1",
+    gated=True,
+)
+print(child.pid, flush=True)
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+
+@pytest.mark.parametrize("die_with_parent", [False, True])
+def test_a_gated_child_whose_parent_is_killed_never_runs_the_program(
+    gw: SystemGateway,
+    tmp_path: Path,
+    grandchildren: list[tuple[int, bytes | None]],
+    die_with_parent: bool,
+) -> None:
+    marker = tmp_path / "ran"
+    proc = subprocess.run(
+        [PY, "-c", GATED_INTERMEDIATE, str(marker), "1" if die_with_parent else "0"],
+        env={**os.environ, "PYTHONPATH": str(Path(gateway.__file__).parents[1])},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == -signal.SIGKILL, proc.stderr
+    pid = int(proc.stdout)
+    grandchildren.append((pid, _start_token(pid)))
+    assert _wait_dead(pid, 10)
+    assert not marker.exists()
+
+
+def test_a_gated_child_runs_the_program_only_once_released(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    marker = tmp_path / "ran"
+    child = gw.spawn(["/bin/sh", "-c", f"echo ran > {marker}"], gated=True)
+    try:
+        assert child.wait(timeout=0.3) is None
+        assert not marker.exists()
+    finally:
+        child.release()
+    assert child.wait(timeout=30) == 0
+    assert marker.read_text() == "ran\n"
+    child.release()  # idempotent
+
+
+@linux_only
+def test_a_gated_child_keeps_its_pid_and_start_time_across_the_release(
+    gw: SystemGateway,
+) -> None:
+    child = gw.spawn(["/bin/sleep", "30"], gated=True)
+    try:
+        before = _start_token(child.pid)
+        child.release()
+        assert _start_token(child.pid) == before
+        with open(f"/proc/{child.pid}/cmdline", "rb") as fh:  # the program now runs
+            assert fh.read().split(b"\0")[:2] == [b"/bin/sleep", b"30"]
+    finally:
+        child.send_signal(signal.SIGKILL)
+        child.wait(timeout=30)
+
+
+def test_a_gated_child_whose_gate_is_dropped_exits_without_running(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    marker = tmp_path / "ran"
+    child = gw.spawn(["/bin/sh", "-c", f"echo ran > {marker}"], gated=True)
+    child._drop_gate()  # pyright: ignore[reportAttributeAccessIssue]  # an abandoned gate
+    assert child.wait(timeout=30) == PARENT_GONE_EXIT
+    assert not marker.exists()
+
+
+def test_a_gated_child_that_cannot_exec_raises_from_release(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    script = tmp_path / "bad"
+    script.write_text("#!/nonexistent/interp\n")
+    script.chmod(0o755)
+    child = gw.spawn([str(script)], gated=True)
+    with pytest.raises(FileNotFoundError):
+        child.release()
+    assert child.wait(timeout=30) == gateway.GATE_EXEC_FAILED
+
+
+def test_a_gated_spawn_of_a_missing_program_raises_at_once(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    with pytest.raises(FileNotFoundError):
+        gw.spawn([str(tmp_path / "missing")], gated=True)
+
+
+def test_releasing_a_gated_child_that_already_died_is_not_an_error(gw: SystemGateway) -> None:
+    child = gw.spawn(["/bin/true"], gated=True)
+    child.send_signal(signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while not _reaped_or_zombie(child.pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    child.release()
+    assert child.wait(timeout=30) == -signal.SIGKILL
+
+
+def _reaped_or_zombie(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            return fh.read().rpartition(b")")[2].split()[0] == b"Z"
+    except FileNotFoundError:
+        return True
+
+
+# --- a gated child's signal state (every platform) ----------------------------------------
+
+
+def _gated_status(gw: SystemGateway, tmp_path: Path, *, die_with_parent: bool) -> dict[str, int]:
+    """The signal masks (``SigBlk``, ``SigIgn``) of the program a gated spawn runs."""
+    out = tmp_path / "status"
+    with open(out, "wb") as fh:
+        child = gw.spawn(
+            ["/bin/cat", "/proc/self/status"],
+            stdout=fh.fileno(),
+            die_with_parent=die_with_parent,
+            gated=True,
+        )
+        child.release()
+        assert child.wait(timeout=30) == 0
+    fields = dict(line.split(":", 1) for line in out.read_text().splitlines() if ":" in line)
+    return {name: int(fields[name].strip(), 16) for name in ("SigBlk", "SigIgn")}
+
+
+def _bits(signals: Iterable[int]) -> int:
+    return sum(1 << (int(sig) - 1) for sig in set(signals))
+
+
+def _no_prctl() -> Callable[..., int]:
+    raise AssertionError("prctl resolved off Linux")
+
+
+@linux_only  # reads /proc; the non-Linux branch is forced
+@pytest.mark.parametrize("die_with_parent", [False, True])
+def test_a_gated_child_off_linux_restores_the_callers_mask(
+    gw: SystemGateway,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    usr1_blocked: None,
+    die_with_parent: bool,
+) -> None:
+    """G1: the gated fork blocks every signal on every platform; off Linux the child must
+    still restore the caller's mask (no death signal there, and no prctl)."""
+    monkeypatch.setattr(gateway, "_prctl", _no_prctl)
+    monkeypatch.setattr(gateway.sys, "platform", "darwin")
+    expected = _sigmask() - ({signal.SIGTERM} if die_with_parent else set())
+    status = _gated_status(gw, tmp_path, die_with_parent=die_with_parent)
+    monkeypatch.undo()
+    assert status["SigBlk"] == _bits(expected)
+
+
+@linux_only
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.parametrize("die_with_parent", [False, True])
+def test_only_a_gated_child_that_dies_with_its_parent_resets_an_inherited_sigterm(
+    gw: SystemGateway,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    die_with_parent: bool,
+) -> None:
+    """G2: an interactive (``die_with_parent=False``) gated child inherits an ignored or
+    blocked SIGTERM as an ungated one does; a headless one starts with it at its default."""
+    if platform != "linux":
+        monkeypatch.setattr(gateway, "_prctl", _no_prctl)
+    monkeypatch.setattr(gateway.sys, "platform", platform)
+    term = _bits([signal.SIGTERM])
+    previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    saved = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        status = _gated_status(gw, tmp_path, die_with_parent=die_with_parent)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, saved)
+        signal.signal(signal.SIGTERM, previous)
+        monkeypatch.undo()
+    assert bool(status["SigIgn"] & term) == (not die_with_parent)
+    assert bool(status["SigBlk"] & term) == (not die_with_parent)

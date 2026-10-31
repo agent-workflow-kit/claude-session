@@ -18,8 +18,8 @@ The checks raise ``errors.LaunchValidationError`` with the end reason interface.
 (``unsafe_cwd``, ``unsafe_path``, ``unsafe_plugin_dir``, ``unsafe_read_dir``,
 ``unsafe_claude_args``, ``plugin_dir_missing``; ``InvalidPermissionProfile`` for profile,
 ``read_dirs`` and ``write_dirs`` entries); an isolated run's ``--outcome-file`` under a
-session-writable path is a ``UsageError`` (exit 2). Messages name paths, never profile
-values other than the offending path.
+session-writable path is ``OutcomeFileRejected``, a ``UsageError`` (exit 2). Messages name
+paths, never profile values other than the offending path.
 
 ``exec`` (``launch.validate``) builds ``Host`` and ``PathRules`` at launch step 5 after the
 session directories exist and calls, for isolated runs, ``check_host`` first (the write
@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from . import sessiondir
-from .errors import InvalidPermissionProfile, LaunchValidationError, UsageError
+from .errors import InvalidPermissionProfile, LaunchValidationError, OutcomeFileRejected
 
 # Credential locations under $HOME a read entry must neither contain nor be inside
 # (interface.md, Path rules: read_dirs and plugin directories).
@@ -329,6 +329,15 @@ def profile_write_paths(profile: Mapping[str, Any], *, cwd: str, home: str) -> l
     and ``Edit``/``Write`` (and ``MultiEdit``/``NotebookEdit``) allow-rule targets. Raises
     ``InvalidPermissionProfile`` for one it cannot place."""
     return _profile_writes(profile, cwd=cwd, home=home)
+
+
+def profile_write_entries(profile: Mapping[str, Any]) -> list[str]:
+    """The strings of a profile (before expansion) that can make a path writable: its sandbox
+    ``allowWrite`` entries and every allow rule (whose target is placed after expansion)."""
+    return [
+        *_strings(profile, "sandbox", "filesystem", "allowWrite"),
+        *_strings(profile, "permissions", "allow"),
+    ]
 
 
 def _profile_writes(profile: Mapping[str, Any], *, cwd: str, home: str) -> list[str]:
@@ -1207,14 +1216,19 @@ def check_claude_args(args: Sequence[str], *, isolated: bool) -> None:
         )
 
 
-def check_outcome_file(path: str, writable: Callable[[str], bool]) -> None:
-    """Isolated runs: an ``--outcome-file`` (resolved: the path or its nearest existing
-    parent) under a session-writable path is a usage error (exit 2); it is never written.
+def outcome_file_hop(path: str, writable: Callable[[str], bool]) -> str | None:
+    """The first session-writable step of resolving an ``--outcome-file`` path, or None
+    (``writable_hop``: the path or its nearest existing parent by realpath, and every
+    symlink followed on the way, whose directory the agent could re-point)."""
+    return writable_hop(path, writable)
 
-    TODO(#21): the outcome-file writers skip a path this rejects; before a run is allocated
-    (launch step 2) the caller passes a predicate whose session directory is the whole
-    ``<state>/sessions`` directory."""
-    if writable(path):
-        raise UsageError(
+
+def check_outcome_file(path: str, writable: Callable[[str], bool]) -> None:
+    """An ``--outcome-file`` that resolves (``outcome_file_hop``) through a session-writable
+    path is ``OutcomeFileRejected``, a usage error (exit 2); it is never written. Before a run
+    is allocated (launch step 2) the caller passes a predicate whose session directory is the
+    whole ``<state>/sessions`` directory (``outcomefile.baseline_writable``)."""
+    if outcome_file_hop(path, writable) is not None:
+        raise OutcomeFileRejected(
             f"--outcome-file is under a session-writable path of an isolated run: {_shown(path)!r}"
         )

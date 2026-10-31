@@ -41,7 +41,7 @@ DESIGN_COLUMNS = {
         "backstop_used report_status report_implicit report_summary report_reason "
         "artifact_name artifact_path artifact_sha256 artifact_size artifact_ingest_seq "
         "reported_at phase outcome end_reason exit_code cost_usd num_turns is_error "
-        "session_end_reason outcome_file outcome_file_written_at"
+        "session_end_reason outcome_file outcome_file_written_at writable_json"
     ),
     "claude_ids": "csession_id claude_session_id run_no source transcript_path seen_at",
     "labels": "csession_id key value",
@@ -51,6 +51,7 @@ DESIGN_COLUMNS = {
     ),
     "requests": "request_id csession_id run_no result ingested_at",
     "deleted_ids": "csession_id deleted_at",
+    "hook_groups": ("id csession_id event_id pgid leader_start holder_pid holder_start started_at"),
     "leases": "name holder_pid holder_start holder_token expires_at",
     "meta": "key value",
 }
@@ -1166,9 +1167,9 @@ def test_a_migration_is_logged(db: str) -> None:
     open_as(db, ME).close()
     log = Path(db).parent / "log.jsonl"
     records = [json.loads(line) for line in log.read_text().splitlines()]
-    assert [r["event"] for r in records] == ["migration"]
+    assert [r["event"] for r in records] == ["migration"] * len(store.MIGRATIONS)
     open_as(db, ME).close()  # nothing to migrate: nothing logged
-    assert len(log.read_text().splitlines()) == 1
+    assert len(log.read_text().splitlines()) == len(store.MIGRATIONS)
 
 
 # Concurrency: BEGIN IMMEDIATE with a busy timeout

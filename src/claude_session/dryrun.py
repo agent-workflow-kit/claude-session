@@ -613,8 +613,8 @@ def request(args: argparse.Namespace, cfg: Config) -> launch.Request:
     """``launch.read_request`` for any mode: interactive mode gets its TTY checks here, then
     is read as headless (the rest of step 2 is the same).
 
-    TODO(#17): once ``read_request`` accepts interactive mode (with these TTY checks),
-    call it as it is and drop ``check_interactive_tty`` here."""
+    ``launch.read_request`` itself requires a terminal in interactive mode (plain ``exec``
+    and ``resume``), which ``start`` and the dry runs must not."""
     mode = args.mode or "interactive"
     if mode == "interactive":
         check_interactive_tty(args)
@@ -627,11 +627,13 @@ def hooks_json(
 ) -> list[dict[str, Any]]:
     """The configured and per-invocation hook entries. ``selected``: the entry's ``kinds``,
     ``exclude_kinds`` and ``labels`` selectors match this run (its run kind and the
-    session's labels after the launch); ``states`` depends on the state change and is not
-    evaluated. Per-invocation entries have no selectors.
+    session's labels after the launch), decided by the runner's own match
+    (``toolhooks.selected``, without a state); ``states`` depends on the state change and is
+    not evaluated. Per-invocation entries have no selectors.
 
-    TODO(#31, #20): share the selector match with the hook runners."""
-    have = set(labels)
+    TODO(#31): the ``pre-launch`` runner uses the same ``toolhooks.selected``."""
+    from . import toolhooks
+
     entries: list[dict[str, Any]] = []
     configured = (
         ("pre-launch", cfg.hooks.pre_launch),
@@ -639,11 +641,16 @@ def hooks_json(
     )
     for hook, items in configured:
         for item in items:
-            selected = (
-                (item.kinds is None or run_kind in item.kinds)
-                and (item.exclude_kinds is None or run_kind not in item.exclude_kinds)
-                and (item.labels is None or set(item.labels) <= have)
+            entry = toolhooks.Entry(
+                cmd=item.cmd,
+                timeout=item.timeout,
+                origin="config",
+                index=0,
+                kinds=None if item.kinds is None else tuple(item.kinds),
+                exclude_kinds=None if item.exclude_kinds is None else tuple(item.exclude_kinds),
+                labels=None if item.labels is None else tuple(item.labels),
             )
+            selected = toolhooks.selected(entry, run_kind=run_kind, labels=labels)
             entries.append(
                 {
                     "hook": hook,

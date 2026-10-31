@@ -51,7 +51,21 @@ C function behind ``signal.pthread_sigmask``, not through its Python wrapper: a 
 raises then does so only after the mask is restored, never before (Python 3.13 runs pending
 handlers on entry to a Python function). Residuals: signals to the forking thread wait until the
 child has exec'd (or failed to); a handler (for a signal another thread took) that raises inside
-``Popen`` after the fork, before ``spawn`` holds the ``Popen``, leaves that child running.
+``Popen`` after the fork, before ``spawn`` holds the ``Popen``, leaves that child running. ``run``
+(Linux) starts its child the same way, without the death signal, so a handler that raises in
+``exec``'s launch phase does so only once ``run`` holds the ``Popen`` and ends its child. A
+``gated`` spawn forks the same way on every platform, and its child restores the caller's mask
+there too; SIGTERM is reset only with ``die_with_parent`` (``run`` and an interactive gated
+child keep an inherited ignored or blocked SIGTERM).
+
+``run(..., discard_output=True)`` connects stdout and stderr to ``/dev/null`` (no pipes): it
+then waits only for the child itself to exit, never for descendants that keep the output open
+(``post-state-change`` hooks, whose output is unused). ``on_started`` is called once the child
+was started and its ``stdin`` text written and closed (at once without ``stdin`` text), so a
+caller can tell a child that got its input from one that never started. ``canceled`` is polled
+while waiting: once it returns true the child is ended as on a timeout and ``GatewayCanceled``
+is raised. Every single wait is at most ``MAX_WAIT`` seconds (looped up to the deadline), so a
+long timeout never overflows ``select``/``poll``.
 
 ``run`` reads the child's output with its own loop rather than ``Popen.communicate``, which
 reaps the child when a ``KeyboardInterrupt`` interrupts it: on Linux the child stays unreaped
@@ -63,6 +77,7 @@ leader when interrupted, after which its group is no longer signaled.
 from __future__ import annotations
 
 import enum
+import errno
 import os
 import select
 import selectors
@@ -87,7 +102,8 @@ class Inherit(enum.Enum):
 # Pass as a ``spawn`` stream to share this process's descriptor (interactive ``claude``).
 INHERIT: Final = Inherit.INHERIT
 
-# Exit code of a ``die_with_parent`` child whose parent died before the death signal was set.
+# Exit code of a ``die_with_parent`` child whose parent died before the death signal was set,
+# and of a ``gated`` child whose gate closed without a release (its parent died or gave up).
 PARENT_GONE_EXIT: Final = 128 + signal.SIGTERM
 
 # PATH when sanitizing leaves no entry: an empty PATH makes some programs search the cwd.
@@ -102,7 +118,16 @@ _GRACE_POLL_MAX = 0.5
 _EXIT_POLL_FIRST = 0.001
 _EXIT_POLL_MAX = 0.05
 _READ_SIZE = 32768
-_PIPE_BUF = getattr(select, "PIPE_BUF", 512)  # a write this small never blocks once writable
+# The longest single wait (select/poll/sleep): a longer timeout is waited in such chunks, as
+# epoll and poll take milliseconds in a C int.
+MAX_WAIT: Final = 86400.0
+# How often ``canceled`` is polled while waiting.
+_CANCEL_POLL = 0.05
+_PIPE_BUF = getattr(select, "PIPE_BUF", 512)
+try:
+    _MAX_FD = max(os.sysconf("SC_OPEN_MAX"), 256)
+except (ValueError, OSError):
+    _MAX_FD = 256  # a write this small never blocks once writable
 
 
 @dataclass(frozen=True)
@@ -137,6 +162,15 @@ class GatewayTimeout(Exception):
         self.timeout = timeout
 
 
+class GatewayCanceled(Exception):
+    """``run``'s ``canceled`` returned true before the child exited. The child was ended as on
+    a timeout (see ``GatewayTimeout``) before this is raised."""
+
+    def __init__(self, argv: Sequence[str]) -> None:
+        super().__init__(f"{argv[0]} was canceled")
+        self.argv = tuple(argv)
+
+
 @runtime_checkable
 class Child(Protocol):
     """A started child process."""
@@ -154,6 +188,11 @@ class Child(Protocol):
 
     def send_signal(self, sig: int) -> None:
         """Signal this child; a no-op once it has been reaped (its PID may be reused)."""
+        ...
+
+    def release(self) -> None:
+        """Let a ``gated`` child exec its program (idempotent; a no-op for an ungated child or
+        one that has already exited)."""
         ...
 
 
@@ -174,8 +213,16 @@ class Gateway(Protocol):
         kill_grace: float | None = None,
         executable: str | None = None,
         kill_group_on_exit: bool = False,
+        output_limit: int | None = None,
+        discard_output: bool = False,
+        on_started: Callable[[], None] | None = None,
+        canceled: Callable[[], bool] | None = None,
+        on_spawn: Callable[[int], None] | None = None,
     ) -> Result:
-        """Run to completion, capturing text output. ``new_process_group`` puts the child in
+        """Run to completion, capturing text output. ``output_limit`` (bytes, per stream) keeps
+        only that prefix of stdout and of stderr; the rest is read and discarded, so untrusted
+        output never grows memory and the child never blocks on a full pipe (a cut may split a
+        UTF-8 character, which is then replaced). ``new_process_group`` puts the child in
         its own process group, which a timeout ends as a whole; ``kill_grace`` (only with a
         group) is the longest SIGTERM-to-SIGKILL delay (see ``GatewayTimeout``).
         ``kill_group_on_exit`` (only with a group) also SIGKILLs the group when the leader
@@ -186,8 +233,13 @@ class Gateway(Protocol):
         while waiting (a signal handler raising, ``KeyboardInterrupt`` included) ends the child
         the same way, then propagates (on Linux; best effort without ``os.waitid``, see
         ``GatewayTimeout``); one raised during the grace still gets the group SIGKILL and the
-        leader reaped first. Raises ``GatewayTimeout``, and ``OSError`` when the
-        program cannot be started."""
+        leader reaped first. ``discard_output`` sends stdout and stderr to ``/dev/null`` (the
+        result has empty output) and only the child's own exit is waited for; ``on_started``
+        and ``canceled``: see the module docs. ``on_spawn`` is called with the child's PID
+        once it exists, before its stdin is written (with ``new_process_group``, the PID is
+        its process group ID); an exception it raises ends the child like any other. Raises
+        ``GatewayTimeout``, ``GatewayCanceled``, and ``OSError`` when the program cannot be
+        started."""
         ...
 
     def spawn(
@@ -203,6 +255,7 @@ class Gateway(Protocol):
         new_process_group: bool = False,
         die_with_parent: bool = False,
         executable: str | None = None,
+        gated: bool = False,
     ) -> Child:
         """Start without waiting. Streams are file descriptors, ``DEVNULL`` or ``INHERIT``;
         ``stdin`` defaults to ``DEVNULL`` (``None`` raises ``TypeError``: pass ``INHERIT``),
@@ -219,7 +272,23 @@ class Gateway(Protocol):
         SIGTERM, so the death signal works even when this process ignores or blocks SIGTERM;
         the rest of the signal mask, and any other ignored (``SIG_IGN``) signal, is inherited
         across exec, so callers install no-op handlers instead of ``SIG_IGN``. Raises
-        ``OSError`` when the program cannot be started (including a failed ``prctl``)."""
+        ``OSError`` when the program cannot be started (including a failed ``prctl``).
+
+        ``gated``: the child is forked but does not exec the program until ``Child.release``.
+        Between fork and exec it blocks reading a close-on-exec gate pipe whose only write end
+        this process holds; one byte lets it exec, end of file (this process died, or dropped
+        the gate because the child exited or was abandoned) makes it ``_exit`` with
+        ``PARENT_GONE_EXIT`` without running the program. So a caller that records the
+        child's PID and start time before releasing it knows an unrecorded child never ran
+        the program (interface.md, Liveness). Its PID and start time are the program's: exec
+        keeps both. The program is checked (exists, executable) here, raising as an ungated
+        spawn would; an exec that fails anyway (a bad interpreter, a race) makes ``release``
+        raise that ``OSError``, and the child exits ``GATE_EXEC_FAILED``. Gated children are
+        started like ``die_with_parent`` ones on every platform (every signal blocked around
+        the fork; before it waits at the gate the child resets the signals with a Python
+        handler here to their default action and restores the caller's mask). Only with
+        ``die_with_parent`` is SIGTERM also reset and unblocked; without it an inherited
+        ignored or blocked SIGTERM stays so, as for an ungated child."""
         ...
 
 
@@ -275,6 +344,16 @@ def check_kill_grace(
         raise ValueError(f"kill_grace must not be negative, got {kill_grace}")
 
 
+def check_output_limit(output_limit: int | None) -> None:
+    """``run``'s ``output_limit`` contract, shared with the fakes: None or an int >= 0."""
+    if output_limit is None:
+        return
+    if isinstance(output_limit, bool) or not isinstance(output_limit, int):
+        raise TypeError("output_limit must be an int")
+    if output_limit < 0:
+        raise ValueError(f"output_limit must not be negative, got {output_limit}")
+
+
 def _child_env(
     env: Mapping[str, str] | None, extra_env: Mapping[str, str] | None
 ) -> dict[str, str]:
@@ -292,7 +371,7 @@ def _stream(value: int | Inherit | None) -> int | None:
 
 @dataclass(frozen=True)
 class _Libc:
-    prctl: Callable[..., int]
+    prctl: Callable[..., int] | None  # Linux only
     signal: Callable[..., object]
     get_errno: Callable[[], int]
 
@@ -317,25 +396,31 @@ def _libc() -> _Libc:
     libc_signal = ctypes.CDLL(None).signal
     libc_signal.restype = ctypes.c_void_p
     libc_signal.argtypes = (ctypes.c_int, ctypes.c_void_p)
-    return _Libc(_prctl(), libc_signal, ctypes.get_errno)
+    prctl = _prctl() if sys.platform.startswith("linux") else None
+    return _Libc(prctl, libc_signal, ctypes.get_errno)
 
 
 def _pdeathsig_preexec(
-    child_mask: set[int], parent: int | None = None
-) -> Callable[[], None] | None:
-    """A ``preexec_fn`` setting ``PR_SET_PDEATHSIG(SIGTERM)``, or ``None`` off Linux.
+    child_mask: set[int], parent: int | None = None, *, death_signal: bool = True
+) -> Callable[[], None]:
+    """A ``preexec_fn`` for a fork made with every signal blocked (``_start_blocked``).
 
-    The fork happens with every signal blocked (``spawn``); the child resets
-    the signals that have a Python handler here, and SIGTERM, to their default action, then
-    sets ``child_mask`` (the caller's mask) without SIGTERM. ``parent`` is the PID the child
-    must see as its parent (default: this process)."""
-    if not sys.platform.startswith("linux"):
-        return None
+    On every platform the child resets the signals that have a Python handler here to their
+    default action and then sets ``child_mask`` (the caller's mask). With ``death_signal``
+    SIGTERM is also reset to its default and dropped from the mask, and on Linux the child
+    sets ``PR_SET_PDEATHSIG(SIGTERM)``; ``parent`` is the PID the child must then see as its
+    parent (default: this process). Without ``death_signal`` (``run``, an interactive gated
+    spawn) an inherited ignored or blocked SIGTERM stays as it was."""
     libc = _libc()  # resolved before the fork
     expected = os.getpid() if parent is None else parent
-    handled = [s for s in signal.valid_signals() if callable(signal.getsignal(s))]
-    reset = sorted({*handled, signal.SIGTERM})
-    mask = child_mask - {signal.SIGTERM}
+    handled = {s for s in signal.valid_signals() if callable(signal.getsignal(s))}
+    if death_signal:
+        reset = sorted({*handled, signal.SIGTERM})
+        mask = child_mask - {signal.SIGTERM}
+    else:
+        reset = sorted(handled)
+        mask = set(child_mask)
+    prctl = libc.prctl if death_signal else None
 
     def preexec() -> None:
         # A Python handler would run here, in the forked child, if its signal arrived; an
@@ -343,10 +428,62 @@ def _pdeathsig_preexec(
         for sig in reset:
             libc.signal(sig, _SIG_DFL)
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        if libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+        if prctl is None:  # no death signal asked for, or not Linux
+            return
+        if prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
             raise OSError(libc.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
         if os.getppid() != expected:  # the parent died before the flag was set
             os._exit(PARENT_GONE_EXIT)
+
+    return preexec
+
+
+# Exit code of a released ``gated`` child whose program could not be executed.
+GATE_EXEC_FAILED: Final = 127
+
+
+def _gate_preexec(
+    inner: Callable[[], None] | None,
+    gate_fd: int,
+    error_fd: int,
+    program: str,
+    argv: tuple[str, ...],
+    env: dict[str, str],
+) -> Callable[[], None]:
+    """``inner`` (the signal reset), then wait at the gate and exec the program here.
+
+    ``subprocess.Popen`` returns only once its child has exec'd (it waits for its
+    close-on-exec error pipe), so the child closes every descriptor above stderr but the
+    gate's read end and its own error pipe's write end (``Popen``'s error pipe and the gate's
+    write end included) before it waits: what ``close_fds`` does right after this function
+    anyway. ``Popen`` then returns at once, and the child execs the program itself on a byte
+    from the gate, or ``_exit(PARENT_GONE_EXIT)`` on end of file. A failing exec writes its
+    errno to the error pipe (close-on-exec: end of file means the exec succeeded) and exits
+    ``GATE_EXEC_FAILED``."""
+    low, high = sorted((gate_fd, error_fd))
+
+    def preexec() -> None:
+        if inner is not None:
+            inner()
+        os.closerange(3, low)
+        os.closerange(low + 1, high)
+        os.closerange(high + 1, _MAX_FD)
+        while True:
+            try:
+                data = os.read(gate_fd, 1)
+            except InterruptedError:
+                continue
+            break
+        if not data:  # the parent died or dropped the gate: never run the program
+            os._exit(PARENT_GONE_EXIT)
+        os.close(gate_fd)
+        try:
+            os.execve(program, argv, env)
+        except OSError as exc:
+            try:
+                os.write(error_fd, str(exc.errno or 0).encode())
+            finally:
+                os._exit(GATE_EXEC_FAILED)
 
     return preexec
 
@@ -468,10 +605,41 @@ def _remaining(deadline: float | None) -> float | None:
     return None if deadline is None else deadline - time.monotonic()
 
 
+def _chunk(remaining: float | None, canceled: Callable[[], bool] | None) -> float:
+    """The length of one wait: at most ``MAX_WAIT``, the time left and, with ``canceled``, its
+    poll interval."""
+    limits = [MAX_WAIT]
+    if canceled is not None:
+        limits.append(_CANCEL_POLL)
+    if remaining is not None:
+        limits.append(max(remaining, 0.0))
+    return min(limits)
+
+
+def _check(
+    popen: subprocess.Popen[bytes],
+    deadline: float | None,
+    timeout: float | None,
+    canceled: Callable[[], bool] | None,
+) -> None:
+    """Raise when waiting must end: ``GatewayCanceled`` once ``canceled()``,
+    ``subprocess.TimeoutExpired`` past the deadline."""
+    if canceled is not None and canceled():
+        args = popen.args
+        raise GatewayCanceled(
+            [str(a) for a in args] if isinstance(args, list | tuple) else [str(args)]
+        )
+    remaining = _remaining(deadline)
+    if remaining is not None and remaining <= 0:
+        assert timeout is not None  # a deadline comes from a timeout
+        raise subprocess.TimeoutExpired(popen.args, timeout)
+
+
 def _wait_exited(
     popen: subprocess.Popen[bytes],
     deadline: float | None,
     timeout: float | None,
+    canceled: Callable[[], bool] | None = None,
     *,
     kill_group: bool = False,
 ) -> None:
@@ -481,8 +649,13 @@ def _wait_exited(
     ``Popen.wait``, which reaps when interrupted, and the group is not signaled."""
     waitid = getattr(os, "waitid", None)
     if waitid is None:
-        popen.wait(_remaining(deadline))
-        return
+        while True:
+            _check(popen, deadline, timeout, canceled)
+            try:
+                popen.wait(_chunk(_remaining(deadline), canceled))
+            except subprocess.TimeoutExpired:
+                continue
+            return
     delay = _EXIT_POLL_FIRST
     while True:
         try:
@@ -490,11 +663,8 @@ def _wait_exited(
                 break
         except ChildProcessError:  # reaped elsewhere; Popen.wait copes
             break
-        remaining = _remaining(deadline)
-        if remaining is not None and remaining <= 0:
-            assert timeout is not None  # a deadline comes from a timeout
-            raise subprocess.TimeoutExpired(popen.args, timeout)
-        time.sleep(delay if remaining is None else min(delay, remaining))
+        _check(popen, deadline, timeout, canceled)
+        time.sleep(min(delay, _chunk(_remaining(deadline), canceled)))
         delay = min(delay * 2, _EXIT_POLL_MAX)
     if kill_group:
         _signal_group(popen, signal.SIGKILL)  # skipped once the leader was reaped elsewhere
@@ -505,34 +675,46 @@ def _exchange(
     popen: subprocess.Popen[bytes],
     data: bytes | None,
     timeout: float | None,
+    output_limit: int | None = None,
     *,
+    on_started: Callable[[], None] | None = None,
+    canceled: Callable[[], bool] | None = None,
     kill_group: bool = False,
 ) -> tuple[bytes, bytes]:
-    """Like ``Popen.communicate``: write ``data`` to stdin, read stdout and stderr to EOF,
-    wait for the exit; ``subprocess.TimeoutExpired`` after ``timeout`` seconds. Unlike it, the
-    child is never reaped before it has exited, even when interrupted (see the module docs)."""
+    """Like ``Popen.communicate``: write ``data`` to stdin, read stdout and stderr (those that
+    are pipes) to EOF, wait for the exit; ``subprocess.TimeoutExpired`` after ``timeout``
+    seconds, ``GatewayCanceled`` once ``canceled()``. Unlike it, the child is never reaped
+    before it has exited, even when interrupted (see the module docs). With ``output_limit``,
+    at most that many bytes of each stream are kept. ``on_started`` is called once stdin is
+    written and closed (at once without stdin)."""
     deadline = None if timeout is None else time.monotonic() + timeout
-    assert popen.stdout is not None and popen.stderr is not None
-    out_fd, err_fd = popen.stdout.fileno(), popen.stderr.fileno()
-    readers = {out_fd: popen.stdout, err_fd: popen.stderr}
+    fds = [None if f is None else f.fileno() for f in (popen.stdout, popen.stderr)]
+    readers = {f.fileno(): f for f in (popen.stdout, popen.stderr) if f is not None}
     output: dict[int, list[bytes]] = {fd: [] for fd in readers}
     pending = memoryview(data or b"")
+    started = False
+
+    def fed() -> None:
+        nonlocal started
+        if not started:
+            started = True
+            if on_started is not None:
+                on_started()
+
     with selectors.DefaultSelector() as selector:
         for fd in readers:
             selector.register(fd, selectors.EVENT_READ)
         stdin = popen.stdin
         in_fd = -1 if stdin is None else stdin.fileno()
-        if stdin is not None:
-            if pending:
-                selector.register(in_fd, selectors.EVENT_WRITE)
-            else:
+        if stdin is not None and pending:
+            selector.register(in_fd, selectors.EVENT_WRITE)
+        else:
+            if stdin is not None:
                 stdin.close()
+            fed()
         while selector.get_map():
-            remaining = _remaining(deadline)
-            if remaining is not None and remaining <= 0:
-                assert timeout is not None  # a deadline comes from a timeout
-                raise subprocess.TimeoutExpired(popen.args, timeout)
-            for key, _ in selector.select(remaining):
+            _check(popen, deadline, timeout, canceled)
+            for key, _ in selector.select(_chunk(_remaining(deadline), canceled)):
                 if key.fd == in_fd:
                     try:
                         pending = pending[os.write(key.fd, pending[:_PIPE_BUF]) :]
@@ -542,15 +724,24 @@ def _exchange(
                         selector.unregister(key.fd)
                         assert stdin is not None
                         stdin.close()
+                        fed()
                     continue
                 chunk = os.read(key.fd, _READ_SIZE)
                 if chunk:
-                    output[key.fd].append(chunk)
+                    if output_limit is not None:
+                        room = output_limit - sum(map(len, output[key.fd]))
+                        chunk = chunk[: max(room, 0)]
+                    if chunk:
+                        output[key.fd].append(chunk)
                 else:
                     selector.unregister(key.fd)
                     readers[key.fd].close()
-    _wait_exited(popen, deadline, timeout, kill_group=kill_group)
-    return b"".join(output[out_fd]), b"".join(output[err_fd])
+    _wait_exited(popen, deadline, timeout, canceled, kill_group=kill_group)
+    out_fd, err_fd = fds
+    return (
+        b"" if out_fd is None else b"".join(output[out_fd]),
+        b"" if err_fd is None else b"".join(output[err_fd]),
+    )
 
 
 def _text(data: bytes) -> str:
@@ -565,25 +756,106 @@ def _kill_and_reap(popen: subprocess.Popen[bytes]) -> None:
         popen.wait()
 
 
+def _start_blocked(
+    start: Callable[[Callable[[], None] | None], subprocess.Popen[bytes]],
+    preexec: Callable[[set[int]], Callable[[], None] | None],
+) -> subprocess.Popen[bytes]:
+    """``start(preexec(caller_mask))`` with every signal blocked in this thread (see the
+    module docstring): a handler that raises does so only once the mask is restored, and then
+    the child it started is killed and reaped here, or the caller holds it."""
+    # Read the mask without changing it; block inside the try, so the finally restores the
+    # mask even when a pending handler raises from the blocking call itself.
+    sigmask = _c_pthread_sigmask()
+    saved_mask = {int(sig) for sig in sigmask(signal.SIG_BLOCK, [])}
+    popen = None
+    try:
+        sigmask(signal.SIG_BLOCK, signal.valid_signals())
+        popen = start(preexec(saved_mask))
+    finally:
+        try:
+            sigmask(signal.SIG_SETMASK, saved_mask)
+        except BaseException:
+            if popen is not None:  # started, but the caller never gets it
+                _kill_and_reap(popen)
+            raise
+    assert popen is not None  # start() returned or raised
+    return popen
+
+
 class _PopenChild:
-    def __init__(self, popen: subprocess.Popen[bytes]) -> None:
+    def __init__(
+        self, popen: subprocess.Popen[bytes], gate: tuple[int, int, str] | None = None
+    ) -> None:
         self._popen = popen
+        # A gated child waiting at its gate: (gate write end, error pipe read end, program).
+        self._gate = gate
 
     @property
     def pid(self) -> int:
         return self._popen.pid
 
     def poll(self) -> int | None:
-        return self._popen.poll()
+        return self._exited(self._popen.poll())
 
     def wait(self, timeout: float | None = None) -> int | None:
         try:
-            return self._popen.wait(timeout)
+            return self._exited(self._popen.wait(timeout))
         except subprocess.TimeoutExpired:
             return None
 
     def send_signal(self, sig: int) -> None:
         self._popen.send_signal(sig)  # Popen skips the signal once the child is reaped
+
+    def release(self) -> None:
+        """Let the child exec; raises ``OSError`` (the child then exits ``GATE_EXEC_FAILED``)
+        when the exec fails, as ``Popen`` raises for an ungated child. A child that already
+        exited is not an error."""
+        gate, self._gate = self._gate, None
+        if gate is None:
+            return
+        gate_fd, error_fd, program = gate
+        try:
+            try:
+                os.write(gate_fd, b"\x01")
+            except BrokenPipeError:  # the child already exited: nothing to release
+                return
+            finally:
+                os.close(gate_fd)
+            report = b""
+            while chunk := _read_retrying(error_fd):  # end of file: the exec succeeded
+                report += chunk
+        finally:
+            os.close(error_fd)
+        if report:
+            code = int(report) if report.isdigit() else errno.ENOEXEC
+            raise OSError(code, os.strerror(code), program)
+
+    def _exited(self, returncode: int | None) -> int | None:
+        if returncode is not None:  # never released: drop the gate
+            self._drop_gate()
+        return returncode
+
+    def _drop_gate(self) -> None:
+        gate, self._gate = self._gate, None
+        if gate is not None:
+            os.close(gate[0])
+            os.close(gate[1])
+
+    def __del__(self) -> None:
+        # An abandoned gate is closed, so a child never released exits instead of waiting.
+        try:
+            if getattr(self, "_gate", None) is not None:
+                self._drop_gate()
+        except Exception:  # interpreter shutdown: the descriptors close with the process
+            pass
+
+
+def _read_retrying(fd: int) -> bytes:
+    while True:
+        try:
+            return os.read(fd, 64)
+        except InterruptedError:
+            continue
 
 
 class SystemGateway:
@@ -602,31 +874,68 @@ class SystemGateway:
         kill_grace: float | None = None,
         executable: str | None = None,
         kill_group_on_exit: bool = False,
+        output_limit: int | None = None,
+        discard_output: bool = False,
+        on_started: Callable[[], None] | None = None,
+        canceled: Callable[[], bool] | None = None,
+        on_spawn: Callable[[int], None] | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(
             kill_grace, new_process_group=new_process_group, kill_group_on_exit=kill_group_on_exit
         )
+        check_output_limit(output_limit)
         args = tuple(argv)
         data = None if stdin is None else stdin.encode("utf-8", "replace")
-        with subprocess.Popen(
-            args,
-            executable=executable,
-            stdin=DEVNULL if stdin is None else subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_child_env(env, extra_env),
-            cwd=cwd,
-            process_group=0 if new_process_group else None,
-        ) as popen:
+
+        output = DEVNULL if discard_output else subprocess.PIPE
+
+        def start(preexec: Callable[[], None] | None) -> subprocess.Popen[bytes]:
             try:
-                out, err = _exchange(popen, data, timeout, kill_group=kill_group_on_exit)
-            except subprocess.TimeoutExpired:
+                return subprocess.Popen(
+                    args,
+                    executable=executable,
+                    stdin=DEVNULL if stdin is None else subprocess.PIPE,
+                    stdout=output,
+                    stderr=output,
+                    env=_child_env(env, extra_env),
+                    cwd=cwd,
+                    process_group=0 if new_process_group else None,
+                    preexec_fn=preexec,
+                )
+            except subprocess.SubprocessError as exc:  # preexec_fn failed in the child
+                raise OSError(f"could not start {argv[0]!r}: {exc}") from exc
+
+        if sys.platform.startswith("linux"):
+            # A signal handler that raises (exec's launch phase) does so only once run()
+            # holds the Popen, so the child is ended (see the module docstring).
+            popen = _start_blocked(start, lambda mask: _pdeathsig_preexec(mask, death_signal=False))
+        else:
+            popen = start(None)
+        try:
+            with popen:
+                try:
+                    if on_spawn is not None:
+                        on_spawn(popen.pid)
+                    out, err = _exchange(
+                        popen,
+                        data,
+                        timeout,
+                        output_limit,
+                        on_started=on_started,
+                        canceled=canceled,
+                        kill_group=kill_group_on_exit,
+                    )
+                except subprocess.TimeoutExpired:
+                    _end(popen, group=new_process_group, kill_grace=kill_grace)
+                    raise GatewayTimeout(args, timeout) from None
+                except BaseException:
+                    _end(popen, group=new_process_group, kill_grace=kill_grace)
+                    raise
+        except BaseException:
+            if popen.returncode is None:  # raised before the inner handler (entering with)
                 _end(popen, group=new_process_group, kill_grace=kill_grace)
-                raise GatewayTimeout(args, timeout) from None
-            except BaseException:
-                _end(popen, group=new_process_group, kill_grace=kill_grace)
-                raise
+            raise
         return Result(args, popen.returncode, _text(out), _text(err))
 
     def spawn(
@@ -642,6 +951,7 @@ class SystemGateway:
         new_process_group: bool = False,
         die_with_parent: bool = False,
         executable: str | None = None,
+        gated: bool = False,
     ) -> Child:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_spawn_stdin(stdin)
@@ -662,22 +972,58 @@ class SystemGateway:
             except subprocess.SubprocessError as exc:  # preexec_fn failed in the child
                 raise OSError(f"could not start {argv[0]!r}: {exc}") from exc
 
+        if gated:
+            program = argv[0] if executable is None else executable
+            _check_program(program)
+            return _spawn_gated(
+                start,
+                program=program,
+                argv=tuple(argv),
+                env=_child_env(env, extra_env),
+                die_with_parent=die_with_parent,
+            )
         if not (die_with_parent and sys.platform.startswith("linux")):
             return _PopenChild(start(None))
-        # Read the mask without changing it; block inside the try, so the finally restores the
-        # mask even when a pending handler raises from the blocking call itself.
-        sigmask = _c_pthread_sigmask()  # see the module docstring
-        saved_mask = {int(sig) for sig in sigmask(signal.SIG_BLOCK, [])}
-        popen = None
-        try:
-            sigmask(signal.SIG_BLOCK, signal.valid_signals())
-            popen = start(_pdeathsig_preexec(saved_mask))
-        finally:
-            try:
-                sigmask(signal.SIG_SETMASK, saved_mask)
-            except BaseException:
-                if popen is not None:  # started, but the caller never gets it
-                    _kill_and_reap(popen)
-                raise
-        assert popen is not None  # start() returned or raised
-        return _PopenChild(popen)
+        return _PopenChild(_start_blocked(start, _pdeathsig_preexec))
+
+
+def _check_program(program: str) -> None:
+    """Raise as ``Popen`` would for a program that cannot be executed, so the common failures
+    come from ``spawn`` itself (``release`` raises for the rest, such as a bad interpreter)."""
+    if not os.path.isfile(program):
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), program)
+    if not os.access(program, os.X_OK):
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), program)
+
+
+def _spawn_gated(
+    start: Callable[[Callable[[], None] | None], subprocess.Popen[bytes]],
+    *,
+    program: str,
+    argv: tuple[str, ...],
+    env: dict[str, str],
+    die_with_parent: bool,
+) -> _PopenChild:
+    """``start`` a child that waits at a gate pipe until ``release`` (see ``spawn``)."""
+    gate_read, gate_write = os.pipe()  # all four ends close-on-exec (PEP 446)
+    try:
+        error_read, error_write = os.pipe()
+    except BaseException:
+        os.close(gate_read)
+        os.close(gate_write)
+        raise
+    try:
+
+        def preexec(mask: set[int]) -> Callable[[], None]:
+            inner = _pdeathsig_preexec(mask, death_signal=die_with_parent)
+            return _gate_preexec(inner, gate_read, error_write, program, argv, env)
+
+        popen = _start_blocked(start, preexec)
+    except BaseException:
+        os.close(gate_write)
+        os.close(error_read)
+        raise
+    finally:
+        os.close(gate_read)
+        os.close(error_write)
+    return _PopenChild(popen, (gate_write, error_read, program))
