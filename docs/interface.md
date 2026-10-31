@@ -187,15 +187,15 @@ Untrusted or agent-generated text is never accepted *only* as a flag value: prom
 
 `--outcome-file <path>` (made absolute and stored with the run) receives exactly what `--json` would print for the run (the outcome object), in every mode, by **whichever process finalizes the run** (`exec`, `resume`, `start`, `stop`, `forget`, an inline liveness check, `reconcile`; see [Liveness](#liveness)):
 
-- The finalizer writes it immediately after winning the finalization compare-and-set, before draining hooks, and records `outcome_file_written_at` on the run. The liveness check and `reconcile` write it for final runs where it is unset (a finalizer that died before writing).
+- The finalizer writes it immediately after winning the finalization compare-and-set, before draining hooks, and records `outcome_file_written_at` on the run (also when the write failed or the path was rejected: those are not retried). The liveness check and `reconcile` write it for final runs where it is unset (a finalizer that died before writing). Writers of one run serialize on a lease and re-read the run under it, so the file is written once even when a backfill races the finalizer.
 - It is written as a temporary file plus rename relative to a parent-directory file descriptor opened with `O_NOFOLLOW`, mode 0600.
 - An allocated run's outcome file always receives the outcome object, also when `start` fails a launch validation (`start`'s stdout still prints the error envelope).
-- For isolated runs the path must not be under a [session-writable path](#session-writable-paths) (compared by realpath of the path or its nearest existing parent): exit 2 at `start`, `exec` and `resume`; at adoption a rejected `--outcome-file` exits 2 and the run stays pending. A rejected path is never written.
+- For isolated runs the path must not be under a [session-writable path](#session-writable-paths) (compared by realpath of the path or its nearest existing parent, and through every symlink followed on the way, whose directory must not be session-writable either): exit 2 at `start`, `exec` and `resume`; at adoption a rejected `--outcome-file` exits 2 and the run stays pending. For every run, isolated or not, the path must not be under `<state>/sessions` or the root of the private temporary directories, which the agents of isolated sessions may write. Step 2 checks those and an isolated run's caller cwd; the rest of the run's session-writable paths (`write_dirs`, the profile's write entries, the private temporary directory) are known only in step 5, where a rejected path is dropped from the run and the launch fails `unsafe_path` (exit 12). A rejected path is never written: a later write to it is skipped with a warning (logged `outcome_file_failed`).
 - A refusal or usage error before a run is allocated writes its error envelope only to an `--outcome-file` given on that command line and not rejected.
 - A write failure never changes the run's outcome or the command's exit code: the command prints its normal output, adds a warning, and logs `outcome_file_failed`.
 - `schema_newer` and a `failed` at the schema check (step 1 of the [launch order](#launch-order)) write no outcome file: they precede parsing.
 
-`wait --outcome-file` writes `wait`'s own output, including any error envelope it prints (same write rules).
+`wait --outcome-file` writes `wait`'s own output, including any error envelope it prints (same write rules; a path under the waited isolated run's cwd, `<state>/sessions` or the temporary-directory root is not written, with a warning, and the exit code is unchanged).
 
 ### Dry run
 

@@ -1150,6 +1150,43 @@ class Store:
                 (json.dumps(merged, ensure_ascii=False), csession_id, run_no),
             )
 
+    # Outcome file (interface.md, Outcome file; design.md, Data model)
+
+    def unwritten_outcome_files(self, csession_id: str | None = None) -> list[tuple[str, int]]:
+        """``(csession_id, run_no)`` of the final runs (of ``csession_id``, or of every
+        session) that have an ``outcome_file`` and no ``outcome_file_written_at``: the ones
+        the outcome-file backfill writes."""
+        sql = (
+            "SELECT csession_id, run_no FROM runs WHERE ended_at IS NOT NULL "
+            "AND outcome_file IS NOT NULL AND outcome_file_written_at IS NULL"
+        )
+        params: tuple[Any, ...] = ()
+        if csession_id is not None:
+            sql += " AND csession_id = ?"
+            params = (csession_id,)
+        rows = self.conn.execute(sql + " ORDER BY csession_id, run_no", params).fetchall()
+        return [(str(sid), int(run_no)) for sid, run_no in rows]
+
+    def mark_outcome_file_written(self, csession_id: str, run_no: int) -> bool:
+        """Set ``outcome_file_written_at`` of a final run once (compare-and-set on it being
+        unset). Returns whether this call set it."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET outcome_file_written_at = ? WHERE csession_id = ? "
+                "AND run_no = ? AND ended_at IS NOT NULL AND outcome_file_written_at IS NULL",
+                (format_ts(self.clock()), csession_id, run_no),
+            )
+        return cursor.rowcount == 1
+
+    def drop_outcome_file(self, csession_id: str, run_no: int) -> None:
+        """Forget the run's ``outcome_file`` (a path rejected after allocation): no
+        finalizer or backfill ever writes it."""
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE runs SET outcome_file = NULL WHERE csession_id = ? AND run_no = ?",
+                (csession_id, run_no),
+            )
+
     def set_implicit_report(self, csession_id: str, run_no: int, artifact: Frozen) -> bool:
         """Store an implicit done (headless ``result`` accepted as done): status ``done``,
         ``report_implicit`` 1, no summary or reason, the frozen ``result.md`` as artifact.

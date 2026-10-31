@@ -39,8 +39,10 @@ def check_liveness(st: store.Store, csession_id: str) -> None:
     """Hook point for the inline liveness check every ``wait`` poll runs: it finalizes a run
     whose wrapper is dead (a pending run never adopted ends ``never_adopted``)."""
     # TODO(#33): run the single-session liveness check here (finalize when the wrapper is
-    # dead, cause `liveness`, outcome-file backfill). Until then a run whose wrapper died
-    # without finalizing keeps wait polling until --timeout.
+    # dead, cause `liveness`; a run it finalizes gets outcomefile.write_run right after the
+    # compare-and-set, then outcomefile.backfill(st, csession_id) for the session's final
+    # runs whose outcome file is unwritten). Until then a run whose wrapper died without
+    # finalizing keeps wait polling until --timeout.
     del st, csession_id
 
 

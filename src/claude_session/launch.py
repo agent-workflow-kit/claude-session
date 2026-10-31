@@ -56,6 +56,7 @@ from . import (
     ids,
     kinds,
     logs,
+    outcomefile,
     pathrules,
     permission_profiles,
     secretindex,
@@ -427,6 +428,9 @@ class Validated:
     tmpdir: str | None
     warnings: list[str] = field(default_factory=list)
     credential_warnings: tuple[str, ...] = ()
+    # The run's session-writable paths (isolated runs; None for trusted ones): the
+    # outcome-file write is checked against them too.
+    writable: pathrules.SessionWritable | None = None
 
 
 def open_dirs(
@@ -587,6 +591,53 @@ def select_profile(
     return permission_profiles.select(
         cfg, resolution, session_writable=writable if resolution.isolated() else None
     )
+
+
+def check_outcome_file(req: Request, resolved: Resolved, process: Process) -> None:
+    """Launch step 2: ``--outcome-file`` must not resolve through ``<state>/sessions`` or the
+    tmp root (every run), nor, for an isolated run, through the caller's cwd it will write
+    (``OutcomeFileRejected``, exit 2; nothing is allocated). The rest of the run's
+    session-writable paths are known at step 5 (``check_outcome_path``)."""
+    if req.outcome_file is None:
+        return
+    cwd = resolved.caller_cwd if resolved.resolution.isolated() else None
+    writable = outcomefile.baseline_writable(process.state_root, *([cwd] if cwd else []))
+    pathrules.check_outcome_file(req.outcome_file, writable)
+
+
+def check_outcome_path(
+    st: store.Store,
+    alloc: Allocated,
+    outcome_file: str | None,
+    writable: pathrules.SessionWritable | None,
+) -> None:
+    """Launch step 5 (isolated runs), once every session-writable path is known: an
+    ``--outcome-file`` that resolves through one is dropped from the run, so it is never
+    written, and the launch fails (``unsafe_path``, exit 12): the run is allocated, so a usage
+    error is no longer possible."""
+    if outcome_file is None or writable is None:
+        return
+    hop = pathrules.outcome_file_hop(outcome_file, writable)
+    if hop is None:
+        return
+    try:
+        st.drop_outcome_file(alloc.csession_id, alloc.run)
+    except Exception:  # the launch-phase end still checks against the full set
+        pass
+    raise UnsafeOutcomeFile(writable, detail=hop)
+
+
+class UnsafeOutcomeFile(LaunchValidationError):
+    """``check_outcome_path`` failed; carries the run's full session-writable set, so the
+    launch-phase end that follows never writes the rejected path."""
+
+    def __init__(self, writable: pathrules.SessionWritable, *, detail: str) -> None:
+        super().__init__(
+            "--outcome-file is under a session-writable path of this run",
+            end_reason="unsafe_path",
+            detail=detail,
+        )
+        self.writable = writable
 
 
 def check_profile_file(
@@ -853,6 +904,7 @@ def validate(
         warnings += write.warnings
         create_write_dirs(dirs, write)
         writable = full_writable(resolution, alloc, cwd, home, tmp, write, expanded)
+        check_outcome_path(st, alloc, req.outcome_file, writable)
         check_profile_file(resolution, writable)
         check_paths(rules, writable, read, write, expanded)
         plugins = check_plugins(rules, req.plugin_dirs, writable, process.caller_cwd)
@@ -906,6 +958,7 @@ def validate(
         tmpdir=check.tmpdir,
         warnings=list(dict.fromkeys(warnings)),
         credential_warnings=tuple(credential),
+        writable=writable,
     )
 
 
@@ -1105,8 +1158,7 @@ def fail_launch(st: store.Store, alloc: Allocated, error: LaunchValidationError)
     """End the run ``not-started`` with the error's end reason (exit 12) and its
     ``failure_message``. Returns whether this call finalized the run.
 
-    TODO(#20): the one final ``post-state-change`` of a launch-phase end.
-    TODO(#21): the ``--outcome-file`` of a launch-phase end, after the compare-and-set."""
+    TODO(#20): the one final ``post-state-change`` of a launch-phase end."""
     return st.finalize_run(
         alloc.csession_id,
         alloc.run,
@@ -1166,7 +1218,8 @@ def end_launch(
     first."""
     try:
         st.rollback_open_transaction()
-        fail_launch(st, alloc, error)
+        if fail_launch(st, alloc, error):  # the outcome file right after the compare-and-set
+            outcomefile.write_run(st, alloc.csession_id, alloc.run, extra=_writable(v, error))
     finally:
         if prepared is not None:
             for fd in (prepared.stdout_fd, prepared.stderr_fd):
@@ -1195,6 +1248,13 @@ def end_launch(
                 message=type(exc).__name__,
                 **fields,
             )
+
+
+def _writable(v: Validated | None, error: LaunchValidationError) -> Callable[[str], bool] | None:
+    """The run's full session-writable set, when step 5 got that far."""
+    if isinstance(error, UnsafeOutcomeFile):
+        return error.writable
+    return None if v is None else v.writable
 
 
 def log_credential_warnings(

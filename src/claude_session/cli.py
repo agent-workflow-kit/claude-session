@@ -19,9 +19,9 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NoReturn
 
-from . import durations, fsutil, ids, outbox, store
+from . import durations, ids, outbox, outcomefile, store
 from .defaults import MAX_INTEGER
-from .errors import CliError, InternalError, RefusedError, UsageError
+from .errors import CliError, InternalError, OutcomeFileRejected, RefusedError, UsageError
 
 if TYPE_CHECKING:
     from .config import Config
@@ -165,7 +165,9 @@ def _exec(args: argparse.Namespace) -> int:
     The signal handlers are installed before allocation and restored once the outcome is
     printed (until then a late signal is only recorded)."""
     if args.session_id is not None:
-        # TODO(#28): adoption of a pending run created by start.
+        # TODO(#28): adoption of a pending run created by start. A given --outcome-file
+        # overrides the stored one and is checked again (launch.check_outcome_file; rejected:
+        # exit 2, the run stays pending).
         raise InternalError("exec --session-id is not implemented yet", detail="not_implemented")
     if args.dry_run:
         # TODO(#27): the dry-run plan.
@@ -183,6 +185,7 @@ def _exec(args: argparse.Namespace) -> int:
                 process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
                 req = launch.read_request(args, cfg)
                 resolved = launch.resolve_kind(req, cfg, process)
+                launch.check_outcome_file(req, resolved, process)
                 signals.defer()  # a signal during allocation acts once the run exists
                 alloc = launch.allocate(st, req, resolved, process)
                 try:
@@ -236,11 +239,13 @@ def _wait(args: argparse.Namespace) -> int:
                 st, args.id, run_no=args.run, timeout=timeout, poll_interval=cfg.poll_interval
             )
             state_root = os.path.dirname(st.path)
+            row = st.run_record(waited.output["csession_id"], waited.output["run"])
+            writable = outcomefile.run_writable(row, state_root)
     except KeyboardInterrupt:
         _die_of(signal.SIGINT)
     output = waited.output
     if args.outcome_file is not None:
-        _write_wait_outcome_file(args.outcome_file, output, state_root)
+        _write_wait_outcome_file(args.outcome_file, output, state_root, writable)
     if args.json:
         print(json.dumps(output, ensure_ascii=False, allow_nan=False))
     elif output["timed_out"]:
@@ -254,32 +259,19 @@ def _wait(args: argparse.Namespace) -> int:
     return waited.exit_code
 
 
-def _write_wait_outcome_file(path: str, output: dict[str, Any], state_root: str) -> None:
-    """``wait --outcome-file``: ``wait``'s own output (interface.md, Outcome file), mode 0600
-    without following a symlink; a failure adds a warning to the output and logs
-    ``outcome_file_failed``, and never changes the exit code."""
-    # TODO(#21): skip a path rejected by the session-writable check, with the other
-    # outcome-file writers.
-    from . import logs
-
-    data = (json.dumps(output, ensure_ascii=False, allow_nan=False) + "\n").encode()
-    try:
-        # Not abspath: `..` must be resolved after symlinks (realpath in write_private_file).
-        fsutil.write_private_file(os.path.join(os.getcwd(), path), data)
-    except (OSError, ValueError) as exc:
-        reason = getattr(exc, "strerror", None) or type(exc).__name__
-        warning = f"could not write --outcome-file: {reason}"
+def _write_wait_outcome_file(
+    path: str, output: dict[str, Any], state_root: str, writable: Callable[[str], bool]
+) -> None:
+    """``wait --outcome-file``: ``wait``'s own output (interface.md, Outcome file), never to a
+    path the waited run's agent could write (``outcomefile.run_writable``); a rejected or
+    failed write adds a warning to the output and logs ``outcome_file_failed``, and never
+    changes the exit code."""
+    warning = outcomefile.write(outcomefile.absolute(path), outcomefile.encode(output), writable)
+    if warning is not None:
         output["warnings"] = [*output["warnings"], warning]
-        try:
-            logs.EventLog(os.path.join(state_root, "log.jsonl")).write(
-                "outcome_file_failed",
-                level="warn",
-                csession_id=output["csession_id"],
-                run=output["run"],
-                message=warning,
-            )
-        except (OSError, ValueError):
-            pass
+        outcomefile.log_failure(
+            state_root, warning, csession_id=output["csession_id"], run=output["run"]
+        )
 
 
 def _end_interrupted_launch(
@@ -843,14 +835,19 @@ def _outcome_file_from_argv(argv: Sequence[str]) -> str | None:
 
 
 def _write_outcome_file(path: str, error: CliError) -> None:
-    # TODO(#21): skip a path rejected by the session-writable check (isolated runs).
+    """An error envelope to ``--outcome-file`` (``outcomefile.write``): never to a path an
+    agent could write (``<state>/sessions``, the tmp root), and never for the rejection of
+    that path itself. A rejected or failed write is a warning on stderr, logged
+    ``outcome_file_failed`` (best effort)."""
+    if isinstance(error, OutcomeFileRejected):
+        return
+    state_root = store.state_dir()
+    writable = outcomefile.baseline_writable(state_root)
     data = (json.dumps(error.envelope()) + "\n").encode()
-    try:
-        # Not abspath: `..` must be resolved after symlinks (realpath in write_private_file).
-        fsutil.write_private_file(os.path.join(os.getcwd(), path), data)
-    except OSError as exc:
-        reason = sanitize(str(exc))
-        print(f"{PROG}: warning: could not write --outcome-file: {reason}", file=sys.stderr)
+    warning = outcomefile.write(outcomefile.absolute(path), data, writable)
+    if warning is not None:
+        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+        outcomefile.log_failure(state_root, warning)
 
 
 def _print_error(error: CliError, json_mode: bool) -> None:
