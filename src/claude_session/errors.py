@@ -110,8 +110,9 @@ class LaunchFailedError(CliError):
         run: int,
         end_reason: str,
         hint: str | None,
+        detail: str | None = None,
     ) -> None:
-        super().__init__(message)
+        super().__init__(message, detail=detail)
         self.csession_id = csession_id
         self.run = run
         self.end_reason = end_reason
@@ -142,7 +143,8 @@ class LaunchValidationError(FailedError):
     ``failed`` envelope."""
 
     # exec maps it to a not-started run (launch.fail_launch: end_reason, its message, detail
-    # and hint as the outcome message, exit 12). TODO(#28): start maps it to LaunchFailedError.
+    # and hint as the outcome message, exit 12); start also ends the run that way and prints
+    # it as LaunchFailedError (lifecycle.start).
 
     end_reason: str
 

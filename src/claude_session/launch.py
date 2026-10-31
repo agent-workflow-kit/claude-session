@@ -27,8 +27,10 @@ private tmpdir, created last by ``check_sandbox``). ``--dry-run`` (``dryrun``) r
 ``read_request``, ``resolve_kind`` and ``checks`` with effects that record and create
 nothing (``self_check(create=False)``), then ``generate`` for the settings and argv; never
 ``allocate``, ``open_dirs`` or ``prepare``.
-TODO(#28): ``start`` stores the request and the resolved spec; adoption reruns ``validate``
-and ``prepare`` for the pending run.
+``start`` and the adopting ``exec`` (``lifecycle``) reuse the same steps: ``start`` allocates
+a pending run (``allocate(..., pending=...)``) and runs ``validate``; the adopting ``exec``
+runs ``run`` with its own effects (``Recording`` subclass comparing what ``start`` stored)
+and ``staged=True`` (step 7 moves ``start``'s staged prompt and inputs into place).
 TODO(#29): resume and fork build their request from the previous run (carry-over).
 TODO(#31): launch step 6, the ``pre-launch`` hooks, between ``validate`` and ``prepare``.
 TODO(#40): ``claude --version`` against ``min_claude_version`` (``claude_too_old``) in
@@ -301,6 +303,8 @@ class Allocated:
     session_dir: str
     private_dir: str
     warnings: tuple[str, ...]
+    # The ``cause`` of a launch-phase end of this run: ``adopt`` in the adopting exec.
+    cause: str = "launch"
 
 
 def _resolved_record(resolution: kinds.Resolution) -> dict[str, Any]:
@@ -323,10 +327,31 @@ def _resolved_record(resolution: kinds.Resolution) -> dict[str, Any]:
     }
 
 
-def allocate(st: store.Store, req: Request, resolved: Resolved, process: Process) -> Allocated:
+@dataclass(frozen=True)
+class Pending:
+    """What ``start`` records on its pending run besides the request: the adoption deadline
+    (``lost_grace`` seconds from now) and the config it froze (``config.Source`` and
+    ``config.config_hash``)."""
+
+    expires_after: float
+    config_hash: str
+    config_path: str
+    config_default: bool
+
+
+def allocate(
+    st: store.Store,
+    req: Request,
+    resolved: Resolved,
+    process: Process,
+    *,
+    pending: Pending | None = None,
+) -> Allocated:
     """Launch step 4: the session id (checked against every live, forgotten and deleted id in
     the inserting transaction) and the session and run rows, with this process as the run's
-    wrapper (plain ``exec`` performs every step), its labels and the ``launch`` event."""
+    wrapper (plain ``exec`` performs every step), its labels and the ``launch`` event. With
+    ``pending`` (``start``) the run has no wrapper but a deadline, and the config hash and
+    path are frozen with it."""
     resolution = resolved.resolution
     spec = {key: value for key, value in req.flags.items() if value is not None}
     if req.plugin_dirs:
@@ -339,6 +364,8 @@ def allocate(st: store.Store, req: Request, resolved: Resolved, process: Process
         "outcome_file": req.outcome_file,
         "input_files": [item.name for item in req.inputs],
     }
+    if pending is not None:
+        invocation["config_default"] = pending.config_default
     warnings = tuple(resolution.warnings)
     new = store.NewRun(
         state_root=process.state_root,
@@ -351,13 +378,14 @@ def allocate(st: store.Store, req: Request, resolved: Resolved, process: Process
         has_prompt=req.prompt is not None,
         spec=spec,
         resolved=_resolved_record(resolution),
-        # TODO(#28): start freezes the config hash and the absolute config path.
-        config_hash=None,
+        # exec runs have no frozen config (it is loaded once, by this process).
+        config_hash=None if pending is None else pending.config_hash,
         invocation=invocation,
         hook_interpreter=process.interpreter,
-        config_path=None,
-        wrapper_pid=os.getpid(),
-        wrapper_start=store.start_time(os.getpid()),
+        config_path=None if pending is None else pending.config_path,
+        wrapper_pid=None if pending is not None else os.getpid(),
+        wrapper_start=None if pending is not None else store.start_time(os.getpid()),
+        pending_for=None if pending is None else pending.expires_after,
         labels=req.labels,
         decision_ids=req.decision_ids,
         warnings=warnings,
@@ -846,6 +874,15 @@ class Effects:
     def record_profile(self, profile: permission_profiles.Profile) -> None:
         pass
 
+    def select_profile(
+        self, cfg: Config, resolution: kinds.Resolution, writable: Callable[[str], bool]
+    ) -> permission_profiles.Profile:
+        """The run's permission profile (the adopting ``exec``: the one ``start`` froze)."""
+        return select_profile(cfg, resolution, writable)
+
+    def record_plugin_dirs(self, plugin_dirs: Sequence[str]) -> None:
+        pass
+
     def warn(self, warnings: Sequence[str]) -> None:
         pass
 
@@ -917,7 +954,9 @@ def checks(
     rules = host_rules(process, resolution, alloc, cwd, tmp, planned=effects.planned)
     check_cwd(rules, resolution)
     effects.record_cwd(cwd)
-    profile = select_profile(cfg, resolution, base_writable(resolution, alloc, cwd, home, tmp))
+    profile = effects.select_profile(
+        cfg, resolution, base_writable(resolution, alloc, cwd, home, tmp)
+    )
     effects.record_profile(profile)
     before_git = git_writable(resolution, alloc, cwd, home, tmp, profile)
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
@@ -936,6 +975,7 @@ def checks(
     check_profile_file(resolution, writable)
     check_paths(rules, writable, read, write, expanded)
     plugins = check_plugins(rules, req.plugin_dirs, writable, process.caller_cwd)
+    effects.record_plugin_dirs(plugins)
     check_hook_interpreter(process, writable)
     check_tmpdir(resolution, alloc)
     tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool)
@@ -985,6 +1025,9 @@ def checks(
     )
 
 
+EffectsFactory = Callable[[store.Store, Allocated, SessionDirs], Effects]
+
+
 def validate(
     st: store.Store,
     cfg: Config,
@@ -992,14 +1035,18 @@ def validate(
     resolved: Resolved,
     alloc: Allocated,
     process: Process,
+    *,
+    effects: EffectsFactory | None = None,
 ) -> Validated:
     """Launch step 5, in the order interface.md (Launch order) lists: rule paths, the
     session directories (``open_dirs``), then ``checks`` with the effects of a real launch
-    (``Recording``). Raises ``LaunchValidationError``; the first failure wins."""
+    (``Recording``, or ``effects``: ``start`` and the adopting ``exec``). Raises
+    ``LaunchValidationError``; the first failure wins."""
     settings_builder.check_rule_paths(process.state_root, process.claude_session)
     dirs, layout = open_dirs(alloc, process, isolated=resolved.resolution.isolated())
     try:
-        checked = checks(cfg, req, resolved, alloc, process, Recording(st, alloc, dirs))
+        made = (effects or Recording)(st, alloc, dirs)
+        checked = checks(cfg, req, resolved, alloc, process, made)
     except BaseException:
         dirs.close()
         raise
@@ -1131,15 +1178,30 @@ def prepare(
     alloc: Allocated,
     v: Validated,
     process: Process,
+    *,
+    staged: bool = False,
 ) -> Prepared:
-    """Launch step 7: the prompt and inputs, ``instructions.md``, ``run.json`` and a new
-    secret (its digest and the directory identities recorded), the secret index (before the
-    agent can file a report), the hook configuration, the profile snapshot, the generated
-    settings and the output files."""
+    """Launch step 7: the prompt and inputs (``staged``: the adopting ``exec`` moves the
+    copies ``start`` staged into place, ``place_staged``; they must be the prompt and input
+    names the run recorded), ``instructions.md``, ``run.json`` and a new secret (its digest
+    and the directory identities recorded), the secret index (before the agent can file a
+    report), the hook configuration, the profile snapshot, the generated settings and the
+    output files."""
     dirs, run, sid = v.dirs, alloc.run, alloc.csession_id
     # TODO(#29): drain (ingest or discard) the previous run's outbox before the secret rotates.
-    prompt_path = None if req.prompt is None else dirs.write_prompt(run, req.prompt)
-    names = dirs.write_inputs(run, req.inputs)
+    if staged:
+        placed = dirs.place_staged(run)
+        expected = sorted(item.name for item in req.inputs)
+        if (placed.prompt_path is not None) != (req.prompt is not None) or sorted(
+            placed.input_names
+        ) != expected:
+            raise sessiondir.SessionDirUnsafe(
+                "the staged prompt and inputs differ from the ones start recorded"
+            )
+        prompt_path, names = placed.prompt_path, list(placed.input_names)
+    else:
+        prompt_path = None if req.prompt is None else dirs.write_prompt(run, req.prompt)
+        names = dirs.write_inputs(run, req.inputs)
     secret = dirs.write_run_files(
         run,
         claude_session_path=process.claude_session,
@@ -1168,6 +1230,7 @@ def prepare(
     )
     snapshot = None
     if v.profile.is_file:
+        # Adoption rewrites start's snapshot with the same bytes (read back with its label).
         snapshot = dirs.write_private_run_file(run, PROFILE_SNAPSHOT, v.profile.snapshot_bytes())
     generated = generate(req, resolution, alloc, v, process, prompt_path)
     dirs.write_settings(run, settings_builder.settings_json(generated.settings))
@@ -1228,7 +1291,7 @@ def fail_launch(st: store.Store, alloc: Allocated, error: LaunchValidationError)
             end_reason=error.end_reason,
             exit_code=EXIT_CODES["not-started"],
             state="not-started",
-            cause="launch",
+            cause=alloc.cause,
             message=failure_message(error),
         ),
     )
@@ -1342,19 +1405,22 @@ def run(
     process: Process,
     *,
     supervise: Callable[..., Any],
+    effects: EffectsFactory | None = None,
+    staged: bool = False,
 ) -> Any:
     """Steps 5 and 7 of an allocated run, then ``supervise`` (``supervisor.run_headless``,
     which spawns ``claude``). A launch validation failure (or an unsafe session directory)
     ends the run ``not-started`` and returns None (the outcome is in the store); so does any
     other error before ``claude`` is spawned (``launch_interrupted``), except a
     ``KeyboardInterrupt`` (or another ``BaseException``), which is re-raised once the run is
-    final."""
+    final. The adopting ``exec`` passes its ``effects`` (``validate``) and ``staged``
+    (``prepare``)."""
     resolution = resolved.resolution
     v: Validated | None = None
     prepared: Prepared | None = None
     try:
         try:
-            v = validate(st, cfg, req, resolved, alloc, process)
+            v = validate(st, cfg, req, resolved, alloc, process, effects=effects)
             secrets = sorted(envbuild.secret_values(v.session_env, process.environ))
             log_credential_warnings(process, alloc, v.credential_warnings, secrets)
             # The audit record is written before the run secret exists (prepare rotates it),
@@ -1362,7 +1428,7 @@ def run(
             # used for the log from here on, is that set plus the run secret.
             audit_sandbox_lowered(process, req, resolution, alloc, secrets)
             st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
-            prepared = prepare(st, cfg, req, resolution, alloc, v, process)
+            prepared = prepare(st, cfg, req, resolution, alloc, v, process, staged=staged)
             st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
         except LaunchValidationError as error:
             end_launch(st, alloc, v, prepared, process, error)

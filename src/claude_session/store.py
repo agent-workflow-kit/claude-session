@@ -1248,7 +1248,7 @@ class Store:
                 return Adoption("expired", run_no)
             if wrapper is not None:
                 return Adoption("already_adopted", run_no)
-            if self._past(expires):
+            if self.past_deadline(expires):
                 self._finalize(conn, csession_id, run_no, NEVER_ADOPTED)
                 return Adoption("expired", run_no, expired_now=True)
             cursor = conn.execute(
@@ -1277,13 +1277,13 @@ class Store:
             ).fetchone()
             if row is None or row[0] is not None or row[1] is not None:
                 return False
-            if not self._past(row[2]):
+            if not self.past_deadline(row[2]):
                 return False
             return self._finalize(
                 conn, csession_id, run_no, dataclasses.replace(NEVER_ADOPTED, cause=cause)
             )
 
-    def _past(self, expires_at: str | None) -> bool:
+    def past_deadline(self, expires_at: str | None) -> bool:
         """Whether a pending run's ``expires_at`` has come (a missing or unreadable deadline
         counts as passed: a pending run is never adoptable without one)."""
         if expires_at is None:

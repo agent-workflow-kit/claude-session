@@ -692,6 +692,49 @@ class SessionDirs:
             os.close(run_fd)
         return os.path.join(where, name)
 
+    def read_private_run_file(self, run: int, name: str, cap: int) -> bytes:
+        """Read ``private/<id>/runs/<run>/<name>`` (the adopting ``exec``: the launch spec
+        ``start`` froze): opened relative to the pinned private directory without following
+        symlinks; it must be a regular file of ours with one link and at most ``cap`` bytes.
+        Raises ``SessionDirUnsafe`` otherwise (also when it is missing)."""
+        _check_run(run)
+        if not name or "/" in name or name in (".", ".."):
+            raise ValueError(f"not a file name: {name!r}")
+        run_fd = self._run_private_dir(run)
+        path = os.path.join(self.private_path, RUNS, str(run), name)
+        try:
+            try:
+                fd = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=run_fd
+                )
+            except OSError as exc:
+                raise _failed(path, exc) from exc
+        finally:
+            os.close(run_fd)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise SessionDirUnsafe(f"{path} is not a regular file")
+            if info.st_nlink != 1:
+                raise SessionDirUnsafe(f"{path} has {info.st_nlink} links")
+            if info.st_uid != os.geteuid():
+                raise SessionDirUnsafe(f"{path} is owned by uid {info.st_uid}")
+            chunks: list[bytes] = []
+            size = 0
+            while size <= cap:
+                chunk = os.read(fd, cap + 1 - size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+        except OSError as exc:
+            raise _failed(path, exc) from exc
+        finally:
+            os.close(fd)
+        if size > cap:
+            raise SessionDirUnsafe(f"{path} is larger than {cap} bytes")
+        return b"".join(chunks)
+
     def open_run_dir(self, run: int) -> int:
         """A descriptor of the private ``runs/<run>/`` (verified ours, no-follow) that the
         caller closes; after ``prepare_run(run)``."""
