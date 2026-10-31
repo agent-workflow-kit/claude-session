@@ -56,6 +56,9 @@ class ScriptedChild:
         cause = self.st.run_record(self.sid, 1)["pending_cause"]
         self.sent.append((sig, cause))
 
+    def release(self) -> None:
+        pass
+
 
 @pytest.fixture
 def st(tmp_path: Path) -> Any:

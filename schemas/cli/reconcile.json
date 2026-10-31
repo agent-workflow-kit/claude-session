@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "claude-session/cli/reconcile.json",
   "title": "claude-session reconcile --json",
-  "description": "reconcile never signals a process (an orphaned child is ended with stop).",
+  "description": "reconcile never signals a session process (wrapper or child; an orphaned child is ended with stop); it ends only verified orphaned post-state-change hook groups of dead deliverers.",
   "type": "object",
   "properties": {
     "already_running": {
@@ -38,9 +38,10 @@
               "outbox_discarded",
               "events_delivered",
               "tmpdir_removed",
+              "secret_files_deleted",
               "deleted"
             ],
-            "description": "finalized_from_cause: a wrapper-lost run with a recorded pending_cause finalized per the cause table."
+            "description": "finalized_from_cause: a wrapper-lost run with a recorded pending_cause finalized per the cause table. secret_files_deleted: a final run's secret index or launch spec (secret-equivalent) that the process which finalized it left behind was deleted (detail names them)."
           },
           "from_state": {
             "$ref": "outcome.json#/$defs/state_or_null"
@@ -99,7 +100,7 @@
         ],
         "additionalProperties": false
       },
-      "description": "Runs whose wrapper is gone but whose child is alive: left live (stop ends them; reconcile never signals). Not a change."
+      "description": "Runs whose wrapper is gone but whose child is alive: left live (stop ends them; reconcile never signals a session process). Not a change."
     },
     "warnings": {
       "type": "array",

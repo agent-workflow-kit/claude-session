@@ -60,6 +60,7 @@ class Call:
     executable: str | None = None  # the program run when argv[0] is only its name
     output_limit: int | None = None  # run only
     discard_output: bool = False  # run only
+    gated: bool = False  # spawn only
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,7 @@ class FakeChild:
     returncode: int | None = None
     signals: list[int] = field(default_factory=list)
     clock: FakeClock | None = None
+    released: bool = False  # a gated child: whether ``release`` let it run its program
 
     def exit(self, returncode: int) -> None:
         self.returncode = returncode
@@ -120,6 +122,9 @@ class FakeChild:
     def send_signal(self, sig: int) -> None:
         if self.returncode is None:
             self.signals.append(sig)
+
+    def release(self) -> None:
+        self.released = True
 
 
 class FakeGateway:
@@ -242,6 +247,7 @@ class FakeGateway:
         new_process_group: bool = False,
         die_with_parent: bool = False,
         executable: str | None = None,
+        gated: bool = False,
     ) -> Child:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_spawn_stdin(stdin)
@@ -259,6 +265,7 @@ class FakeGateway:
                 stdout=stdout,
                 stderr=stderr,
                 executable=executable,
+                gated=gated,
             )
         )
         if self._spawn_via is not None:
@@ -273,6 +280,7 @@ class FakeGateway:
                 new_process_group=new_process_group,
                 die_with_parent=die_with_parent,
                 executable=executable,
+                gated=gated,
             )
         response = self._answer(args)
         if response.error is not None:

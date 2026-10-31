@@ -761,8 +761,8 @@ def final_drain(store: Store, csession_id: str, run_no: int, state_dir: str) -> 
     a hook drain. Returns whether a drain was recorded; a drain that cannot run is logged
     (``hook_event_failed`` with the exception type only) and its requests stay claimed."""
     log = _Log(state_dir)
-    try:
-        drain = prepare_drain(store, csession_id, log)
+    try:  # only while run_no is the current run: never claims a later run's requests
+        drain = prepare_drain(store, csession_id, log, run_no=run_no)
     except Exception as exc:
         log.failure(csession_id, f"final drain: {type(exc).__name__}")
         return False
