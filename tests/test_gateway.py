@@ -588,7 +588,7 @@ def test_exception_before_the_sigkill_is_sent_still_ends_the_group(
 ) -> None:
     # A signal handler raising inside the SIGKILL step, before killpg, must not leave the
     # cleanup waiting forever for a leader that ignores SIGTERM. (Should it hang anyway, the
-    # conftest watchdog kills the group and this test fails on the elapsed time.)
+    # conftest watchdog reports it; nothing unblocks it.)
     real = gateway._signal_group  # pyright: ignore[reportPrivateUsage]
     raised: list[int] = []
 

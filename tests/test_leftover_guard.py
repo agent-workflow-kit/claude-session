@@ -105,14 +105,48 @@ def test_the_tracking_popen_is_restored_when_the_setup_fails(
     assert subprocess.Popen is real
 
 
-def test_a_test_the_watchdog_had_to_unblock_fails(
+def test_the_watchdog_reports_a_hung_test_without_signalling_its_processes(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The process the inner test started outlives the watchdog firing; teardown then ends it
+    # and fails the test.
     monkeypatch.setattr(conftest, "WATCHDOG_SECONDS", 0.2)
     pytester.makeconftest("from tests.conftest import no_leftover_processes  # noqa: F401\n")
     pytester.makepyfile(
-        "import time\n\ndef test_slow():\n    time.sleep(1)\n",
+        "import subprocess, time\n\n"
+        "def test_slow():\n"
+        "    proc = subprocess.Popen(['/bin/sleep', '30'])\n"
+        "    time.sleep(1)\n"
+        "    assert proc.poll() is None\n",
     )
     result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
     result.assert_outcomes(passed=1, errors=1)
     result.stdout.fnmatch_lines(["*watchdog fired*"])
+
+
+@linux_only
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="needs a pidfd")
+def test_a_group_leader_that_left_its_group_is_killed_through_its_pidfd() -> None:
+    # The leader moves itself into this process's group: killpg on its PID reaches nobody,
+    # its pidfd still ends it.
+    pgrp = os.getpgrp()
+    leader = subprocess.Popen(
+        [sys.executable, "-c", f"import os, time; os.setpgid(0, {pgrp}); time.sleep(30)"],
+        process_group=0,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while (stat := _stat(leader.pid)) is not None and stat[0] != pgrp:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        assert stat is not None
+        record = _Started(leader, stat[2], True, os.pidfd_open(leader.pid))
+        try:
+            record.kill()
+            assert leader.wait(timeout=5) == -signal.SIGKILL
+        finally:
+            record.close()
+    finally:
+        if leader.returncode is None:
+            leader.kill()
+            leader.wait(timeout=5)

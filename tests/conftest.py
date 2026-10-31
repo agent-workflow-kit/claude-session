@@ -2,14 +2,23 @@
 
 ``no_leftover_processes`` (autouse) records every process a test starts in this process
 through ``subprocess.Popen`` (the gateway's included) at launch: its PID, its start ticks, a
-pidfd (Linux) and whether it leads its own process group. At teardown, and from a watchdog thread
-should the test hang, each one still running is SIGKILLed, and only while it is verifiably the
-process started here: a plain child through its pidfd (a signal through it can never reach a
-reused PID), a group leader's whole group only while the leader is still our unreaped child with
-the same start ticks (the unreaped leader pins the group ID). Nothing else is ever signalled: the
-members of a group whose leader was already reaped are left to the tests that started them (see
-``grandchildren`` in test_gateway.py), which record them by exact PID. A test the watchdog had
-to unblock fails at teardown.
+pidfd (Linux 5.3+) and whether it leads its own process group. At teardown, after the test has
+returned, each one still running is SIGKILLed while it is still the process started here:
+
+- a plain child through its pidfd, which names that exact process and never a reused PID;
+- a group leader through its pidfd too (should it have left its group), and its whole group
+  only while the leader is still our unreaped child with the same start ticks (an unreaped
+  leader pins the group ID; Linux cannot signal a group through a pidfd).
+
+The check before ``killpg``, and before ``kill`` where there is no pidfd (macOS, older Linux),
+leaves a window: if the leader is reaped in it and its PID reused, the signal reaches the new
+process. Only a thread the test left running past teardown can reap it then, so the window is
+open only for such a test. Nothing else is ever signalled: the members of a group whose leader
+was already reaped are left to the tests that started them (see ``grandchildren`` in
+test_gateway.py), which record them by exact PID.
+
+The watchdog signals nothing. Should a test run past ``WATCHDOG_SECONDS`` it writes the live
+tracked PIDs to stderr, and the test fails at teardown.
 """
 
 from __future__ import annotations
@@ -29,7 +38,7 @@ import pytest
 pytest_plugins = ["pytester"]  # test_leftover_guard.py runs the guard in a pytest of its own
 
 LINUX = sys.platform.startswith("linux")
-# A test still running after this long is hung: its processes are killed to unblock it.
+# A test still running after this long is reported as hung (nothing is signalled).
 WATCHDOG_SECONDS = 60.0
 
 
@@ -72,7 +81,7 @@ class _Started:
     own_group: bool
     pidfd: int | None = None  # None off Linux
 
-    def _leader_is_ours(self) -> bool:
+    def is_ours(self) -> bool:
         """Whether the PID still names the process started here: not reaped (through Popen or
         otherwise), still our child and, on Linux, with the same start ticks."""
         if self.popen.returncode is not None or not _unreaped_child(self.popen.pid):
@@ -85,17 +94,13 @@ class _Started:
     def kill(self) -> None:
         pid = self.popen.pid
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            if self.own_group:
-                # A small window remains: should another thread reap the leader between this
-                # check and killpg (the test's own wait racing the watchdog), and the PID be
-                # reused as a new group leader within those microseconds, killpg would reach
-                # that group. Linux 5.15 cannot signal a group through a pidfd.
-                if self._leader_is_ours():
-                    os.killpg(pid, signal.SIGKILL)
-            elif self.pidfd is not None:
+            if self.own_group and self.is_ours():
+                os.killpg(pid, signal.SIGKILL)  # check-then-kill: see the module docstring
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            if self.pidfd is not None:
                 signal.pidfd_send_signal(self.pidfd, signal.SIGKILL)  # ESRCH once reaped
-            elif self._leader_is_ours():
-                os.kill(pid, signal.SIGKILL)
+            elif self.is_ours():
+                os.kill(pid, signal.SIGKILL)  # no pidfd: check-then-kill
 
     def close(self) -> None:
         if self.pidfd is not None:
@@ -124,10 +129,11 @@ def no_leftover_processes() -> Iterator[list[_Started]]:
     done, fired = threading.Event(), threading.Event()
 
     def watchdog() -> None:
+        # Report only: a signal from here could race the test's own wait (see the docstring).
         if not done.wait(WATCHDOG_SECONDS):
             fired.set()
-            for proc in list(started):
-                proc.kill()  # no reaping here: the test's own wait returns
+            live = [p.popen.pid for p in list(started) if p.is_ours()]  # never reaps
+            print(f"watchdog: test hung; live tracked PIDs: {live}", file=sys.__stderr__)
 
     thread: threading.Thread | None = None
     try:
