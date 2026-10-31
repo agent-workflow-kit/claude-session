@@ -65,25 +65,6 @@ _IMPLIED: tuple[tuple[str, Any, str | None], ...] = (
     ("env.inherit", False, "env_allowlist_only"),
     ("mcp", "none", None),
 )
-# Variables that would point git at another repository or config than the one at ``cwd``.
-_GIT_ENV_DROP = frozenset(
-    {
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-        "GIT_NAMESPACE",
-        "GIT_CONFIG",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-    }
-)
-_GIT_ENV_DROP_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
-
 # Hardening for every git call (design.md, Git calls).
 GIT_HARDENING = (
     "-c",
@@ -267,16 +248,25 @@ def _check_repo(value: str, where: str) -> None:
         raise UsageError(f"{where}: invalid repo id (expected host[:port]/path)")
 
 
-def git_origin_url(cwd: str, *, git: str, gw: Gateway, git_name: str | None = None) -> str | None:
-    """The URL of the ``origin`` remote of the repository at ``cwd`` (hardened, read-only git),
-    or None when there is none or git fails. ``git`` is the absolute git resolved at launch
+def git_origin_url(
+    cwd: str,
+    *,
+    git: str,
+    gw: Gateway,
+    git_name: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """The URL of the ``origin`` remote of the repository at ``cwd`` (hardened, read-only git
+    with the minimal environment ``git_env`` of ``environ``, default ``os.environ``), or None
+    when there is none or git fails. ``git`` is the absolute git resolved at launch
     (``pathrules.resolve_tool``: its realpath, run with ``argv[0]`` = ``git_name`` when
     given). The output is decoded by the gateway (UTF-8, invalid bytes replaced); only git's
     trailing newline is removed."""
     argv = [git_name or git, *GIT_HARDENING, "-C", os.fspath(cwd), "remote", "get-url", "origin"]
     executable = git if git_name else None
+    env = git_env(os.environ if environ is None else environ)
     try:
-        result = gw.run(argv, timeout=GIT_TIMEOUT, env=git_env(os.environ), executable=executable)
+        result = gw.run(argv, timeout=GIT_TIMEOUT, env=env, executable=executable)
     except (OSError, ValueError, GatewayTimeout):
         return None
     if result.returncode != 0:
@@ -294,16 +284,19 @@ def _default_origin_url(cwd: str) -> str | None:
 
 
 def git_env(env: Mapping[str, str]) -> dict[str, str]:
-    """``env`` without the variables that select another repository or extra config
-    (``GIT_DIR``, ``GIT_CONFIG_*`` and the like), with ``GIT_CONFIG_NOSYSTEM=1`` and
-    ``LC_ALL=C``."""
+    """The minimal environment of every git call (design.md, Git calls): ``PATH`` of ``env``
+    sanitized (empty and relative entries dropped), ``HOME`` (git's global config, such as
+    ``safe.directory``), ``LC_ALL=C`` (git's messages are matched untranslated) and
+    ``GIT_CONFIG_NOSYSTEM=1``. Nothing else of ``env`` reaches git: no secret, and no
+    variable that selects another repository or extra config (``GIT_DIR``,
+    ``GIT_CONFIG_*`` and the like)."""
     clean = {
-        key: value
-        for key, value in env.items()
-        if key not in _GIT_ENV_DROP and not key.startswith(_GIT_ENV_DROP_PREFIXES)
+        "PATH": sanitize_path(env.get("PATH", "")),
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
     }
-    clean["GIT_CONFIG_NOSYSTEM"] = "1"
-    clean["LC_ALL"] = "C"  # git's output never depends on the caller's locale
+    if "HOME" in env:
+        clean["HOME"] = env["HOME"]
     return clean
 
 

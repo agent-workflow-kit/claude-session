@@ -673,7 +673,33 @@ def test_kinds_words_a_trusted_kinds_unrun_claude_as_not_probed(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
     """A launch of a trusted kind checks no session-writable path, so it would not refuse a
-    ``claude`` under the caller's cwd; ``kinds`` still never runs it, and says so."""
+    ``claude`` under a trusted kind's ``write_dirs``; ``kinds`` still never runs it, and says
+    so."""
+    marker = tmp_path / "ran"
+    planted = home() / "td" / "bin"
+    plant(planted, marker)
+    proc = cli(
+        ["kinds", "--json", "--kind", "implement"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config="kinds:\n  implement:\n    write_dirs: ['~/td']\n",
+        env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists()
+    report = json.loads(proc.stdout)
+    validate(report, KINDS)
+    claude = [w for w in report["warnings"] if w.startswith("claude:")]
+    assert claude and all("not probed by a dry run" in w for w in claude), claude
+    assert not any("a launch refuses it" in w for w in claude)
+
+
+def test_kinds_refuses_a_claude_under_any_isolated_kinds_cwd(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """S4: ``claude_bin`` under the caller's cwd is refused by a launch of an isolated kind
+    whose cwd is the caller's (``respond``), also when ``--kind`` names a trusted kind."""
     marker = tmp_path / "ran"
     plant(work / "bin", marker)
     proc = cli(
@@ -686,10 +712,7 @@ def test_kinds_words_a_trusted_kinds_unrun_claude_as_not_probed(
     assert proc.returncode == 0, proc.stderr
     assert not marker.exists()
     report = json.loads(proc.stdout)
-    validate(report, KINDS)
-    claude = [w for w in report["warnings"] if w.startswith("claude:")]
-    assert claude and all("not probed by a dry run" in w for w in claude), claude
-    assert not any("a launch refuses it" in w for w in claude)
+    assert any("a launch refuses it" in w for w in report["warnings"]), report["warnings"]
 
 
 # Tools under a ${GIT_DIR} write path (G1, G2)
@@ -1053,7 +1076,7 @@ def plant_git(directory: Path, marker: Path) -> None:
     """A ``git`` that records that it ran (and fails, as a broken git would)."""
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "git"
-    path.write_text(f"#!/bin/sh\necho git >> {marker}\nexit 1\n", encoding="utf-8")
+    path.write_text(f'#!/bin/sh\necho "git $*" >> {marker}\nexit 1\n', encoding="utf-8")
     path.chmod(0o755)
 
 
@@ -1106,7 +1129,12 @@ def test_step2_never_runs_a_git_under_the_kinds_write_paths(
         )
         assert plan["repo"] is None
         assert any("repo not derived" in w for w in plan["warnings"]), plan["warnings"]
-    assert not marker.exists()
+    ran = marker.read_text(encoding="utf-8") if marker.exists() else ""
+    assert "get-url" not in ran  # step 2 never ran it
+    if where != "rw":
+        # The run's own write path: step 5 refuses it too. (A per-repo override's path is
+        # not the repo-less run's: step 5 checks only the run's own set.)
+        assert ran == ""
 
 
 @pytest.mark.parametrize("entry", GIT_DIR_ENTRIES)
@@ -1279,14 +1307,31 @@ def test_kinds_without_repo_never_runs_a_tool_under_a_repo_override_write_path(
     planted = home() / "rw" / "bin"
     plant(planted, marker)
     env = {"PATH": f"{planted}:{tools}:/usr/bin:/bin"}
-    for args in (["kinds", "--json"], ["kinds", "--json", "--kind", "respond"]):
-        proc = cli(args, cwd=work, tools=tools, tmp_path=tmp_path, config=REPO_OVERRIDE, env=env)
-        assert proc.returncode == 0, proc.stderr
-        report = json.loads(proc.stdout)
-        validate(report, KINDS)
-        assert report["claude_bin_resolved"] is None
-        respond = next(row for row in report["kinds"] if row["name"] == "respond")
-        assert respond["sandbox_available"] is False
+    proc = cli(
+        ["kinds", "--json", "--kind", "respond"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=REPO_OVERRIDE,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    validate(report, KINDS)
+    assert report["claude_bin_resolved"] is None
+    (respond,) = report["kinds"]
+    assert respond["sandbox_available"] is False
+    assert any("a launch refuses it" in p for p in respond["sandbox_problems"])
+    assert not marker.exists()
+    # Every kind: claude is checked against respond's override too. (bwrap and socat are
+    # checked against each row's own kind, so only claude is planted here.)
+    for name in ("bwrap", "socat"):
+        (planted / name).unlink()
+    proc = cli(
+        ["kinds", "--json"], cwd=work, tools=tools, tmp_path=tmp_path, config=REPO_OVERRIDE, env=env
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["claude_bin_resolved"] is None
     assert not marker.exists()
 
 

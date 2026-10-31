@@ -8,8 +8,9 @@ Launch order step 5; design.md, Platform notes).
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
+from . import pathrules
 from .gateway import Gateway, GatewayTimeout
 from .pathrules import ResolvedTool
 
@@ -25,14 +26,28 @@ _LEADING = re.compile(r"([0-9]+(?:\.[0-9]+)*)(?:\s|$)")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
-def probe_env(environ: Mapping[str, str]) -> dict[str, str]:
-    """The probe's minimal environment: ``PATH``, ``HOME`` and the locale variables
-    (``LANG``, ``LANGUAGE``, ``LC_*``) of ``environ``."""
-    return {
+def probe_path(environ: Mapping[str, str], writable: Callable[[str], bool]) -> list[str]:
+    """The probe's ``PATH`` entries: the caller's, relative and empty entries dropped, and
+    every entry that is session-writable at any step of resolving it
+    (``pathrules.writable_hop`` against ``writable``) removed. ``claude`` may be a script
+    (``#!/usr/bin/env node``) whose interpreter is looked up on this ``PATH``."""
+    return [
+        entry
+        for entry in pathrules.sanitize_path(environ.get("PATH", ""))
+        if pathrules.writable_hop(entry, writable) is None
+    ]
+
+
+def probe_env(environ: Mapping[str, str], writable: Callable[[str], bool]) -> dict[str, str]:
+    """The probe's minimal environment: ``PATH`` (``probe_path``), ``HOME`` and the locale
+    variables (``LANG``, ``LANGUAGE``, ``LC_*``) of ``environ``."""
+    env = {
         name: value
         for name, value in environ.items()
-        if name in PROBE_NAMES or name.startswith("LC_")
+        if (name in PROBE_NAMES or name.startswith("LC_")) and name != "PATH"
     }
+    env["PATH"] = ":".join(probe_path(environ, writable))
+    return env
 
 
 def probe(
@@ -40,21 +55,28 @@ def probe(
     environ: Mapping[str, str],
     gw: Gateway,
     *,
+    writable: Callable[[str], bool],
     timeout: float = PROBE_TIMEOUT,
 ) -> str | None:
     """The first line of ``claude --version`` (stripped, control characters removed, at most
     ``MAX_TEXT`` characters), run from the resolved realpath with ``argv[0]`` the tool's
-    name, in ``/`` with the minimal environment (``probe_env``) and in its own process
-    group, which a timeout ends as a whole; None when it cannot run, times out, exits
-    non-zero or prints nothing. The caller never passes a binary a launch would refuse."""
+    name, in ``/`` with the minimal environment (``probe_env``: no ``PATH`` entry under
+    ``writable``) and in its own process group, which a timeout ends as a whole and which
+    is SIGKILLed when ``claude`` exits, so no descendant outlives the probe; None when it
+    cannot run (also when no ``PATH`` entry is left), times out, exits non-zero or prints
+    nothing. The caller never passes a binary a launch would refuse."""
+    env = probe_env(environ, writable)
+    if not env["PATH"]:
+        return None
     try:
         result = gw.run(
             [claude.name, "--version"],
-            env=probe_env(environ),
+            env=env,
             cwd="/",
             timeout=timeout,
             new_process_group=True,
             kill_grace=KILL_GRACE,
+            kill_group_on_exit=True,
             executable=claude.path,
         )
     except (OSError, ValueError, GatewayTimeout):
