@@ -1264,6 +1264,22 @@ class Store:
         names = [column[0] for column in cursor.description]
         return dict(zip(names, row, strict=True))
 
+    def waited_run(self, csession_id: str, run_no: int | None) -> dict[str, Any] | None:
+        """For ``wait``: the run row ``run_no`` (None: the session's current run) of a session
+        that is not forgotten, in one read (never a write, so a waiter holds no lock between
+        polls); None when the session is forgotten or gone, or has no such run."""
+        cursor = self.conn.execute(
+            "SELECT r.* FROM runs r JOIN sessions s ON s.csession_id = r.csession_id "
+            "WHERE r.csession_id = ? AND r.run_no = COALESCE(?, s.current_run) "
+            "AND s.forgotten_at IS NULL",
+            (csession_id, run_no),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        names = [column[0] for column in cursor.description]
+        return dict(zip(names, row, strict=True))
+
     # The hook path (hookevent). Call these inside one ``transaction()``; they read and write
     # only columns of schema 1.0, so a newer additive schema keeps working (design.md, Data
     # model: hook-event never migrates).
