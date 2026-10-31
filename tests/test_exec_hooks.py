@@ -15,6 +15,7 @@ import pytest
 
 from .schemas import validate
 from .test_exec_headless import START, STOP, result_step, run_exec
+from .test_exec_interactive import FAST, HANG, check_outcome, report, start_terminal
 
 HOOK = Path(__file__).parent / "fakebin" / "post_hook.py"
 PAYLOAD_SCHEMA = "claude-session/hooks/post-state-change.json"
@@ -157,3 +158,31 @@ def test_a_per_invocation_hook_is_delivered_too(tmp_path: Path, state: Path, wor
     records = [json.loads(line) for line in log.read_text().splitlines()]
     assert {r["name"] for r in records} == {"flag"}
     assert records[-1]["payload"]["final"] is True
+
+
+def test_an_interactive_run_with_hooks_still_auto_exits_and_delivers_the_final_event(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    # Delivery writes no events (only delivered_at), so it never comes between the idle Stop
+    # and the report auto-exit reads (supervisor.auto_exit_candidate).
+    log = tmp_path / "hook.jsonl"
+    cmd = shlex.join([sys.executable, "-I", str(HOOK), "--log", str(log)])
+    term = start_terminal(
+        tmp_path,
+        state,
+        work,
+        [START, report("done"), STOP, HANG],
+        config=FAST + f"hooks:\n  post-state-change:\n    - cmd: {json.dumps(cmd)}\n",
+    )
+    code, outcome, err = term.finish()
+    outcome = check_outcome(code, outcome, err)
+    assert (code, outcome["end_reason"]) == (0, "auto_exit")
+    got = payloads(log)
+    assert [p["final"] for p in got].count(True) == 1
+    assert (got[-1]["cause"], got[-1]["mode"], got[-1]["state"]) == (
+        "auto_exit",
+        "interactive",
+        "exited",
+    )
+    for payload in got:
+        validate(payload, PAYLOAD_SCHEMA)
