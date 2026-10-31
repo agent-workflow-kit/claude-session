@@ -13,6 +13,7 @@ import fcntl
 import os
 import secrets
 import stat
+import sys
 import time
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -102,7 +103,7 @@ def _repair_dir_mode_at(dir_fd: int, name: str) -> tuple[int, int]:
     Linux: open it ``O_PATH`` (needs no read permission), check it through that descriptor
     and chmod it through ``/proc/self/fd``. Elsewhere (macOS): a no-follow ``chmod`` relative
     to ``dir_fd``, after an ``lstat`` check; without one the repair fails."""
-    o_path = getattr(os, "O_PATH", 0)
+    o_path = os.O_PATH if sys.platform.startswith("linux") else 0
     if o_path:
         flags = o_path | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         fd = os.open(name, flags, dir_fd=dir_fd)

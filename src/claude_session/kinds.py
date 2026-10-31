@@ -17,13 +17,15 @@ Never imported by the hook path: it needs ``config`` (Pydantic and PyYAML).
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import cache
 from typing import Any, Literal
 
-from . import config, defaults, gateway, ids
+from . import config, defaults, ids
 from .errors import UsageError
+from .gateway import Gateway, GatewayTimeout, SystemGateway, sanitize_path
 
 Origin = Literal["builtin", "config", "repo", "previous_run", "flag", "flag-implied", "derived"]
 Mode = Literal["interactive", "headless"]
@@ -240,7 +242,7 @@ def _resolve_repo(
         return previous.repo, "previous_run" if previous.repo is not None else None
     if base.cwd == "session-dir" or cwd is None:
         return None, None
-    lookup = git_origin_url if origin_url is None else origin_url
+    lookup = _default_origin_url if origin_url is None else origin_url
     url = lookup(cwd)
     derived = ids.repo_id_from_origin(url) if url is not None else None
     return derived, "derived" if derived is not None else None
@@ -251,30 +253,41 @@ def _check_repo(value: str, where: str) -> None:
         raise UsageError(f"{where}: invalid repo id (expected host[:port]/path)")
 
 
-def git_origin_url(cwd: str) -> str | None:
+def git_origin_url(cwd: str, *, git: str, gw: Gateway) -> str | None:
     """The URL of the ``origin`` remote of the repository at ``cwd`` (hardened, read-only git),
-    or None when there is none or git fails. Only git's trailing newline is removed."""
-    # TODO(#15): run git through the #51 gateway: the absolute git resolved at launch and the
-    # cwd set by the gateway; the environment cleanup below (git_env) moves there too.
-    argv = ["git", *GIT_HARDENING, "-C", os.fspath(cwd), "remote", "get-url", "origin"]
+    or None when there is none or git fails. ``git`` is the absolute git resolved at launch.
+    The output is decoded by the gateway (UTF-8, invalid bytes replaced); only git's trailing
+    newline is removed."""
+    argv = [git, *GIT_HARDENING, "-C", os.fspath(cwd), "remote", "get-url", "origin"]
     try:
-        result = gateway.run(argv, timeout=GIT_TIMEOUT, env=git_env(os.environ))
-    except (OSError, ValueError, gateway.subprocess.SubprocessError):
+        result = gw.run(argv, timeout=GIT_TIMEOUT, env=git_env(os.environ))
+    except (OSError, ValueError, GatewayTimeout):
         return None
     if result.returncode != 0:
         return None
     return result.stdout.removesuffix("\n")
 
 
+def _default_origin_url(cwd: str) -> str | None:
+    """``git_origin_url`` with the ``git`` found on the sanitized ``PATH`` and the real gateway
+    (callers outside the launch path, which pass the git resolved under the path rules)."""
+    git = shutil.which("git", path=sanitize_path(os.environ.get("PATH", "")))
+    if git is None:
+        return None
+    return git_origin_url(cwd, git=os.path.abspath(git), gw=SystemGateway())
+
+
 def git_env(env: Mapping[str, str]) -> dict[str, str]:
     """``env`` without the variables that select another repository or extra config
-    (``GIT_DIR``, ``GIT_CONFIG_*`` and the like), with ``GIT_CONFIG_NOSYSTEM=1``."""
+    (``GIT_DIR``, ``GIT_CONFIG_*`` and the like), with ``GIT_CONFIG_NOSYSTEM=1`` and
+    ``LC_ALL=C``."""
     clean = {
         key: value
         for key, value in env.items()
         if key not in _GIT_ENV_DROP and not key.startswith(_GIT_ENV_DROP_PREFIXES)
     }
     clean["GIT_CONFIG_NOSYSTEM"] = "1"
+    clean["LC_ALL"] = "C"  # git's output never depends on the caller's locale
     return clean
 
 
