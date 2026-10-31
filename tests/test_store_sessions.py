@@ -111,10 +111,13 @@ def test_a_full_id_is_its_own_only_candidate(state: Store) -> None:
     assert state.session_id_candidates("cs-abcdaaaa") == [("cs-abcdaaaa", False)]
 
 
-@pytest.mark.parametrize("prefix", ["cs-a%", "cs-a_cd", "cs-%", "%", "_"])
-def test_like_wildcards_match_literally(state: Store, prefix: str) -> None:
+@pytest.mark.parametrize(
+    "prefix", ["cs-a%", "cs-a_cd", "cs-%", "%", "_", "cs-ABCD", "cs-\U0010ffff", "cs-\ud7ff"]
+)
+def test_a_prefix_outside_the_id_grammar_is_refused(state: Store, prefix: str) -> None:
     add_session(state, "cs-abcdaaaa")
-    assert state.session_id_candidates(prefix) == []
+    with pytest.raises(ValueError):
+        state.session_id_candidates(prefix)
 
 
 def test_prefix_lookup_never_uses_like(state: Store) -> None:

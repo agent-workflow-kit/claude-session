@@ -761,3 +761,204 @@ def test_write_run_files(root: Path, dirs: SessionDirs) -> None:
     )
     assert secret.value not in (sdir(root) / "run.json").read_text()
     assert secret.value not in (sdir(root) / "instructions.md").read_text()
+
+
+# Review round 1
+
+
+def test_no_temporary_name_ever_appears_in_the_session_tree(
+    root: Path, dirs: SessionDirs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1-1: every file is staged in the private directory and renamed into place."""
+    dirs.prepare_run(2)
+    seen: list[str] = []
+    real_rename = os.rename
+
+    def spy(*args: object, **kwargs: object) -> None:
+        for path in sdir(root).rglob("*"):
+            seen.append(path.name)
+        real_rename(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sessiondir.fsutil.os, "rename", spy)
+    dirs.write_prompt(1, b"p1")
+    dirs.write_prompt(2, b"p2")
+    dirs.write_inputs(2, [InputFile("a.txt", b"A")])
+    dirs.write_run_files(
+        2,
+        claude_session_path=CS_PATH,
+        summary_max_bytes=1,
+        artifact_max_bytes=1,
+        input_files=["a.txt"],
+    )
+    assert seen
+    assert not [name for name in seen if name.endswith(".tmp")]
+    assert not [p for p in pdir(root).iterdir() if p.name.endswith(".tmp")]
+
+
+def test_a_racing_linker_never_captures_a_run_file(
+    tmp_path: Path, root: Path, dirs: SessionDirs
+) -> None:
+    """R1-1: an agent hard-linking every name it sees in the session root."""
+    import threading
+
+    dirs.prepare_run(1)
+    grabbed = tmp_path / "grabbed"
+    grabbed.mkdir()
+    stop = threading.Event()
+
+    def linker() -> None:
+        count = 0
+        for _ in range(200_000):
+            if stop.is_set():
+                return
+            for name in os.listdir(sdir(root)):
+                if name.endswith(".tmp"):
+                    try:
+                        os.link(sdir(root) / name, grabbed / f"{count}")
+                        count += 1
+                    except OSError:
+                        pass
+
+    thread = threading.Thread(target=linker)
+    thread.start()
+    try:
+        written = [
+            dirs.write_run_files(
+                1,
+                claude_session_path=CS_PATH,
+                summary_max_bytes=1,
+                artifact_max_bytes=1,
+                input_files=[],
+            )
+            for _ in range(20)
+        ]
+    finally:
+        stop.set()
+        thread.join()
+    assert list(grabbed.iterdir()) == []
+    for name in ("secret", "run.json", "instructions.md"):
+        assert os.lstat(sdir(root) / name).st_nlink == 1
+    assert (sdir(root) / "secret").read_text() == written[-1].value
+    assert (sdir(root) / "instructions.md").read_text() == sessiondir.render_instructions(CS_PATH)
+
+
+def test_dirs_on_different_devices_are_refused(tmp_path: Path) -> None:
+    """R1-1: a rename from the private directory needs both on one file system."""
+    if os.stat("/proc").st_dev == os.stat(tmp_path).st_dev:
+        pytest.skip("needs two file systems")
+    a = os.open("/proc", os.O_RDONLY | os.O_DIRECTORY)
+    b = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(FailedError, match="same file system"):
+            sessiondir._check_same_device(a, b, "/proc", str(tmp_path))
+    finally:
+        os.close(a)
+        os.close(b)
+
+
+def test_place_checks_everything_before_moving(root: Path, dirs: SessionDirs) -> None:
+    """R1-2: a planted prompts symlink fails placement with nothing moved."""
+    dirs.prepare_run(2)
+    dirs.stage(2, b"p", [InputFile("a.txt", b"A")])
+    elsewhere = root.parent / "elsewhere"
+    elsewhere.mkdir()
+    (sdir(root) / "prompts").symlink_to(elsewhere)
+    staged = pdir(root) / "runs" / "2" / "staged"
+    with pytest.raises(FailedError, match="prompts"):
+        dirs.place_staged(2)
+    assert (staged / "prompt.md").read_bytes() == b"p"
+    assert (staged / "inputs" / "a.txt").read_bytes() == b"A"
+    assert not (sdir(root) / "inputs" / "2").exists()
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_place_with_a_hard_linked_prompt_moves_no_inputs(
+    tmp_path: Path, root: Path, dirs: SessionDirs
+) -> None:
+    """R1-2: the prompt is checked before the inputs are moved."""
+    dirs.prepare_run(1)
+    dirs.stage(1, b"p", [InputFile("a.txt", b"A")])
+    staged = pdir(root) / "runs" / "1" / "staged"
+    os.link(staged / "prompt.md", tmp_path / "other")
+    with pytest.raises(FailedError, match="prompt.md"):
+        dirs.place_staged(1)
+    assert (staged / "inputs" / "a.txt").exists()
+    assert not (sdir(root) / "inputs" / "1").exists()
+    assert not (sdir(root) / "prompt.md").exists()
+
+
+def test_umask_0o477_inputs_and_staging_get_0700(root: Path) -> None:
+    """R1-6: directories this module creates are repaired to 0700 whatever the umask."""
+    old = os.umask(0o477)
+    try:
+        with SessionDirs.open(str(root), SID) as d:
+            d.prepare_run(1)
+            d.write_inputs(1, [InputFile("a.txt", b"A")])
+            d.prepare_run(2)
+            d.stage(2, b"p", [InputFile("b.txt", b"B")])
+    finally:
+        os.umask(old)
+    assert mode(sdir(root) / "inputs" / "1") == 0o700
+    assert mode(pdir(root) / "runs" / "2" / "staged") == 0o700
+    assert mode(pdir(root) / "runs" / "2" / "staged" / "inputs") == 0o700
+
+
+def test_an_owned_mode_000_outbox_is_repaired(root: Path) -> None:
+    """R1-6."""
+    (sdir(root) / "outbox").mkdir(parents=True)
+    (sdir(root) / "outbox").chmod(0o000)
+    with SessionDirs.open(str(root), SID) as d:
+        d.prepare_run(1)
+    assert mode(sdir(root) / "outbox") == 0o700
+
+
+def test_read_stream_capped_waits_on_a_non_blocking_pipe() -> None:
+    """R1-7: only end of file ends the prompt, not a momentarily empty pipe."""
+    import threading
+    import time
+
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(read_fd, False)
+    os.write(write_fd, b"first part, ")
+
+    def finish() -> None:
+        time.sleep(0.2)
+        os.write(write_fd, b"second part")
+        os.close(write_fd)
+
+    thread = threading.Thread(target=finish)
+    thread.start()
+    with open(read_fd, "rb") as stream:
+        data = sessiondir.read_stream_capped(stream, 1000, flag="--prompt-file")
+    thread.join()
+    assert data == b"first part, second part"
+
+
+def test_a_non_utf8_executable_path_fails(dirs: SessionDirs) -> None:
+    """R1-8."""
+    dirs.prepare_run(1)
+    with pytest.raises(FailedError, match="UTF-8"):
+        dirs.write_run_files(
+            1,
+            claude_session_path=os.fsdecode(b"/opt/\xff/claude-session"),
+            summary_max_bytes=1,
+            artifact_max_bytes=1,
+            input_files=[],
+        )
+
+
+def test_a_non_utf8_state_root_fails(tmp_path: Path) -> None:
+    """R1-8."""
+    state = tmp_path / os.fsdecode(b"state-\xff")
+    state.mkdir(mode=0o700)
+    with SessionDirs.open(str(state), SID) as d:
+        d.prepare_run(1)
+        with pytest.raises(FailedError, match="UTF-8"):
+            d.write_run_files(
+                1,
+                claude_session_path=CS_PATH,
+                summary_max_bytes=1,
+                artifact_max_bytes=1,
+                input_files=[],
+            )
+        assert not (sdir(state) / "run.json").exists()

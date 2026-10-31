@@ -553,3 +553,16 @@ def test_outcome_file_prescan_accepts_a_negative_number(
     monkeypatch.chdir(tmp_path)
     assert main(["exec", "--bogus", "--outcome-file", "-1"]) == 2
     assert read_envelope(tmp_path / "-1")["error"]["code"] == "usage"
+
+
+@pytest.mark.parametrize("value", [".", "sub/.."])
+def test_outcome_file_naming_a_directory_is_a_warning(
+    value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "sub").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert main(["exec", "--timeout", "0", "--outcome-file", value, "--json"]) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"]["code"] == "usage"
+    assert "warning: could not write --outcome-file" in captured.err
+    assert "Traceback" not in captured.err

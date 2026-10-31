@@ -54,6 +54,8 @@ MIGRATE_POLL = 0.05  # seconds
 # ``PRAGMA application_id`` of a claude-session database ("CSes"; design.md, Data model).
 APPLICATION_ID = 0x43536573
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+# A session id or a prefix of one (ids.SESSION_ID is the full grammar).
+_SESSION_ID_PREFIX = re.compile(r"cs-[a-z2-7]{1,8}")
 # Held while state.db is checked and, when missing, created: closing the create descriptor
 # drops this process's POSIX locks, so no other thread may connect before that close. Any
 # thread that takes it after the creator finds the file and closed descriptor; it is never
@@ -832,12 +834,12 @@ class Store:
         """``(csession_id, forgotten)`` of every session whose id starts with ``prefix``.
 
         A range comparison on the primary key (``prefix <= id < upper``, where ``upper`` is
-        ``prefix`` with its last character incremented), never ``LIKE``: wildcards in the
-        input match only themselves. Callers normalize and validate the prefix first
-        (``ids.lookup_session_id``).
+        ``prefix`` with its last character incremented), never ``LIKE``. Callers normalize
+        and validate the prefix first (``ids.lookup_session_id``); a prefix outside
+        ``cs-[a-z2-7]{1,8}`` raises ``ValueError``.
         """
-        if not prefix:
-            raise ValueError("empty session id prefix")
+        if _SESSION_ID_PREFIX.fullmatch(prefix) is None:
+            raise ValueError(f"not a session id prefix: {prefix!r}")
         upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
         rows = self.conn.execute(
             "SELECT csession_id, forgotten_at IS NOT NULL FROM sessions "

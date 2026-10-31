@@ -8,9 +8,11 @@ design.md, Session directories; interface.md, Concepts and File handling:
   open: every later write is relative to those pinned descriptors, so a directory renamed or
   swapped for a symlink afterwards is never written through. Each subdirectory is verified to
   be a real directory owned by the user before use.
-- Every file is written as a temporary file plus rename relative to its directory descriptor
-  (``O_EXCL|O_NOFOLLOW``); a planted symlink or hard link at the name is replaced, never
-  written through.
+- Every file is written as a temporary file (``O_EXCL|O_NOFOLLOW``) created in the private
+  directory, which the agent never sees, and renamed into place relative to the pinned
+  descriptors; a planted symlink or hard link at the name is replaced, never written through,
+  and no temporary name ever appears in the session directory. Both directories must
+  therefore be on one file system.
 - The run secret is rotated every run; only its SHA-256 leaves this module besides the file.
 - The standard instructions contain no per-run values (design.md, Prompt delivery).
 
@@ -29,6 +31,7 @@ import json
 import os
 import re
 import secrets
+import select
 import stat
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -219,12 +222,32 @@ class Readable(Protocol):
     def read(self, size: int = ..., /) -> bytes | None: ...
 
 
+def _stream_fd(stream: Readable) -> int | None:
+    fileno = getattr(stream, "fileno", None)
+    if fileno is None:
+        return None
+    try:
+        return int(fileno())
+    except (OSError, ValueError):
+        return None  # io.UnsupportedOperation is both
+
+
 def read_stream_capped(stream: Readable, cap: int, *, flag: str) -> bytes:
-    """Read a binary stream (``--prompt-file -``: stdin) to its end, at most ``cap`` bytes."""
+    """Read a binary stream (``--prompt-file -``: stdin) to its end, at most ``cap`` bytes.
+    Only end of file ends it: a non-blocking descriptor is switched to blocking, and a read
+    that returns ``None`` (no data yet) waits for more."""
+    fd = _stream_fd(stream)
+    if fd is not None:
+        os.set_blocking(fd, True)
     chunks: list[bytes] = []
     size = 0
     while size <= cap:
         chunk = stream.read(min(_READ_CHUNK, cap + 1 - size))
+        if chunk is None:
+            if fd is None:
+                raise UsageError(f"{flag} -: the stream has no data yet and cannot be waited on")
+            select.select([fd], [], [])
+            continue
         if not chunk:
             break
         chunks.append(chunk)
@@ -262,14 +285,26 @@ def load_inputs(paths: Sequence[str], cap: int) -> list[InputFile]:
 # Generated content
 
 
+def _check_utf8(label: str, path: str) -> None:
+    """``path`` goes into a UTF-8 file: a name that is not valid UTF-8 (decoded with
+    surrogate escapes) fails with ``FailedError`` (exit 12)."""
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        shown = os.fsencode(path).decode("utf-8", "backslashreplace")
+        raise FailedError(f"{label} is not valid UTF-8: {shown}") from exc
+
+
 def render_instructions(claude_session_path: str, *, respond: bool = False) -> str:
     """The standard instructions: identical for every run of a kind. The only literal is
     the absolute path of the ``claude-session`` executable (fixed per installation);
-    ``respond`` adds the respond kind's paragraph."""
+    ``respond`` adds the respond kind's paragraph. A path that is not valid UTF-8 raises
+    ``FailedError``."""
     if not os.path.isabs(claude_session_path):
         raise ValueError(f"claude-session path must be absolute: {claude_session_path!r}")
     if _CONTROL.search(claude_session_path):
         raise ValueError(f"control character in claude-session path: {claude_session_path!r}")
+    _check_utf8("claude-session path", claude_session_path)
     text = INSTRUCTIONS_TEXT.replace("{claude_session_path}", claude_session_path)
     return text + RESPOND_INSTRUCTIONS_TEXT if respond else text
 
@@ -291,7 +326,8 @@ def build_run_json(
     input_files: Sequence[str],
 ) -> dict[str, Any]:
     """``run.json``: the per-run facts ``report`` reads instead of ``state.db``
-    (design.md, Session directories). ``state_root`` must be the resolved absolute path."""
+    (design.md, Session directories). ``state_root`` must be the resolved absolute path
+    (``FailedError`` when it is not valid UTF-8)."""
     if not ids.is_session_id(csession_id):
         raise ValueError(f"not a session id: {csession_id!r}")
     _positive("run", run)
@@ -299,6 +335,7 @@ def build_run_json(
     _positive("artifact_max_bytes", artifact_max_bytes)
     if not os.path.isabs(state_root):
         raise ValueError(f"state_root must be absolute: {state_root!r}")
+    _check_utf8("state root", state_root)
     try:
         check_input_names(input_files)
     except UsageError as exc:
@@ -321,7 +358,20 @@ def _check_run(run: int) -> None:
 
 
 def _failed(path: str, exc: OSError) -> FailedError:
+    """The ``FailedError`` (exit 12) for an unsafe or unusable session-directory entry.
+
+    TODO(#15): decide and specify the launch end reason for a session-directory failure in
+    step 7 (no current launch_end_reason covers it; candidate: a new validation reason such
+    as `session_dir_unsafe`, exit 12).
+    """
     return FailedError(f"unsafe or unusable session directory entry {path}: {exc}")
+
+
+def _check_same_device(session_fd: int, private_fd: int, session: str, private: str) -> None:
+    """Files are staged in the private directory and renamed into the session directory,
+    which needs both on one file system."""
+    if os.fstat(session_fd).st_dev != os.fstat(private_fd).st_dev:
+        raise FailedError(f"{session} and {private} are not on the same file system")
 
 
 # The directories
@@ -369,6 +419,12 @@ class SessionDirs:
                 fd = _ensure_dir(top_fd, csession_id, os.path.join(root, top, csession_id))
                 opened.append(fd)
                 fds.append(fd)
+            _check_same_device(
+                fds[0],
+                fds[1],
+                os.path.join(root, SESSIONS, csession_id),
+                os.path.join(root, PRIVATE, csession_id),
+            )
         except BaseException:
             for fd in opened:
                 os.close(fd)
@@ -512,12 +568,11 @@ class SessionDirs:
         inputs_fd = _ensure_dir(self._sfd, INPUTS, inputs)
         try:
             try:
-                os.mkdir(str(run), 0o700, dir_fd=inputs_fd)
+                return fsutil.create_private_dir_at(inputs_fd, str(run))
             except FileExistsError as exc:
                 raise FailedError(f"{INPUTS}/{run} already exists in {self.session_path}") from exc
             except OSError as exc:
                 raise _failed(os.path.join(inputs, str(run)), exc) from exc
-            return _ensure_dir(inputs_fd, str(run), os.path.join(inputs, str(run)))
         finally:
             os.close(inputs_fd)
 
@@ -525,7 +580,12 @@ class SessionDirs:
 
     def stage(self, run: int, prompt: bytes | None, inputs: Sequence[InputFile]) -> None:
         """``start``: stage the prompt and inputs in ``private/<id>/runs/<run>/staged/``
-        (which must not exist yet), so the caller may delete its files afterwards."""
+        (which must not exist yet), so the caller may delete its files afterwards.
+
+        TODO(#28): decide and specify the launch end reason for a session-directory failure
+        during staging (no current launch_end_reason covers it; candidate: a new validation
+        reason such as `session_dir_unsafe`, exit 12).
+        """
         _check_run(run)
         check_input_names([item.name for item in inputs])
         run_fd = self._run_private_dir(run)
@@ -533,10 +593,9 @@ class SessionDirs:
         staged = os.path.join(run_path, STAGED)
         try:
             try:
-                os.mkdir(STAGED, 0o700, dir_fd=run_fd)
+                staged_fd = fsutil.create_private_dir_at(run_fd, STAGED)
             except OSError as exc:
                 raise _failed(staged, exc) from exc
-            staged_fd = _ensure_dir(run_fd, STAGED, staged)
         finally:
             os.close(run_fd)
         try:
@@ -555,7 +614,9 @@ class SessionDirs:
     def place_staged(self, run: int) -> Placed:
         """The adopting ``exec``: move ``start``'s staged prompt and inputs into the session
         directory (renames relative to the pinned descriptors). Every staged entry must be a
-        regular file with one link and a valid name; ``inputs/<run>/`` must not exist yet."""
+        regular file with one link and a valid name; ``inputs/<run>/`` must not exist yet.
+        Every check and destination directory comes first, then the prompt is moved and the
+        inputs directory last, so a failure before the moves leaves ``staged/`` intact."""
         _check_run(run)
         run_fd = self._run_private_dir(run)
         staged = os.path.join(self.private_path, RUNS, str(run), STAGED)
@@ -563,31 +624,55 @@ class SessionDirs:
             staged_fd = _open_dir(run_fd, STAGED, staged)
         finally:
             os.close(run_fd)
+        opened: list[int] = []
         try:
             names = sorted(os.listdir(staged_fd))
             unexpected = [name for name in names if name not in (PROMPT, INPUTS)]
             if unexpected:
                 raise FailedError(f"unexpected entry {unexpected[0]!r} in {staged}")
-            input_names = self._place_inputs(run, staged_fd, staged) if INPUTS in names else []
+            has_prompt = PROMPT in names
+            if has_prompt:
+                _check_staged_file(staged_fd, PROMPT, staged)
+            input_names: list[str] = []
+            if INPUTS in names:
+                input_names = _check_staged_inputs(staged_fd, os.path.join(staged, INPUTS))
+            # Destinations
+            prompt_dst: tuple[int, str, str] | None = None
+            if has_prompt and run == 1:
+                prompt_dst = (self._sfd, PROMPT, self.session_path)
+            elif has_prompt:
+                prompts = os.path.join(self.session_path, PROMPTS)
+                prompts_fd = _ensure_dir(self._sfd, PROMPTS, prompts)
+                opened.append(prompts_fd)
+                prompt_dst = (prompts_fd, f"{run}.md", prompts)
+            inputs_fd = None
+            inputs = os.path.join(self.session_path, INPUTS)
+            if INPUTS in names:
+                inputs_fd = _ensure_dir(self._sfd, INPUTS, inputs)
+                opened.append(inputs_fd)
+                try:
+                    os.stat(str(run), dir_fd=inputs_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise _failed(os.path.join(inputs, str(run)), exc) from exc
+                else:
+                    raise FailedError(f"{INPUTS}/{run} already exists in {self.session_path}")
+            # Moves: the prompt first, the inputs directory last.
             prompt_path = None
-            if PROMPT in names:
-                prompt_path = self._place_prompt(run, staged_fd, staged)
+            if prompt_dst is not None:
+                dst_fd, dst, where = prompt_dst
+                self._move(staged_fd, PROMPT, dst_fd, dst, where)
+                prompt_path = os.path.join(where, dst)
+            if inputs_fd is not None:
+                # rename(2) would silently replace an empty directory created in between; the
+                # check above narrows that to a trusted agent racing its own launch.
+                self._move(staged_fd, INPUTS, inputs_fd, str(run), inputs)
             return Placed(prompt_path=prompt_path, input_names=input_names)
         finally:
+            for fd in opened:
+                os.close(fd)
             os.close(staged_fd)
-
-    def _place_prompt(self, run: int, staged_fd: int, staged: str) -> str:
-        _check_staged_file(staged_fd, PROMPT, staged)
-        if run == 1:
-            self._move(staged_fd, PROMPT, self._sfd, PROMPT, self.session_path)
-            return os.path.join(self.session_path, PROMPT)
-        prompts = os.path.join(self.session_path, PROMPTS)
-        prompts_fd = _ensure_dir(self._sfd, PROMPTS, prompts)
-        try:
-            self._move(staged_fd, PROMPT, prompts_fd, f"{run}.md", prompts)
-        finally:
-            os.close(prompts_fd)
-        return os.path.join(prompts, f"{run}.md")
 
     @staticmethod
     def _move(src_fd: int, src: str, dst_fd: int, dst: str, where: str) -> None:
@@ -597,39 +682,13 @@ class SessionDirs:
         except OSError as exc:
             raise _failed(os.path.join(where, dst), exc) from exc
 
-    def _place_inputs(self, run: int, staged_fd: int, staged: str) -> list[str]:
-        src = os.path.join(staged, INPUTS)
-        src_fd = _open_dir(staged_fd, INPUTS, src)
-        try:
-            names = sorted(os.listdir(src_fd))
-            for name in names:
-                if not ids.is_artifact_name(name):
-                    raise FailedError(f"unexpected staged input name {name!r} in {src}")
-                _check_staged_file(src_fd, name, src)
-        finally:
-            os.close(src_fd)
-        inputs = os.path.join(self.session_path, INPUTS)
-        inputs_fd = _ensure_dir(self._sfd, INPUTS, inputs)
-        try:
-            try:
-                os.stat(str(run), dir_fd=inputs_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
-                raise FailedError(f"{INPUTS}/{run} already exists in {self.session_path}")
-            # rename(2) would silently replace an empty directory created in between; the
-            # check above narrows that to a trusted agent racing its own launch.
-            self._move(staged_fd, INPUTS, inputs_fd, str(run), inputs)
-        finally:
-            os.close(inputs_fd)
-        return names
-
     # Helpers
 
-    @staticmethod
-    def _write(dir_fd: int, name: str, data: bytes, where: str) -> None:
+    def _write(self, dir_fd: int, name: str, data: bytes, where: str) -> None:
+        # The temporary file lives in the private directory, never in the agent-visible
+        # session tree (an agent could hard-link or rewrite it before the rename).
         try:
-            fsutil.write_private_file_at(dir_fd, name, data)
+            fsutil.write_private_file_at(dir_fd, name, data, tmp_dir_fd=self._pfd)
         except OSError as exc:
             raise _failed(os.path.join(where, name), exc) from exc
 
@@ -646,6 +705,20 @@ def _open_dir(dir_fd: int, name: str, path: str) -> int:
         return fsutil.open_private_dir_at(dir_fd, name)
     except OSError as exc:
         raise _failed(path, exc) from exc
+
+
+def _check_staged_inputs(staged_fd: int, src: str) -> list[str]:
+    """Check every staged input; return their names, sorted."""
+    src_fd = _open_dir(staged_fd, INPUTS, src)
+    try:
+        names = sorted(os.listdir(src_fd))
+        for name in names:
+            if not ids.is_artifact_name(name):
+                raise FailedError(f"unexpected staged input name {name!r} in {src}")
+            _check_staged_file(src_fd, name, src)
+    finally:
+        os.close(src_fd)
+    return names
 
 
 def _check_staged_file(dir_fd: int, name: str, where: str) -> None:
