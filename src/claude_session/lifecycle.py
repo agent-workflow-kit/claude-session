@@ -10,7 +10,8 @@ become pending (``Store.release_pending``: no wrapper, ``expires_at`` = now +
 ``lost_grace``), so no adopter can take it before it is frozen. A step-5 failure ends the
 run ``not-started`` (``launch.end_launch``) and ``start`` exits 12 with ``launch_failed``.
 TODO(#33): a ``start`` that dies before the run is pending leaves a launch-phase run whose
-wrapper is gone; the liveness check ends it ``launch_interrupted``.
+wrapper is gone; the liveness check ends it ``launch_interrupted`` and must also delete
+``runs/<n>/launch-spec.json`` via ``discard_spec_at``.
 
 The launch spec holds what the adopting ``exec`` must not take from anywhere else: the
 fully resolved kind profile with its origins (``env.set`` values included, which
@@ -926,7 +927,8 @@ def adopt(
     assert result.run_no is not None
     run = result.run_no
     # TODO(#33): a wrapper that dies between here and the spawn leaves an adopted run in the
-    # launch phase; the liveness check's wrapper-lost rule must cover it (launch_interrupted).
+    # launch phase; the liveness check's wrapper-lost rule must cover it (launch_interrupted)
+    # and delete runs/<n>/launch-spec.json via discard_spec_at if it is still there.
     launch.log_best_effort(
         launch.event_log(process), "adopt", level="info", csession_id=sid, run=run
     )
