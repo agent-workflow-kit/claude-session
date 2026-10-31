@@ -134,6 +134,28 @@ def test_a_processed_hook_event_imports_nothing_heavy(tmp_path: Path) -> None:
         assert conn.execute("SELECT claude_session_id FROM claude_ids").fetchall() == [(CLAUDE_ID,)]
 
 
+def test_a_draining_hook_event_imports_nothing_heavy(tmp_path: Path) -> None:
+    """PostToolUse with a request in the outbox: claim, pre-check, record and log."""
+    from .outbox_env import Run
+
+    root = tmp_path / "state"
+    store.Store.open(str(root / "state.db")).close()
+    run = Run(root).setup()
+    run.write_artifact("a.md", b"a")
+    run.report(artifact="a.md")
+    run.plant(run.request(secret="0" * 64))  # a rejection: the log is written too
+    argv = ["hook-event", "--state-dir", str(root), "PostToolUse"]
+    result = run_probe(
+        runner=RUN_MODULE_FOR.format(argv=argv),
+        stdin="{}",
+        env={**os.environ, "CSESSION_ID": run.environ()["CSESSION_ID"]},
+    )
+    assert result["code"] == 0
+    assert violations(result) == []
+    assert "claude_session.outbox" in result["package"]
+    assert sorted(r["result"] for r in run.requests()) == ["bad_secret", "ingested"]
+
+
 def test_console_script_hook_event_imports_nothing_heavy() -> None:
     result = run_probe(runner=CONSOLE_SCRIPT)
     assert result["code"] == 0

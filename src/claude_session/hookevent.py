@@ -2,8 +2,13 @@
 
 See design.md (Hook-event fast path, State machine) and interface.md (State transitions,
 Internal commands). ``__main__`` dispatches here before importing ``cli``, so this module and
-everything it imports stay standard library only, plus ``store`` (and, once they exist,
-``outbox``'s ingestion side and ``gateway``): never ``config``, Pydantic, YAML or argparse.
+everything it imports stay standard library only, plus ``store``, ``outbox`` (itself stdlib
+only) and, once it is needed, ``gateway``: never ``config``, Pydantic, YAML or argparse.
+
+``PostToolUse`` and ``Stop`` drain the run's outbox: requests are claimed and pre-checked
+before the transaction (``prepare_drain``), recorded inside it after the hook's own row, and
+cleaned up and logged after the commit; a rejection found by ``PostToolUse`` is the hook's
+output (design.md, Outbox and ingestion).
 
 Contract with ``__main__``: ``main`` raises on any error and writes the hook's JSON output to
 ``sys.stdout`` only on success; ``__main__`` contains the error (logged as
@@ -22,6 +27,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, BinaryIO
 
+from . import outbox
 from .store import BUSY_TIMEOUT, HookRun, Store, db_path
 
 # The events the injected hooks pass (interface.md, Internal commands). Kept equal to
@@ -134,7 +140,7 @@ TABLE: dict[str, Rule] = {
     "stop_background": Rule(activity="working", after_session_start=True),
     # Stop without background tasks, Notification idle_prompt.
     "stop_idle": Rule(activity="idle", after_session_start=True),
-    # Report rows: applied by ingestion (outbox, #14) through ``transition``.
+    # Report rows: applied by outbox ingestion (``_apply_report``) through ``transition``.
     "report_final": Rule(escalation_open=False, report=True),
     "report_needs_input": Rule(escalation_open=True, report=True),
     "session_end": Rule(),
@@ -347,21 +353,52 @@ def _session_start(payload: dict[str, Any]) -> Hook:
 # hookconf.json: hook-event's configuration, written by exec into the private run directory
 
 
-def hookconf_bytes(input_files: list[str]) -> bytes:
+@dataclass(frozen=True)
+class HookConf:
+    """``hookconf.json``: the run's input names and the report caps ingestion applies."""
+
+    input_files: list[str]
+    summary_max_bytes: int
+    artifact_max_bytes: int
+
+    @property
+    def limits(self) -> outbox.Limits:
+        return outbox.Limits(
+            summary_max_bytes=self.summary_max_bytes,
+            artifact_max_bytes=self.artifact_max_bytes,
+        )
+
+
+HOOKCONF_KEYS = frozenset({"v", "input_files", "summary_max_bytes", "artifact_max_bytes"})
+
+
+def hookconf_bytes(
+    input_files: list[str], *, summary_max_bytes: int, artifact_max_bytes: int
+) -> bytes:
     """The content of ``private/<id>/runs/<n>/hookconf.json`` for a run whose inputs are
-    ``input_files`` (basenames, in order).
+    ``input_files`` (basenames, in order) and whose report caps are the given ones (outbox
+    ingestion reads them here, never from config or an agent-writable file).
 
     TODO(#15): exec writes it at launch step 7, through ``SessionDirs`` (private run dir).
     TODO(#38): add the notes command settings (``notes_context_cmd`` and its limits).
     """
-    conf = {"v": 1, "input_files": list(input_files)}
+    conf = {
+        "v": 1,
+        "input_files": list(input_files),
+        "summary_max_bytes": summary_max_bytes,
+        "artifact_max_bytes": artifact_max_bytes,
+    }
     _check_hookconf(conf)
     return json.dumps(conf, ensure_ascii=False).encode("utf-8")
 
 
-def _check_hookconf(conf: object) -> list[str]:
-    """Validate a hookconf object; returns its input names."""
-    if not isinstance(conf, dict) or set(conf) != {"v", "input_files"} or conf["v"] != 1:
+def _cap(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 2**53 - 1
+
+
+def _check_hookconf(conf: object) -> HookConf:
+    """Validate a hookconf object."""
+    if not isinstance(conf, dict) or set(conf) != HOOKCONF_KEYS or conf["v"] != 1:
         raise HookEventError("hookconf.json has an unknown shape")
     names = conf["input_files"]
     if not isinstance(names, list) or len(names) > HOOKCONF_MAX_INPUTS:
@@ -371,7 +408,13 @@ def _check_hookconf(conf: object) -> list[str]:
             raise HookEventError("hookconf.json has an invalid input name")
     if len(set(names)) != len(names):
         raise HookEventError("hookconf.json has duplicate input names")
-    return names
+    if not _cap(conf["summary_max_bytes"]) or not _cap(conf["artifact_max_bytes"]):
+        raise HookEventError("hookconf.json has an invalid size cap")
+    return HookConf(
+        input_files=names,
+        summary_max_bytes=conf["summary_max_bytes"],
+        artifact_max_bytes=conf["artifact_max_bytes"],
+    )
 
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
@@ -386,13 +429,15 @@ def _open_own_dir(name: str, dir_fd: int | None) -> int:
     return fd
 
 
-def read_hookconf(private_dir: str, run_no: int) -> list[str]:
-    """Read ``<private_dir>/runs/<run_no>/hookconf.json`` without following a symlink at any
-    step under the trusted ``private`` directory (only that parent is resolved; it is then
-    walked component by component, and ``<id>``, ``runs`` and ``<n>`` are opened without
-    following a symlink); each directory of the private run path and the file must be the
-    user's own, the file a regular single-link file no one else can access, of at most
-    ``HOOKCONF_MAX_BYTES``. Returns the run's input names."""
+def private_run_path(private_dir: str, run_no: int) -> str:
+    return os.path.join(os.path.normpath(private_dir), "runs", str(run_no))
+
+
+def open_private_run_dir(private_dir: str, run_no: int) -> int:
+    """Open ``<private_dir>/runs/<run_no>`` without following a symlink at any step under the
+    trusted ``private`` directory (only that parent is resolved; it is then walked component
+    by component, and ``<id>``, ``runs`` and ``<n>`` are opened without following a symlink
+    and must be the user's own). Returns a descriptor the caller closes."""
     normalized = os.path.normpath(private_dir)
     session_part = os.path.basename(normalized)
     if not os.path.isabs(normalized) or session_part in ("", ".", ".."):
@@ -408,23 +453,30 @@ def read_hookconf(private_dir: str, run_no: int) -> list[str]:
                 next_fd = os.open(part, _DIR_FLAGS, dir_fd=fd)
             os.close(fd)
             fd = next_fd
-        file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-        file_fd = os.open(HOOKCONF_NAME, file_flags, dir_fd=fd)
-        try:
-            info = os.fstat(file_fd)
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_nlink != 1
-                or info.st_uid != os.geteuid()
-                or stat.S_IMODE(info.st_mode) & 0o077
-                or info.st_size > HOOKCONF_MAX_BYTES
-            ):
-                raise HookEventError("hookconf.json is not a private regular file")
-            data = os.read(file_fd, HOOKCONF_MAX_BYTES + 1)
-        finally:
-            os.close(file_fd)
-    finally:
+    except BaseException:
         os.close(fd)
+        raise
+    return fd
+
+
+def read_hookconf_at(run_fd: int) -> HookConf:
+    """Read ``hookconf.json`` in the private run directory ``run_fd``: a regular single-link
+    file of the user's own that no one else can access, of at most ``HOOKCONF_MAX_BYTES``."""
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    file_fd = os.open(HOOKCONF_NAME, file_flags, dir_fd=run_fd)
+    try:
+        info = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+            or info.st_size > HOOKCONF_MAX_BYTES
+        ):
+            raise HookEventError("hookconf.json is not a private regular file")
+        data = os.read(file_fd, HOOKCONF_MAX_BYTES + 1)
+    finally:
+        os.close(file_fd)
     if len(data) > HOOKCONF_MAX_BYTES:
         raise HookEventError("hookconf.json is too large")
     try:
@@ -432,6 +484,16 @@ def read_hookconf(private_dir: str, run_no: int) -> list[str]:
     except (UnicodeDecodeError, ValueError) as exc:
         raise HookEventError("hookconf.json is not JSON") from exc
     return _check_hookconf(conf)
+
+
+def read_hookconf(private_dir: str, run_no: int) -> HookConf:
+    """Read ``<private_dir>/runs/<run_no>/hookconf.json`` (``open_private_run_dir``,
+    ``read_hookconf_at``)."""
+    fd = open_private_run_dir(private_dir, run_no)
+    try:
+        return read_hookconf_at(fd)
+    finally:
+        os.close(fd)
 
 
 # Output
@@ -453,6 +515,10 @@ def session_start_output(csession_dir: str, run_no: int, inputs: list[str]) -> d
 
 # The handler
 
+# The hooks that drain the outbox (design.md, Hook-event fast path).
+DRAIN_CAUSES = frozenset({"PostToolUse", "Stop"})
+LOG_NAME = "log.jsonl"
+
 
 def _escalation_open(store: Store, run: HookRun) -> bool:
     """An unanswered escalation: the run's report is ``needs-input`` and no
@@ -463,19 +529,103 @@ def _escalation_open(store: Store, run: HookRun) -> bool:
     return not store.prompt_submitted_after_report(run)
 
 
+def _drainable(run: HookRun | None) -> bool:
+    """A run whose outbox a hook may drain: adopted, open, live, not forgotten, with the
+    secret digest and directory identities ``exec`` recorded."""
+    return (
+        run is not None
+        and not run.forgotten
+        and run.adopted_and_open
+        and run.state in LIVE_STATES
+        and run.csession_dir is not None
+        and run.private_dir is not None
+        and run.secret_sha256 is not None
+        and run.outbox_dev_ino is not None
+        and run.artifacts_dev_ino is not None
+    )
+
+
+def prepare_drain(store: Store, csession_id: str, log: _Log) -> outbox.Drain | None:
+    """Claim and pre-check the current run's outbox requests, before the hook's transaction
+    (design.md, Hook-event fast path). None when there is nothing to drain. An ``outbox/``
+    that cannot be trusted is logged (``outside_dir``) and never drained; the hook's own
+    event still applies."""
+    run = store.hook_run(csession_id)
+    if not _drainable(run):
+        return None
+    assert run is not None and run.private_dir is not None and run.csession_dir is not None
+    assert run.secret_sha256 is not None
+    assert run.outbox_dev_ino is not None and run.artifacts_dev_ino is not None
+    run_fd = open_private_run_dir(run.private_dir, run.run_no)
+    try:
+        return outbox.Drain.prepare(
+            csession_id=csession_id,
+            run_no=run.run_no,
+            csession_dir=run.csession_dir,
+            private_run_fd=run_fd,
+            private_run_dir=private_run_path(run.private_dir, run.run_no),
+            outbox_dev_ino=run.outbox_dev_ino,
+            artifacts_dev_ino=run.artifacts_dev_ino,
+            secret_sha256=run.secret_sha256,
+            limits=lambda: read_hookconf_at(run_fd).limits,
+        )
+    except outbox.OutboxDirError:
+        log.write("report_rejected", "warn", csession_id, run.run_no, reason="outside_dir")
+        return None
+    finally:
+        os.close(run_fd)
+
+
 @dataclass(frozen=True)
 class Applied:
-    """What ``apply_hook`` did: the run it applied to (None: ignored) and the output decided
-    inside the transaction."""
+    """What ``apply_hook`` did: the run it applied to (None: ignored), the output decided
+    inside the transaction and whether the drain's requests were recorded."""
 
     run: HookRun | None
     output: dict[str, Any] | None = None
+    drained: bool = False
 
 
-def apply_hook(store: Store, csession_id: str, hook: Hook) -> Applied:
+def _apply_report(store: Store, csession_id: str, drain: outbox.Drain) -> None:
+    """Record the drained requests after the hook's own row (interface.md: "its row applies
+    after that hook's own event") and apply the ingested report through the table, with a
+    ``report`` event even when only the report changed."""
+    run = store.hook_run(csession_id)  # reloaded: the hook's own row changed it
+    assert run is not None
+    before = values_from(
+        state=run.state,
+        activity=run.activity,
+        needs_input_reason=run.needs_input_reason,
+        escalation_open=_escalation_open(store, run),
+        has_report=run.report_status is not None,
+    )
+    status = drain.record(store, run_no=run.run_no, live=True)
+    if status is None:
+        return
+    event = "report_needs_input" if status == "needs-input" else "report_final"
+    after = transition(
+        before, event, mode=run.mode or "", session_started=run.session_started_at is not None
+    )
+    state, reason, activity = derive(after)
+    # TODO(#20): post-state-change delivery picks up the appended event (cause report).
+    store.apply_state(
+        run,
+        state=state,
+        activity=activity,
+        needs_input_reason=reason,
+        cause="report",
+        always=True,
+    )
+
+
+def apply_hook(
+    store: Store, csession_id: str, hook: Hook, drain: outbox.Drain | None = None
+) -> Applied:
     """In one transaction: load the session's current run, record SessionStart and SessionEnd
-    facts, decide the Stop backstop, apply the table and append the event. A run that is not
-    adopted, already ended or not in a live state is left alone."""
+    facts, decide the Stop backstop, apply the table and append the event, then record the
+    drained outbox requests (``drain``, prepared before the transaction) and apply an
+    ingested report. A run that is not adopted, already ended or not in a live state is left
+    alone (its claimed requests stay for the next drain)."""
     with store.transaction():
         run = store.hook_run(csession_id)
         if run is None:
@@ -484,6 +634,8 @@ def apply_hook(store: Store, csession_id: str, hook: Hook) -> Applied:
             return Applied(None)  # ignored silently (design.md, Input and configuration)
         if not run.adopted_and_open or run.state not in LIVE_STATES:
             return Applied(None)
+        if drain is not None and drain.run_no != run.run_no:
+            drain = None  # a new run began after the drain was prepared: leave its requests
         if hook.claude_session_id is not None:
             assert hook.source is not None
             store.record_session_start(
@@ -494,22 +646,21 @@ def apply_hook(store: Store, csession_id: str, hook: Hook) -> Applied:
             )
         if hook.session_end_reason is not None:
             store.record_session_end_reason(run, hook.session_end_reason)
-        # TODO(#14): claim and pre-check outbox requests before this transaction (PostToolUse
-        # and Stop only) and record them here, after this hook's own row (interface.md:
-        # "its row applies after that hook's own event"); a rejection found by PostToolUse
-        # returns the rejection block. The backstop below must see a report drained by this
-        # Stop.
         started = run.session_started_at is not None
         if (
             hook.backstop_candidate
             and started
             and run.mode == "headless"
             and run.report_status is None
+            and (drain is None or drain.winner is None)  # a report drained by this Stop
             and not run.backstop_used
             and store.take_backstop(run)
         ):
-            # A blocked Stop changes nothing and records no event (design.md, State machine).
-            return Applied(run, backstop_output())
+            # A blocked Stop changes nothing and records no event (design.md, State machine);
+            # the drained requests (all rejected) are still recorded.
+            if drain is not None:
+                drain.record(store, run_no=run.run_no, live=True)
+            return Applied(run, backstop_output(), drained=drain is not None)
         before = values_from(
             state=run.state,
             activity=run.activity,
@@ -523,7 +674,70 @@ def apply_hook(store: Store, csession_id: str, hook: Hook) -> Applied:
         store.apply_state(
             run, state=state, activity=activity, needs_input_reason=reason, cause=hook.cause
         )
-    return Applied(run)
+        if drain is not None:
+            _apply_report(store, csession_id, drain)
+    return Applied(run, drained=drain is not None)
+
+
+class _Log:
+    """Best-effort ``log.jsonl`` records of the hook path (``logs`` is imported only when a
+    record is written). Never agent text: request ids are validated UUIDs."""
+
+    def __init__(self, state_dir: str) -> None:
+        self.path = os.path.join(state_dir, LOG_NAME)
+
+    def write(
+        self,
+        event: str,
+        level: str,
+        csession_id: str,
+        run_no: int,
+        *,
+        reason: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        try:
+            from . import logs
+
+            logs.EventLog(self.path).write(
+                event,
+                level=level,
+                csession_id=csession_id,
+                run=run_no,
+                reason=reason,
+                message=message,
+            )
+        except Exception:  # logging is best effort (interface.md, Audit and log)
+            pass
+
+    def failure(self, csession_id: str, message: str) -> None:
+        try:
+            from . import logs
+
+            logs.EventLog(self.path).write(
+                "hook_event_failed", level="error", csession_id=csession_id, message=message
+            )
+        except Exception:
+            pass
+
+
+def log_drain(log: _Log, drain: outbox.Drain) -> None:
+    """One record per drained request: ``report_ingested``, ``report_rejected`` (with the
+    reason) or ``outbox_discarded``; plus the malformed entries removed from the outbox."""
+    sid, run_no = drain.csession_id, drain.run_no
+    for _ in range(drain.removed_malformed):
+        log.write("report_rejected", "warn", sid, run_no, reason="malformed")
+    for item in drain.items:
+        request = f"request {item.request_id}"
+        if item.duplicate:
+            log.write("outbox_discarded", "info", sid, run_no, message=f"{request}: duplicate")
+        elif item.result == "ingested":
+            log.write("report_ingested", "info", sid, run_no, message=request)
+        elif item.result == "discarded":
+            why = "over the drain cap" if item.unchecked else "superseded by a newer request"
+            log.write("outbox_discarded", "info", sid, run_no, message=f"{request}: {why}")
+        elif item.result is not None:
+            log.write("report_rejected", "warn", sid, run_no, reason=item.result, message=request)
 
 
 def main(
@@ -539,15 +753,39 @@ def main(
     hook = classify(cause, data)
     if hook is None:
         return 0
+    log = _Log(state_dir)
     with Store.open(db_path(state_dir), migrate=False, busy_timeout=BUSY_TIMEOUT) as store:
-        applied = apply_hook(store, csession_id, hook)
+        drain = None
+        if cause in DRAIN_CAUSES:
+            try:
+                drain = prepare_drain(store, csession_id, log)
+            except Exception as exc:
+                # The hook's own event must not depend on the outbox: a drain that cannot run
+                # (an unusable private directory or hookconf.json) is logged with the
+                # exception type only, and its claimed requests stay for the next drain.
+                log.failure(csession_id, f"{cause}: outbox drain: {type(exc).__name__}")
+        try:
+            applied = apply_hook(store, csession_id, hook, drain)
+        except BaseException:
+            if drain is not None:
+                drain.finish(committed=False)  # claimed requests stay for the next drain
+            raise
     run = applied.run
     output = applied.output
+    if drain is not None:
+        drain.finish(committed=applied.drained)
+        if applied.drained:
+            log_drain(log, drain)
+            rejection = drain.feedback()
+            if cause == "PostToolUse" and rejection is not None:
+                output = outbox.rejection_output(rejection)
+        elif drain.removed_malformed:
+            log_drain(log, drain)
     if run is not None and cause == "SessionStart":
         if run.csession_dir is None or run.private_dir is None:
             raise HookEventError("session has no directories")
-        inputs = read_hookconf(run.private_dir, run.run_no)
-        output = session_start_output(run.csession_dir, run.run_no, inputs)
+        conf = read_hookconf(run.private_dir, run.run_no)
+        output = session_start_output(run.csession_dir, run.run_no, conf.input_files)
     if output is not None:
         sys.stdout.write(json.dumps(output) + "\n")
     return 0

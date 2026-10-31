@@ -1,0 +1,752 @@
+"""Outbox ingestion in the injected hooks (design.md, Outbox and ingestion; interface.md,
+report and State transitions): claim by rename, secret check, artifact copy-then-scan and
+freeze, rejection feedback through PostToolUse, drain caps, latest valid report wins."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sqlite3
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from claude_session import hookevent, outbox
+from claude_session.store import Store
+
+from .outbox_env import ARTIFACT_MAX, SUMMARY_MAX, Run, listing, rejection
+from .schemas import validate
+from .test_hookevent import SID
+
+
+@pytest.fixture
+def run(tmp_path: Path) -> Iterator[Run]:
+    root = tmp_path / "state"
+    Store.open(str(root / "state.db")).close()
+    yield Run(root).setup()
+
+
+def results(run: Run) -> list[str]:
+    return [r["result"] for r in run.requests()]
+
+
+def log_events(run: Run) -> list[tuple[str, str | None]]:
+    for record in run.log():
+        validate(record, "claude-session/log.json")
+    return [(r["event"], r.get("reason")) for r in run.log()]
+
+
+def assert_rejected(run: Run, code: str, output: str) -> None:
+    assert rejection(output) == code
+    assert run.run()["report_status"] is None
+    assert results(run) == [code]
+    assert listing(run.outbox) == [] and listing(run.claimed) == []
+    assert ("report_rejected", code) in log_events(run)
+
+
+# Ingestion and the state
+
+
+def test_a_done_report_is_ingested_by_post_tool_use(run: Run) -> None:
+    queued = run.report(summary="All tests pass.")
+    assert run.post_tool_use() == ""
+    r = run.run()
+    assert (r["report_status"], r["report_summary"], r["report_reason"]) == (
+        "done",
+        "All tests pass.",
+        None,
+    )
+    assert r["report_implicit"] == 0 and r["reported_at"] is not None
+    assert r["artifact_name"] is None and r["artifact_path"] is None
+    assert run.state() == ("reported", None, "working")
+    assert [(q["request_id"], q["result"], q["run_no"]) for q in run.requests()] == [
+        (queued.request_id, "ingested", 1)
+    ]
+    assert listing(run.outbox) == [] and listing(run.claimed) == []
+    assert log_events(run) == [("report_ingested", None)]
+    assert run.session()["updated_at"] != "2026-10-30T00:00:00.000000Z"
+
+
+def test_the_report_row_follows_the_hooks_own_row(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    Store.open(str(root / "state.db")).close()
+    run = Run(root).setup(state="idle", activity="idle")
+    run.report()
+    run.post_tool_use()
+    events = [(e["cause"], e["from_state"], e["to_state"], e["to_activity"]) for e in run.events()]
+    assert events == [
+        ("PostToolUse", "idle", "working", "working"),
+        ("report", "working", "reported", "working"),
+    ]
+
+
+def test_a_report_only_change_still_writes_a_report_event(run: Run) -> None:
+    run.report(summary="first")
+    run.post_tool_use()
+    run.report(summary="second")
+    run.post_tool_use()
+    assert run.state() == ("reported", None, "working")
+    assert len(run.report_events()) == 2
+    assert run.run()["report_summary"] == "second"
+
+
+def test_a_needs_input_report_escalates_until_the_next_prompt(run: Run) -> None:
+    reason = run.write_artifact("reason.md", b"Which database?")
+    run.report("needs-input", reason_file=reason)
+    run.post_tool_use()
+    assert run.state() == ("needs-input", "escalation", "working")
+    run.stop_hook()
+    assert run.state() == ("needs-input", "escalation", "idle")
+    run.hook("UserPromptSubmit", {})
+    assert run.state() == ("reported", None, "working")
+    run.post_tool_use()
+    assert run.state() == ("reported", None, "working")
+    # A new escalation after the prompt opens again (it relies on the report event).
+    run.report("needs-input", reason_file=reason)
+    run.post_tool_use()
+    assert run.state() == ("needs-input", "escalation", "working")
+    run.post_tool_use()
+    assert run.state() == ("needs-input", "escalation", "working")
+
+
+def test_a_final_report_closes_an_escalation(run: Run) -> None:
+    reason = run.write_artifact("reason.md", b"?")
+    run.report("needs-input", reason_file=reason)
+    run.post_tool_use()
+    run.report("done")
+    run.post_tool_use()
+    assert run.state() == ("reported", None, "working")
+
+
+def test_a_waiting_prompt_takes_precedence_over_the_report(run: Run) -> None:
+    """Drained by Stop while a permission prompt waits: needs-input(permission) stays, and
+    the report event is still written."""
+    run.hook("PermissionRequest", {"tool_name": "Bash"})
+    run.report()
+    run.stop_hook()
+    assert run.state() == ("needs-input", "permission", "idle")
+    assert run.run()["report_status"] == "done"
+    assert len(run.report_events()) == 1
+
+
+def test_stop_drains_and_the_backstop_sees_the_report(run: Run) -> None:
+    run.report()
+    assert run.stop_hook() == ""
+    assert run.run()["report_status"] == "done"
+    assert run.run()["backstop_used"] == 0
+    assert run.state() == ("reported", None, "idle")
+
+
+def test_a_rejection_found_by_stop_is_only_logged_and_the_backstop_still_blocks(run: Run) -> None:
+    run.plant(run.request(secret="0" * 64))
+    output = json.loads(run.stop_hook())
+    assert output == hookevent.backstop_output()
+    assert results(run) == ["bad_secret"]
+    assert run.run()["report_status"] is None
+
+
+def test_a_rejection_found_by_an_interactive_stop_prints_nothing(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    Store.open(str(root / "state.db")).close()
+    run = Run(root).setup(mode="interactive")
+    run.plant(run.request(secret="0" * 64))
+    assert run.stop_hook() == ""
+    assert results(run) == ["bad_secret"]
+
+
+@pytest.mark.parametrize(
+    "event",
+    ["UserPromptSubmit", "PermissionRequest", "Notification", "SessionEnd"],
+)
+def test_other_hooks_never_drain(run: Run, event: str) -> None:
+    payload = {"tool_name": "Bash", "notification_type": "idle_prompt", "reason": "other"}
+    run.report()
+    run.hook(event, payload)
+    assert len(listing(run.outbox)) == 1
+    assert run.requests() == []
+
+
+def test_a_post_tool_use_without_requests_prints_nothing_and_writes_no_log(run: Run) -> None:
+    assert run.post_tool_use() == ""
+    assert run.requests() == [] and run.log() == []
+
+
+# Artifacts
+
+
+def test_the_artifact_is_frozen_with_its_hash(run: Run) -> None:
+    data = b"# Result\nok\n"
+    run.write_artifact("result.md", data)
+    run.report(artifact="result.md")
+    run.post_tool_use()
+    r = run.run()
+    frozen = run.private_run / "artifact" / "1" / "result.md"
+    assert r["artifact_name"] == "result.md"
+    assert r["artifact_path"] == str(frozen)
+    assert r["artifact_sha256"] == hashlib.sha256(data).hexdigest()
+    assert r["artifact_size"] == len(data)
+    assert r["artifact_ingest_seq"] == 1
+    assert frozen.read_bytes() == data
+    assert oct(frozen.stat().st_mode & 0o777) == oct(0o600)
+    assert listing(run.private_run / "scan") == []
+    # The agent changing its working copy does not change the frozen one.
+    run.write_artifact("result.md", b"changed")
+    assert frozen.read_bytes() == data
+
+
+def test_later_reports_never_overwrite_earlier_frozen_files(run: Run) -> None:
+    run.write_artifact("result.md", b"one")
+    run.report(artifact="result.md")
+    run.post_tool_use()
+    run.report()  # no artifact: the run's artifact becomes null
+    run.post_tool_use()
+    assert run.run()["artifact_name"] is None and run.run()["artifact_path"] is None
+    run.write_artifact("result.md", b"three")
+    run.report(artifact="result.md")
+    run.post_tool_use()
+    r = run.run()
+    assert r["artifact_ingest_seq"] == 3
+    assert (run.private_run / "artifact" / "1" / "result.md").read_bytes() == b"one"
+    assert (run.private_run / "artifact" / "3" / "result.md").read_bytes() == b"three"
+
+
+def test_an_artifact_changed_after_report_is_rejected(run: Run) -> None:
+    run.write_artifact("result.md", b"reviewed content")
+    run.report(artifact="result.md")
+    run.write_artifact("result.md", b"swapped content")
+    assert_rejected(run, "artifact_changed", run.post_tool_use())
+    assert listing(run.private_run / "scan") == []
+    assert not (run.private_run / "artifact").exists()
+
+
+def test_an_artifact_removed_after_report_is_rejected(run: Run) -> None:
+    path = run.write_artifact("result.md", b"x")
+    run.report(artifact="result.md")
+    os.unlink(path)
+    assert_rejected(run, "artifact_missing", run.post_tool_use())
+
+
+def test_an_artifact_swapped_for_a_symlink_is_rejected(run: Run, tmp_path: Path) -> None:
+    path = run.write_artifact("result.md", b"x")
+    run.report(artifact="result.md")
+    os.unlink(path)
+    target = tmp_path / "private-key"
+    target.write_bytes(b"x")  # even the same bytes
+    os.symlink(target, path)
+    assert_rejected(run, "not_regular_file", run.post_tool_use())
+
+
+def test_an_artifact_swapped_for_a_hard_link_is_rejected(run: Run, tmp_path: Path) -> None:
+    path = run.write_artifact("result.md", b"x")
+    run.report(artifact="result.md")
+    os.link(path, tmp_path / "second-link")
+    assert_rejected(run, "not_regular_file", run.post_tool_use())
+
+
+def test_an_artifact_swapped_for_a_fifo_is_rejected_without_waiting(run: Run) -> None:
+    path = run.write_artifact("result.md", b"x")
+    run.report(artifact="result.md")
+    os.unlink(path)
+    os.mkfifo(path)
+    assert_rejected(run, "not_regular_file", run.post_tool_use())
+
+
+def test_an_artifact_grown_past_the_cap_is_rejected(run: Run) -> None:
+    path = run.write_artifact("result.md", b"x")
+    run.report(artifact="result.md")
+    Path(path).write_bytes(b"x" * (ARTIFACT_MAX + 1))
+    assert_rejected(run, "too_large", run.post_tool_use())
+
+
+def test_a_replaced_artifacts_directory_is_rejected(run: Run) -> None:
+    run.write_artifact("result.md", b"x")
+    run.report(artifact="result.md")
+    run.artifacts.rename(Path(run.csession_dir) / "artifacts.old")
+    run.artifacts.mkdir()
+    (run.artifacts / "result.md").write_bytes(b"x")
+    assert_rejected(run, "outside_dir", run.post_tool_use())
+
+
+def test_a_report_without_an_artifact_ignores_a_replaced_artifacts_directory(run: Run) -> None:
+    run.report()
+    run.artifacts.rename(Path(run.csession_dir) / "artifacts.old")
+    run.artifacts.mkdir()
+    run.post_tool_use()
+    assert results(run) == ["ingested"]
+
+
+# Rejections of the request itself
+
+
+def test_a_forged_secret_is_rejected(run: Run) -> None:
+    run.plant(run.request(secret="f" * 64))
+    assert_rejected(run, "bad_secret", run.post_tool_use())
+
+
+def test_a_request_for_another_run_is_stale(run: Run) -> None:
+    run.plant(run.request(run=2))
+    assert_rejected(run, "stale_run", run.post_tool_use())
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"v": 2},
+        {"v": True},
+        {"v": 1.0},
+        {"run": 0},
+        {"run": True},
+        {"secret": "F" * 64},
+        {"secret": 5},
+        {"status": "finished"},
+        {"status": "done", "summary": None},
+        {"status": "done", "summary": "   "},
+        {"status": "blocked", "reason": None},
+        {"summary": 7},
+        {"summary": "nul\u0000"},
+        {"summary": "\ud800 lone surrogate"},
+        {"artifact": "../x", "artifact_sha256": "0" * 64},
+        {"artifact": "a", "artifact_sha256": None},
+        {"artifact": None, "artifact_sha256": "0" * 64},
+        {"artifact": "a", "artifact_sha256": "XYZ"},
+        {"created": "yesterday"},
+        {"created": None},
+        {"extra": 1},
+    ],
+)
+def test_a_malformed_request_is_rejected(run: Run, change: dict[str, Any]) -> None:
+    run.plant(run.request(**change))
+    assert_rejected(run, "malformed", run.post_tool_use())
+
+
+def test_a_request_with_a_missing_field_is_rejected(run: Run) -> None:
+    doc = run.request()
+    del doc["created"]
+    run.plant(doc)
+    assert_rejected(run, "malformed", run.post_tool_use())
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"",
+        b"not json",
+        b"[]",
+        b"\xff\xfe",
+        b'{"v": NaN}',
+        b"[" * 10_000,  # deep nesting: RecursionError
+    ],
+)
+def test_garbage_is_rejected_malformed(run: Run, raw: bytes) -> None:
+    run.plant(raw=raw)
+    assert_rejected(run, "malformed", run.post_tool_use())
+
+
+def test_duplicate_keys_are_rejected(run: Run) -> None:
+    good = json.dumps(run.request())
+    raw = good[:-1] + ', "status": "failed"}'
+    run.plant(raw=raw.encode())
+    assert_rejected(run, "malformed", run.post_tool_use())
+
+
+def test_an_oversized_request_is_rejected_unread(run: Run) -> None:
+    run.plant(raw=b" " * (4 * SUMMARY_MAX + outbox.REQUEST_OVERHEAD + 1))
+    assert_rejected(run, "too_large", run.post_tool_use())
+
+
+def test_an_oversized_summary_is_rejected(run: Run) -> None:
+    run.plant(run.request(summary="x" * (SUMMARY_MAX + 1)))
+    assert_rejected(run, "too_large", run.post_tool_use())
+
+
+def test_a_symlinked_request_is_rejected_and_never_followed(run: Run, tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text(json.dumps(run.request()))
+    rid = outbox.new_request_id()
+    os.symlink(target, run.outbox / f"{rid}.json")
+    assert_rejected(run, "not_regular_file", run.post_tool_use())
+    assert target.exists()  # only the link was removed
+
+
+def test_a_hard_linked_request_is_rejected(run: Run, tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text(json.dumps(run.request()))
+    os.link(target, run.outbox / f"{outbox.new_request_id()}.json")
+    assert_rejected(run, "not_regular_file", run.post_tool_use())
+    assert target.exists()
+
+
+def test_a_fifo_request_is_rejected_without_waiting(run: Run) -> None:
+    os.mkfifo(run.outbox / f"{outbox.new_request_id()}.json")
+    assert_rejected(run, "not_regular_file", run.post_tool_use())
+
+
+def test_a_directory_with_a_request_name_is_removed_never_claimed(run: Run) -> None:
+    rid = outbox.new_request_id()
+    (run.outbox / f"{rid}.json").mkdir()
+    (run.outbox / f"{rid}.json" / "inner").write_text("x")
+    assert run.post_tool_use() == ""
+    assert listing(run.claimed) == []
+    assert run.requests() == []
+    assert ("report_rejected", "malformed") in log_events(run)
+
+
+@pytest.mark.parametrize("name", ["junk.txt", ".hidden", "0190b6b2.json", "x" * 200])
+def test_other_names_are_removed_as_malformed(run: Run, name: str) -> None:
+    (run.outbox / name).write_text("x")
+    assert run.post_tool_use() == ""  # no request to give feedback on
+    assert listing(run.outbox) == []
+    assert log_events(run) == [("report_rejected", "malformed")]
+
+
+def test_an_empty_junk_directory_is_removed_and_a_full_one_left(run: Run) -> None:
+    (run.outbox / "empty").mkdir()
+    (run.outbox / "full").mkdir()
+    (run.outbox / "full" / "x").write_text("x")
+    run.post_tool_use()
+    assert listing(run.outbox) == ["full"]
+
+
+def test_the_log_never_contains_agent_text(run: Run) -> None:
+    marker = "AGENT-TEXT-MARKER"
+    (run.outbox / f"{marker}.json").write_text(marker)
+    run.plant(run.request(summary=marker, secret="0" * 64))
+    run.report(summary=marker)
+    run.post_tool_use()
+    assert marker not in (run.root / "log.jsonl").read_text()
+
+
+# Secrets
+
+
+def test_contains_secret_rejects_through_the_scanner(run: Run, tmp_path: Path) -> None:
+    """The contains_secret seam (#26): a scanner hit rejects the summary, the reason or the
+    artifact copy."""
+    run.write_artifact("a.md", b"has CANARY inside")
+    run.report(artifact="a.md")
+    with Store.open(run.db) as store:
+        hook_run = store.hook_run(SID)
+    assert hook_run is not None
+    fd = hookevent.open_private_run_dir(run.private_dir, 1)
+    try:
+        drain = outbox.Drain.prepare(
+            csession_id=SID,
+            run_no=1,
+            csession_dir=run.csession_dir,
+            private_run_fd=fd,
+            private_run_dir=str(run.private_run),
+            outbox_dev_ino=hook_run.outbox_dev_ino or "",
+            artifacts_dev_ino=hook_run.artifacts_dev_ino or "",
+            secret_sha256=hook_run.secret_sha256 or "",
+            limits=lambda: outbox.Limits(SUMMARY_MAX, ARTIFACT_MAX),
+            scanner=lambda data: b"CANARY" in data,
+        )
+    finally:
+        os.close(fd)
+    try:
+        assert [item.rejection for item in drain.items] == ["contains_secret"]
+        assert drain.winner is None
+    finally:
+        drain.finish()
+    assert listing(run.private_run / "scan") == []
+    assert len(listing(run.claimed)) == 1  # not recorded: kept for the next drain
+
+
+def test_secret_comparison_uses_the_stored_digest_only(run: Run) -> None:
+    """The plaintext secret is never stored; a request with the digest as its secret fails."""
+    with Store.open(run.db) as store:
+        hook_run = store.hook_run(SID)
+    assert hook_run is not None and hook_run.secret_sha256 is not None
+    assert hook_run.secret_sha256 != run.secret
+    run.plant(run.request(secret=hook_run.secret_sha256))
+    assert_rejected(run, "bad_secret", run.post_tool_use())
+
+
+# Drain caps and ordering
+
+
+def test_the_newest_valid_request_wins(run: Run) -> None:
+    first = run.report(summary="first")
+    second = run.report(summary="second")
+    third = run.report(summary="third")
+    assert run.post_tool_use() == ""
+    assert run.run()["report_summary"] == "third"
+    assert {r["request_id"]: r["result"] for r in run.requests()} == {
+        first.request_id: "discarded",
+        second.request_id: "discarded",
+        third.request_id: "ingested",
+    }
+    assert len(run.report_events()) == 1
+    assert log_events(run).count(("outbox_discarded", None)) == 2
+
+
+def test_a_newer_rejected_request_does_not_beat_an_older_valid_one(run: Run) -> None:
+    run.report(summary="valid")
+    run.plant(run.request(secret="0" * 64))
+    output = run.post_tool_use()
+    assert run.run()["report_summary"] == "valid"
+    assert rejection(output) == "bad_secret"  # the agent's latest attempt failed
+
+
+def test_an_older_rejection_after_a_newer_valid_request_is_not_fed_back(run: Run) -> None:
+    run.plant(run.request(secret="0" * 64))
+    run.report(summary="valid")
+    assert run.post_tool_use() == ""
+    assert sorted(results(run)) == ["bad_secret", "ingested"]
+
+
+def test_at_most_sixteen_requests_are_processed(run: Run) -> None:
+    ids = [run.plant(run.request(summary=f"report {n}"), rid=None) for n in range(20)]
+    run.post_tool_use()
+    by_id = {r["request_id"]: r["result"] for r in run.requests()}
+    assert by_id[ids[-1]] == "ingested"
+    assert [by_id[i] for i in ids[:-1]] == ["discarded"] * 19
+    assert run.run()["report_summary"] == "report 19"
+    messages = [r.get("message", "") for r in run.log() if r["event"] == "outbox_discarded"]
+    assert sum("over the drain cap" in m for m in messages) == 4
+
+
+def test_a_drain_reads_at_most_64_outbox_entries(run: Run) -> None:
+    for n in range(100):
+        (run.outbox / f"junk-{n:03d}").write_text("x")
+    run.post_tool_use()
+    assert len(listing(run.outbox)) == 36
+    run.post_tool_use()
+    assert listing(run.outbox) == []
+
+
+def test_requests_claimed_by_a_canceled_drain_are_processed_by_the_next(run: Run) -> None:
+    queued = run.report(summary="claimed earlier")
+    run.claimed.mkdir(mode=0o700, exist_ok=True)
+    os.rename(run.outbox / f"{queued.request_id}.json", run.claimed / f"{queued.request_id}.json")
+    run.post_tool_use()
+    assert results(run) == ["ingested"]
+    assert listing(run.claimed) == []
+
+
+def test_a_failed_transaction_leaves_the_claimed_request_for_the_next_drain(
+    run: Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run.write_artifact("a.md", b"a")
+    run.report(artifact="a.md")
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(Store, "set_report", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        run.post_tool_use()
+    assert run.requests() == [] and run.run()["report_status"] is None
+    assert len(listing(run.claimed)) == 1
+    assert listing(run.private_run / "scan") == []
+    monkeypatch.undo()
+    run.post_tool_use()
+    assert results(run) == ["ingested"]
+    assert run.run()["artifact_ingest_seq"] == 1
+    assert (run.private_run / "artifact" / "1" / "a.md").read_bytes() == b"a"
+
+
+def test_a_request_is_ingested_at_most_once(run: Run) -> None:
+    """A replayed request id (same name planted again) is a duplicate, never re-ingested."""
+    queued = run.report(summary="once")
+    content = (run.outbox / f"{queued.request_id}.json").read_bytes()
+    run.post_tool_use()
+    (run.outbox / f"{queued.request_id}.json").write_bytes(content)
+    before = run.run()["reported_at"]
+    assert run.post_tool_use() == ""
+    assert results(run) == ["ingested"]
+    assert run.run()["reported_at"] == before
+    assert len(run.report_events()) == 1
+    assert listing(run.claimed) == []
+    assert ("outbox_discarded", None) in log_events(run)
+
+
+def prepared(run: Run) -> outbox.Drain:
+    with Store.open(run.db) as store:
+        hook_run = store.hook_run(SID)
+    assert hook_run is not None
+    fd = hookevent.open_private_run_dir(run.private_dir, 1)
+    try:
+        return outbox.Drain.prepare(
+            csession_id=SID,
+            run_no=1,
+            csession_dir=run.csession_dir,
+            private_run_fd=fd,
+            private_run_dir=str(run.private_run),
+            outbox_dev_ino=hook_run.outbox_dev_ino or "",
+            artifacts_dev_ino=hook_run.artifacts_dev_ino or "",
+            secret_sha256=hook_run.secret_sha256 or "",
+            limits=lambda: outbox.Limits(SUMMARY_MAX, ARTIFACT_MAX),
+        )
+    finally:
+        os.close(fd)
+
+
+def test_two_concurrent_drains_ingest_a_request_once(run: Run) -> None:
+    """Both drains see the same claimed request; the requests primary key lets only one
+    ingest it."""
+    run.write_artifact("a.md", b"a")
+    run.report(artifact="a.md")
+    first = prepared(run)  # claims it
+    second = prepared(run)  # picks it up from claimed/
+    assert first.winner is not None and second.winner is not None
+    with Store.open(run.db) as store:
+        for drain in (first, second):
+            with store.transaction():
+                drain.record(store, run_no=1, live=True)
+            drain.finish(committed=True)
+    assert results(run) == ["ingested"]
+    assert second.items[0].duplicate
+    assert run.run()["artifact_ingest_seq"] == 1
+    assert listing(run.private_run / "scan") == []
+    assert listing(run.private_run / "artifact" / "1") == ["a.md"]
+
+
+def test_the_frozen_copy_is_what_was_checked(run: Run) -> None:
+    """Changing the artifact after the copy (between pre-check and commit) changes nothing."""
+    run.write_artifact("a.md", b"checked")
+    run.report(artifact="a.md")
+    drain = prepared(run)
+    run.write_artifact("a.md", b"swapped after the copy")
+    with Store.open(run.db) as store:
+        with store.transaction():
+            drain.record(store, run_no=1, live=True)
+        drain.finish(committed=True)
+    assert (run.private_run / "artifact" / "1" / "a.md").read_bytes() == b"checked"
+
+
+def test_record_rejects_a_request_once_the_run_changed(run: Run) -> None:
+    run.report()
+    drain = prepared(run)
+    with Store.open(run.db) as store:
+        with store.transaction():
+            assert drain.record(store, run_no=2, live=True) is None
+        drain.finish(committed=True)
+    assert results(run) == ["stale_run"]
+
+
+def test_record_rejects_when_the_run_is_not_live(run: Run) -> None:
+    run.report()
+    drain = prepared(run)
+    with Store.open(run.db) as store:
+        with store.transaction():
+            assert drain.record(store, run_no=1, live=False) is None
+        drain.finish(committed=True)
+    assert results(run) == ["not_live"]
+    assert drain.feedback() == "not_live"
+
+
+def test_old_scan_leftovers_are_removed(run: Run) -> None:
+    scan = run.private_run / "scan"
+    scan.mkdir(mode=0o700)
+    old, fresh = scan / "old.tmp", scan / "fresh.tmp"
+    old.write_bytes(b"x")
+    fresh.write_bytes(b"x")
+    os.utime(old, (0, 0))
+    run.report()
+    run.post_tool_use()
+    assert listing(scan) == ["fresh.tmp"]
+
+
+# When the outbox is not drained
+
+
+def test_a_replaced_outbox_is_never_drained(run: Run) -> None:
+    run.outbox.rename(Path(run.csession_dir) / "outbox.old")
+    run.outbox.mkdir()
+    run.plant(run.request())
+    assert run.post_tool_use() == ""
+    assert len(listing(run.outbox)) == 1 and run.requests() == []
+    assert log_events(run) == [("report_rejected", "outside_dir")]
+    assert run.state() == ("working", None, "working")
+
+
+def test_a_symlinked_outbox_is_never_drained(run: Run, tmp_path: Path) -> None:
+    real = Path(run.csession_dir) / "outbox.real"
+    run.outbox.rename(real)
+    run.outbox.symlink_to(real)
+    run.plant(run.request())
+    run.post_tool_use()
+    assert run.requests() == []
+    assert log_events(run) == [("report_rejected", "outside_dir")]
+
+
+def test_a_symlinked_session_directory_is_never_drained(run: Run, tmp_path: Path) -> None:
+    real = tmp_path / "moved"
+    Path(run.csession_dir).rename(real)
+    Path(run.csession_dir).symlink_to(real)
+    (real / "outbox" / f"{outbox.new_request_id()}.json").write_text(json.dumps(run.request()))
+    run.post_tool_use()
+    assert run.requests() == []
+    assert log_events(run) == [("report_rejected", "outside_dir")]
+
+
+def test_nothing_is_drained_before_exec_records_the_run_files(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    Store.open(str(root / "state.db")).close()
+    run = Run(root).setup(record=False)
+    run.report()
+    run.post_tool_use()
+    assert len(listing(run.outbox)) == 1 and run.requests() == []
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        {"wrapper": False},
+        {"ended": True},
+        {"forgotten": True},
+        {"state": "exited", "activity": None},
+    ],
+)
+def test_runs_that_are_not_live_are_not_drained(tmp_path: Path, setup: dict[str, Any]) -> None:
+    root = tmp_path / "state"
+    Store.open(str(root / "state.db")).close()
+    run = Run(root).setup(**setup)
+    run.report()
+    assert run.post_tool_use() == ""
+    assert len(listing(run.outbox)) == 1 and run.requests() == []
+
+
+def test_a_drain_that_cannot_run_still_applies_the_hooks_own_event(tmp_path: Path) -> None:
+    """A missing hookconf.json stops the drain, not the hook: the claimed request stays for
+    the next drain and the failure is logged with the exception type only."""
+    root = tmp_path / "state"
+    Store.open(str(root / "state.db")).close()
+    run = Run(root).setup(state="idle", activity="idle")
+    run.report()
+    os.unlink(run.private_run / "hookconf.json")
+    assert run.post_tool_use() == ""
+    assert run.state() == ("working", None, "working")
+    assert len(listing(run.claimed)) == 1
+    assert run.requests() == []
+    (record,) = run.log()
+    assert record["event"] == "hook_event_failed"
+    assert record["message"] == "PostToolUse: outbox drain: FileNotFoundError"
+    run.write_conf(1, summary_max=SUMMARY_MAX, artifact_max=ARTIFACT_MAX)
+    run.post_tool_use()
+    assert results(run) == ["ingested"]
+
+
+def test_a_previous_runs_leftover_request_is_stale(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    Store.open(str(root / "state.db")).close()
+    run = Run(root).setup()
+    run.report(summary="for run 1")
+    with sqlite3.connect(run.db) as conn:
+        conn.execute("UPDATE runs SET ended_at = 'x' WHERE run_no = 1")
+        conn.execute(
+            "INSERT INTO runs (csession_id, run_no, created_at, run_kind, mode, "
+            "session_started_at, wrapper_pid, wrapper_start) "
+            "VALUES (?, 2, 'x', 'implement', 'headless', 'x', ?, 'x')",
+            (SID, os.getpid()),
+        )
+        conn.execute("UPDATE sessions SET current_run = 2")
+    run.prepare(2, summary_max=SUMMARY_MAX, artifact_max=ARTIFACT_MAX)
+    run.run_no = 2
+    output = run.post_tool_use()
+    assert rejection(output) == "stale_run"
+    assert [(r["result"], r["run_no"]) for r in run.requests()] == [("stale_run", 2)]
