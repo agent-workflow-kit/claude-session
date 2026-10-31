@@ -14,7 +14,8 @@ git directory: with a ``${GIT_DIR}`` write entry, git is resolved against them b
 the session, calls ``check_git_cwd`` for the run kind and ``credential_warnings`` on
 third-party-reading runs with a git directory. The origin lookup stays in
 ``kinds.git_origin_url`` (``kinds`` resolves the repo before a launch has a git directory).
-TODO(#28): adoption calls ``check_unchanged`` against the stored value.
+The adopting ``exec`` calls ``check_unchanged`` against the value ``start`` stored
+(``lifecycle.FrozenChecks``).
 TODO(#29): every resume calls ``check_unchanged`` against the stored value.
 """
 

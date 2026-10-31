@@ -33,9 +33,10 @@ per-repo override of it (``_every_kind``). It never knows the git directory, so 
 with a ``${GIT_DIR}`` write entry has paths that are not known: its row probes nothing,
 and ``claude`` is not run at all.
 
-TODO(#28): ``start --resume --dry-run`` and ``exec --session-id <id> --dry-run`` (inspect
-the pending run without adopting it: ``would_refuse`` ``already_adopted``/``expired``,
-``config_hash_changed``).
+``exec --session-id <id> --dry-run`` (``lifecycle.adoption_plan``) reuses ``run_checks``,
+``unchecked_writable``, ``plan_sandbox``, ``plan_preview`` and ``plan_json`` with the pending
+run's real id and paths and the stored git directory.
+TODO(#29): ``start --resume --dry-run``.
 TODO(#29): ``resume --dry-run`` (carry-over from the previous run, the liveness check that
 only reports, ``would_refuse`` ``live``/``tainted``, the run number, ``fork``).
 """
@@ -254,6 +255,7 @@ def unchecked_writable(
     caller_cwd: str | None,
     recorded: Profile | None = None,
     git: GitDir | None = None,
+    alloc: launch.Allocated | None = None,
 ) -> pathrules.SessionWritable | None:
     """The session-writable paths known without a session (a dry run whose checks failed,
     and ``kinds``): the step-2 set (``probe_cwd``, ``<state>/sessions``, the tmp root;
@@ -264,7 +266,8 @@ def unchecked_writable(
     ``git``). None when the profile or the ``write_dirs`` cannot be known (a profile file
     that was not read, an entry that does not expand, a ``${GIT_DIR}`` write entry while
     the git directory is not known): nothing may be probed. ``caller_cwd`` is the run's
-    (None: ``work/``)."""
+    (None: ``work/``). ``alloc`` is the session's (default: the placeholder of a new
+    session)."""
     step2 = launch.step2_writable(process, probe_cwd).paths
     known = launch.known_write_paths(
         resolution,
@@ -273,6 +276,7 @@ def unchecked_writable(
         caller_cwd=caller_cwd,
         git_dirs=None if git is None else git.dirs,
         git_known=git is not None,
+        alloc=alloc,
     )
     if known is None:
         return None
@@ -707,11 +711,14 @@ def run_checks(
     resolved: launch.Resolved,
     alloc: launch.Allocated,
     process: launch.Process,
+    *,
+    effects: DryRunEffects | None = None,
 ) -> Outcome:
     """Launch step 5 and the step-7 generation, without side effects; the first
-    ``LaunchValidationError`` becomes ``would_fail``."""
+    ``LaunchValidationError`` becomes ``would_fail``. ``effects`` (default
+    ``DryRunEffects``): the adoption dry run's, which also compare with the stored run."""
     found = Outcome()
-    effects = DryRunEffects()
+    effects = effects or DryRunEffects()
     try:
         settings_builder.check_rule_paths(process.state_root, process.claude_session)
         sessiondir.check_dirs(process.state_root, alloc.csession_id)
@@ -771,26 +778,14 @@ def new_session_plan(
         recorded=found.profile,
         git=found.git,
     )
-    sandbox: Sandbox | None
-    if found.checked is not None:
-        # The checks passed: their (verified) tools and self-check, no second probe.
-        sandbox = (
-            None
-            if resolution.profile.sandbox == "off"
-            else Sandbox(
-                available=found.checked.sandbox_active, problems=found.checked.sandbox_problems
-            )
-        )
-    else:
-        probes = prerequisites or Prerequisites(process.gateway)
-        sandbox = probes.check(process, resolution, writable)
+    sandbox = plan_sandbox(process, resolution, found, writable, prerequisites)
     plan = plan_json(
         cfg,
         req,
         resolution,
         found,
         sandbox=sandbox,
-        preview=_plan_preview(cfg, resolution, process, found, writable),
+        preview=plan_preview(cfg, resolution, process, found, writable),
         cwd=found.checked.cwd if found.checked is not None else _cwd(resolved, alloc),
         allow_tainted=bool(getattr(args, "allow_tainted", False)),
         override_escalation=bool(getattr(args, "override_escalation", False)),
@@ -802,7 +797,26 @@ def _cwd(resolved: launch.Resolved, alloc: launch.Allocated) -> str:
     return os.path.realpath(resolved.caller_cwd or os.path.join(alloc.session_dir, sessiondir.WORK))
 
 
-def _plan_preview(
+def plan_sandbox(
+    process: launch.Process,
+    resolution: kinds.Resolution,
+    found: Outcome,
+    writable: pathrules.SessionWritable | None,
+    prerequisites: Prerequisites | None = None,
+) -> Sandbox | None:
+    """The plan's sandbox: when the checks passed, their (verified) tools and self-check
+    (no second probe); otherwise the prerequisites probed against ``writable``."""
+    if found.checked is not None:
+        if resolution.profile.sandbox == "off":
+            return None
+        return Sandbox(
+            available=found.checked.sandbox_active, problems=found.checked.sandbox_problems
+        )
+    probes = prerequisites or Prerequisites(process.gateway)
+    return probes.check(process, resolution, writable)
+
+
+def plan_preview(
     cfg: Config,
     resolution: kinds.Resolution,
     process: launch.Process,

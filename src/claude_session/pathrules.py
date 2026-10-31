@@ -31,7 +31,7 @@ git directory included), ``check_claude_args``, and passes ``session_writable`` 
 ``permission_profiles.select``, ``envbuild.build``, ``resolve_tool`` (``claude_bin``,
 ``bwrap``, ``socat``, ``git`` on the sanitized PATH) and
 ``settings_builder.check_interpreter``; trusted runs call ``check_profile`` (refused paths
-only). TODO(#28): adoption repeats them.
+only). The adopting ``exec`` repeats them against its own environment (``lifecycle``).
 """
 
 from __future__ import annotations
@@ -322,6 +322,13 @@ def session_writable(
     if profile is not None:
         paths += _profile_writes(profile, cwd=cwd, home=home)
     return SessionWritable(paths)
+
+
+def profile_write_paths(profile: Mapping[str, Any], *, cwd: str, home: str) -> list[str]:
+    """The paths the expanded ``profile`` makes writable: its sandbox ``allowWrite`` entries
+    and ``Edit``/``Write`` (and ``MultiEdit``/``NotebookEdit``) allow-rule targets. Raises
+    ``InvalidPermissionProfile`` for one it cannot place."""
+    return _profile_writes(profile, cwd=cwd, home=home)
 
 
 def _profile_writes(profile: Mapping[str, Any], *, cwd: str, home: str) -> list[str]:

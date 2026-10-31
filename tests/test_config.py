@@ -1510,3 +1510,67 @@ def test_invalid_env_rules_are_not_echoed(cfg_dir: Path, text: str) -> None:
     error = invalid(cfg_dir)
     assert "SENTINEL0secret" not in str(error.detail)
     assert "SENTINEL0secret" not in error.message
+
+
+# Source and hash (start freezes them; the adopting exec reloads and compares)
+
+
+def test_a_given_config_path_is_stored_absolute_and_read_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(tmp_path / "c" / "main.yaml", "lost_grace: 7\n")
+    write(tmp_path / "c" / "config.d" / "a.yaml", "lost_grace: 9\n")
+    monkeypatch.chdir(tmp_path)
+    source = config.Source.of("c/main.yaml", env={})
+    assert source == config.Source(path=str(tmp_path / "c" / "main.yaml"), default=False)
+    assert source.load(env={}).lost_grace == 7
+
+
+def test_a_given_config_path_through_a_symlink_and_dotdot_is_stored_as_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # base/L -> A/sub: L/../c.yaml opens A/c.yaml, not base/c.yaml.
+    write(tmp_path / "A" / "c.yaml", "lost_grace: 7\n")
+    write(tmp_path / "base" / "c.yaml", "lost_grace: 9\n")
+    (tmp_path / "A" / "sub").mkdir()
+    (tmp_path / "base" / "L").symlink_to(tmp_path / "A" / "sub")
+    monkeypatch.chdir(tmp_path / "base")
+    source = config.Source.of("L/../c.yaml", env={})
+    assert source.path == str((tmp_path / "A" / "c.yaml").resolve())
+    assert source.load(env={}).lost_grace == 7
+
+
+def test_the_default_source_reloads_with_its_dropins(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "lost_grace: 7\n")
+    write(cfg_dir / "config.d" / "a.yaml", "lost_grace: 9\n")
+    env = {"XDG_CONFIG_HOME": str(cfg_dir.parent)}
+    source = config.Source.of(None, env=env)
+    assert source == config.Source(path=str(cfg_dir / "config.yaml"), default=True)
+    # Reloaded with another XDG_CONFIG_HOME: the stored path wins, drop-ins included.
+    assert source.load(env={"XDG_CONFIG_HOME": "/nonexistent"}).lost_grace == 9
+
+
+def test_a_missing_default_source_loads_the_builtins(cfg_dir: Path) -> None:
+    source = config.Source.of(None, env={"XDG_CONFIG_HOME": str(cfg_dir.parent)})
+    assert source.load(env={}).lost_grace == load(cfg_dir).lost_grace
+
+
+def test_a_missing_given_source_is_an_error_when_reloaded(tmp_path: Path) -> None:
+    source = config.Source(path=str(tmp_path / "gone.yaml"), default=False)
+    with pytest.raises(UsageError):
+        source.load(env={})
+
+
+def test_the_config_hash_ignores_formatting_but_not_values(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "lost_grace: 7\n")
+    first = config.config_hash(load(cfg_dir))
+    write(cfg_dir / "config.yaml", "# a comment\nlost_grace:   7\n")
+    assert config.config_hash(load(cfg_dir)) == first
+    write(cfg_dir / "config.yaml", "lost_grace: 8\n")
+    assert config.config_hash(load(cfg_dir)) != first
+    assert re.fullmatch(r"[0-9a-f]{64}", first)
+
+
+def test_the_config_hash_covers_environment_overrides(cfg_dir: Path) -> None:
+    plain = config.config_hash(load(cfg_dir))
+    assert config.config_hash(load(cfg_dir, {"CSESSION_LOST_GRACE": "9"})) != plain

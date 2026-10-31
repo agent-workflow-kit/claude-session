@@ -160,8 +160,7 @@ def _exec(args: argparse.Namespace) -> int:
     """``exec`` of a new headless session: launch steps 2 to 7, then supervision (interface.md,
     Launch order and exec). A launch-phase end exits 12 with the outcome object."""
     if args.session_id is not None:
-        # TODO(#28): adoption of a pending run created by start.
-        raise InternalError("exec --session-id is not implemented yet", detail="not_implemented")
+        return _adopt(args)
     if args.dry_run:
         return _dry_run(args)
     if args.mode != "headless":
@@ -193,12 +192,44 @@ def _exec(args: argparse.Namespace) -> int:
     return int(outcome["exit_code"]) if ended is None else ended.exit_code
 
 
+def _adopt(args: argparse.Namespace) -> int:
+    """``exec --session-id <id>``: adopt the pending run ``start`` created and launch it
+    (interface.md, Launch order); with ``--dry-run``, inspect it without adopting."""
+    from . import launch, lifecycle, supervisor
+    from .gateway import SystemGateway
+
+    try:
+        with store.open_state() as st:
+            process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+            if args.dry_run:
+                return _print_dry_run(args, *lifecycle.adoption_plan(st, args, process))
+            outcome, code = lifecycle.adopt(st, args, process, supervise=supervisor.run_headless)
+    except KeyboardInterrupt:
+        # TODO(#17): as for plain exec (signal handling of the launch and session phases).
+        _die_of_sigint()
+    _print_outcome(outcome, args.json)
+    return code
+
+
 def _start(args: argparse.Namespace) -> int:
-    """``start``: only ``--dry-run`` of a new session so far."""
-    if args.dry_run and args.resume is None:
+    """``start`` of a new session (interface.md, start): steps 1 to 5, the run frozen and
+    left pending; prints the start object. A launch-validation failure exits 12 with
+    ``launch_failed``."""
+    if args.resume is not None:
+        # TODO(#29): start --resume (and its --dry-run), with the carry-over.
+        raise InternalError("start --resume is not implemented yet", detail="not_implemented")
+    if args.dry_run:
         return _dry_run(args)
-    # TODO(#28): start and start --resume (and its --dry-run, with #29's carry-over).
-    raise InternalError("start is not implemented yet", detail="not_implemented")
+    from . import config, launch, lifecycle
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    source = config.Source.of(args.config)
+    with store.open_state() as st:
+        process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+        result = lifecycle.start(st, args, cfg, source, process)
+    print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+    return 0
 
 
 def _dry_run(args: argparse.Namespace) -> int:
@@ -209,6 +240,12 @@ def _dry_run(args: argparse.Namespace) -> int:
 
     cfg = load_config(args)
     plan, message = dryrun.new_session_plan(args, cfg, dryrun.current_process(SystemGateway()))
+    return _print_dry_run(args, plan, message)
+
+
+def _print_dry_run(args: argparse.Namespace, plan: dict[str, Any], message: str | None) -> int:
+    from . import dryrun
+
     plan = dryrun.printable(plan)  # valid UTF-8 output, also for a non-UTF-8 path
     if args.json:
         print(json.dumps(plan, ensure_ascii=False, allow_nan=False))

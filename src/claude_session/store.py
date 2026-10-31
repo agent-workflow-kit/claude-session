@@ -27,6 +27,7 @@ the hook path may import it (design.md, Hook-event fast path), but never migrate
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -972,13 +973,17 @@ class Store:
     def allocate(self, run: NewRun, *, new_id: Callable[[Callable[[str], bool]], str]) -> str:
         """Launch step 4: allocate a session id (``new_id`` is ``ids.new_session_id``, given
         ``session_id_used`` so the check and the insert share this transaction) and insert the
-        session (state ``starting``), its run 1 (phase ``launch``, the wrapper already set:
-        plain ``exec`` performs every step itself), its labels and the ``launch`` event. A
-        third-party-reading run taints the session here (interface.md, Taint). Returns the
-        session id."""
+        session (state ``starting``), its run 1 (phase ``launch``), its labels and the
+        ``launch`` event. The run has its wrapper set already: plain ``exec``, which performs
+        every step itself, or ``start``, which hands the run over to adoption only once it is
+        frozen (``release_pending``). A third-party-reading run taints the session here
+        (interface.md, Taint). Returns the session id."""
+        if run.wrapper_pid is None or run.wrapper_start is None:
+            raise ValueError("a run is allocated with its wrapper")
         with self.transaction() as conn:
             csession_id = new_id(self.session_id_used)
             now = format_ts(self.clock())
+            expires_at = None
             conn.execute(
                 "INSERT INTO sessions (csession_id, created_at, launch_kind, csession_dir, "
                 "private_dir, tainted, tainted_at, tainted_by_run, current_run, state, "
@@ -1000,8 +1005,9 @@ class Store:
                 "INSERT INTO runs (csession_id, run_no, created_at, run_kind, reads_third_party, "
                 "mode, repo, model, skill, has_prompt, spec_json, resolved_json, config_hash, "
                 "invocation_json, decision_ids_json, warnings_json, hook_interpreter, "
-                "config_path, wrapper_pid, wrapper_start, outcome_file, phase) "
-                "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'launch')",
+                "config_path, wrapper_pid, wrapper_start, outcome_file, expires_at, phase) "
+                "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "'launch')",
                 (
                     csession_id,
                     now,
@@ -1023,6 +1029,7 @@ class Store:
                     run.wrapper_pid,
                     run.wrapper_start,
                     run.outcome_file,
+                    expires_at,
                 ),
             )
             labels = sorted({f"kind={run.kind}", *run.labels})
@@ -1123,70 +1130,216 @@ class Store:
         final state (``exited`` when the run has a report, else the outcome's state) and
         append the one final event. Returns whether this call won (False: the run was
         already final or its report status differs, nothing changed)."""
+        with self.transaction() as conn:
+            return self._finalize(conn, csession_id, run_no, final, report_status=report_status)
+
+    def _finalize(
+        self,
+        conn: sqlite3.Connection,
+        csession_id: str,
+        run_no: int,
+        final: Final,
+        *,
+        report_status: Any = ANY,
+    ) -> bool:
+        """``finalize_run`` inside the caller's transaction."""
         report_check = "" if report_status is ANY else " AND report_status IS ?"
         report_param = () if report_status is ANY else (report_status,)
-        with self.transaction() as conn:
-            now = format_ts(self.clock())
-            cursor = conn.execute(
-                "UPDATE runs SET ended_at = ?, phase = ?, outcome = ?, end_reason = ?, "
-                "exit_code = ?, cost_usd = ?, num_turns = ?, is_error = ?, "
-                "message = COALESCE(?, message) "
-                "WHERE csession_id = ? AND run_no = ? AND ended_at IS NULL" + report_check,
-                (
-                    now,
-                    final.phase,
-                    final.outcome,
-                    final.end_reason,
-                    final.exit_code,
-                    final.cost_usd,
-                    final.num_turns,
-                    None if final.is_error is None else int(final.is_error),
-                    final.message,
-                    csession_id,
-                    run_no,
-                    *report_param,
-                ),
+        now = format_ts(self.clock())
+        cursor = conn.execute(
+            "UPDATE runs SET ended_at = ?, phase = ?, outcome = ?, end_reason = ?, "
+            "exit_code = ?, cost_usd = ?, num_turns = ?, is_error = ?, "
+            "message = COALESCE(?, message) "
+            "WHERE csession_id = ? AND run_no = ? AND ended_at IS NULL" + report_check,
+            (
+                now,
+                final.phase,
+                final.outcome,
+                final.end_reason,
+                final.exit_code,
+                final.cost_usd,
+                final.num_turns,
+                None if final.is_error is None else int(final.is_error),
+                final.message,
+                csession_id,
+                run_no,
+                *report_param,
+            ),
+        )
+        if cursor.rowcount != 1:
+            return False
+        row = conn.execute(
+            "SELECT s.state, s.activity, r.report_status FROM sessions s JOIN runs r "
+            "ON r.csession_id = s.csession_id AND r.run_no = ? WHERE s.csession_id = ?",
+            (run_no, csession_id),
+        ).fetchone()
+        if row is None:
+            raise InternalError(f"no run {run_no} of session {csession_id}")
+        before_state, before_activity, report_status = row
+        state = "exited" if report_status is not None else final.state
+        conn.execute(
+            "UPDATE sessions SET state = ?, activity = NULL, needs_input_reason = NULL, "
+            "state_since = CASE WHEN state IS ? THEN state_since ELSE ? END, updated_at = ? "
+            "WHERE csession_id = ? AND current_run = ?",
+            (state, state, now, now, csession_id, run_no),
+        )
+        labels = [
+            f"{key}={value}"
+            for key, value in conn.execute(
+                "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+                (csession_id,),
             )
-            if cursor.rowcount != 1:
-                return False
-            row = conn.execute(
-                "SELECT s.state, s.activity, r.report_status FROM sessions s JOIN runs r "
-                "ON r.csession_id = s.csession_id AND r.run_no = ? WHERE s.csession_id = ?",
-                (run_no, csession_id),
-            ).fetchone()
-            if row is None:
-                raise InternalError(f"no run {run_no} of session {csession_id}")
-            before_state, before_activity, report_status = row
-            state = "exited" if report_status is not None else final.state
-            conn.execute(
-                "UPDATE sessions SET state = ?, activity = NULL, needs_input_reason = NULL, "
-                "state_since = CASE WHEN state IS ? THEN state_since ELSE ? END, updated_at = ? "
-                "WHERE csession_id = ? AND current_run = ?",
-                (state, state, now, now, csession_id, run_no),
-            )
-            labels = [
-                f"{key}={value}"
-                for key, value in conn.execute(
-                    "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
-                    (csession_id,),
-                )
-            ]
-            conn.execute(
-                "INSERT INTO events (csession_id, run_no, event_ts, from_state, to_state, "
-                "from_activity, to_activity, needs_input_reason, cause, final, labels_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, 1, ?)",
-                (
-                    csession_id,
-                    run_no,
-                    now,
-                    before_state,
-                    state,
-                    before_activity,
-                    final.cause,
-                    json.dumps(labels, ensure_ascii=False),
-                ),
-            )
+        ]
+        conn.execute(
+            "INSERT INTO events (csession_id, run_no, event_ts, from_state, to_state, "
+            "from_activity, to_activity, needs_input_reason, cause, final, labels_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, 1, ?)",
+            (
+                csession_id,
+                run_no,
+                now,
+                before_state,
+                state,
+                before_activity,
+                final.cause,
+                json.dumps(labels, ensure_ascii=False),
+            ),
+        )
         return True
+
+    # Pending runs (start) and adoption (exec --session-id)
+
+    def adopt(
+        self,
+        csession_id: str,
+        *,
+        wrapper_pid: int,
+        wrapper_start: str,
+        outcome_file: str | None = None,
+        hook_interpreter: str | None = None,
+    ) -> Adoption:
+        """The adoption compare-and-set (interface.md, Launch order; design.md, Launch,
+        adoption and pending runs), one ``BEGIN IMMEDIATE`` transaction on the session's
+        current run:
+
+        - a forgotten (or unknown) session: ``not_found`` (exit 10);
+        - a final run (any end): ``expired``;
+        - a run that has a wrapper: ``already_adopted``;
+        - a pending run at or past ``expires_at`` (or without one): finalized ``not-started``
+          with ``never_adopted`` in this transaction (cause ``adopt``), then ``expired``;
+        - otherwise the wrapper is set (this process), and ``outcome_file`` and
+          ``hook_interpreter`` (the adopting process's, written into the injected hooks),
+          when given, replace the stored values: ``adopted``. Exactly one caller ever
+          wins."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT s.forgotten_at, r.run_no, r.wrapper_pid, r.ended_at, r.expires_at "
+                "FROM sessions s JOIN runs r "
+                "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
+                "WHERE s.csession_id = ?",
+                (csession_id,),
+            ).fetchone()
+            if row is None or row[0] is not None:
+                return Adoption("not_found", None)
+            _, run_no, wrapper, ended, expires = row
+            if ended is not None:
+                return Adoption("expired", run_no)
+            if wrapper is not None:
+                return Adoption("already_adopted", run_no)
+            if self.past_deadline(expires):
+                self._finalize(conn, csession_id, run_no, NEVER_ADOPTED)
+                # TODO(#21): write the run's outcome file with the never_adopted outcome.
+                # TODO(#20): the run's exactly one final post-state-change.
+                return Adoption("expired", run_no, expired_now=True)
+            cursor = conn.execute(
+                "UPDATE runs SET wrapper_pid = ?, wrapper_start = ?, "
+                "outcome_file = COALESCE(?, outcome_file), "
+                "hook_interpreter = COALESCE(?, hook_interpreter) "
+                "WHERE csession_id = ? AND run_no = ? AND wrapper_pid IS NULL "
+                "AND ended_at IS NULL",
+                (wrapper_pid, wrapper_start, outcome_file, hook_interpreter, csession_id, run_no),
+            )
+            if cursor.rowcount != 1:  # not reachable inside the transaction
+                raise InternalError(f"adoption of run {run_no} of session {csession_id} lost")
+        return Adoption("adopted", run_no)
+
+    def expire_pending(self, csession_id: str, run_no: int, *, cause: str = "adopt") -> bool:
+        """Finalize run ``run_no`` ``not-started`` (``never_adopted``) when it is still
+        pending (no wrapper, not final) and at or past its ``expires_at``. Returns whether
+        this call finalized it.
+
+        TODO(#33): the liveness check and ``reconcile`` call this (``cause`` ``liveness`` or
+        ``reconcile``) for every pending run they see, and delete the launch spec
+        (``lifecycle.SPEC_NAME``) of each run this finalizes.
+        TODO(#21): write the run's outcome file with the never_adopted outcome.
+        TODO(#20): the run's exactly one final post-state-change."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT wrapper_pid, ended_at, expires_at FROM runs "
+                "WHERE csession_id = ? AND run_no = ?",
+                (csession_id, run_no),
+            ).fetchone()
+            if row is None or row[0] is not None or row[1] is not None:
+                return False
+            if not self.past_deadline(row[2]):
+                return False
+            return self._finalize(
+                conn, csession_id, run_no, dataclasses.replace(NEVER_ADOPTED, cause=cause)
+            )
+
+    def release_pending(
+        self,
+        csession_id: str,
+        run_no: int,
+        *,
+        wrapper_pid: int,
+        wrapper_start: str,
+        pending_for: float,
+    ) -> str | None:
+        """``start``'s last step: the run it allocated (and still wraps: ``wrapper_pid`` and
+        ``wrapper_start``) becomes pending, adoptable until ``expires_at`` = now +
+        ``pending_for``. One compare-and-set on the run still having this wrapper and not
+        being final. Returns the ``expires_at`` set, or None when it matched no row (the run
+        is final or has another wrapper: nothing changed)."""
+        with self.transaction() as conn:
+            expires_at = format_ts(self.clock() + timedelta(seconds=pending_for))
+            cursor = conn.execute(
+                "UPDATE runs SET wrapper_pid = NULL, wrapper_start = NULL, expires_at = ? "
+                "WHERE csession_id = ? AND run_no = ? AND wrapper_pid = ? "
+                "AND wrapper_start = ? AND ended_at IS NULL",
+                (expires_at, csession_id, run_no, wrapper_pid, wrapper_start),
+            )
+            return expires_at if cursor.rowcount == 1 else None
+
+    def past_deadline(self, expires_at: Any) -> bool:
+        """Whether a pending run's ``expires_at`` has come (a missing or unreadable deadline,
+        or one that is not text, counts as passed: a pending run is never adoptable without
+        one)."""
+        if not isinstance(expires_at, str):
+            return True
+        try:
+            deadline = parse_ts(expires_at)
+        except (ValueError, TypeError):
+            return True
+        return self.clock() >= deadline
+
+    def current_run(self, csession_id: str) -> dict[str, Any] | None:
+        """``run_record`` of the session's current run plus the session's ``git_dir`` and
+        ``forgotten_at``; None when the session or its current run row does not exist."""
+        row = self.conn.execute(
+            "SELECT current_run FROM sessions WHERE csession_id = ?", (csession_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            record = self.run_record(csession_id, row[0])
+        except InternalError:
+            return None
+        session = self.conn.execute(
+            "SELECT git_dir, forgotten_at FROM sessions WHERE csession_id = ?", (csession_id,)
+        ).fetchone()
+        record["session_git_dir"], record["session_forgotten_at"] = session
+        return record
 
     def run_record(self, csession_id: str, run_no: int) -> dict[str, Any]:
         """The run row joined with its session's ``forked_from``, ``claude_session_id`` and
@@ -1462,8 +1615,9 @@ class NewRun:
     invocation: dict[str, Any]
     hook_interpreter: str
     config_path: str | None
-    wrapper_pid: int
-    wrapper_start: str
+    # This process (plain exec, or start until release_pending).
+    wrapper_pid: int | None
+    wrapper_start: str | None
     labels: tuple[str, ...] = ()
     decision_ids: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
@@ -1485,6 +1639,29 @@ class Final:
     num_turns: int | None = None
     is_error: bool | None = None
     message: str | None = None
+
+
+# A pending run not adopted before ``expires_at`` (interface.md, Outcome mapping: launch).
+NEVER_ADOPTED = Final(
+    phase="launch",
+    outcome="not-started",
+    end_reason="never_adopted",
+    exit_code=12,
+    state="not-started",
+    cause="adopt",
+    message="the pending run was not adopted before it expired",
+)
+
+
+@dataclass(frozen=True)
+class Adoption:
+    """The result of ``Store.adopt``: ``outcome`` is ``adopted``, ``already_adopted``,
+    ``expired`` or ``not_found``; ``run_no`` the session's current run (None when not found);
+    ``expired_now`` whether this call finalized the run ``never_adopted``."""
+
+    outcome: str
+    run_no: int | None
+    expired_now: bool = False
 
 
 @dataclass(frozen=True)
