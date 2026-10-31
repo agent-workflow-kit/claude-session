@@ -32,6 +32,8 @@ from typing import Any
 
 import pytest
 
+from claude_session.store import start_time
+
 from .fakeclaude import claude_bin, read_jsonl, wait_for, write_json
 from .test_exec_headless import (
     START,
@@ -765,6 +767,42 @@ def test_a_sigint_during_the_interactive_spawn_is_dropped(
     assert run_row_of(state)["pending_cause"] is None
     assert fake_signals(term) == []
     assert signals_sent(term) == [] and signals_not_sent(term) == []
+
+
+def test_an_interactive_exec_killed_before_recording_its_child_never_runs_claude(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    # The wrapper dies inside the store write that records the child (after waiting up to 2s
+    # for an ungated child to start claude): the gated child exits without running claude.
+    pidfile, ran = tmp_path / "childpid", tmp_path / "ran"
+    patch = (
+        "import os, signal, time\n"
+        "from claude_session import store\n"
+        "_orig = store.Store.update_run\n"
+        "def _upd(self, *a, **k):\n"
+        "    if 'child_pid' in k:\n"
+        f"        open({str(pidfile)!r}, 'w').write(str(k['child_pid']))\n"
+        "        end = time.monotonic() + 2\n"
+        f"        while not os.path.exists({str(ran)!r}) and time.monotonic() < end:\n"
+        "            time.sleep(0.02)\n"
+        "        os.kill(os.getpid(), signal.SIGKILL)\n"
+        "    return _orig(self, *a, **k)\n"
+        "store.Store.update_run = _upd\n"
+    )
+    term = start_terminal(tmp_path, state, work, [touch(ran), START, HANG], patch=patch)
+    code, _, err = term.finish()
+    assert code == -signal.SIGKILL, err
+    child = int(pidfile.read_text())
+    token = start_time(child)
+    try:
+        deadline = time.monotonic() + 10
+        while start_time(child) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not start_time(child), "the unrecorded child is still alive"
+    finally:  # only the exact child this test's exec started, while it is still that one
+        if token and start_time(child) == token:
+            os.kill(child, signal.SIGKILL)
+    assert not ran.exists(), "claude ran"
 
 
 # Interactive resume (#17 with #29)

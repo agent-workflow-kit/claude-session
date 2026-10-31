@@ -10,9 +10,11 @@ finalizes it only when nobody owns it any more:
   ``never_adopted`` (``Store.expire_pending``), its launch spec deleted;
 - a run whose **wrapper is dead** (gone or a zombie) and that has **no child** recorded (the
   launch phase: a ``start`` that died before the run became pending, an adopting or plain
-  ``exec`` that died between allocation or the adoption compare-and-set and the spawn):
-  ``not-started``, ``launch_interrupted``, its launch spec deleted (a run marked as having
-  audited an escalation override gets that record's ``result: error`` follow-up);
+  ``exec`` that died between allocation or the adoption compare-and-set and the recording
+  of its child; the spawn is gated, so such a child never ran ``claude``):
+  ``not-started``, ``launch_interrupted``, its launch spec and secret index deleted before
+  the compare-and-set (a run marked as having audited an escalation override gets that
+  record's ``result: error`` follow-up);
 - a run whose **wrapper is dead and child alive**: left live and reported as an **orphan**
   (``reconcile`` lists it; ``stop`` ends it); nothing is ever signaled here;
 - a run whose **wrapper and child are dead**: **salvaged** under the lease
@@ -27,16 +29,23 @@ Every finalization is a compare-and-set that also requires the wrapper and child
 found dead to be still recorded (``Store.finalize_run(expect=...)``), so a run that changed
 hands meanwhile is never finalized; there is exactly one final event per run. The final
 event's cause is the caller's (``liveness``, or ``reconcile``), except ``timeout`` and
-``auto_exit`` when ``exec`` recorded them before it died (as ``exec`` itself would). Right
-after a won compare-and-set the run's outcome file is written (``outcomefile.write_run``);
-then its secret index is deleted and the session's private tmpdir removed when the run is
-the session's current one (``reconcile.remove_tmpdir``, identity-safe against a next run).
+``auto_exit`` when ``exec`` recorded them before it died (as ``exec`` itself would); its
+``from_state`` is the run's own (``Store.run_state``: a superseded run's latest event). The
+secret index is deleted before the compare-and-set (nothing reads it once the end is mapped);
+right after a won compare-and-set the run's outcome file is written
+(``outcomefile.write_run``), then the session's private tmpdir removed when the run is the
+session's current one (``reconcile.remove_tmpdir``, identity-safe against a next run;
+reported as ``tmpdir_removed``). A salvage claims the outbox only while the run is the
+current one, counts as undrained only that run's requests, checks an implicit done against
+the run's frozen ``artifact_max_bytes`` (``hookconf.json``), and ignores (with a warning) a
+recorded ``pending_cause`` the cause table cannot map.
 
 **Who is alive.** A wrapper or child is alive while the exact process (PID plus the recorded
 start-time token, ``Store.liveness``) runs and is not a zombie. A token that could not be read
 when it was recorded (``""``) is never taken as matching anything: the PID alone then decides,
-and the process counts as alive while that PID exists (it may be the wrapper; a run is never
-finalized on a guess). When the platform cannot answer, a process counts as alive too.
+and the process counts as alive while that PID exists and is not a zombie (it may be the
+wrapper; a run is never finalized on a guess). When the platform cannot answer, a process
+counts as alive too.
 
 The check never delivers ``post-state-change`` events itself: the caller delivers what it
 changed (``status`` and ``list`` never run hooks; ``reconcile`` delivers later), and writes
@@ -142,13 +151,17 @@ class Checked:
 
 def process_alive(st: store.Store, pid: Any, start: Any) -> bool:
     """Whether the exact recorded process still runs (not a zombie). An empty token is never
-    a match: the PID alone decides, alive while it exists. A PID that is not a valid process
-    ID is not alive; an unanswerable check is alive (``Store.liveness``)."""
+    a match: the PID alone decides, alive while it exists and is not a zombie. A PID that is
+    not a valid process ID is not alive; an unanswerable check is alive
+    (``Store.liveness``)."""
     if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid < 2**31:
         return False
     token = start if isinstance(start, str) else ""
     if token == "":
-        return store.pid_exists(pid)
+        if not store.pid_exists(pid):
+            return False
+        # A zombie is dead: readable only with ``zombie`` (unreadable both ways: alive).
+        return not (store.start_time(pid) == "" and store.start_time(pid, zombie=True) != "")
     return bool(st.liveness(pid, token))
 
 
@@ -184,8 +197,9 @@ def check_session(
     patience: float = 0.0,
 ) -> Checked:
     """Apply the liveness rules to every run of the session that is not final (see the
-    module docs). ``cfg`` gives ``artifact_max_bytes`` for an implicit done (None: such a
-    salvage reads as ``result_rejected``, the conservative end). ``patience``: how long to
+    module docs). ``cfg`` is not needed by the check (an implicit done is checked against
+    the run's own frozen ``artifact_max_bytes``, from its private ``hookconf.json``).
+    ``patience``: how long to
     wait for another process that is salvaging the same run (0: leave it to that process).
     Never raises for one run's failure: it is a warning, and the run is left as it was."""
     checked = Checked()
@@ -193,9 +207,7 @@ def check_session(
     for row in st.open_runs(csession_id):
         try:
             checked.extend(
-                _check_run(
-                    st, cfg, row, state_root, cause=cause, dry_run=dry_run, patience=patience
-                )
+                _check_run(st, row, state_root, cause=cause, dry_run=dry_run, patience=patience)
             )
         except Exception as exc:
             st.rollback_open_transaction()
@@ -204,13 +216,13 @@ def check_session(
                 f" ({type(exc).__name__}); the run is left as it was"
             )
             checked.warnings.append(warning)
-            _log(state_root, "reconcile_change", "warn", csession_id, row["run_no"], warning)
+            if not dry_run:  # a dry run writes nothing
+                _log(state_root, "reconcile_change", "warn", csession_id, row["run_no"], warning)
     return checked
 
 
 def _check_run(
     st: store.Store,
-    cfg: Config | None,
     row: dict[str, Any],
     state_root: str,
     *,
@@ -226,14 +238,14 @@ def _check_run(
     if verdict == ORPHAN:
         checked.orphans.append({"csession_id": sid, "run": run, "child_pid": row["child_pid"]})
         return checked
-    before = row["session_state"]
+    before = st.run_state(sid, run)  # a superseded run's own, never a later run's
     if dry_run:
-        checked.changes.append(_predicted(st, row, verdict, state_root))
+        checked.changes.append(_predicted(st, row, verdict, state_root, before))
         return checked
     if verdict == EXPIRED:
         if st.expire_pending(sid, run, cause=cause):
-            _after_launch_end(st, sid, run, state_root)
             checked.changes.append(_change(st, sid, run, "marked_not_started", before))
+            checked.changes += _after_launch_end(st, sid, run, state_root)
         return checked
     if verdict == LAUNCH_LOST:
         final = store.Final(
@@ -245,12 +257,16 @@ def _check_run(
             cause=cause,
             message=LAUNCH_LOST_MESSAGE,
         )
+        # The adopter (or exec) is dead and its child never ran claude (the spawn gate):
+        # nothing reads the launch spec or the secret index any more, so they go before the
+        # compare-and-set (a crash right after it leaves nothing secret-equivalent behind).
+        _delete_secret_files(state_root, sid, run)
         if st.finalize_run(sid, run, final, expect=_dead(row)):
-            _after_launch_end(st, sid, run, state_root)
-            _audit_lost_override(st, sid, run, state_root)
             checked.changes.append(_change(st, sid, run, "marked_not_started", before))
+            checked.changes += _after_launch_end(st, sid, run, state_root)
+            _audit_lost_override(st, sid, run, state_root)
         return checked
-    return _salvage(st, cfg, row, state_root, cause=cause, patience=patience)
+    return _salvage(st, row, state_root, cause=cause, patience=patience)
 
 
 def _dead(row: dict[str, Any]) -> dict[str, Any]:
@@ -263,15 +279,30 @@ def _dead(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _after_launch_end(st: store.Store, sid: str, run: int, state_root: str) -> None:
-    """After a won launch-phase end: the outcome file, then the launch spec and secret index
-    deleted (both secret-equivalent) and the private tmpdir removed."""
-    from . import lifecycle, reconcile
-
+def _after_launch_end(st: store.Store, sid: str, run: int, state_root: str) -> list[Change]:
+    """After a won launch-phase end: the launch spec and secret index deleted (both
+    secret-equivalent; before the outcome file, so a crash there leaves neither), the outcome
+    file, then the private tmpdir removed (a ``tmpdir_removed`` change when it was)."""
+    _delete_secret_files(state_root, sid, run)
     outcomefile.write_run(st, sid, run)
+    return _tmpdir_change(st, sid, run)
+
+
+def _delete_secret_files(state_root: str, sid: str, run: int) -> None:
+    from . import lifecycle
+
     lifecycle.discard_spec_at(state_root, sid, run)
     _delete_index(state_root, sid, run)
-    reconcile.remove_tmpdir(st, sid, expected_run=run)
+
+
+def _tmpdir_change(st: store.Store, sid: str, run: int) -> list[Change]:
+    """Remove the session's private tmpdir when ``run`` is its final current run; the
+    ``tmpdir_removed`` change when it was removed."""
+    from . import reconcile
+
+    if reconcile.remove_tmpdir(st, sid, expected_run=run):
+        return [Change(sid, run, "tmpdir_removed")]
+    return []
 
 
 def _audit_lost_override(st: store.Store, sid: str, run: int, state_root: str) -> None:
@@ -325,7 +356,6 @@ def _change(
 
 def _salvage(
     st: store.Store,
-    cfg: Config | None,
     row: dict[str, Any],
     state_root: str,
     *,
@@ -341,13 +371,13 @@ def _salvage(
     try:
         if st.run_record(sid, run)["ended_at"] is not None:
             return checked
-        before = st.run_record(sid, run)["session_state"]
+        before = st.run_state(sid, run)
         ingested = _final_drain(st, sid, run, state_root)
         if ingested:
             checked.changes.append(
                 Change(sid, run, "outbox_ingested", before, None, None, None, "salvage")
             )
-        won, action, warnings = _finalize_lost(st, cfg, row, state_root, cause=cause)
+        won, action, warnings = _finalize_lost(st, row, state_root, cause=cause)
         if won:
             outcomefile.write_run(st, sid, run)
             checked.changes.append(_change(st, sid, run, action, before))
@@ -359,10 +389,8 @@ def _salvage(
         except Exception:  # it expires on its own; a dead holder's is taken over at once
             pass
     if any(change.outcome is not None for change in checked.changes):
-        _delete_index(state_root, sid, run)
-        from . import reconcile
-
-        reconcile.remove_tmpdir(st, sid, expected_run=run)
+        _delete_index(state_root, sid, run)  # deleted before the compare-and-set already
+        checked.changes += _tmpdir_change(st, sid, run)
     return checked
 
 
@@ -383,29 +411,53 @@ def _final_drain(st: store.Store, sid: str, run: int, state_root: str) -> bool:
     for _ in range(FINAL_DRAINS):
         drained = hookevent.final_drain(st, sid, run, state_root)
         recorded = recorded or drained
-        if not drained or not _pending_requests(state_root, sid, run):
+        if not drained or not _pending_requests(st, state_root, sid, run):
             break
     return recorded
 
 
-def _pending_requests(state_root: str, sid: str, run: int) -> bool:
-    """Whether report requests wait in ``outbox/`` or the run's ``claimed/`` (best effort,
-    as ``supervisor._has_pending_requests``)."""
-    for path in (
-        os.path.join(sessiondir.session_dir(state_root, sid), outbox.OUTBOX),
-        os.path.join(sessiondir.private_dir(state_root, sid), "runs", str(run), outbox.CLAIMED),
-    ):
+# Outbox requests read to tell whose they are, at most (the rest count as not this run's).
+PENDING_READ_MAX = outbox.DRAIN_MAX_ENTRIES
+
+
+def _pending_requests(st: store.Store, state_root: str, sid: str, run: int) -> bool:
+    """Whether report requests of this run wait: in its own ``claimed/``, or in ``outbox/``
+    with this run's number and a secret matching its stored hash (a later run's requests in
+    the shared outbox are not this run's). Best effort, as
+    ``supervisor._has_pending_requests``; read no-follow."""
+    claimed = os.path.join(sessiondir.private_dir(state_root, sid), "runs", str(run))
+    try:
+        if any(
+            outbox.is_request_name(name)
+            for name in os.listdir(os.path.join(claimed, outbox.CLAIMED))
+        ):
+            return True
+    except OSError:
+        pass
+    digest = st.run_record(sid, run)["secret_sha256"]
+    if not isinstance(digest, str):
+        return False
+
+    def ours(data: bytes) -> bool:
         try:
-            if any(outbox.is_request_name(name) for name in os.listdir(path)):
-                return True
-        except OSError:
-            continue
-    return False
+            request = json.loads(data)
+        except ValueError:
+            return False
+        if not isinstance(request, dict) or request.get("run") != run:
+            return False
+        secret = request.get("secret")
+        return isinstance(secret, str) and hmac.compare_digest(
+            hashlib.sha256(secret.encode("utf-8", "replace")).hexdigest(), digest
+        )
+
+    try:
+        return sessiondir.any_outbox_request(state_root, sid, ours, limit=PENDING_READ_MAX)
+    except (OSError, ValueError, sessiondir.SessionDirUnsafe):
+        return False
 
 
 def _finalize_lost(
     st: store.Store,
-    cfg: Config | None,
     row: dict[str, Any],
     state_root: str,
     *,
@@ -415,7 +467,7 @@ def _finalize_lost(
     status it was mapped from and the dead wrapper and child). Returns whether this call
     won, the reconcile action and the warnings recorded with it."""
     sid, run = str(row["csession_id"]), int(row["run_no"])
-    pending = _pending_requests(state_root, sid, run)
+    pending = _pending_requests(st, state_root, sid, run)
     warnings: list[str] = []
     if pending:
         warnings.append(
@@ -430,23 +482,21 @@ def _finalize_lost(
             record = st.run_record(sid, run)
             if record["ended_at"] is not None:
                 return False, "", []
-            mapped = endmap.map_wrapper_lost(
-                pending_cause=record["pending_cause"],
-                report_status=record["report_status"],
-                headless_result=parsed if headless else None,
-                session_started=record["session_started_at"] is not None,
-                implicit_done=_implicit_done(record),
-            )
+            mapped = _map_lost(record, parsed if headless else None, warnings)
             expected = record["report_status"]
             if mapped.implicit and pending:
                 mapped = Mapped("exited-unreported", "result_rejected")
             elif mapped.implicit:
-                accepted = _implicit(st, cfg, record, run_fd, parsed, state_root)
+                accepted = _implicit(st, record, run_fd, parsed, state_root)
                 if accepted is None:
                     continue  # a report was recorded meanwhile: map it
                 mapped = accepted
                 expected = "done" if accepted.outcome == "done" else None
             final = _final(mapped, parsed, cause, tuple(warnings))
+            # Nothing reads the secret index once the end is mapped (the drain and the
+            # implicit done are behind): deleted before the compare-and-set, so a crash
+            # right after it leaves nothing secret-equivalent behind.
+            _delete_index(state_root, sid, run)
             if st.finalize_run(sid, run, final, report_status=expected, expect=_dead(row)):
                 return True, _action(record, parsed, headless), warnings
             now = st.run_record(sid, run)
@@ -460,9 +510,52 @@ def _finalize_lost(
             os.close(run_fd)
 
 
+def _map_lost(
+    record: dict[str, Any], headless_result: HeadlessResult | None, warnings: list[str]
+) -> Mapped:
+    """``endmap.map_wrapper_lost`` for the run. A recorded ``pending_cause`` the cause table
+    cannot map (``auto_exit`` without a report, which ``exec`` never records; an unknown
+    cause) is ignored with a warning: the run ends by the rest of the wrapper-lost rules
+    rather than never (interface.md defines no end for it)."""
+    rules = {
+        "report_status": record["report_status"],
+        "headless_result": headless_result,
+        "session_started": record["session_started_at"] is not None,
+        "implicit_done": _implicit_done(record),
+    }
+    try:
+        return endmap.map_wrapper_lost(pending_cause=record["pending_cause"], **rules)
+    except ValueError:
+        warning = (
+            f"the recorded pending cause {record['pending_cause']!r} cannot be mapped"
+            " (auto_exit is recorded only after a done report); ended by the wrapper-lost rules"
+        )
+        if warning not in warnings:
+            warnings.append(warning)
+        return endmap.map_wrapper_lost(pending_cause=None, **rules)
+
+
+def _from_cause(record: dict[str, Any]) -> bool:
+    """Whether the run's recorded ``pending_cause`` maps by the cause table."""
+    cause = record["pending_cause"]
+    if cause is None:
+        return False
+    try:
+        endmap.map_wrapper_lost(
+            pending_cause=cause,
+            report_status=record["report_status"],
+            headless_result=None,
+            session_started=False,
+            implicit_done=False,
+        )
+    except ValueError:
+        return False
+    return True
+
+
 def _action(record: dict[str, Any], parsed: HeadlessResult, headless: bool) -> str:
     """The reconcile action of a wrapper-lost end (schemas/cli/reconcile.json)."""
-    if record["pending_cause"] is not None:
+    if _from_cause(record):
         return "finalized_from_cause"
     if headless and parsed.complete:
         return "finalized_from_result"
@@ -519,7 +612,6 @@ def _result(run_fd: int | None) -> HeadlessResult:
 
 def _implicit(
     st: store.Store,
-    cfg: Config | None,
     record: dict[str, Any],
     run_fd: int | None,
     parsed: HeadlessResult,
@@ -533,13 +625,14 @@ def _implicit(
 
     sid, run = str(record["csession_id"]), int(record["run_no"])
     secret = _run_secret(state_root, sid, record["secret_sha256"])
-    if cfg is None or run_fd is None or secret is None or parsed.final is None:
+    if run_fd is None or secret is None or parsed.final is None:
+        return Mapped("exited-unreported", "result_rejected")
+    try:  # the run's frozen cap (exec froze it at launch), never the caller's config
+        cap = hookevent.read_hookconf_at(run_fd).artifact_max_bytes
+    except (OSError, hookevent.HookEventError):
         return Mapped("exited-unreported", "result_rejected")
     data = supervisor.accept_result_md(
-        parsed.final.get("result"),
-        run_fd=run_fd,
-        secret=secret,
-        artifact_max_bytes=cfg.artifact_max_bytes,
+        parsed.final.get("result"), run_fd=run_fd, secret=secret, artifact_max_bytes=cap
     )
     if data is None:
         return Mapped("exited-unreported", "result_rejected")
@@ -578,12 +671,13 @@ def _delete_index(state_root: str, sid: str, run: int) -> None:
 # Dry run
 
 
-def _predicted(st: store.Store, row: dict[str, Any], verdict: str, state_root: str) -> Change:
+def _predicted(
+    st: store.Store, row: dict[str, Any], verdict: str, state_root: str, before: str | None
+) -> Change:
     """The change a check would make (nothing is read that a real one would ingest first, so
     the outcome is the one the run's state now maps to)."""
     sid, run = str(row["csession_id"]), int(row["run_no"])
     detail = "dry run: not applied"
-    before = row["session_state"]
     if verdict in (EXPIRED, LAUNCH_LOST):
         return Change(
             sid,
@@ -602,13 +696,7 @@ def _predicted(st: store.Store, row: dict[str, Any], verdict: str, state_root: s
     finally:
         if run_fd is not None:
             os.close(run_fd)
-    mapped = endmap.map_wrapper_lost(
-        pending_cause=row["pending_cause"],
-        report_status=row["report_status"],
-        headless_result=parsed if headless else None,
-        session_started=row["session_started_at"] is not None,
-        implicit_done=_implicit_done(row),
-    )
+    mapped = _map_lost(row, parsed if headless else None, [])
     reported = row["report_status"] is not None or mapped.implicit
     state = "exited" if reported else endmap.final_state(mapped.outcome)
     return Change(

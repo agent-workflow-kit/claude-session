@@ -806,14 +806,18 @@ class Deliverer:
         environ: Mapping[str, str],
         state_root: str,
         log: logs.EventLog | None = None,
-        renew_interval: float = LEASE_RENEW_INTERVAL,
+        renew_interval: float | None = None,
         cancel: threading.Event | None = None,
+        heartbeat: Callable[[], None] | None = None,
     ) -> None:
         self.st, self.cfg, self.gateway = st, cfg, gateway
         self.environ, self.state_root = environ, state_root
         self.log = log or logs.EventLog(os.path.join(state_root, LOG_NAME))
-        self.renew_interval = renew_interval
+        self.renew_interval = LEASE_RENEW_INTERVAL if renew_interval is None else renew_interval
         self.cancel = cancel
+        # Called before each event and at least every ``renew_interval`` while a hook runs
+        # (``reconcile`` renews its own lease there); it must not raise.
+        self.heartbeat = heartbeat
         self.entries = config_entries(cfg)
         self._async: list[threading.Thread] = []
         # When the lease expires (time.monotonic), as of the last successful take or renewal.
@@ -841,7 +845,11 @@ class Deliverer:
                 # A deliverer that died mid-hook left that hook's group running: end it before
                 # its event is delivered again (``end_orphaned_groups``).
                 end_orphaned_groups(
-                    self.st, csession_id, kill_grace=self.cfg.kill_grace, log=self.log
+                    self.st,
+                    csession_id,
+                    kill_grace=self.cfg.kill_grace,
+                    log=self.log,
+                    heartbeat=self.heartbeat,
                 )
                 self._pass(csession_id, lease, done)
             finally:
@@ -907,8 +915,10 @@ class Deliverer:
                 if self.canceled():
                     done.canceled = True
                     return
+                if self.heartbeat is not None:
+                    self.heartbeat()
                 record = self.st.delivery_record(sid, int(event["run_no"]))
-                if record is not None and self._other_live_wrapper(record, me):
+                if record is not None and other_live_wrapper(self.st, record, me):
                     done.blocked = True
                     return
                 if record is not None:
@@ -921,15 +931,6 @@ class Deliverer:
                     done.lease_lost = True
                     return
                 done.delivered.append(int(event["id"]))
-
-    def _other_live_wrapper(self, record: Mapping[str, Any], me: store.Holder) -> bool:
-        """Whether the run is open with a wrapper that is alive and not this process."""
-        pid, start = record["wrapper_pid"], record["wrapper_start"] or ""
-        if record["ended_at"] is not None or pid is None or pid == me.pid:
-            return False
-        if start == "":
-            return store.pid_exists(int(pid))
-        return self.st.liveness(int(pid), start)
 
     def _run_event(
         self, sid: str, lease: str, event: Mapping[str, Any], record: Mapping[str, Any]
@@ -1002,6 +1003,8 @@ class Deliverer:
     def _renew(self, lease: str, sid: str) -> bool:
         """Renew the lease. False when a renewal finds it lost, or when a renewal fails with a
         store error (logged; retried at the next call) after its expiry has passed."""
+        if self.heartbeat is not None:
+            self.heartbeat()
         asked = time.monotonic()
         try:
             held = self.st.renew_lease(lease)
@@ -1119,12 +1122,24 @@ class _GroupRecord:
 _GROUP_POLL = 0.05
 
 
+def other_live_wrapper(st: store.Store, record: Mapping[str, Any], me: store.Holder | None) -> bool:
+    """Whether the run is open with a wrapper that is alive and not ``me`` (a deliverer
+    stops at such a run's event: that ``exec`` delivers it)."""
+    pid, start = record["wrapper_pid"], record["wrapper_start"] or ""
+    if record["ended_at"] is not None or pid is None or (me is not None and pid == me.pid):
+        return False
+    if start == "":
+        return store.pid_exists(int(pid))
+    return st.liveness(int(pid), start)
+
+
 def end_orphaned_groups(
     st: store.Store,
     csession_id: str | None,
     *,
     kill_grace: float,
     log: logs.EventLog | None = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> list[int]:
     """End the hook process groups a dead holder (a deliverer, or an ``exec`` killed during a
     ``pre-launch`` hook) left running (of ``csession_id``, or of every session): for each
@@ -1134,27 +1149,57 @@ def end_orphaned_groups(
     if the verified leader still runs. Groups of a live deliverer are left alone; a row
     whose leader cannot be verified (gone, reused, token unknown) is dropped without any
     signal (members that outlived the leader cannot be told apart from a reused group ID).
-    Returns the process group IDs signaled."""
+    Best effort: a store error (listing the groups, or for one row) is logged and the rest
+    goes on, so it never stops a delivery or a ``reconcile`` pass. ``heartbeat`` is called
+    before each group and while waiting out a group's grace. Returns the process group IDs
+    signaled."""
     ended: list[int] = []
-    for row in st.hook_groups(csession_id):
-        if st.holder_alive(int(row["holder_pid"]), str(row["holder_start"] or "")):
-            continue
-        pgid, token = int(row["pgid"]), str(row["leader_start"] or "")
-        if _verified_leader(pgid, token):
-            ended.append(pgid)
-            _end_group(pgid, token, kill_grace)
-            if log is not None:
-                _log(
-                    log,
-                    "hook_failed",
-                    level="warn",
-                    csession_id=str(row["csession_id"]),
-                    message=f"{_group_hook(int(row['event_id']))}: the hook its dead"
-                    f" {_group_holder(int(row['event_id']))} left running was ended (process"
-                    f" group {pgid})",
-                )
-        st.remove_hook_group(int(row["id"]))
+    try:
+        rows = st.hook_groups(csession_id)
+    except Exception as exc:
+        st.rollback_open_transaction()
+        _group_failure(log, csession_id, f"the groups could not be read ({type(exc).__name__})")
+        return ended
+    for row in rows:
+        if heartbeat is not None:
+            heartbeat()
+        try:
+            if st.holder_alive(int(row["holder_pid"]), str(row["holder_start"] or "")):
+                continue
+            pgid, token = int(row["pgid"]), str(row["leader_start"] or "")
+            if _verified_leader(pgid, token):
+                ended.append(pgid)
+                _end_group(pgid, token, kill_grace, heartbeat)
+                if log is not None:
+                    _log(
+                        log,
+                        "hook_failed",
+                        level="warn",
+                        csession_id=str(row["csession_id"]),
+                        message=f"{_group_hook(int(row['event_id']))}: the hook its dead"
+                        f" {_group_holder(int(row['event_id']))} left running was ended"
+                        f" (process group {pgid})",
+                    )
+            st.remove_hook_group(int(row["id"]))
+        except Exception as exc:
+            st.rollback_open_transaction()
+            _group_failure(
+                log,
+                str(row["csession_id"]),
+                f"group row {row['id']} could not be handled ({type(exc).__name__})",
+            )
     return ended
+
+
+def _group_failure(log: logs.EventLog | None, csession_id: str | None, message: str) -> None:
+    if log is not None:
+        _log(
+            log,
+            "hook_failed",
+            level="warn",
+            csession_id=csession_id,
+            message=f"orphaned hook groups: {message}; retried next time",
+        )
 
 
 def _group_hook(event_id: int) -> str:
@@ -1181,7 +1226,9 @@ def _verified_leader(pgid: int, token: str) -> bool:
         return False
 
 
-def _end_group(pgid: int, token: str, kill_grace: float) -> None:
+def _end_group(
+    pgid: int, token: str, kill_grace: float, heartbeat: Callable[[], None] | None = None
+) -> None:
     """SIGTERM the verified group; SIGKILL it after ``kill_grace`` while its leader is still
     the verified process (checked again right before)."""
     try:
@@ -1192,6 +1239,8 @@ def _end_group(pgid: int, token: str, kill_grace: float) -> None:
     while time.monotonic() < deadline:
         if not _verified_leader(pgid, token):
             return
+        if heartbeat is not None:
+            heartbeat()
         time.sleep(_GROUP_POLL)
     if _verified_leader(pgid, token):
         try:
@@ -1210,11 +1259,21 @@ def deliver(
     state_root: str,
     cancel: threading.Event | None = None,
     patience: float = 0.0,
+    heartbeat: Callable[[], None] | None = None,
 ) -> Delivery:
     """Synchronous delivery for a command that changed a run with no live wrapper (or
     ``exec`` after its run ended). With ``patience``, a busy lease or a store error is
-    retried up to that many seconds (``Deliverer.deliver_all``)."""
-    d = Deliverer(st, cfg, gateway=gateway, environ=environ, state_root=state_root, cancel=cancel)
+    retried up to that many seconds (``Deliverer.deliver_all``). ``heartbeat``: see
+    ``Deliverer``."""
+    d = Deliverer(
+        st,
+        cfg,
+        gateway=gateway,
+        environ=environ,
+        state_root=state_root,
+        cancel=cancel,
+        heartbeat=heartbeat,
+    )
     if patience > 0:
         return d.deliver_all(csession_id, patience=patience)
     return d.deliver(csession_id)
@@ -1230,6 +1289,7 @@ def deliver_best_effort(
     state_root: str,
     cancel: threading.Event | None = None,
     patience: float = LEASE_TTL,
+    heartbeat: Callable[[], None] | None = None,
 ) -> Delivery | None:
     """``deliver`` with ``patience`` (default: the lease TTL) for a command that changed a run
     with no live wrapper, never raising an ``Exception``: an error is logged and whatever stays
@@ -1245,6 +1305,7 @@ def deliver_best_effort(
             state_root=state_root,
             cancel=cancel,
             patience=patience,
+            heartbeat=heartbeat,
         )
     except Exception as exc:
         st.rollback_open_transaction()

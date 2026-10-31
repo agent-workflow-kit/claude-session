@@ -155,10 +155,17 @@ def liveness(
     pending run past its deadline ends ``never_adopted``, a run whose wrapper died is
     finalized (salvaged, or ``launch_interrupted`` before its spawn), each with its outcome
     file written and its launch spec deleted; then, with ``cfg``, what it changed is
-    delivered. A run still live afterwards refuses the resume ``live`` at allocation."""
-    from . import toolhooks
+    delivered. Outcome files of the session's final runs never written are backfilled
+    (``outcomefile.backfill``), as every liveness check does. A run still live afterwards
+    refuses the resume ``live`` at allocation."""
+    from . import outcomefile, toolhooks
 
-    if check_liveness.check_session(st, cfg, csession_id, patience=SALVAGE_PATIENCE).finalized:
+    checked = check_liveness.check_session(st, cfg, csession_id, patience=SALVAGE_PATIENCE)
+    try:  # best effort: an unwritten one stays for the next check or reconcile
+        outcomefile.backfill(st, csession_id)
+    except Exception:
+        st.rollback_open_transaction()
+    if checked.finalized:
         if cfg is not None:
             toolhooks.deliver_best_effort(
                 st,
@@ -747,15 +754,18 @@ def allocate(
     *,
     pending: launch.Pending | None = None,
     cfg: Config | None = None,
+    check: bool = True,
 ) -> launch.Allocated:
     """Launch step 4, after the inline liveness check (``liveness``; with ``cfg``, what it
-    changed is delivered): a fork is a new
+    changed is delivered; ``check`` False: the caller ran it already, as ``resume`` does in
+    its deferred window before it raises a pending signal): a fork is a new
     session (``launch.allocate``; its git directory is checked against the source's when it
     runs in the source's cwd); a resume is run n + 1 (``launch.allocate_resume``, refusals
     in the same transaction). Any run of a fork may merge into the copied ``inputs/<run>/``;
     a resume that repeats a fork re-checks the source's taint before step 7."""
     source = planned.source
-    liveness(st, process, source.csession_id, cfg)
+    if check:
+        liveness(st, process, source.csession_id, cfg)
     git_dir = stored_git_dir(planned, process)
     if planned.fork:
         alloc = launch.allocate(

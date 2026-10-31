@@ -235,6 +235,19 @@ def test_run_selects_another_run(st: Store, clock: Clock) -> None:
     assert clock.slept == []
 
 
+def test_a_timeout_on_a_superseded_open_run_reports_its_own_state(st: Store, clock: Clock) -> None:
+    """``wait --run n-1 --timeout`` on a run a crash left open (its wrapper counts as alive)
+    while run n is current: run n-1's own latest state, never the session's."""
+    sid = session(st)
+    add_event(st, sid, "SessionStart", "working", None)
+    second_run(st, sid)
+    st.conn.execute("UPDATE sessions SET state = 'needs-input' WHERE csession_id = ?", (sid,))
+    waited = wait(st, clock, sid, run_no=1, timeout=1.0)  # validated against wait.json
+    out = waited.output
+    assert (waited.exit_code, out["run"], out["timed_out"]) == (22, 1, True)
+    assert out["state"] == "working"
+
+
 @pytest.mark.parametrize(
     "run_no",
     [0, -1, 2, 9007199254740991, 2**63, 99999999999999999999, -(2**63) - 1, -99999999999999999999],
