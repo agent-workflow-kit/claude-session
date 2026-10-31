@@ -52,15 +52,19 @@ MAX_INTEGER = defaults.MAX_INTEGER  # every integer key (JSON's exact-integer ra
 MAX_RETENTION_DAYS = 36500
 
 VERSION = r"[0-9]+(\.[0-9]+)*"
-# Names that are never config keys and may not be set in env.set (interface.md).
 INVALID_REPO = "<invalid repo id>"
-RESERVED_ENV = (
-    "CSESSION_ID",
-    "CSESSION_DIR",
-    "CSESSION_KIND",
-    "CSESSION_HOOK",
-    "CSESSION_OBJECT_TYPE",
+# No env.set name may start with it (interface.md, Environment variables).
+CSESSION_PREFIX = "CSESSION_"
+# env.allow entries: a name, or a PREFIX* glob whose prefix is a valid name start.
+ENV_PATTERN = r"[A-Za-z_][A-Za-z0-9_]*\*?"
+# The only references env.set values may contain (interface.md, Permission profiles).
+EXPAND_VARS = ("CSESSION_DIR", "CWD", "HOME", "GIT_DIR")
+ENV_REFERENCE = re.compile(r"\$\{(" + "|".join(EXPAND_VARS) + r")\}")
+REFERENCE_PROBLEM = (
+    "only ${CSESSION_DIR}, ${CWD}, ${HOME} and ${GIT_DIR} may be referenced"
+    " (any other '${' is refused)"
 )
+INVALID_ENV_NAME = "<invalid variable name>"
 
 
 def _integer(text: str) -> int:
@@ -172,11 +176,46 @@ def _unique(values: list[str]) -> list[str]:
     return values
 
 
-def _no_reserved(values: dict[str, str]) -> dict[str, str]:
-    for name in values:
-        if name in RESERVED_ENV:
-            raise ValueError(f"{name} is reserved and cannot be set")
-    return values
+def _settable(name: str) -> str:
+    """``env.set`` names: every ``CSESSION_*`` name is claude-session's own (step 8 of
+    design.md, Environment clears and sets them), so none may be set."""
+    if name.startswith(CSESSION_PREFIX):
+        raise ValueError(f"{CSESSION_PREFIX}* names cannot be set")
+    return name
+
+
+def env_set_value_problem(value: str) -> str | None:
+    """Why ``value`` is not a valid ``env.set`` value (None: valid). A value has no NUL, and
+    every ``${`` in it starts one of the exact references ``${CSESSION_DIR}``, ``${CWD}``,
+    ``${HOME}``, ``${GIT_DIR}``. A ``$``, ``{`` or ``}`` on its own is literal (``$${HOME}{``
+    is valid: expansion is single-pass, so no new reference forms). The message never contains
+    the value."""
+    if "\x00" in value:
+        return "must not contain a NUL character"
+    start = value.find("${")
+    while start != -1:
+        if not ENV_REFERENCE.match(value, start):
+            return REFERENCE_PROBLEM
+        start = value.find("${", start + 1)
+    return None
+
+
+def _set_value(value: str) -> str:
+    problem = env_set_value_problem(value)
+    if problem:
+        raise ValueError(problem)
+    return value
+
+
+def is_path_entry(entry: str) -> bool:
+    """A ``PATH`` entry is one absolute path: non-empty, starts with ``/``, no ``:`` or NUL."""
+    return entry.startswith("/") and ":" not in entry and "\x00" not in entry
+
+
+def _path_entry(entry: str) -> str:
+    if not is_path_entry(entry):
+        raise ValueError("must be an absolute path without ':' or NUL (not expanded)")
+    return entry
 
 
 KindName = Annotated[str, _grammar(ids.is_kind_name, "kind name", ids.KIND_NAME.pattern)]
@@ -200,7 +239,12 @@ Count = Annotated[int, Integral, Field(ge=0, le=MAX_INTEGER)]
 Days = Annotated[int, Integral, Field(ge=0, le=MAX_RETENTION_DAYS)]
 Turns = Annotated[int, Integral, Field(ge=1, le=MAX_INTEGER)]
 Model = Annotated[str, AfterValidator(_no_controls), AfterValidator(_no_leading_dash)]
-EnvSet = Annotated[dict[str, str], AfterValidator(_no_reserved)]
+EnvName = Annotated[str, _grammar(ids.is_env_name, "variable name", ids.ENV_NAME.pattern)]
+EnvSetName = Annotated[EnvName, AfterValidator(_settable)]
+EnvSetValue = Annotated[str, AfterValidator(_set_value)]
+EnvSet = dict[EnvSetName, EnvSetValue]
+EnvPattern = Annotated[str, _matching(ENV_PATTERN, "entry")]
+PathEntry = Annotated[str, AfterValidator(_path_entry)]
 SettingSources = Annotated[list[Literal["user", "project", "local"]], AfterValidator(_unique)]
 Sandbox = Literal["required", "preferred", "off"]
 State = Literal[
@@ -227,9 +271,9 @@ class _Model(BaseModel):
 
 class KindEnv(_Model):
     inherit: bool
-    allow: list[str]
+    allow: list[EnvPattern]
     set: EnvSet
-    path_prepend: list[str]
+    path_prepend: list[PathEntry]
 
 
 class Kind(_Model):
@@ -262,9 +306,9 @@ class Kind(_Model):
 
 class EnvOverride(_Model):
     inherit: Annotated[bool | None, NotNull] = None
-    allow: Annotated[list[str] | None, NotNull] = None
+    allow: Annotated[list[EnvPattern] | None, NotNull] = None
     set: Annotated[EnvSet | None, NotNull] = None
-    path_prepend: Annotated[list[str] | None, NotNull] = None
+    path_prepend: Annotated[list[PathEntry] | None, NotNull] = None
 
 
 class RepoKindOverride(_Model):
@@ -320,8 +364,8 @@ class Config(_Model):
     claude_bin: Annotated[str, AfterValidator(_no_controls)]
     min_claude_version: Annotated[str, _matching(VERSION, "version")]
     default_kind: KindName  # also names a built-in or configured kind (checked by ``load``)
-    claude_auth_env: list[str]
-    secret_env: list[str]
+    claude_auth_env: list[EnvName]
+    secret_env: list[EnvName]
     notes_context_cmd: Annotated[list[str], Field(min_length=1)]
     notes_context_timeout: PositiveDuration
     notes_context_max_bytes: Count
@@ -760,10 +804,12 @@ def _unsupported(value: _Unsupported, where: str, path: Path) -> UsageError:
 
 
 def _key_path(where: str, key: str) -> str:
-    """``where.key``; a repo key that is not a valid repo id is not echoed (it may hold
-    credentials)."""
+    """``where.key``; a repo key that is not a valid repo id and an ``env.set`` key that is not
+    a valid variable name are not echoed (they may hold credentials or control characters)."""
     if where == "repos" and not ids.is_repo_id(key):
         key = INVALID_REPO
+    elif (where == "env.set" or where.endswith(".env.set")) and not ids.is_env_name(key):
+        key = INVALID_ENV_NAME
     return f"{where}.{key}" if where else key
 
 
