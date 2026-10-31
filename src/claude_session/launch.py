@@ -17,8 +17,10 @@ Everything up to and including a successful spawn of ``claude`` is the launch ph
 validation normally catches first, becomes ``config_invalid``) ends the run ``not-started``
 with its end reason (``end_launch``); any other error before the spawn (the audit record
 cannot be written, ``claude`` cannot be started) ends it ``launch_interrupted``. Either way
-the command exits 12 with the outcome object; only a ``KeyboardInterrupt`` (SIGINT) is
-re-raised once the run is final.
+the command exits 12 with the outcome object. A signal (``signals.LaunchInterrupted``: SIGINT,
+SIGTERM or SIGHUP) ends it ``launch_interrupted``, or ``canceled`` for SIGTERM and SIGHUP after
+a ``stop`` request (``interrupted_by``), and is re-raised once the run is final, as is a
+``KeyboardInterrupt``.
 
 The step-5 helpers take every input explicitly and return values; the side effects of step 5
 are confined to ``open_dirs`` (the session's directories) and the ``Effects`` that
@@ -43,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import re
 import sys
@@ -58,6 +61,7 @@ from . import (
     ids,
     kinds,
     logs,
+    outcomefile,
     pathrules,
     permission_profiles,
     secretindex,
@@ -71,14 +75,15 @@ from .config import Config
 from .endmap import EXIT_CODES
 from .errors import (
     FailedError,
-    InternalError,
     InvalidPermissionProfile,
     LaunchValidationError,
     RefusedError,
     UsageError,
 )
 from .gateway import Gateway
+from .kinds import Mode
 from .sessiondir import InputFile, SessionDirs
+from .signals import STOP_SIGNALS, ExecSignals, LaunchInterrupted
 
 LOG_NAME = "log.jsonl"
 AUDIT_NAME = "audit.jsonl"
@@ -166,7 +171,7 @@ class Request:
     ``previous_run``) and the conversation it continues."""
 
     kind: str | None
-    mode: str
+    mode: Mode
     skill: str | None
     prompt: bytes | None = field(repr=False)
     inputs: tuple[InputFile, ...]
@@ -198,17 +203,42 @@ def _actor(given: str | None, cfg: Config) -> str:
     return "auto:unknown"
 
 
+TTY_HINT = "run it in a terminal, or pass --mode headless"
+
+
+def _isatty(stream: Any) -> bool:
+    try:
+        return stream is not None and stream.isatty()
+    except (OSError, ValueError):
+        return False
+
+
+def check_tty(mode: str, prompt_file: str | None) -> None:
+    """The TTY check of plain ``exec`` in interactive mode (launch step 2, exit 2): stdin and
+    stdout must be terminals, and ``--prompt-file -`` cannot read a terminal stdin."""
+    if mode != "interactive":
+        return
+    if not (_isatty(sys.stdin) and _isatty(sys.stdout)):
+        raise UsageError(f"interactive mode needs a terminal on stdin and stdout; {TTY_HINT}")
+    if prompt_file == "-":
+        raise UsageError("--prompt-file - cannot read the prompt from a terminal stdin")
+
+
+def parse_mode(given: str | None) -> Mode:
+    """``--mode`` (argparse choices), ``interactive`` by default."""
+    if given is None or given == "interactive":
+        return "interactive"
+    if given == "headless":
+        return "headless"
+    raise UsageError(f"unknown mode {given!r}")
+
+
 def read_request(args: argparse.Namespace, cfg: Config) -> Request:
-    """Launch step 2 for ``exec``: the flags (already checked by ``cli``'s flag rules), the
-    prompt and the input files read into memory (each at most ``input_max_bytes``; a bad file
-    is a ``UsageError``, exit 2). Only headless runs are implemented."""
-    mode = args.mode or "interactive"
-    if mode != "headless":
-        # TODO(#17): interactive supervision (exec's default mode).
-        raise InternalError(
-            "interactive exec is not implemented yet; pass --mode headless",
-            detail="not_implemented",
-        )
+    """Launch step 2 for ``exec``: the TTY check of interactive mode, the flags (already
+    checked by ``cli``'s flag rules), the prompt and the input files read into memory (each
+    at most ``input_max_bytes``; a bad file is a ``UsageError``, exit 2)."""
+    mode = parse_mode(args.mode)
+    check_tty(mode, args.prompt_file)
     cap = cfg.input_max_bytes
     prompt = None
     if args.prompt_file == "-":
@@ -232,7 +262,10 @@ def read_request(args: argparse.Namespace, cfg: Config) -> Request:
         decision_ids=tuple(args.decision_id or ()),
         hooks=tuple(args.hook or ()),
         hook_timeouts=tuple(args.hook_timeout or ()),
-        outcome_file=None if args.outcome_file is None else os.path.abspath(args.outcome_file),
+        # Joined, not abspath: `..` applies after symlinks, as when the file is written.
+        outcome_file=(
+            None if args.outcome_file is None else outcomefile.absolute(args.outcome_file)
+        ),
     )
 
 
@@ -353,7 +386,7 @@ def resolve_kind(req: Request, cfg: Config, process: Process) -> Resolved:
     resolution = kinds.resolve(
         cfg,
         req.kind,
-        mode="headless" if req.mode == "headless" else "interactive",
+        mode=req.mode,
         repo=req.repo,
         cwd=probe_cwd,
         flags=req.flags,
@@ -599,6 +632,9 @@ class Checked:
     # An open descriptor of the private tmpdir this run created (``tmpdir.create_pinned``):
     # its removal is identity-checked against it; closed with the session directories.
     tmpdir_pin: int | None = None
+    # The run's session-writable paths (isolated runs; None for trusted ones): the
+    # outcome-file write is checked against them too.
+    writable: pathrules.SessionWritable | None = None
 
     def close_tmpdir_pin(self) -> None:
         if self.tmpdir_pin is not None:
@@ -884,6 +920,122 @@ def select_profile(
         session_writable=writable if resolution.isolated() else None,
         expected_label=resolution.permission_profile_label,
     )
+
+
+def check_outcome_file(req: Request, resolved: Resolved, process: Process) -> None:
+    """Launch step 2: ``--outcome-file`` must not resolve through ``<state>/sessions`` or the
+    tmp root (every run), nor, for an isolated run, through the caller's cwd it will write
+    (``OutcomeFileRejected``, exit 2; nothing is allocated). The rest of the run's
+    session-writable paths are known at step 5 (``check_outcome_path``)."""
+    if req.outcome_file is not None:
+        pathrules.check_outcome_file(req.outcome_file, step2_outcome_writable(resolved, process))
+
+
+def step2_outcome_writable(resolved: Resolved, process: Process) -> pathrules.SessionWritable:
+    """What ``--outcome-file`` must not resolve through at step 2: ``<state>/sessions`` and the
+    tmp root, plus an isolated run's caller cwd."""
+    cwd = resolved.caller_cwd if resolved.resolution.isolated() else None
+    return outcomefile.baseline_writable(process.state_root, *([cwd] if cwd else []))
+
+
+def check_outcome_path(
+    outcome_file: str | None, writable: pathrules.SessionWritable | None
+) -> None:
+    """Launch step 5 (isolated runs), once every session-writable path is known: an
+    ``--outcome-file`` that resolves through one fails the launch (``UnsafeOutcomeFile``,
+    ``unsafe_path``, exit 12: the run is allocated, so a usage error is no longer possible);
+    ``fail_launch`` drops the path from the run in the finalization transaction, so it is
+    never written."""
+    if outcome_file is None or writable is None:
+        return
+    hop = pathrules.outcome_file_hop(outcome_file, writable)
+    if hop is not None:
+        raise UnsafeOutcomeFile(detail=hop)
+
+
+class UnsafeOutcomeFile(LaunchValidationError):
+    """``check_outcome_path`` failed: the launch-phase end drops the run's ``outcome_file``
+    atomically with the finalization."""
+
+    def __init__(self, *, detail: str) -> None:
+        super().__init__(
+            "--outcome-file is under a session-writable path of this run",
+            end_reason="unsafe_path",
+            detail=detail,
+        )
+
+
+@dataclass
+class WritableGuard:
+    """The strongest set of an isolated run's session-writable paths known so far in its
+    launch (realpaths), for a launch-phase end before step 5 knows the full set: the end
+    stores it on the run, so no outcome-file writer checks less. None: not determined (a
+    trusted run, or an entry that cannot be expanded yet); an isolated run's outcome file is
+    then not written (``outcomefile.UNDETERMINED``)."""
+
+    paths: tuple[str, ...] | None = None
+
+
+def known_writable(
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    cwd: str,
+    home: str,
+    content: Mapping[str, Any] | None,
+) -> tuple[str, ...] | None:
+    """An isolated run's session-writable paths as far as they are known before git runs:
+    the cwd, ``$CSESSION_DIR`` and its writable directories, the private tmpdir path, the
+    ``write_dirs`` and the profile ``content``'s write entries expanded with the variables
+    known (``${GIT_DIR}`` is not). None when that cannot be determined (fail closed): the
+    profile is not read yet (``content`` None), a ``write_dirs`` entry or a profile write
+    entry uses ``${GIT_DIR}``, or an entry does not expand."""
+    if content is None:
+        return None
+    entries = [*resolution.profile.write_dirs, *pathrules.profile_write_entries(content)]
+    if any(GIT_DIR_VARIABLE in entry for entry in entries):
+        return None
+    try:
+        variables = profile_variables(alloc, cwd, home, None)
+        write = pathrules.resolve_dirs(
+            resolution.profile.write_dirs, variables, home=home, key="write_dirs"
+        )
+        expanded = permission_profiles.expand(_without_git_dir(content), variables)
+        return pathrules.session_writable(
+            session_dir=alloc.session_dir,
+            cwd=cwd,
+            home=home,
+            tmpdir=tmpdir.run_path(alloc.csession_id),
+            write_dirs=write,
+            profile=expanded,
+        ).paths
+    except Exception:
+        return None
+
+
+def launch_guard(
+    cfg: Config, resolved: Resolved, alloc: Allocated, process: Process
+) -> WritableGuard:
+    """The ``WritableGuard`` of a launch before step 5 starts: for an isolated run, the
+    ``known_writable`` set with the configured permission profile (a profile file is not read
+    yet: not determined). Never raises."""
+    resolution = resolved.resolution
+    try:
+        if not resolution.isolated():
+            return WritableGuard()
+        content = None
+        if resolution.permission_profile_file is None:
+            content = permission_profiles.configured(cfg, resolution).content
+        home = os.path.realpath(process.environ.get("HOME", "/"))
+        return WritableGuard(
+            known_writable(resolution, alloc, _run_cwd(resolved, alloc), home, content)
+        )
+    except Exception:
+        return WritableGuard()
+
+
+def _run_cwd(resolved: Resolved, alloc: Allocated) -> str:
+    """The run's cwd, resolved (``validate`` records it on the run)."""
+    return os.path.realpath(resolved.caller_cwd or os.path.join(alloc.session_dir, sessiondir.WORK))
 
 
 def check_profile_file(
@@ -1188,6 +1340,9 @@ class Effects:
     def warn(self, warnings: Sequence[str]) -> None:
         pass
 
+    def record_writable(self, paths: Sequence[str]) -> None:
+        """An isolated run's full session-writable set, once known (``writable_json``)."""
+
     def create_write_dirs(self, write: pathrules.WriteDirs) -> None:
         pass
 
@@ -1211,6 +1366,11 @@ class Recording(Effects):
 
     def record_cwd(self, cwd: str) -> None:
         self.st.update_run(self.alloc.csession_id, self.alloc.run, cwd=cwd)
+
+    def record_writable(self, paths: Sequence[str]) -> None:
+        self.st.update_run(
+            self.alloc.csession_id, self.alloc.run, writable_json=json.dumps(list(paths))
+        )
 
     def git_cwd(self, cwd: str) -> str:
         return cwd
@@ -1261,17 +1421,21 @@ def checks(
     alloc: Allocated,
     process: Process,
     effects: Effects,
+    guard: WritableGuard | None = None,
 ) -> Checked:
     """Launch step 5 after the rule paths and the session directories, in the order
     interface.md (Launch order) lists: ``$HOME``, the cwd, the permission profile read (its
     write entries and ``write_dirs`` without ``${GIT_DIR}`` expanded), git and the git
-    directory, the profile expanded, ``read_dirs``/``write_dirs``, the profile file against
-    the full set, the profile's paths, plugin directories, the hook interpreter, the tmpdir,
-    the tools (``claude_bin``, ``git``, ``bwrap``, ``socat``), the session environment
-    (``PATH``), the generated read entries, ``claude_args``, setting sources and the sandbox
-    self-check, which creates the private tmpdir last. What a launch records and creates in
-    between goes through ``effects``. Raises ``LaunchValidationError``; the first failure
-    wins."""
+    directory, the profile expanded, ``read_dirs``/``write_dirs``, the ``--outcome-file`` and
+    the profile file against the full set, the profile's paths, plugin directories, the hook
+    interpreter, the tmpdir, the tools (``claude_bin``, ``git``, ``bwrap``, ``socat``), the
+    session environment (``PATH``), the generated read entries, ``claude_args``, setting
+    sources and the sandbox self-check, which creates the private tmpdir last. What a launch
+    records and creates in between goes through ``effects``. Raises
+    ``LaunchValidationError``; the first failure wins. ``guard`` (isolated runs) is kept at
+    the strongest session-writable set known, and the full set is recorded on the run
+    (``effects.record_writable``: ``writable_json``) before it is checked against."""
+    guard = WritableGuard() if guard is None else guard
     resolution = resolved.resolution
     if resolved.fork_cwd_unsupported:
         raise LaunchValidationError(
@@ -1281,7 +1445,7 @@ def checks(
     isolated = resolution.isolated()
     home = os.path.realpath(process.environ.get("HOME", "/"))
     tmp = None if resolution.profile.sandbox == "off" else tmpdir.run_path(alloc.csession_id)
-    cwd = os.path.realpath(resolved.caller_cwd or os.path.join(alloc.session_dir, sessiondir.WORK))
+    cwd = _run_cwd(resolved, alloc)
     rules = host_rules(process, resolution, alloc, cwd, tmp, planned=effects.planned)
     check_cwd(rules, resolution)
     effects.record_cwd(cwd)
@@ -1289,6 +1453,8 @@ def checks(
         cfg, resolution, base_writable(resolution, alloc, cwd, home, tmp)
     )
     effects.record_profile(profile)
+    if isolated:
+        guard.paths = known_writable(resolution, alloc, cwd, home, profile.content)
     git_cwd = effects.git_cwd(cwd)
     before_git = git_writable(resolution, alloc, cwd, home, tmp, profile, git_cwd)
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
@@ -1304,6 +1470,10 @@ def checks(
     effects.warn(write.warnings)
     effects.create_write_dirs(write)
     writable = full_writable(resolution, alloc, cwd, home, tmp, write, expanded)
+    if writable is not None:
+        guard.paths = writable.paths
+        effects.record_writable(writable.paths)
+    check_outcome_path(req.outcome_file, writable)
     check_profile_file(resolution, writable)
     check_paths(rules, writable, read, write, expanded)
     effects.record_dirs(lambda: run_dirs(read, write.dirs, expanded, cwd, home))
@@ -1356,6 +1526,7 @@ def checks(
         credential_warnings=tuple(credential),
         sandbox_problems=check.problems,
         tmpdir_pin=check.tmpdir_pin,
+        writable=writable,
     )
 
 
@@ -1372,6 +1543,7 @@ def validate(
     *,
     effects: EffectsFactory | None = None,
     stage: bool = True,
+    guard: WritableGuard | None = None,
 ) -> Validated:
     """Launch step 5, in the order interface.md (Launch order) lists: rule paths, the
     session directories (``open_dirs``), then ``checks`` with the effects of a real launch
@@ -1383,7 +1555,7 @@ def validate(
     ``start`` staged them), so a run that then ends ``not-started`` keeps them for the next
     run (interface.md, Prompts and inputs), and then a fork's run copies the source's
     ``inputs/`` (``SessionDirs.copy_inputs``; an unsafe entry is ``session_dir_unsafe``)
-    and records the copied paths (``copied_inputs``)."""
+    and records the copied paths (``copied_inputs``). ``guard``: see ``checks``."""
     settings_builder.check_rule_paths(process.state_root, process.claude_session)
     dirs, layout = open_dirs(alloc, process, isolated=resolved.resolution.isolated())
     try:
@@ -1397,7 +1569,7 @@ def validate(
                 alloc.csession_id, alloc.run, [f"{sessiondir.INPUTS}/{path}" for path in copied]
             )
         made = (effects or Recording)(st, alloc, dirs)
-        checked = checks(cfg, req, resolved, alloc, process, made)
+        checked = checks(cfg, req, resolved, alloc, process, made, guard)
     except BaseException:
         dirs.close()
         raise
@@ -1488,15 +1660,16 @@ def drain_previous(st: store.Store, alloc: Allocated, dirs: SessionDirs, process
 class Prepared:
     """What step 7 wrote and the supervisor needs: the ``claude`` argv (``argv[0]`` the
     tool's name, run from ``executable``), the run's secret values (for log redaction) and
-    the run secret (refused in an implicit ``result.md``), and the descriptors for its stdout
-    and stderr (the supervisor closes them)."""
+    the run secret (refused in an implicit ``result.md``), and, for a headless run, the
+    descriptors for its stdout and stderr (the supervisor closes them; None in interactive
+    mode, where ``claude`` inherits the terminal)."""
 
     argv: list[str]
     executable: str
     secrets: frozenset[str] = field(repr=False)
     run_secret: str = field(repr=False)
-    stdout_fd: int
-    stderr_fd: int
+    stdout_fd: int | None
+    stderr_fd: int | None
     warnings: list[str]
 
 
@@ -1537,7 +1710,7 @@ def generate(
     )
     conversation = req.conversation
     launch = settings_builder.Launch(
-        mode="headless" if req.mode == "headless" else "interactive",
+        mode=req.mode,
         cwd=v.cwd,
         skill=req.skill,
         prompt_path=prompt_path,
@@ -1619,12 +1792,14 @@ def prepare(
         fields["backstop_used"] = 1  # the kind turns the Stop backstop off: never taken
     st.update_run(sid, run, **fields)
     warnings = [*v.warnings, *generated.warnings]
-    stdout_fd = dirs.create_run_output(run, RESULT_FILE)
-    try:
-        stderr_fd = dirs.create_run_output(run, STDERR_FILE)
-    except BaseException:
-        os.close(stdout_fd)
-        raise
+    stdout_fd = stderr_fd = None
+    if req.mode == "headless":  # interactive claude inherits the terminal
+        stdout_fd = dirs.create_run_output(run, RESULT_FILE)
+        try:
+            stderr_fd = dirs.create_run_output(run, STDERR_FILE)
+        except BaseException:
+            os.close(stdout_fd)
+            raise
     return Prepared(
         argv=[v.claude.name, *generated.argv[1:]],
         executable=v.claude.path,
@@ -1652,12 +1827,18 @@ def failure_message(error: LaunchValidationError) -> str:
     return _CONTROL.sub("", text)[:MESSAGE_MAX]
 
 
-def fail_launch(st: store.Store, alloc: Allocated, error: LaunchValidationError) -> bool:
+def fail_launch(
+    st: store.Store,
+    alloc: Allocated,
+    error: LaunchValidationError,
+    writable: Sequence[str] | None = None,
+) -> bool:
     """End the run ``not-started`` with the error's end reason (exit 12) and its
-    ``failure_message``. Returns whether this call finalized the run.
+    ``failure_message``. Returns whether this call finalized the run. In the same
+    transaction: the run's session-writable paths ``writable`` are stored unless the run has
+    them already, and an ``UnsafeOutcomeFile`` drops the run's ``outcome_file``.
 
-    TODO(#20): the one final ``post-state-change`` of a launch-phase end.
-    TODO(#21): the ``--outcome-file`` of a launch-phase end, after the compare-and-set."""
+    TODO(#20): the one final ``post-state-change`` of a launch-phase end."""
     return st.finalize_run(
         alloc.csession_id,
         alloc.run,
@@ -1669,6 +1850,8 @@ def fail_launch(st: store.Store, alloc: Allocated, error: LaunchValidationError)
             state="not-started",
             cause=alloc.cause,
             message=failure_message(error),
+            writable=None if writable is None else tuple(writable),
+            drop_outcome_file=isinstance(error, UnsafeOutcomeFile),
         ),
     )
 
@@ -1678,9 +1861,26 @@ def interrupted(exc: BaseException, message: str | None = None) -> LaunchValidat
     if message is None:
         if isinstance(exc, KeyboardInterrupt):
             message = "launch interrupted by SIGINT"
+        elif isinstance(exc, LaunchInterrupted):
+            message = f"launch interrupted by {exc.name}"
         else:
             message = f"launch interrupted by an internal error ({type(exc).__name__})"
     return LaunchValidationError(message, end_reason="launch_interrupted")
+
+
+def interrupted_by(st: store.Store, alloc: Allocated, exc: BaseException) -> LaunchValidationError:
+    """The launch-phase end for ``exc``: ``canceled`` for a SIGTERM or SIGHUP after a ``stop``
+    request (``stop_requested_at`` set), else ``launch_interrupted`` (interface.md, Signals)."""
+    if isinstance(exc, LaunchInterrupted) and exc.signum in STOP_SIGNALS:
+        try:
+            stop_requested = st.run_record(alloc.csession_id, alloc.run)["stop_requested_at"]
+        except Exception:  # unreadable: the conservative end is the interruption
+            stop_requested = None
+        if stop_requested is not None:
+            return LaunchValidationError(
+                f"launch canceled by stop ({exc.name})", end_reason="canceled"
+            )
+    return interrupted(exc)
 
 
 def end_launch(
@@ -1692,16 +1892,24 @@ def end_launch(
     error: LaunchValidationError,
     *,
     exc: BaseException | None = None,
+    guard: WritableGuard | None = None,
 ) -> None:
-    """A launch-phase end: finalize the run (``fail_launch``), then, whatever happens, close
+    """A launch-phase end: finalize the run (``fail_launch``, with the strongest
+    session-writable set known: ``v``'s full set, else ``guard``'s), write its outcome file
+    right after the compare-and-set, then, whatever happens, close
     the output descriptors, delete the secret index, remove the private tmpdir and log the
     failure (``launch`` with the end reason; ``launch_interrupted`` with the exception type
-    for an ``exc``)."""
+    for an ``exc``). A transaction an interrupted store write left open is rolled back
+    first."""
     try:
-        fail_launch(st, alloc, error)
+        st.rollback_open_transaction()
+        if fail_launch(st, alloc, error, _known_writable(v, guard)):
+            outcomefile.write_run(st, alloc.csession_id, alloc.run)
     finally:
         if prepared is not None:
             for fd in (prepared.stdout_fd, prepared.stderr_fd):
+                if fd is None:
+                    continue
                 try:
                     os.close(fd)
                 except OSError:
@@ -1721,10 +1929,17 @@ def end_launch(
                 log,
                 "launch_interrupted",
                 level="error",
-                reason="launch_interrupted",
+                reason=error.end_reason,
                 message=type(exc).__name__,
                 **fields,
             )
+
+
+def _known_writable(v: Validated | None, guard: WritableGuard | None) -> tuple[str, ...] | None:
+    """The strongest session-writable set a launch-phase end knows (isolated runs)."""
+    if v is not None and v.writable is not None:
+        return v.writable.paths
+    return None if guard is None else guard.paths
 
 
 def log_credential_warnings(
@@ -1808,47 +2023,91 @@ def run(
     supervise: Callable[..., Any],
     effects: EffectsFactory | None = None,
     staged: bool = False,
+    signals: ExecSignals | None = None,
 ) -> Any:
-    """Steps 5 and 7 of an allocated run, then ``supervise`` (``supervisor.run_headless``,
+    """Steps 5 and 7 of an allocated run, then ``supervise`` (``supervisor.run_session``,
     which spawns ``claude``). A launch validation failure (or an unsafe session directory)
     ends the run ``not-started`` and returns None (the outcome is in the store); so does any
     other error before ``claude`` is spawned (``launch_interrupted``), except a
-    ``KeyboardInterrupt`` (or another ``BaseException``), which is re-raised once the run is
-    final. The adopting ``exec`` passes its ``effects`` (``validate``) and ``staged``
+    ``LaunchInterrupted`` (a signal: ``launch_interrupted`` or ``canceled``), a
+    ``KeyboardInterrupt`` or another ``BaseException``, which is re-raised once the run is
+    final; a fork source that became tainted after allocation ends it ``launch_interrupted``
+    and re-raises the ``RefusedError``. ``signals`` enters the launch phase here (a signal
+    received during allocation raises now) and defers signals again before the hand-over
+    (the supervisor checks them right before the spawn); None: handlers that were never
+    installed. The adopting ``exec`` passes its ``effects`` (``validate``) and ``staged``
     (``start`` staged the prompt and inputs already)."""
+    signals = ExecSignals() if signals is None else signals
     resolution = resolved.resolution
+    guard = launch_guard(cfg, resolved, alloc, process)
     v: Validated | None = None
     prepared: Prepared | None = None
+    ending = False  # an inner handler is ending the launch: the outer one must not again
     try:
+        # The outer handler also takes a signal that arrives while a launch failure is being
+        # handled, before the inner handler's defer() (the phase is still RAISE there).
         try:
-            v = validate(st, cfg, req, resolved, alloc, process, effects=effects, stage=not staged)
-            secrets = sorted(envbuild.secret_values(v.session_env, process.environ))
-            log_credential_warnings(process, alloc, v.credential_warnings, secrets)
-            # The audit record is written before the run secret exists (prepare rotates it),
-            # so it is redacted against the session's secret values only; prepared.secrets,
-            # used for the log from here on, is that set plus the run secret.
-            audit_sandbox_lowered(process, req, resolution, alloc, secrets)
-            st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
-            # TODO(#31): insert step 6 (pre-launch hooks) before this re-check.
-            recheck_fork_taint(st, alloc, resolution)
-            prepared = prepare(st, cfg, req, resolution, alloc, v, process)
-            st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
-        except LaunchValidationError as error:
-            end_launch(st, alloc, v, prepared, process, error)
-            return None
-        except RefusedError as refused:
-            # The fork source became tainted after allocation: the run ends not-started and
-            # the command exits 20 (tainted), as the refusal at step 3 would have.
-            end_launch(st, alloc, v, prepared, process, _refused_end(refused))
-            raise
-        except Exception as exc:
-            end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc)
-            return None
+            try:
+                signals.enter_launch()
+                v = validate(
+                    st,
+                    cfg,
+                    req,
+                    resolved,
+                    alloc,
+                    process,
+                    effects=effects,
+                    stage=not staged,
+                    guard=guard,
+                )
+                secrets = sorted(envbuild.secret_values(v.session_env, process.environ))
+                log_credential_warnings(process, alloc, v.credential_warnings, secrets)
+                # The audit record is written before the run secret exists (prepare rotates
+                # it), so it is redacted against the session's secret values only;
+                # prepared.secrets, used for the log from here on, is that set plus the run
+                # secret.
+                audit_sandbox_lowered(process, req, resolution, alloc, secrets)
+                st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
+                # TODO(#31): insert step 6 (pre-launch hooks) before this re-check.
+                recheck_fork_taint(st, alloc, resolution)
+                prepared = prepare(st, cfg, req, resolution, alloc, v, process)
+                st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
+                signals.defer()  # the supervisor raises a signal from here before the spawn
+            except LaunchValidationError as error:
+                signals.defer()  # a signal during the cleanup is only recorded
+                ending = True
+                end_launch(st, alloc, v, prepared, process, error, guard=guard)
+                return None
+            except RefusedError as refused:
+                # The fork source became tainted after allocation: the run ends not-started
+                # and the command exits 20 (tainted), as the refusal at step 3 would have.
+                signals.defer()
+                ending = True
+                end_launch(st, alloc, v, prepared, process, _refused_end(refused), guard=guard)
+                raise
+            except Exception as exc:
+                signals.defer()
+                ending = True
+                end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc, guard=guard)
+                return None
         except BaseException as exc:
-            end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc)
+            signals.defer()  # a second signal during the cleanup is only recorded
+            if not ending:  # an inner end_launch that raised is not run again
+                error = interrupted_by(st, alloc, exc)
+                end_launch(st, alloc, v, prepared, process, error, exc=exc, guard=guard)
             raise
         return supervise(
-            st, cfg, alloc, v, prepared, process, implicit_done=resolution.profile.implicit_done
+            st,
+            cfg,
+            alloc,
+            v,
+            prepared,
+            process,
+            mode=req.mode,
+            implicit_done=resolution.profile.implicit_done,
+            auto_exit=resolution.profile.auto_exit,
+            signals=signals,
+            bound=resolution.timeout(req.mode),
         )
     finally:
         if v is not None:

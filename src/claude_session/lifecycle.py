@@ -849,7 +849,7 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
         inputs = tuple(InputFile(name=name, data=b"") for name in _texts(data["input_files"]))
         return launch.Request(
             kind=frozen.resolution.kind,
-            mode=_text(data["mode"]),
+            mode=launch.parse_mode(_text(data["mode"])),
             skill=_optional_text(data["skill"]),
             prompt=b"" if _bool(data["has_prompt"]) else None,
             inputs=inputs,

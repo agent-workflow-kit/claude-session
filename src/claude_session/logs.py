@@ -32,6 +32,7 @@ EVENTS = frozenset(
         "hook_event_failed",
         "notes_failed",
         "signal_sent",
+        "signal_not_sent",
         "reconcile_change",
         "config_warning",
         "session_start_missing",

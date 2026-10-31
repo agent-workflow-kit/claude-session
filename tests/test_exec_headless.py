@@ -26,7 +26,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 from claude_session import pathrules
 
 from .conftest import REAL_TMP_ROOT
-from .fakeclaude import claude_bin, read_jsonl, write_json
+from .fakeclaude import claude_bin, read_jsonl, wait_for, write_json
 from .test_schemas import registry
 
 CLAUDE_SESSION = Path(sys.executable).parent / "claude-session"
@@ -554,66 +554,54 @@ def test_a_required_sandbox_without_prerequisites_is_not_started(
     assert run.outcome["message"]  # the install hint
 
 
-def test_sigint_during_supervision_is_an_internal_error_that_ends_the_child(
-    tmp_path: Path, state: Path, work: Path
+@pytest.mark.parametrize(
+    ("sig", "cause", "fake_code"),
+    [(2, "forwarded_int", 130), (15, "forwarded_term", 143), (1, "forwarded_hup", 129)],
+)
+def test_a_signal_during_headless_supervision_is_forwarded_once(
+    tmp_path: Path, state: Path, work: Path, sig: int, cause: str, fake_code: int
 ) -> None:
+    """interface.md, Signals (headless, session phase): SIGINT, SIGTERM and SIGHUP are
+    forwarded to the exact child after pending_cause is recorded; exec exits with the run's
+    outcome code (killed, 15), not by the signal."""
     marker = tmp_path / "hanging"
-    log = tmp_path / "fake.jsonl"
-    scenario = write_json(
-        tmp_path / "scenario.json",
-        {"steps": [START, {"do": "touch", "path": str(marker)}, {"do": "hang"}]},
-    )
-    fake = claude_bin(tmp_path / "fakebin", scenario, log)
-    cfg = tmp_path / "config.yaml"
-    cfg.write_text(f"claude_bin: {fake}\n{FAST}kill_grace: 2s\n", encoding="utf-8")
-    (tmp_path / "p.md").write_text("x")
-    proc = subprocess.Popen(
-        [
-            *claude_session_cmd(),
-            "exec",
-            "--mode",
-            "headless",
-            "--json",
-            "--config",
-            str(cfg),
-            "--prompt-file",
-            str(tmp_path / "p.md"),
-        ],
-        cwd=work,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    steps = [START, {"do": "touch", "path": str(marker)}, {"do": "hang"}]
+    proc = start_hanging(tmp_path, work, steps, marker)
     try:
-        deadline = 30.0
-        import time
-
-        start = time.monotonic()
-        while not marker.exists():
-            assert proc.poll() is None, proc.communicate()
-            assert time.monotonic() - start < deadline
-            time.sleep(0.02)
-        proc.send_signal(2)  # SIGINT to the exact process started here
+        proc.send_signal(sig)  # to the exact process started here
         out, err = proc.communicate(timeout=30)
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
-    # exec dies by SIGINT after the run is finalized, without a traceback (TODO(#17): SIGINT
-    # is then forwarded as forwarded_int instead of being an internal error).
-    assert proc.returncode == -2, err
+    assert proc.returncode == 15, err
     assert "Traceback" not in err
-    db = sqlite3.connect(f"file:{state / 'state.db'}?mode=ro", uri=True)
-    try:
-        row = db.execute(
-            "SELECT pending_cause, outcome, end_reason, exit_code, child_pid FROM runs"
-        ).fetchone()
-    finally:
-        db.close()
-    assert row[:4] == ("internal_error", "killed", "internal_error", 15)
-    child = row[4]
-    assert not os.path.exists(f"/proc/{child}") or "Z" in Path(f"/proc/{child}/stat").read_text()
+    outcome = json.loads(out)
+    validate_exec(outcome)
+    assert (outcome["outcome"], outcome["end_reason"], outcome["exit_code"]) == (
+        "killed",
+        cause,
+        15,
+    )
+    row = run_row_of(state)
+    assert row["pending_cause"] == cause
+    assert gone(row["child_pid"])
+    fake = read_jsonl(tmp_path / "fake.jsonl")
+    started = next(r for r in fake if r["event"] == "start")
+    assert started["pid"] == row["child_pid"]
+    received = [r for r in fake if r["event"] == "signal"]
+    assert [r["signal"] for r in received] == [signal_name(sig)]
+    assert any(r["event"] == "exit" and r["code"] == fake_code for r in fake), fake
+    sent = [r for r in read_jsonl(state / "log.jsonl") if r["event"] == "signal_sent"]
+    assert [(r["pid"], r["signal"], r["message"]) for r in sent] == [
+        (row["child_pid"], f"SIG{signal_name(sig)}", cause)
+    ]
+
+
+def signal_name(sig: int) -> str:
+    import signal
+
+    return signal.Signals(sig).name.removeprefix("SIG")
 
 
 def test_a_rejected_report_is_refiled_from_the_hooks_block(
@@ -747,11 +735,15 @@ def test_a_missing_secret_index_fails_the_drains_visibly(
             result_step(),
         ],
         config=FAST + "kinds:\n  implement:\n    implicit_done: false\n",
+        args=["--outcome-file", str(tmp_path / "outcome.json")],
     )
     # Nothing is ingested without the scan: no report, and the caller is told.
     assert run.outcome["report"] is None
     assert run.outcome["end_reason"] == "no_report"
     assert any("not ingested" in w for w in run.outcome["warnings"])
+    # Known before the finalization: recorded with it, so the outcome file carries it too.
+    written = json.loads((tmp_path / "outcome.json").read_text())
+    assert any("not ingested" in w for w in written["warnings"])
     assert list((run.private_run / "claimed").iterdir())  # the request stays claimed
 
 
@@ -995,11 +987,38 @@ def test_the_child_start_time_is_recorded_for_a_child_that_exits_at_once(
     assert run.run_row()["child_start"]
 
 
+def _ignoring(signals: Sequence[int]) -> Any:
+    """A ``preexec_fn`` that sets ``signals`` to ``SIG_IGN`` (``nohup``) before the exec."""
+    import signal
+
+    if not signals:
+        return None
+
+    def preexec() -> None:  # pragma: no cover - runs in the child
+        for sig in signals:
+            signal.signal(sig, signal.SIG_IGN)
+
+    return preexec
+
+
 def start_hanging(
-    tmp_path: Path, work: Path, steps: list[dict[str, Any]], marker: Path, config: str = ""
+    tmp_path: Path,
+    work: Path,
+    steps: list[dict[str, Any]],
+    marker: Path,
+    config: str = "",
+    ignore: Sequence[int] = (),
+    status_to: Path | None = None,
 ) -> subprocess.Popen[str]:
+    """``status_to``: claude is a shell wrapper that first copies its ``/proc`` status there
+    (the dispositions it inherited), then execs the fake (same PID)."""
     scenario = write_json(tmp_path / "scenario.json", {"steps": steps})
     fake = claude_bin(tmp_path / "fakebin", scenario, tmp_path / "fake.jsonl")
+    if status_to is not None:
+        fake = script(
+            tmp_path / "wrapbin" / "claude",
+            f'#!/bin/sh\n/bin/cat /proc/self/status > "{status_to}"\nexec "{fake}" "$@"\n',
+        )
     cfg = tmp_path / "config.yaml"
     cfg.write_text(f"claude_bin: {fake}\n{FAST}{config}", encoding="utf-8")
     (tmp_path / "p.md").write_text("x")
@@ -1021,6 +1040,7 @@ def start_hanging(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        preexec_fn=_ignoring(ignore),
     )
     import time
 
@@ -1057,34 +1077,53 @@ def gone(pid: int, timeout: float = 10.0) -> bool:
     return False
 
 
-def test_a_second_sigint_during_cleanup_still_ends_the_child_and_the_run(
+def test_a_second_signal_is_not_forwarded_and_the_child_is_killed_after_kill_grace(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
+    """A child that ignores the forwarded signal is SIGKILLed after kill_grace, the same
+    child (its PID from the fake's own start record); a second signal is never forwarded."""
     import signal
     import time
 
     marker = tmp_path / "hanging"
     steps = [
         START,
-        {"do": "ignore_signals", "signals": ["TERM"]},
+        {"do": "ignore_signals", "signals": ["TERM", "INT"]},
         {"do": "touch", "path": str(marker)},
         {"do": "hang"},
     ]
-    proc = start_hanging(tmp_path, work, steps, marker, config="kill_grace: 3s\n")
+    proc = start_hanging(tmp_path, work, steps, marker, config="kill_grace: 2s\n")
     try:
         assert run_row_of(state)["phase"] == "session"  # claude is running
         proc.send_signal(signal.SIGINT)
-        time.sleep(1.0)  # cleanup waits kill_grace for the child that ignores TERM
-        proc.send_signal(signal.SIGINT)
-        _, err = proc.communicate(timeout=30)
+        wait_for(tmp_path / "fake.jsonl", lambda r: r["event"] == "signal_ignored")
+        sent_at = time.monotonic()
+        proc.send_signal(signal.SIGTERM)  # during the grace: recorded, not forwarded
+        out, err = proc.communicate(timeout=30)
+        took = time.monotonic() - sent_at
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
-    assert proc.returncode == -signal.SIGINT, err
+    assert proc.returncode == 15, err
+    assert 1.0 < took < 15, took
     row = run_row_of(state)
-    assert (row["outcome"], row["end_reason"]) == ("killed", "internal_error")
+    assert (row["pending_cause"], row["outcome"], row["end_reason"]) == (
+        "forwarded_int",
+        "killed",
+        "forwarded_int",
+    )
     assert gone(row["child_pid"])
+    fake = read_jsonl(tmp_path / "fake.jsonl")
+    assert next(r for r in fake if r["event"] == "start")["pid"] == row["child_pid"]
+    assert [r["signal"] for r in fake if r["event"] == "signal_ignored"] == ["INT"]
+    signal_events = ("signal_sent", "signal_not_sent")
+    sent = [r for r in read_jsonl(state / "log.jsonl") if r["event"] in signal_events]
+    assert [(r["event"], r.get("pid"), r["signal"]) for r in sent] == [
+        ("signal_sent", row["child_pid"], "SIGINT"),
+        ("signal_not_sent", None, "SIGTERM"),
+        ("signal_sent", row["child_pid"], "SIGKILL"),
+    ]
 
 
 # In-process runs: a fault injected into exec itself
@@ -1286,7 +1325,7 @@ def test_a_run_record_failure_after_spawn_is_an_internal_error_and_the_run_ends(
     failed: list[bool] = []
 
     def flaky(self: store.Store, *args: Any, **kwargs: Any) -> Any:
-        if not failed and sys._getframe(1).f_code.co_name == "run_headless":
+        if not failed and sys._getframe(1).f_code.co_name == "run_session":
             failed.append(True)
             raise sqlite3.OperationalError("database is locked")
         return real_run_record(self, *args, **kwargs)
@@ -1300,3 +1339,69 @@ def test_a_run_record_failure_after_spawn_is_an_internal_error_and_the_run_ends(
     row = run_row_of(state)
     assert (row["outcome"], row["end_reason"], row["exit_code"]) == ("killed", "internal_error", 15)
     assert row["ended_at"] is not None and row["child_pid"] is not None
+
+
+def ignored_signals(status: Path) -> int:
+    """The ``SigIgn`` mask in a copy of ``/proc/<pid>/status``."""
+    (line,) = (x for x in status.read_text().splitlines() if x.startswith("SigIgn:"))
+    return int(line.split()[1], 16)
+
+
+@pytest.mark.parametrize("ignored", [1, 2], ids=["SIGHUP", "SIGINT"])
+def test_a_signal_ignored_when_exec_starts_stays_ignored_and_claude_inherits_it(
+    tmp_path: Path, state: Path, work: Path, ignored: int
+) -> None:
+    """R1-06 (nohup, or a background job's SIGINT): exec installs no handler for it, sends
+    nothing on it, and the headless claude inherits the ignore."""
+    import signal
+
+    marker = tmp_path / "hanging"
+    steps = [START, {"do": "touch", "path": str(marker)}, {"do": "hang"}]
+    status = tmp_path / "claude-status"
+    proc = start_hanging(tmp_path, work, steps, marker, ignore=[ignored], status_to=status)
+    try:
+        child = run_row_of(state)["child_pid"]
+        # claude (here its wrapper's cat, which a shell cannot un-ignore) inherited it.
+        assert ignored_signals(status) & (1 << (ignored - 1))
+        proc.send_signal(ignored)  # the exact exec started here: ignored
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert proc.returncode == 15, err
+    outcome = json.loads(out)
+    assert outcome["end_reason"] == "forwarded_term"
+    fake = read_jsonl(tmp_path / "fake.jsonl")
+    assert [r["signal"] for r in fake if r["event"] == "signal"] == ["TERM"]
+    assert gone(child)
+
+
+def test_a_headless_run_with_a_done_report_auto_exits(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """R1-16: a done report, a Stop without background tasks, then a claude that would hang:
+    exec ends it after auto_exit_delay (auto_exit), and the outcome is the report's."""
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [
+            START,
+            {"do": "report", "args": ["done", "--summary", "finished"]},
+            STOP,
+            {"do": "hang"},
+        ],
+        config=FAST + "auto_exit_delay: 0.3s\n",
+    )
+    assert run.code == 0, run.proc.stderr
+    assert (run.outcome["outcome"], run.outcome["end_reason"], run.outcome["state"]) == (
+        "done",
+        "auto_exit",
+        "exited",
+    )
+    row = run.run_row()
+    assert row["pending_cause"] == "auto_exit"
+    assert [r["signal"] for r in run.fake_log() if r["event"] == "signal"] == ["TERM"]
+    assert gone(row["child_pid"])

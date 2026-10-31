@@ -1,0 +1,26 @@
+{
+  "claude_session_id": null,
+  "cost_usd": null,
+  "csession_id": "cs-aaaaaaaa",
+  "end_reason": null,
+  "exit_code": 22,
+  "forked_from": null,
+  "message": null,
+  "outcome": null,
+  "pending": false,
+  "phase": "session",
+  "report": {
+    "artifact": null,
+    "implicit": false,
+    "reason": null,
+    "reported_at": "2026-01-01T00:00:00Z",
+    "status": "done",
+    "summary": "ok"
+  },
+  "run": 1,
+  "run_exit_code": null,
+  "session_started_at": null,
+  "state": "reported",
+  "timed_out": true,
+  "warnings": []
+}

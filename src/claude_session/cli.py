@@ -8,6 +8,7 @@ path).
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -18,12 +19,13 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NoReturn
 
-from . import durations, fsutil, ids, outbox, store
+from . import durations, ids, outbox, outcomefile, store
 from .defaults import MAX_INTEGER
-from .errors import CliError, InternalError, RefusedError, UsageError
+from .errors import CliError, InternalError, OutcomeFileRejected, RefusedError, UsageError
 
 if TYPE_CHECKING:
     from .config import Config
+    from .launch import Allocated, Process
 
 PROG = "claude-session"
 DESCRIPTION = "Runs and supervises Claude Code sessions (terminal-agnostic)."
@@ -157,39 +159,111 @@ def _report(args: argparse.Namespace) -> int:
 
 
 def _exec(args: argparse.Namespace) -> int:
-    """``exec`` of a new headless session: launch steps 2 to 7, then supervision (interface.md,
-    Launch order and exec). A launch-phase end exits 12 with the outcome object."""
+    """``exec`` of a new session: launch steps 2 to 7, then supervision (interface.md, Launch
+    order, exec and Signals). A launch-phase end exits 12 with the outcome object, also when a
+    signal interrupted the launch; a signal before allocation ends ``exec`` by that signal.
+    The signal handlers are installed before allocation and restored once the outcome is
+    printed (until then a late signal is only recorded)."""
     if args.session_id is not None:
         return _adopt(args)
     if args.dry_run:
         return _dry_run(args)
-    if args.mode != "headless":
-        # TODO(#17): interactive supervision (exec's default mode).
-        raise InternalError(
-            "interactive exec is not implemented yet; pass --mode headless",
-            detail="not_implemented",
-        )
     from . import launch, supervisor
     from .gateway import SystemGateway
+    from .signals import ExecSignals, LaunchInterrupted
 
     cfg = load_config(args)
-    # TODO(#17): install the signal handlers (interface.md, Signals) here, before allocation.
+    signals = ExecSignals()
+    try:  # entered first: a signal during the install is handled and the handlers restored
+        try:
+            signals.install()  # before allocation (interface.md, Signals)
+            with store.open_state() as st:
+                process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+                req = launch.read_request(args, cfg)
+                resolved = launch.resolve_kind(req, cfg, process)
+                launch.check_outcome_file(req, resolved, process)
+                # From here an error envelope's outcome file is checked as the run's is.
+                args.outcome_file_writable = launch.step2_outcome_writable(resolved, process)
+                signals.defer()  # a signal during allocation acts once the run exists
+                alloc = launch.allocate(st, req, resolved, process)
+                try:
+                    ended = launch.run(
+                        st,
+                        cfg,
+                        req,
+                        resolved,
+                        alloc,
+                        process,
+                        supervise=supervisor.run_session,
+                        signals=signals,
+                    )
+                except LaunchInterrupted as exc:
+                    ended = None  # the run ended not-started: its outcome is in the store
+                    signals.defer()
+                    _end_interrupted_launch(st, alloc, process, exc)
+                outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
+        except LaunchInterrupted as exc:  # before allocation: nothing to record
+            _die_of(exc.signum)
+        except KeyboardInterrupt:  # handlers not installed (not the main thread)
+            _die_of(signal.SIGINT)
+        signals.defer()  # until the outcome is printed, a signal is only recorded
+        try:
+            _print_outcome(outcome, args.json)
+        except OSError as exc:
+            # A terminal that hung up (interactive SIGHUP) cannot take the outcome: the run
+            # is final and stored, and the exit code still carries it.
+            if exc.errno != errno.EIO:
+                raise
+    finally:
+        signals.restore()
+    if ended is not None:
+        return ended.exit_code
+    if outcome["exit_code"] is None:  # a run that is still not final: never read as a code
+        raise InternalError("the run has no outcome after its launch was interrupted")
+    return int(outcome["exit_code"])
+
+
+def _wait(args: argparse.Namespace) -> int:
+    """``wait <id> [--run n] [--timeout d] [--outcome-file p]`` (interface.md, wait): the
+    run's outcome code, or 22 when ``--timeout`` expired first. Ctrl-C ends it by the signal,
+    printing nothing."""
+    from . import waiter
+
+    cfg = load_config(args)
+    timeout = durations.parse_bound(args.timeout)
     try:
         with store.open_state() as st:
-            process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
-            req = launch.read_request(args, cfg)
-            resolved = launch.resolve_kind(req, cfg, process)
-            alloc = launch.allocate(st, req, resolved, process)
-            ended = launch.run(
-                st, cfg, req, resolved, alloc, process, supervise=supervisor.run_headless
+            state_root = os.path.dirname(st.path)
+
+            def bound(row: dict[str, Any]) -> None:
+                # Once bound, an error envelope is checked against the waited run's paths.
+                args.outcome_file_writable = outcomefile.run_writable(row, state_root)
+
+            waited = waiter.wait_for_run(
+                st,
+                args.id,
+                run_no=args.run,
+                timeout=timeout,
+                poll_interval=cfg.poll_interval,
+                on_row=bound,
             )
-            outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
     except KeyboardInterrupt:
-        # TODO(#17): SIGINT is then forwarded and mapped forwarded_int (headless) or ignored
-        # (interactive); exec exits with the run's stored exit_code instead of dying by it.
-        _die_of_sigint()
-    _print_outcome(outcome, args.json)
-    return int(outcome["exit_code"]) if ended is None else ended.exit_code
+        _die_of(signal.SIGINT)
+    output = waited.output
+    if args.outcome_file is not None:
+        writable = outcomefile.run_writable(waited.row, state_root)
+        _write_wait_outcome_file(args.outcome_file, output, state_root, writable)
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False, allow_nan=False))
+    elif output["timed_out"]:
+        line = (
+            f"{output['csession_id']} run {output['run']}: timed out, still {output['state']}"
+            f" (exit {waiter.TIMED_OUT})"
+        )
+        print(f"{PROG}: {sanitize(line)}", file=sys.stderr)
+    else:
+        _print_outcome(output, False)
+    return waited.exit_code
 
 
 def _adopt(args: argparse.Namespace) -> int:
@@ -203,10 +277,10 @@ def _adopt(args: argparse.Namespace) -> int:
             process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
             if args.dry_run:
                 return _print_dry_run(args, *lifecycle.adoption_plan(st, args, process))
-            outcome, code = lifecycle.adopt(st, args, process, supervise=supervisor.run_headless)
+            outcome, code = lifecycle.adopt(st, args, process, supervise=supervisor.run_session)
     except KeyboardInterrupt:
         # TODO(#17): as for plain exec (signal handling of the launch and session phases).
-        _die_of_sigint()
+        _die_of(signal.SIGINT)
     _print_outcome(outcome, args.json)
     return code
 
@@ -252,14 +326,14 @@ def _resume(args: argparse.Namespace) -> int:
                 planned.resolved,
                 alloc,
                 process,
-                supervise=supervisor.run_headless,
+                supervise=supervisor.run_session,
             )
             outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
             # TODO(#20): deliver the run's post-state-change events (toolhooks.deliver) for a
             # run that ended without a live wrapper delivering them.
     except KeyboardInterrupt:
         # TODO(#17): as for plain exec (SIGINT forwarded, or ignored in interactive mode).
-        _die_of_sigint()
+        _die_of(signal.SIGINT)
     _print_outcome(outcome, args.json)
     return int(outcome["exit_code"]) if ended is None else ended.exit_code
 
@@ -358,16 +432,43 @@ def _kinds(args: argparse.Namespace) -> int:
     return 0
 
 
-def _die_of_sigint() -> NoReturn:
-    """Exit by SIGINT (the run is already final) without a traceback: restore the default
-    action and signal this process itself."""
+def _write_wait_outcome_file(
+    path: str, output: dict[str, Any], state_root: str, writable: Callable[[str], bool] | None
+) -> None:
+    """``wait --outcome-file``: ``wait``'s own output (interface.md, Outcome file), never to a
+    path the waited run's agent could write (``outcomefile.run_writable``; None: not
+    determined, not written); a rejected, skipped or failed write adds a warning to the output
+    and logs ``outcome_file_failed``, and never changes the exit code."""
+    warning = outcomefile.write(outcomefile.absolute(path), outcomefile.encode(output), writable)
+    if warning is not None:
+        output["warnings"] = [*output["warnings"], warning]
+        outcomefile.log_failure(
+            state_root, warning, csession_id=output["csession_id"], run=output["run"]
+        )
+
+
+def _end_interrupted_launch(
+    st: store.Store, alloc: Allocated, process: Process, exc: BaseException
+) -> None:
+    """Backstop: a ``LaunchInterrupted`` that reached ``exec`` with the run not final (it
+    escaped the launch's own handling) ends the run ``not-started`` here."""
+    from . import launch
+
+    if st.run_record(alloc.csession_id, alloc.run)["ended_at"] is None:
+        error = launch.interrupted_by(st, alloc, exc)
+        launch.end_launch(st, alloc, None, None, process, error, exc=exc)
+
+
+def _die_of(signum: int) -> NoReturn:
+    """Exit by ``signum`` without a traceback: restore its default action and signal this
+    process itself (its exact PID)."""
     try:
         sys.stdout.flush()
     except (OSError, ValueError):
         pass
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    os.kill(os.getpid(), signal.SIGINT)
-    raise KeyboardInterrupt  # not reached: SIGINT ends the process
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+    raise KeyboardInterrupt  # not reached: the signal ends the process
 
 
 def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
@@ -392,7 +493,7 @@ HANDLERS: dict[str, Handler] = {
     "start": _start,
     "resume": _resume,
     "stop": _not_implemented,
-    "wait": _not_implemented,
+    "wait": _wait,
     "report": _report,
     "status": _not_implemented,
     "list": _list,
@@ -899,28 +1000,55 @@ def _outcome_file_from_argv(argv: Sequence[str]) -> str | None:
     """The last ``--outcome-file`` value in ``argv`` (as argparse would take it)."""
     if not argv or argv[0] not in OUTCOME_FILE_COMMANDS:
         return None
+    return _value_from_argv(argv, "--outcome-file")
+
+
+def _value_from_argv(argv: Sequence[str], flag: str) -> str | None:
+    """The last value of ``flag`` in ``argv`` before any ``--`` (as argparse would take it)."""
     found: str | None = None
     for index, token in enumerate(argv):
         if token == "--":
             break
-        if token == "--outcome-file" and index + 1 < len(argv):
+        if token == flag and index + 1 < len(argv):
             value = argv[index + 1]
             if not value.startswith("-") or NEGATIVE_NUMBER.match(value):
                 found = value
-        elif token.startswith("--outcome-file="):
+        elif token.startswith(flag + "="):
             found = token.partition("=")[2]
     return found
 
 
-def _write_outcome_file(path: str, error: CliError) -> None:
-    # TODO(#21): skip a path rejected by the session-writable check (isolated runs).
+def _envelope_writable(
+    args: argparse.Namespace | None, argv: Sequence[str], state_root: str
+) -> Callable[[str], bool] | None:
+    """What an error envelope's ``--outcome-file`` write refuses: what the command set once it
+    knew (``args.outcome_file_writable``: ``exec`` once the kind is resolved, ``wait`` once the
+    run is bound), else, failing closed, ``<state>/sessions``, the tmp root, this process's
+    cwd and ``--cwd`` (an isolated run's agent may write either; the kind may not be known)."""
+    if args is not None and hasattr(args, "outcome_file_writable"):
+        return args.outcome_file_writable  # type: ignore[no-any-return]
+    cwd = os.getcwd()
+    given = getattr(args, "cwd", None) if args else _value_from_argv(argv, "--cwd")
+    extra = [cwd, *([os.path.join(cwd, given)] if given else [])]
+    return outcomefile.baseline_writable(state_root, *(os.path.realpath(p) for p in extra))
+
+
+def _write_outcome_file(path: str, error: CliError, writable: Callable[[str], bool] | None) -> None:
+    """An error envelope to ``--outcome-file`` (``outcomefile.write``): never to a path
+    ``writable`` refuses (None: not determined, never written), and never for the rejection
+    of that path itself. A rejected, skipped or failed write is a warning on stderr, logged
+    ``outcome_file_failed`` (best effort)."""
+    if isinstance(error, OutcomeFileRejected):
+        return
+    state_root = store.state_dir()
     data = (json.dumps(error.envelope()) + "\n").encode()
     try:
-        # Not abspath: `..` must be resolved after symlinks (realpath in write_private_file).
-        fsutil.write_private_file(os.path.join(os.getcwd(), path), data)
-    except OSError as exc:
-        reason = sanitize(str(exc))
-        print(f"{PROG}: warning: could not write --outcome-file: {reason}", file=sys.stderr)
+        warning = outcomefile.write(outcomefile.absolute(path), data, writable)
+    except OSError as exc:  # no cwd to make the path absolute against
+        warning = f"{outcomefile.NOT_WRITTEN}: {exc.strerror or type(exc).__name__}"
+    if warning is not None:
+        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+        outcomefile.log_failure(state_root, warning)
 
 
 def _print_error(error: CliError, json_mode: bool) -> None:
@@ -968,16 +1096,20 @@ def check_schema(argv: Sequence[str]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args: argparse.Namespace | None = None
+    schema_checked = False
     try:
         check_schema(argv)
+        schema_checked = True
         args = parse(build_parser(), argv)
         check_flag_rules(args)
         return HANDLERS[args.handler](args)
     except CliError as error:
-        if isinstance(error, (UsageError, RefusedError)):
-            path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
-            if path:
-                _write_outcome_file(path, error)
+        # `wait --outcome-file` gets any error envelope wait prints after the schema check
+        # (interface.md, Outcome file); the other commands' outcome files only usage errors
+        # and refusals.
+        is_wait = _command_name(args, argv) == "wait"
+        if (is_wait and schema_checked) or isinstance(error, (UsageError, RefusedError)):
+            _write_error_outcome_file(args, argv, error)
         code = error.exit_code
         _emit_error(error, args.json if args else _given(argv, "--json"))
         return code
@@ -986,6 +1118,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:  # last resort: any bug is reported as `internal` (exit 1)
         error = InternalError(f"internal error: {type(exc).__name__}")
         code = error.exit_code
+        if schema_checked and _command_name(args, argv) == "wait":
+            # wait's outcome file gets this envelope too (interface.md, Outcome file); a
+            # write failure only warns.
+            _write_error_outcome_file(args, argv, error)
         try:
             if args.verbose if args else _given(argv, "--verbose"):
                 traceback.print_exc(file=sys.stderr)
@@ -993,6 +1129,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             pass
         _emit_error(error, args.json if args else _given(argv, "--json"))
         return code
+
+
+def _command_name(args: argparse.Namespace | None, argv: Sequence[str]) -> str | None:
+    """The command being run: the parsed handler, else the first argument."""
+    if args:
+        return str(args.handler)
+    return argv[0] if argv else None
+
+
+def _write_error_outcome_file(
+    args: argparse.Namespace | None, argv: Sequence[str], error: CliError
+) -> None:
+    """Write ``error``'s envelope to the ``--outcome-file`` given, if any."""
+    path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
+    if not path:
+        return
+    try:
+        writable = _envelope_writable(args, argv, store.state_dir())
+    except (OSError, ValueError):  # no cwd to refuse: fail closed
+        writable = None
+    _write_outcome_file(path, error, writable)
 
 
 def _emit_error(error: CliError, json_mode: bool) -> None:
