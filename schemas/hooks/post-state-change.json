@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "claude-session/hooks/post-state-change.json",
   "title": "post-state-change hook payload (stdin)",
-  "description": "Fired on every real state or activity change of a run (and when the report's status or reported_at changes, cause report), in order, at least once (deduplicate on event_id). Delivered by exec while its wrapper runs; for a run with no live wrapper, synchronously by the command that changes it (start, stop, forget, wait, resume, reconcile) or by the next delivering command; status and list never run hooks. A per-session delivery lease prevents concurrent double delivery. Exactly one final: true per run. Fires every turn; filter with the states selector. Cannot veto.",
+  "description": "Fired on every real state or activity change of a run (and when the report's status or reported_at changes, cause report), in order, at least once (deduplicate on event_id). Delivered by exec while its wrapper runs; for a run with no live wrapper, synchronously by the command that changes it (start, stop, forget, wait, resume, reconcile) or by the next delivering command; status and list never run hooks. A per-session delivery lease prevents concurrent double delivery. Exactly one final: true per run. Fires every turn; filter with the states selector. Cannot veto. state, activity, needs_input_reason, previous_state, previous_activity, cause, final, live, labels, event_id and event_ts describe the event. Every other field describes the run when the payload is delivered (ts), so a late or repeated delivery can show a later report, pending, phase, message or session_end_reason than the change it reports, and a redelivery of the same event_id can carry different values for these fields.",
   "type": "object",
   "properties": {
     "tool": {
@@ -38,7 +38,7 @@
     "ts": {
       "type": "string",
       "format": "date-time",
-      "description": "When this payload was delivered (delivery is at least once; see event_ts for post-state-change)."
+      "description": "When this payload was delivered, taken for each entry just before it runs (delivery is at least once; see event_ts for post-state-change). Every field that does not describe the event describes the run at this time."
     },
     "event_id": {
       "type": "integer",
@@ -55,7 +55,7 @@
     },
     "pending": {
       "type": "boolean",
-      "description": "true while the run is pending (created by start, not yet adopted)."
+      "description": "true while the run is pending (created by start, not yet adopted), at delivery time (ts), not at the event."
     },
     "phase": {
       "type": "string",
@@ -63,7 +63,7 @@
         "launch",
         "session"
       ],
-      "description": "launch for a pending run and launch-phase ends; session once claude was spawned."
+      "description": "launch for a pending run and launch-phase ends; session once claude was spawned. At delivery time (ts), not at the event."
     },
     "forked_from": {
       "type": [
@@ -127,7 +127,8 @@
       "description": "true for the run's last change: outcome, end_reason and exit_code are then non-null and state is final. Exactly one per run, including runs that ended in the launch phase (state not-started)."
     },
     "report": {
-      "$ref": "../cli/outcome.json#/$defs/report"
+      "$ref": "../cli/outcome.json#/$defs/report",
+      "description": "The run's report at delivery time (ts), not at the event: a late or repeated delivery can show a later report than the change it reports."
     },
     "outcome": {
       "$ref": "../cli/outcome.json#/$defs/outcome_value"
@@ -167,14 +168,14 @@
         "string",
         "null"
       ],
-      "description": "The reason of Claude Code's last SessionEnd hook for this run, verbatim; null if none was seen."
+      "description": "The reason of Claude Code's last SessionEnd hook for this run, verbatim; null if none was seen. At delivery time (ts)."
     },
     "message": {
       "type": [
         "string",
         "null"
       ],
-      "description": "Launch failure message (the error, its detail, then the hint when there is one) or pre-launch hook stderr (control characters stripped, capped at 2 KiB); never agent text."
+      "description": "Launch failure message (the error, its detail, then the hint when there is one) or pre-launch hook stderr (control characters stripped, capped at 2 KiB); never agent text. At delivery time (ts)."
     },
     "cause": {
       "$ref": "../cli/outcome.json#/$defs/cause"

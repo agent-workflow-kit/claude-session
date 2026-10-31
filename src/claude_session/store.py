@@ -1483,6 +1483,75 @@ class Store:
         )
         return cursor.rowcount == 1
 
+    # post-state-change delivery (toolhooks). Delivery holds the session's lease
+    # ``delivery:<id>`` (DELIVERY_LEASE_PREFIX); events are marked under it, in id order.
+
+    def undelivered_events(self, csession_id: str, limit: int) -> list[dict[str, Any]]:
+        """The session's events with ``delivered_at`` NULL, oldest first by id (at most
+        ``limit``), every run's: delivery is in order per session."""
+        cursor = self.conn.execute(
+            "SELECT id, run_no, event_ts, from_state, to_state, from_activity, to_activity, "
+            "needs_input_reason, cause, final, labels_json FROM events "
+            "WHERE csession_id = ? AND delivered_at IS NULL ORDER BY id LIMIT ?",
+            (csession_id, limit),
+        )
+        names = [column[0] for column in cursor.description]
+        return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+    def has_undelivered(self, csession_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM events WHERE csession_id = ? AND delivered_at IS NULL LIMIT 1",
+            (csession_id,),
+        ).fetchone()
+        return row is not None
+
+    def delivery_record(self, csession_id: str, run_no: int) -> dict[str, Any] | None:
+        """The run row with its session's ``launch_kind``, ``forked_from``, ``tainted`` and
+        ``claude_session_id`` (prefixed ``session_``), for a ``post-state-change`` payload;
+        None when the run row is gone."""
+        cursor = self.conn.execute(
+            "SELECT r.*, s.launch_kind AS session_launch_kind, "
+            "s.forked_from AS session_forked_from, s.tainted AS session_tainted, "
+            "s.claude_session_id AS session_claude_session_id "
+            "FROM runs r JOIN sessions s ON s.csession_id = r.csession_id "
+            "WHERE r.csession_id = ? AND r.run_no = ?",
+            (csession_id, run_no),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        names = [column[0] for column in cursor.description]
+        return dict(zip(names, row, strict=True))
+
+    def mark_delivered(self, event_id: int, lease: str) -> bool:
+        """In one transaction, while this store still holds ``lease``: set the event's
+        ``delivered_at`` (once) and renew the lease. Returns False, changing nothing, when the
+        lease was lost (taken over or released): the event stays undelivered and its next
+        deliverer runs it again (at least once)."""
+        with self.transaction() as conn:
+            now = self.clock()
+            cursor = conn.execute(
+                "UPDATE leases SET expires_at = ? WHERE name = ? AND holder_pid = ? "
+                "AND holder_start = ? AND holder_token = ?",
+                (
+                    format_ts(now + LEASE_TTL),
+                    lease,
+                    self.holder.pid,
+                    self.holder.start,
+                    self.token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            conn.execute(
+                "UPDATE events SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL",
+                (format_ts(now), event_id),
+            )
+        return True
+
+
+DELIVERY_LEASE_PREFIX = "delivery:"
+
 
 # Run and session columns ``exec`` sets after allocation (``update_run``, ``update_session``).
 RUN_FIELDS = frozenset(

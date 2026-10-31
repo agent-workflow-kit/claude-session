@@ -405,7 +405,9 @@
             "type": "object",
             "properties": {
               "cmd": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^[^\\u0000]*$",
+                "description": "Run as sh -c <cmd>; no NUL character."
               },
               "timeout": {
                 "anyOf": [
@@ -461,7 +463,9 @@
             "type": "object",
             "properties": {
               "cmd": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^[^\\u0000]*$",
+                "description": "Run as sh -c <cmd>; no NUL character."
               },
               "timeout": {
                 "anyOf": [
@@ -479,7 +483,8 @@
                 "default": "30s"
               },
               "async": {
-                "type": "boolean"
+                "type": "boolean",
+                "description": "async: true: the entry does not hold up later entries or events. It is still supervised (timeout, process-group kill), and the delivering command, exec included, waits for it before exiting. The event is marked delivered once the async entry's hook has started and received its payload, so async entries are delivered at least once but may finish out of order relative to later entries and events."
               },
               "kinds": {
                 "type": "array",
