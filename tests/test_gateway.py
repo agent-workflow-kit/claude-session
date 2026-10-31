@@ -265,6 +265,36 @@ def test_run_handles_large_output_on_both_streams_with_input(gw: SystemGateway) 
     assert proc.stderr == "e" * size
 
 
+def test_run_output_limit_keeps_a_prefix_and_drains_the_rest(gw: SystemGateway) -> None:
+    size = 3 * 1024 * 1024  # far above a pipe buffer: a child left unread would block
+    proc = gw.run(
+        py(
+            f"""
+            import sys
+            sys.stdout.write("o" * {size})
+            sys.stderr.write("é" * {size})
+            sys.stdout.write("tail")
+            """
+        ),
+        timeout=60,
+        output_limit=5,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout == "ooooo"
+    assert proc.stderr == "éé\ufffd"  # 5 bytes: two whole characters, then half of one
+
+
+def test_run_output_limit_zero_discards_everything(gw: SystemGateway) -> None:
+    proc = gw.run(py("print('out'); import sys; print('err', file=sys.stderr)"), output_limit=0)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+
+
+@pytest.mark.parametrize("limit", [-1, True, 1.5])
+def test_run_output_limit_must_be_a_non_negative_int(gw: SystemGateway, limit: Any) -> None:
+    with pytest.raises((ValueError, TypeError)):
+        gw.run([PY, "-c", "pass"], output_limit=limit)
+
+
 def test_run_timeout_raises_gateway_timeout_and_reaps_the_child(
     gw: SystemGateway, tmp_path: Path
 ) -> None:

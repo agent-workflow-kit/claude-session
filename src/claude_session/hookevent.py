@@ -624,7 +624,8 @@ def _record_report(store: Store, csession_id: str, drain: outbox.Drain) -> None:
         before, event, mode=run.mode or "", session_started=run.session_started_at is not None
     )
     state, reason, activity = derive(after)
-    # TODO(#20): post-state-change delivery picks up the appended event (cause report).
+    # Never delivered here (the fast path): exec's worker or the next delivering command
+    # delivers the appended event (cause report) through toolhooks.
     store.apply_state(
         run,
         state=state,
@@ -651,7 +652,8 @@ def _apply_own_row(store: Store, run: HookRun, hook: Hook) -> None:
     started = run.session_started_at is not None
     after = transition(before, hook.event, mode=run.mode or "", session_started=started)
     state, reason, activity = derive(after)
-    # TODO(#20): post-state-change delivery picks up the appended event.
+    # Never delivered here (the fast path): exec's worker or the next delivering command
+    # delivers the appended event through toolhooks.
     store.apply_state(
         run, state=state, activity=activity, needs_input_reason=reason, cause=hook.cause
     )

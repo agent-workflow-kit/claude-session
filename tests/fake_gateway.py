@@ -27,6 +27,7 @@ from claude_session.gateway import (
     Result,
     check_argv,
     check_kill_grace,
+    check_output_limit,
     check_spawn_stdin,
 )
 
@@ -53,6 +54,7 @@ class Call:
     stderr: int | Inherit | None = None  # spawn only
     kill_grace: float | None = None  # run only
     executable: str | None = None  # the program run when argv[0] is only its name
+    output_limit: int | None = None  # run only
 
 
 @dataclass(frozen=True)
@@ -168,9 +170,11 @@ class FakeGateway:
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        output_limit: int | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(kill_grace, new_process_group=new_process_group)
+        check_output_limit(output_limit)
         args = tuple(argv)
         self.calls.append(
             Call(
@@ -184,6 +188,7 @@ class FakeGateway:
                 new_process_group=new_process_group,
                 kill_grace=kill_grace,
                 executable=executable,
+                output_limit=output_limit,
             )
         )
         response = self._answer(args)
@@ -198,7 +203,11 @@ class FakeGateway:
             if self._clock is not None:
                 self._clock.advance(timeout + (kill_grace or 0))
             raise GatewayTimeout(args, timeout)
-        return Result(args, response.returncode, response.stdout, response.stderr)
+        out, err = response.stdout, response.stderr
+        if output_limit is not None:  # as the real gateway: a byte prefix of each stream
+            out = out.encode()[:output_limit].decode("utf-8", "replace")
+            err = err.encode()[:output_limit].decode("utf-8", "replace")
+        return Result(args, response.returncode, out, err)
 
     def spawn(
         self,

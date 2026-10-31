@@ -1105,7 +1105,8 @@ def fail_launch(st: store.Store, alloc: Allocated, error: LaunchValidationError)
     """End the run ``not-started`` with the error's end reason (exit 12) and its
     ``failure_message``. Returns whether this call finalized the run.
 
-    TODO(#20): the one final ``post-state-change`` of a launch-phase end.
+    The one final event it appends is delivered (``post-state-change``) by the caller's
+    delivery: ``exec`` delivers it synchronously once the launch ended (``toolhooks``).
     TODO(#21): the ``--outcome-file`` of a launch-phase end, after the compare-and-set."""
     return st.finalize_run(
         alloc.csession_id,

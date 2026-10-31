@@ -35,7 +35,12 @@ cost null), deletes the secret index and removes the tmpdir on every path, and r
 
 TODO(#19): the run's bound (``timeout``) and the ``session_start_timeout`` warning in the poll
 loop.
-TODO(#20): deliver ``post-state-change`` events of the run in the poll loop and at the end.
+``post-state-change`` delivery (``toolhooks``): once ``claude`` is spawned (never before: the
+headless spawn must precede any thread), a background worker delivers the session's events in
+order; the poll loop only wakes it, so a slow hook never delays supervision. Once the run is
+final the worker delivers what is left, the final event included, and stops (``exec`` waits
+for it, each hook bounded by its own timeout). A launch-phase end is delivered synchronously
+by ``exec`` (``cli``).
 TODO(#21): write ``--outcome-file`` right after the finalization compare-and-set.
 """
 
@@ -47,10 +52,11 @@ import os
 import signal
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from . import endmap, fsutil, hookevent, launch, logs, outbox, secretindex, store, tmpdir
+from . import endmap, fsutil, hookevent, launch, logs, outbox, secretindex, store, tmpdir, toolhooks
 from .config import Config
 from .endmap import EXIT_CODES, HeadlessResult, Mapped
 from .errors import InternalError
@@ -170,6 +176,7 @@ class Supervision:
         *,
         auto_exit: bool,
         monotonic: Any = time.monotonic,
+        deliver: Callable[[], None] | None = None,
     ) -> None:
         self.st, self.cfg, self.alloc, self.child = st, cfg, alloc, child
         self.signals, self.log = signals, log
@@ -179,6 +186,7 @@ class Supervision:
         self.kill_at: float | None = None
         self.candidate: int | None = None  # the auto_exit_candidate event id
         self.due = 0.0
+        self.deliver = deliver  # wakes the post-state-change worker (never blocks)
 
     def wait(self) -> int:
         """Supervise until the child exits; its return code (negative: killed by that
@@ -200,7 +208,8 @@ class Supervision:
                 if self.auto_exit and not self.ended:
                     self.check_auto_exit(now)
                 # TODO(#19): check the run's bound and the session_start_timeout warning here.
-                # TODO(#20): deliver new events of the run (post-state-change) here.
+                if self.deliver is not None:
+                    self.deliver()  # post-state-change: the worker delivers new events
 
     def forward(self, signum: int) -> None:
         """Forward a signal ``exec`` received, once, its cause recorded first."""
@@ -584,6 +593,7 @@ def run_session(
         error = launch.interrupted_by(st, alloc, exc)
         launch.end_launch(st, alloc, v, None, process, error, exc=exc)
         raise
+    worker: toolhooks.Worker | None = None
     try:
         signals.enter_session(interactive=mode == "interactive")
         st.update_run(
@@ -604,10 +614,15 @@ def run_session(
             pid=child.pid,
             decision_ids=list(_decision_ids(record)),
         )
-        returncode = Supervision(st, cfg, alloc, child, signals, log, auto_exit=auto_exit).wait()
+        worker = _start_worker(st, cfg, alloc, process)
+        returncode = Supervision(
+            st, cfg, alloc, child, signals, log, auto_exit=auto_exit, deliver=worker.wake
+        ).wait()
         signals.defer()  # the child is gone: later signals are recorded and dropped
     except BaseException:
         _internal_error(st, cfg, alloc, v, child)
+        if worker is not None:
+            worker.close()
         raise
     try:
         return finish(
@@ -624,6 +639,22 @@ def run_session(
     except BaseException:
         _internal_error(st, cfg, alloc, v, None)
         raise
+    finally:
+        worker.close()  # after finalization (and the outcome file): the final event too
+
+
+def _start_worker(
+    st: store.Store, cfg: Config, alloc: launch.Allocated, process: launch.Process
+) -> toolhooks.Worker:
+    """The started ``post-state-change`` worker of the run's session (after the spawn)."""
+    return toolhooks.start_worker(
+        st,
+        cfg,
+        alloc.csession_id,
+        gateway=process.gateway,
+        environ=process.environ,
+        state_root=process.state_root,
+    )
 
 
 def _not_started(exc: BaseException) -> str:

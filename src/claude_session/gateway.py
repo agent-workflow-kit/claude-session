@@ -172,8 +172,12 @@ class Gateway(Protocol):
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        output_limit: int | None = None,
     ) -> Result:
-        """Run to completion, capturing text output. ``new_process_group`` puts the child in
+        """Run to completion, capturing text output. ``output_limit`` (bytes, per stream) keeps
+        only that prefix of stdout and of stderr; the rest is read and discarded, so untrusted
+        output never grows memory and the child never blocks on a full pipe (a cut may split a
+        UTF-8 character, which is then replaced). ``new_process_group`` puts the child in
         its own process group, which a timeout ends as a whole; ``kill_grace`` (only with a
         group) is the longest SIGTERM-to-SIGKILL delay (see ``GatewayTimeout``). An exception
         while waiting (a signal handler raising, ``KeyboardInterrupt`` included) ends the child
@@ -262,6 +266,16 @@ def check_kill_grace(kill_grace: float | None, *, new_process_group: bool) -> No
         raise ValueError("kill_grace needs new_process_group (it applies to the group)")
     if kill_grace < 0:
         raise ValueError(f"kill_grace must not be negative, got {kill_grace}")
+
+
+def check_output_limit(output_limit: int | None) -> None:
+    """``run``'s ``output_limit`` contract, shared with the fakes: None or an int >= 0."""
+    if output_limit is None:
+        return
+    if isinstance(output_limit, bool) or not isinstance(output_limit, int):
+        raise TypeError("output_limit must be an int")
+    if output_limit < 0:
+        raise ValueError(f"output_limit must not be negative, got {output_limit}")
 
 
 def _child_env(
@@ -486,11 +500,15 @@ def _wait_exited(
 
 
 def _exchange(
-    popen: subprocess.Popen[bytes], data: bytes | None, timeout: float | None
+    popen: subprocess.Popen[bytes],
+    data: bytes | None,
+    timeout: float | None,
+    output_limit: int | None = None,
 ) -> tuple[bytes, bytes]:
     """Like ``Popen.communicate``: write ``data`` to stdin, read stdout and stderr to EOF,
     wait for the exit; ``subprocess.TimeoutExpired`` after ``timeout`` seconds. Unlike it, the
-    child is never reaped before it has exited, even when interrupted (see the module docs)."""
+    child is never reaped before it has exited, even when interrupted (see the module docs).
+    With ``output_limit``, at most that many bytes of each stream are kept."""
     deadline = None if timeout is None else time.monotonic() + timeout
     assert popen.stdout is not None and popen.stderr is not None
     out_fd, err_fd = popen.stdout.fileno(), popen.stderr.fileno()
@@ -525,7 +543,11 @@ def _exchange(
                     continue
                 chunk = os.read(key.fd, _READ_SIZE)
                 if chunk:
-                    output[key.fd].append(chunk)
+                    if output_limit is not None:
+                        room = output_limit - sum(map(len, output[key.fd]))
+                        chunk = chunk[: max(room, 0)]
+                    if chunk:
+                        output[key.fd].append(chunk)
                 else:
                     selector.unregister(key.fd)
                     readers[key.fd].close()
@@ -607,9 +629,11 @@ class SystemGateway:
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        output_limit: int | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(kill_grace, new_process_group=new_process_group)
+        check_output_limit(output_limit)
         args = tuple(argv)
         data = None if stdin is None else stdin.encode("utf-8", "replace")
 
@@ -638,7 +662,7 @@ class SystemGateway:
         try:
             with popen:
                 try:
-                    out, err = _exchange(popen, data, timeout)
+                    out, err = _exchange(popen, data, timeout, output_limit)
                 except subprocess.TimeoutExpired:
                     _end(popen, group=new_process_group, kill_grace=kill_grace)
                     raise GatewayTimeout(args, timeout) from None
