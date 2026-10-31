@@ -1,11 +1,14 @@
 """``cron install`` / ``cron uninstall``: tests run against a fake ``crontab`` program on a
-private PATH (state in a file under ``tmp_path``), never the real crontab."""
+private PATH (state in a file under ``tmp_path``) or a scripted gateway, never the real
+crontab (``conftest.crontab_guard`` fails any test that tries)."""
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -17,7 +20,7 @@ from claude_session import cronblock
 from claude_session.cli import main
 from claude_session.errors import FailedError, UsageError
 
-from .fake_gateway import FakeGateway
+from .fake_gateway import FakeGateway, Response
 from .schemas import validate
 
 FAKE_CRONTAB = textwrap.dedent(
@@ -83,20 +86,6 @@ class Env:
         return [c for c in self.calls() if c in ("-", "-r")]
 
 
-@pytest.fixture(autouse=True)
-def _never_the_real_crontab(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Every real gateway run in this module must be the fake program under ``tmp_path``."""
-    from claude_session.gateway import SystemGateway
-
-    real_run = SystemGateway.run
-
-    def guarded(self: SystemGateway, argv: Any, **kwargs: Any) -> Any:
-        assert str(argv[0]).startswith(str(tmp_path)), f"refusing to run {argv[0]}"
-        return real_run(self, argv, **kwargs)
-
-    monkeypatch.setattr(SystemGateway, "run", guarded)
-
-
 @pytest.fixture
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
     return Env(tmp_path, monkeypatch)
@@ -129,6 +118,44 @@ def uninstall(capsys: pytest.CaptureFixture[str], *flags: str) -> tuple[int, Any
 
 def block_lines(out: dict[str, Any]) -> list[str]:
     return out["block"].split("\n")
+
+
+def cron_command(line: str) -> str:
+    """The command cron runs for a crontab entry ``line`` (five time fields), after cron's
+    ``%`` processing as cronie's do_command.c does it: a backslash before ``%`` escapes it
+    (the backslash is dropped), ``\\\\`` is not special, and the first unescaped ``%`` ends
+    the command (the rest would be its stdin; the block never has one)."""
+    raw = line.split(" ", 5)[5]
+    out: list[str] = []
+    escaped = False
+    for i, ch in enumerate(raw):
+        if escaped:
+            if ch == "%":
+                out[-1] = "%"
+            else:
+                out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+        if ch == "%":
+            raise AssertionError(f"unescaped % ends the command early: {raw[: i + 1]!r}")
+        out.append(ch)
+    return "".join(out)
+
+
+def sh_words(script: str) -> list[str]:
+    """``script`` as the shell's words, with each ``;`` a word of its own."""
+    lexer = shlex.shlex(script, posix=True, punctuation_chars=";")
+    lexer.whitespace_split = True
+    return list(lexer)
+
+
+def cron_script(line: str) -> str:
+    """The script the entry's ``/bin/sh -c`` runs."""
+    sh, flag, script = shlex.split(cron_command(line))
+    assert (sh, flag) == ("/bin/sh", "-c")
+    return script
 
 
 # Install
@@ -248,6 +275,19 @@ def test_block_command_runs_this_interpreter_with_an_explicit_path(
     assert os.path.join(os.environ["HOME"], ".local/bin") in line
 
 
+def test_block_runs_the_interpreter_with_e_and_p_but_not_i(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # -I would drop the user site, where a pip install --user puts claude-session.
+    code, out, _ = install(capsys)
+    assert code == 0
+    words = sh_words(cron_script(block_lines(out)[1]))
+    at = words.index(sys.executable)
+    assert words[at - 1] == "exec"
+    assert words[at + 1 :] == ["-E", "-P", "-m", "claude_session", "reconcile", ">/dev/null"]
+    assert "-I" not in words
+
+
 def private_env_file(root: Path, name: str = "env.sh", mode: int = 0o600) -> Path:
     path = root / name
     path.write_text("export FOO=bar\n", encoding="utf-8")
@@ -255,13 +295,16 @@ def private_env_file(root: Path, name: str = "env.sh", mode: int = 0o600) -> Pat
     return path
 
 
-def test_env_file_is_sourced_before_the_command(
+def test_env_file_is_sourced_after_path_and_before_the_command(
     env: Env, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     path = private_env_file(tmp_path)
     code, out, _ = install(capsys, "--env-file", str(path))
     assert code == 0 and out["env_file"] == os.path.realpath(path)
-    assert f". {path} && PATH=" in block_lines(out)[1]
+    script = cron_script(block_lines(out)[1])
+    assert script.startswith("PATH=")
+    assert f"; export PATH; . {path}; exec " in script
+    assert "&&" not in script
 
 
 def test_env_file_symlink_is_resolved_to_its_target(
@@ -333,24 +376,16 @@ def test_relative_env_file_is_made_absolute(
 def test_hostile_env_file_names_are_quoted_for_the_shell_and_for_cron(
     env: Env, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    directory = tmp_path / "it's $(touch pwned); `id` 50% & #x"
-    directory.mkdir()
+    directory = tmp_path / "it's $(touch pwned); `id` 50% & #x %%"
+    directory.mkdir(mode=0o700)
     path = private_env_file(directory)
     code, out, _ = install(capsys, "--env-file", str(path))
     assert code == 0
     cron_line = block_lines(out)[1]
-    # cron turns an unescaped % into a newline: every % is escaped
+    # cron's own % processing (no unescaped %), then the shell must see the path as one word
     assert "%" in cron_line
-    assert cron_line.replace("\\%", "").count("%") == 0
-    # undo cron's escaping, then the shell must see the path as one word
-    import shlex
-
-    command = cron_line.split(" ", 5)[5].replace("\\%", "%")
-    sh, flag, script = shlex.split(command)
-    assert (sh, flag) == ("/bin/sh", "-c")
-    words = shlex.split(script)
-    assert words[:3] == [".", str(path), "&&"]
-    assert not any("\n" in line for line in cron_line.split("\n"))
+    words = sh_words(cron_script(cron_line))
+    assert words[5:8] == [".", str(path), ";"]
     assert len(block_lines(out)) == 3
 
 
@@ -387,14 +422,14 @@ def test_home_with_spaces_and_quotes_is_quoted(
     monkeypatch.setenv("HOME", "/tmp/my home/o'brien")
     code, out, _ = install(capsys)
     assert code == 0
-    import shlex
-
-    command = block_lines(out)[1].split(" ", 5)[5].replace("\\%", "%")
-    script = shlex.split(command)[2]
-    assert (
-        shlex.split(script)[0]
-        == "PATH=/tmp/my home/o'brien/.local/bin:/usr/local/bin:/usr/bin:/bin"
-    )
+    words = sh_words(cron_script(block_lines(out)[1]))
+    assert words[:5] == [
+        "PATH=/tmp/my home/o'brien/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        ";",
+        "export",
+        "PATH",
+        ";",
+    ]
 
 
 # Uninstall
@@ -509,11 +544,33 @@ def test_markers_with_trailing_whitespace_still_match(
     env: Env, capsys: pytest.CaptureFixture[str]
 ) -> None:
     env.state.write_text(
-        "# claude-session managed  \n*/1 * * * * old\n# claude-session managed end\r\n",
+        "# claude-session managed  \n*/1 * * * * old\n# claude-session managed end\t \n",
         encoding="utf-8",
     )
     code, out, _ = install(capsys)
     assert out["action"] == "updated" and env.crontab() == out["block"] + "\n"
+
+
+@pytest.mark.parametrize("trail", ["\u00a0", "\u3000", "\r", "\x0b"])
+def test_markers_followed_by_other_whitespace_are_not_markers(
+    env: Env, capsys: pytest.CaptureFixture[str], trail: str
+) -> None:
+    # Only spaces and tabs may follow a marker. An end marker that does not count leaves
+    # the block unterminated: refused, nothing deleted.
+    text = f"# claude-session managed\n*/1 * * * * old\n# claude-session managed end{trail}\n"
+    env.state.write_bytes(text.encode())
+    code, out, _ = run(capsys, *UNINSTALL)
+    assert code == 12 and "malformed" in out["error"]["message"]
+    assert env.state.read_bytes() == text.encode()
+    # A start marker that does not count is a foreign line: kept byte for byte.
+    foreign = f"# claude-session managed{trail}\n0 0 * * * mine\n"
+    env.state.write_bytes(foreign.encode())
+    code, out, _ = install(capsys)
+    assert (code, out["action"]) == (0, "installed")
+    assert env.state.read_bytes() == (foreign + out["block"] + "\n").encode()
+    code, out, _ = uninstall(capsys)
+    assert (code, out["action"]) == (0, "removed")
+    assert env.state.read_bytes() == foreign.encode()
 
 
 def test_empty_crontab_file_installs(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
@@ -541,11 +598,21 @@ def test_no_crontab_command_exits_12(
 
 
 def test_relative_and_empty_path_entries_are_not_searched(
-    env: Env, monkeypatch: pytest.MonkeyPatch
+    env: Env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    fake = other / "crontab"
+    fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake.chmod(0o755)
     monkeypatch.chdir(env.bin)  # a cwd-relative search would find ./crontab here
-    crontab = cronblock.Crontab(FakeGateway(), {"PATH": f":.:bin:{env.bin.name}:crontab"})
-    assert not crontab.program.startswith(str(env.bin))
+    crontab = cronblock.Crontab(FakeGateway(), {"PATH": f":.:bin:{env.bin.name}:crontab:{other}"})
+    assert crontab.program == str(fake)
+
+
+def test_an_explicit_program_is_used_without_a_path_search(tmp_path: Path) -> None:
+    crontab = cronblock.Crontab(FakeGateway(), {"PATH": ""}, "/opt/fake/crontab")
+    assert crontab.program == "/opt/fake/crontab"
 
 
 def test_unreadable_crontab_is_not_treated_as_empty(
@@ -618,29 +685,59 @@ def test_timeout_and_oserror_become_failed(tmp_path: Path) -> None:
     fake, environ, program = scripted(tmp_path)
     fake.on([program, "-l"], timeout=True)
     with pytest.raises(FailedError, match="timed out"):
-        cronblock.uninstall(fake, environ, dry_run=False)
+        cronblock.uninstall(fake, environ, dry_run=False, program=program)
     fake2, environ, program = scripted(tmp_path)
     fake2.on([program, "-l"], error=PermissionError(13, "Permission denied"))
     with pytest.raises(FailedError, match="cannot run crontab"):
-        cronblock.uninstall(fake2, environ, dry_run=False)
+        cronblock.uninstall(fake2, environ, dry_run=False, program=program)
 
 
 def test_crontab_is_called_with_absolute_path_and_the_text_on_stdin(tmp_path: Path) -> None:
     fake, environ, program = scripted(tmp_path)
-    fake.on([program, "-l"], stdout=USER_LINES)
+    block = cronblock.build_block(interval=7, env_file=None, python="/p/py", home="/home/u")
+    after = USER_LINES + block + "\n"
+    fake.on([program, "-l"], responses=[Response(stdout=USER_LINES)] * 2 + [Response(stdout=after)])
     fake.on([program, "-"])
     result = cronblock.install(
-        fake, environ, interval=7, env_file=None, dry_run=True, python="/p/py"
+        fake, environ, interval=7, env_file=None, dry_run=False, python="/p/py", program=program
     )
     assert result["action"] == "installed"
-    assert [c.argv for c in fake.calls] == [(program, "-l")]
+    assert [c.argv for c in fake.calls] == [
+        (program, "-l"),
+        (program, "-l"),
+        (program, "-"),
+        (program, "-l"),
+    ]
+    assert os.path.isabs(program)
+    assert fake.calls[2].stdin == after
+    assert all(c.keep_raw_stdout for c in fake.calls if c.argv[1] == "-l")
 
 
-def test_python_path_with_a_newline_is_refused(tmp_path: Path) -> None:
+def test_read_back_without_the_expected_block_exits_12(tmp_path: Path) -> None:
+    fake, environ, program = scripted(tmp_path)
+    fake.on([program, "-l"], stdout=USER_LINES)  # the write seems to have no effect
+    fake.on([program, "-"])
+    with pytest.raises(FailedError, match="expected block after the write"):
+        cronblock.install(
+            fake, environ, interval=7, env_file=None, dry_run=False, python="/p/py", program=program
+        )
+    assert [c.argv[1] for c in fake.calls] == ["-l", "-l", "-", "-l"]
+
+
+@pytest.mark.parametrize("python", ["/p\ny", "/p\\y", "relative/py"])
+def test_unusable_python_path_is_refused(tmp_path: Path, python: str) -> None:
     fake, environ, program = scripted(tmp_path)
     fake.on([program, "-l"], stdout="")
     with pytest.raises(FailedError):
-        cronblock.install(fake, environ, interval=None, env_file=None, dry_run=True, python="/p\ny")
+        cronblock.install(
+            fake,
+            environ,
+            interval=None,
+            env_file=None,
+            dry_run=True,
+            python=python,
+            program=program,
+        )
 
 
 def test_usage_error_type_for_bad_interval(tmp_path: Path) -> None:
@@ -660,3 +757,317 @@ def test_split_block_exactness() -> None:
         ["c"],
     )
     assert cronblock.split_block("").block is None
+
+
+# The job as cron runs it (/bin/sh on the generated line, a stub interpreter)
+
+
+STUB = """#!/bin/sh
+{{ printf '%s\\n' "$@"; printf 'PATH=%s\\n' "$PATH"; printf 'FOO=%s\\n' "${{FOO-unset}}"; }} > {out}
+"""
+
+
+def stub_python(root: Path) -> tuple[str, Path]:
+    """A stand-in interpreter that records its argv, PATH and FOO in a file."""
+    directory = root / "stub py"
+    directory.mkdir(mode=0o700)
+    out = directory / "out.txt"
+    program = directory / "python3"
+    program.write_text(STUB.format(out=shlex.quote(str(out))), encoding="utf-8")
+    program.chmod(0o755)
+    return str(program), out
+
+
+def run_job(line: str, home: Path) -> int:
+    """Run the entry's command the way cron does: ``/bin/sh -c`` after ``%`` processing, in
+    cron's small environment, from HOME."""
+    home.mkdir(exist_ok=True)
+    environ = {
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "LOGNAME": "tester",
+        "SHELL": "/bin/sh",
+        "PATH": "/usr/bin:/bin",
+    }
+    done = subprocess.run(
+        ["/bin/sh", "-c", cron_command(line)],
+        env=environ,
+        cwd=home,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    return done.returncode
+
+
+def job_line(tmp_path: Path, env_file: Path | None, home: str = "/home/u") -> tuple[str, Path]:
+    python, out = stub_python(tmp_path)
+    real = None if env_file is None else cronblock.check_env_file(str(env_file))
+    block = cronblock.build_block(interval=5, env_file=real, python=python, home=home)
+    return block.split("\n")[1], out
+
+
+def recorded(out: Path) -> tuple[list[str], str, str]:
+    lines = out.read_text(encoding="utf-8").splitlines()
+    return lines[:-2], lines[-2].removeprefix("PATH="), lines[-1].removeprefix("FOO=")
+
+
+def test_job_runs_the_interpreter_with_its_flags_and_path(tmp_path: Path) -> None:
+    line, out = job_line(tmp_path, None)
+    assert run_job(line, tmp_path / "home") == 0
+    argv, path, foo = recorded(out)
+    assert argv == ["-E", "-P", "-m", "claude_session", "reconcile"]
+    assert path == "/home/u/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    assert foo == "unset"
+
+
+def test_job_sources_the_env_file_and_sees_its_exported_variables(tmp_path: Path) -> None:
+    line, out = job_line(tmp_path, private_env_file(tmp_path))
+    assert run_job(line, tmp_path / "home") == 0
+    assert recorded(out)[2] == "bar"
+
+
+def test_job_runs_when_the_env_file_ends_in_a_failing_command(tmp_path: Path) -> None:
+    path = private_env_file(tmp_path)
+    path.write_text("export FOO=bar\nfalse\n", encoding="utf-8")
+    line, out = job_line(tmp_path, path)
+    assert run_job(line, tmp_path / "home") == 0
+    assert recorded(out)[0][-1] == "reconcile"
+
+
+def test_job_keeps_a_path_the_env_file_extends(tmp_path: Path) -> None:
+    path = private_env_file(tmp_path)
+    path.write_text('export PATH="/x:$PATH"\n', encoding="utf-8")
+    line, out = job_line(tmp_path, path)
+    assert run_job(line, tmp_path / "home") == 0
+    _, seen, _ = recorded(out)
+    assert seen == "/x:/home/u/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+
+def test_job_does_not_run_when_the_env_file_is_gone(tmp_path: Path) -> None:
+    # ``.`` is a special builtin: a missing file ends the non-interactive shell.
+    path = private_env_file(tmp_path)
+    line, out = job_line(tmp_path, path)
+    path.unlink()
+    assert run_job(line, tmp_path / "home") != 0
+    assert not out.exists()
+
+
+def test_job_with_a_hostile_env_file_name_and_home_sources_that_file(tmp_path: Path) -> None:
+    directory = tmp_path / "it's $(touch pwned); `id` 50% & #x %% ;"
+    directory.mkdir(mode=0o700)
+    path = private_env_file(directory, "e%nv 'x'.sh")
+    line, out = job_line(tmp_path, path, home="/tmp/my home/o'brien 100%")
+    assert run_job(line, tmp_path / "home") == 0
+    _, seen, foo = recorded(out)
+    assert foo == "bar"
+    assert seen.startswith("/tmp/my home/o'brien 100%/.local/bin:")
+    assert not (tmp_path / "home" / "pwned").exists()
+
+
+# Env file location (who else could replace it)
+
+
+def nested_env_file(tmp_path: Path, *modes: int) -> Path:
+    """An env file below directories ``tmp_path/d0/d1/...`` with ``modes`` (outermost first)."""
+    directory = tmp_path
+    for i, mode in enumerate(modes):
+        directory = directory / f"d{i}"
+        directory.mkdir()
+        directory.chmod(mode)
+    return private_env_file(directory)
+
+
+def test_env_file_in_a_private_directory_tree_is_accepted(tmp_path: Path) -> None:
+    path = nested_env_file(tmp_path, 0o755, 0o700)
+    assert cronblock.check_env_file(str(path)) == os.path.realpath(path)
+
+
+def test_env_file_below_a_sticky_world_writable_directory_is_accepted(tmp_path: Path) -> None:
+    path = nested_env_file(tmp_path, 0o1777, 0o700)
+    assert cronblock.check_env_file(str(path)) == os.path.realpath(path)
+
+
+@pytest.mark.parametrize("mode", [0o1777, 0o777, 0o770, 0o1770, 0o702])
+def test_env_file_in_a_group_or_world_writable_directory_is_refused(
+    tmp_path: Path, mode: int
+) -> None:
+    # Even sticky: a file deleted from its directory can be recreated by anyone.
+    path = nested_env_file(tmp_path, mode)
+    with pytest.raises(UsageError, match=r"directory .*d0.* group- or world-writable"):
+        cronblock.check_env_file(str(path))
+
+
+@pytest.mark.parametrize("mode", [0o777, 0o770])
+def test_env_file_below_a_writable_directory_without_sticky_bit_is_refused(
+    tmp_path: Path, mode: int
+) -> None:
+    path = nested_env_file(tmp_path, mode, 0o700)
+    with pytest.raises(UsageError, match=r"directory .*d0.* without the sticky bit"):
+        cronblock.check_env_file(str(path))
+
+
+def test_env_file_below_a_directory_owned_by_someone_else_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = nested_env_file(tmp_path, 0o755, 0o700)
+    foreign = os.path.realpath(tmp_path / "d0")
+    real_stat = os.stat
+
+    def fake_stat(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        info = real_stat(target, *args, **kwargs)
+        if os.fspath(target) != foreign:
+            return info
+        fields = list(info)
+        fields[stat.ST_UID] = os.geteuid() + 1 if os.geteuid() + 1 != 0 else 2
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(cronblock.os, "stat", fake_stat)
+    with pytest.raises(UsageError, match=r"directory .*d0.* neither you nor root"):
+        cronblock.check_env_file(str(path))
+
+
+def test_env_file_not_readable_by_you_is_refused(tmp_path: Path) -> None:
+    path = private_env_file(tmp_path, mode=0o200)
+    with pytest.raises(UsageError, match="not readable"):
+        cronblock.check_env_file(str(path))
+
+
+def test_env_file_in_an_unsafe_directory_exits_2_and_touches_nothing(
+    env: Env, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    path = nested_env_file(tmp_path, 0o777)
+    code, out, _ = run(capsys, *INSTALL, "--env-file", str(path))
+    assert code == 2 and out["error"]["code"] == "usage"
+    assert "d0" in out["error"]["message"]
+    assert env.calls() == []
+
+
+# Backslashes (cron cannot write a backslash before %)
+
+
+def test_env_file_with_a_backslash_is_refused(
+    env: Env, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    path = private_env_file(tmp_path, "a\\%b.sh")
+    code, out, _ = run(capsys, *INSTALL, "--env-file", str(path))
+    assert code == 2 and out["error"]["code"] == "usage"
+    assert env.calls() == []
+
+
+def test_env_file_linked_to_a_name_with_a_backslash_is_refused(tmp_path: Path) -> None:
+    target = private_env_file(tmp_path, "real\\.sh")
+    link = tmp_path / "link.sh"
+    link.symlink_to(target)
+    with pytest.raises(UsageError, match="backslash"):
+        cronblock.check_env_file(str(link))
+
+
+@pytest.mark.parametrize("home", ["/tmp/a\\b", "/tmp/a\\%b"])
+def test_home_with_a_backslash_is_refused(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, home: str
+) -> None:
+    monkeypatch.setenv("HOME", home)
+    code, out, _ = run(capsys, *INSTALL)
+    assert code == 12 and out["error"]["code"] == "failed"
+    assert env.writes() == []
+
+
+def test_cron_command_follows_cron_backslash_rules() -> None:
+    assert cron_command("* * * * * a\\%b") == "a%b"
+    assert cron_command("* * * * * a\\b") == "a\\b"
+    with pytest.raises(AssertionError, match="unescaped"):
+        cron_command("* * * * * a\\\\%b")  # \\ is not special: the % ends the command
+    with pytest.raises(AssertionError, match="unescaped"):
+        cron_command("* * * * * a%b")
+
+
+# Carriage returns and literal U+FFFD in the crontab
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        b"# a comment\r0 0 * * * looks-live\n1 1 * * * mine\n",  # lone CR in a comment
+        b"0 1 * * * a\r\n# c\r\nMAILTO=x\r\n",  # CRLF line ends
+        b"0 0 * * * echo \xef\xbf\xbd\n",  # literal U+FFFD (valid UTF-8)
+    ],
+)
+def test_foreign_lines_are_kept_byte_for_byte(
+    env: Env, capsys: pytest.CaptureFixture[str], text: bytes
+) -> None:
+    env.state.write_bytes(text)
+    code, out, _ = install(capsys)
+    assert (code, out["action"]) == (0, "installed")
+    assert env.state.read_bytes() == text + out["block"].encode() + b"\n"
+    code, out, _ = uninstall(capsys)
+    assert (code, out["action"]) == (0, "removed")
+    assert env.state.read_bytes() == text
+
+
+def test_a_lone_cr_does_not_split_a_line(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    # Were the CR a line break, the second half would be a stray end marker (exit 12).
+    text = b"# note\r# claude-session managed end\n"
+    env.state.write_bytes(text)
+    code, out, _ = install(capsys)
+    assert code == 0 and env.state.read_bytes() == text + out["block"].encode() + b"\n"
+
+
+def test_crontab_with_invalid_utf8_is_refused_by_the_scripted_gateway(tmp_path: Path) -> None:
+    fake, environ, program = scripted(tmp_path)
+    fake.on([program, "-l"], raw_stdout=b"0 0 * * * \xff\n")
+    with pytest.raises(FailedError, match="not valid UTF-8"):
+        cronblock.uninstall(fake, environ, dry_run=False, program=program)
+    assert [c.argv[1] for c in fake.calls] == ["-l"]
+
+
+# HOME fallback
+
+
+class _Passwd:
+    def __init__(self, home: str) -> None:
+        self.pw_dir = home
+
+
+@pytest.mark.parametrize("home", ["", "relative/home", None])
+def test_unusable_home_falls_back_to_the_passwd_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, home: str | None
+) -> None:
+    fake, environ, program = scripted(tmp_path)
+    if home is None:
+        del environ["HOME"]
+    else:
+        environ["HOME"] = home
+    monkeypatch.setattr(cronblock.pwd, "getpwuid", lambda uid: _Passwd("/home/from-passwd"))
+    fake.on([program, "-l"], stdout="")
+    result = cronblock.install(
+        fake, environ, interval=None, env_file=None, dry_run=True, python="/p/py", program=program
+    )
+    assert "PATH=/home/from-passwd/.local/bin:" in result["block"]
+
+
+@pytest.mark.parametrize("passwd_home", ["", "rel", "/a:b", None])
+def test_unusable_passwd_home_exits_12(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, passwd_home: str | None
+) -> None:
+    fake, environ, program = scripted(tmp_path)
+    environ["HOME"] = ""
+
+    def getpwuid(uid: int) -> _Passwd:
+        if passwd_home is None:
+            raise KeyError(uid)
+        return _Passwd(passwd_home)
+
+    monkeypatch.setattr(cronblock.pwd, "getpwuid", getpwuid)
+    with pytest.raises(FailedError, match="home directory"):
+        cronblock.install(
+            fake,
+            environ,
+            interval=None,
+            env_file=None,
+            dry_run=True,
+            python="/p/py",
+            program=program,
+        )
+    assert fake.calls == []

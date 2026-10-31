@@ -724,6 +724,15 @@ def test_run_timeout_counts_the_wait_after_output_closes(gw: SystemGateway) -> N
 def test_run_translates_newlines_like_text_mode(gw: SystemGateway) -> None:
     proc = gw.run(py("import sys; sys.stdout.buffer.write(b'a\\r\\nb\\rc\\n')"))
     assert proc.stdout == "a\nb\nc\n"
+    assert proc.raw_stdout is None  # only on request
+
+
+def test_run_keep_raw_stdout_returns_the_bytes_untranslated(gw: SystemGateway) -> None:
+    proc = gw.run(
+        py("import sys; sys.stdout.buffer.write(b'a\\r\\nb\\rc\\xff\\n')"), keep_raw_stdout=True
+    )
+    assert proc.raw_stdout == b"a\r\nb\rc\xff\n"
+    assert proc.stdout == "a\nb\nc\ufffd\n"  # the decoded text is unchanged
 
 
 def test_run_with_empty_stdin_text_gives_eof(gw: SystemGateway) -> None:

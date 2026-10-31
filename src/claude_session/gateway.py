@@ -132,12 +132,15 @@ except (ValueError, OSError):
 
 @dataclass(frozen=True)
 class Result:
-    """A finished ``run``: exit code and decoded output (invalid UTF-8 replaced)."""
+    """A finished ``run``: exit code and decoded output (invalid UTF-8 replaced).
+    ``raw_stdout`` holds stdout's bytes exactly as read (no decoding, no newline
+    translation) when the run asked for them with ``keep_raw_stdout``, else None."""
 
     argv: tuple[str, ...]
     returncode: int
     stdout: str
     stderr: str
+    raw_stdout: bytes | None = None
 
 
 class GatewayTimeout(Exception):
@@ -218,6 +221,7 @@ class Gateway(Protocol):
         on_started: Callable[[], None] | None = None,
         canceled: Callable[[], bool] | None = None,
         on_spawn: Callable[[int], None] | None = None,
+        keep_raw_stdout: bool = False,
     ) -> Result:
         """Run to completion, capturing text output. ``output_limit`` (bytes, per stream) keeps
         only that prefix of stdout and of stderr; the rest is read and discarded, so untrusted
@@ -237,9 +241,11 @@ class Gateway(Protocol):
         result has empty output) and only the child's own exit is waited for; ``on_started``
         and ``canceled``: see the module docs. ``on_spawn`` is called with the child's PID
         once it exists, before its stdin is written (with ``new_process_group``, the PID is
-        its process group ID); an exception it raises ends the child like any other. Raises
-        ``GatewayTimeout``, ``GatewayCanceled``, and ``OSError`` when the program cannot be
-        started."""
+        its process group ID); an exception it raises ends the child like any other.
+        ``keep_raw_stdout`` also returns stdout's bytes as read (``Result.raw_stdout``), for a
+        caller that must decode strictly or keep carriage returns (``crontab -l``); ``stdout``
+        is decoded as always. Raises ``GatewayTimeout``, ``GatewayCanceled``, and ``OSError``
+        when the program cannot be started."""
         ...
 
     def spawn(
@@ -879,6 +885,7 @@ class SystemGateway:
         on_started: Callable[[], None] | None = None,
         canceled: Callable[[], bool] | None = None,
         on_spawn: Callable[[int], None] | None = None,
+        keep_raw_stdout: bool = False,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(
@@ -936,7 +943,8 @@ class SystemGateway:
             if popen.returncode is None:  # raised before the inner handler (entering with)
                 _end(popen, group=new_process_group, kill_grace=kill_grace)
             raise
-        return Result(args, popen.returncode, _text(out), _text(err))
+        raw = out if keep_raw_stdout else None
+        return Result(args, popen.returncode, _text(out), _text(err), raw)
 
     def spawn(
         self,

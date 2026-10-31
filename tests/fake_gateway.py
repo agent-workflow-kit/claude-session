@@ -62,6 +62,7 @@ class Call:
     output_limit: int | None = None  # run only
     discard_output: bool = False  # run only
     gated: bool = False  # spawn only
+    keep_raw_stdout: bool = False  # run only
 
 
 @dataclass(frozen=True)
@@ -70,7 +71,9 @@ class Response:
     given a ``timeout``: otherwise the fake fails, as the real call could not time out), a
     spawned child keeps running. ``error``: the call raises it. ``release_error``: a gated
     spawn's ``release`` raises it, as the real one does when the exec fails (the child then
-    exits ``GATE_EXEC_FAILED``)."""
+    exits ``GATE_EXEC_FAILED``). ``raw_stdout``: the bytes a ``keep_raw_stdout`` run returns
+    (default: ``stdout`` encoded as UTF-8), for output that is not valid UTF-8 or holds
+    carriage returns."""
 
     returncode: int = 0
     stdout: str = ""
@@ -78,6 +81,7 @@ class Response:
     timeout: bool = False
     error: OSError | None = None
     release_error: OSError | None = None
+    raw_stdout: bytes | None = None
 
 
 @dataclass
@@ -165,12 +169,13 @@ class FakeGateway:
         timeout: bool = False,
         error: OSError | None = None,
         release_error: OSError | None = None,
+        raw_stdout: bytes | None = None,
         responses: Sequence[Response] | None = None,
     ) -> None:
         """Answer commands whose argv starts with ``prefix``, with one response (the keyword
         arguments) or ``responses`` in order (the last repeats). The most recent matching rule
         wins, so a test can override a fixture's default."""
-        single = Response(returncode, stdout, stderr, timeout, error, release_error)
+        single = Response(returncode, stdout, stderr, timeout, error, release_error, raw_stdout)
         if responses is None:
             scripted = [single]
         elif single != Response():
@@ -205,6 +210,7 @@ class FakeGateway:
         on_started: Callable[[], None] | None = None,
         canceled: Callable[[], bool] | None = None,
         on_spawn: Callable[[int], None] | None = None,
+        keep_raw_stdout: bool = False,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(
@@ -227,6 +233,7 @@ class FakeGateway:
                 executable=executable,
                 output_limit=output_limit,
                 discard_output=discard_output,
+                keep_raw_stdout=keep_raw_stdout,
             )
         )
         response = self._answer(args)
@@ -246,12 +253,16 @@ class FakeGateway:
                 self._clock.advance(timeout + (kill_grace or 0))
             raise GatewayTimeout(args, timeout)
         out, err = response.stdout, response.stderr
+        raw = response.stdout.encode() if response.raw_stdout is None else response.raw_stdout
+        if response.raw_stdout is not None:  # as the real gateway: decoded from the bytes
+            out = raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
         if discard_output:
-            out, err = "", ""
+            out, err, raw = "", "", b""
         if output_limit is not None:  # as the real gateway: a byte prefix of each stream
+            raw = raw[:output_limit]
             out = out.encode()[:output_limit].decode("utf-8", "replace")
             err = err.encode()[:output_limit].decode("utf-8", "replace")
-        return Result(args, response.returncode, out, err)
+        return Result(args, response.returncode, out, err, raw if keep_raw_stdout else None)
 
     def spawn(
         self,
