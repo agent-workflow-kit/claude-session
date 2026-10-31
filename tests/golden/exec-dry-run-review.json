@@ -1,0 +1,504 @@
+{
+  "actor": "auto:test",
+  "allow_tainted": false,
+  "claude_argv": [
+    "claude",
+    "--settings",
+    "/home/user/.local/state/claude-session/private/cs-aaaaaaaa/runs/1/settings.json",
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+    "--add-dir",
+    "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa",
+    "--plugin-dir",
+    "/opt/plugins/review-kit",
+    "--add-dir",
+    "/opt/plugins/review-kit",
+    "--append-system-prompt-file",
+    "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/instructions.md",
+    "--system-prompt-snapshot",
+    "off",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--",
+    "Your claude-session directory is /home/user/.local/state/claude-session/sessions/cs-aaaaaaaa. Read and follow /home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/prompt.md"
+  ],
+  "config_hash_changed": null,
+  "csession_id": null,
+  "cwd": "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work",
+  "dry_run": true,
+  "env_names": [
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_TMPDIR",
+    "CSESSION_DIR",
+    "CSESSION_ID",
+    "CSESSION_KIND",
+    "GH_CONFIG_DIR",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_KEY_1",
+    "GIT_CONFIG_KEY_2",
+    "GIT_CONFIG_KEY_3",
+    "GIT_CONFIG_KEY_4",
+    "GIT_CONFIG_KEY_5",
+    "GIT_CONFIG_VALUE_0",
+    "GIT_CONFIG_VALUE_1",
+    "GIT_CONFIG_VALUE_2",
+    "GIT_CONFIG_VALUE_3",
+    "GIT_CONFIG_VALUE_4",
+    "GIT_CONFIG_VALUE_5",
+    "GIT_OPTIONAL_LOCKS",
+    "GLAB_CONFIG_DIR",
+    "HOME",
+    "PATH",
+    "TMPDIR"
+  ],
+  "fork": false,
+  "forked_from": null,
+  "has_prompt": true,
+  "hooks": [],
+  "implicit_done": true,
+  "input_files": [],
+  "labels": [
+    "kind=review"
+  ],
+  "launch_kind": "review",
+  "max_turns": null,
+  "mode": "headless",
+  "origins": {
+    "auto_exit": "builtin",
+    "backstop": "builtin",
+    "claude_args": "builtin",
+    "cwd": "builtin",
+    "env.allow": "builtin",
+    "env.inherit": "builtin",
+    "env.path_prepend": "builtin",
+    "env.set_names": "builtin",
+    "implicit_done": "builtin",
+    "interactive_timeout": "builtin",
+    "max_turns": "builtin",
+    "mcp": "builtin",
+    "model": "builtin",
+    "notes_context": "builtin",
+    "permission_profile": "builtin",
+    "read_dirs": "config",
+    "reads_third_party": "builtin",
+    "sandbox": "builtin",
+    "setting_sources": "builtin",
+    "timeout": "builtin",
+    "write_dirs": "builtin"
+  },
+  "override_escalation": false,
+  "permission_profile": "review",
+  "profile": {
+    "auto_exit": true,
+    "backstop": true,
+    "builtin": true,
+    "claude_args": [],
+    "cwd": "session-dir",
+    "env": {
+      "allow": [],
+      "inherit": false,
+      "path_prepend": [],
+      "set_names": []
+    },
+    "fallback": false,
+    "implicit_done": true,
+    "interactive_timeout": null,
+    "max_turns": null,
+    "mcp": "none",
+    "model": null,
+    "name": "review",
+    "notes_context": false,
+    "path": "/opt/claude-session/bin:/usr/bin:/usr/local/bin",
+    "permission_profile": "review",
+    "read_dirs": [
+      "/usr",
+      "/bin",
+      "/usr/bin",
+      "/sbin",
+      "/usr/sbin",
+      "/lib",
+      "/usr/lib",
+      "/lib64",
+      "/usr/lib64",
+      "/etc",
+      "/usr/local/bin",
+      "/opt/claude/versions",
+      "/opt/claude-session",
+      "/opt/python/3.12",
+      "/opt/toolchain"
+    ],
+    "reads_third_party": true,
+    "required_env_names": [
+      "ANTHROPIC_API_KEY"
+    ],
+    "sandbox": "required",
+    "sandbox_available": true,
+    "sandbox_problems": [],
+    "setting_sources": [],
+    "timeout": 7200.0,
+    "warnings": [],
+    "write_dirs": []
+  },
+  "repo": null,
+  "run": 1,
+  "run_kind": "review",
+  "sandbox": {
+    "allow_read": [
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa",
+      "/usr",
+      "/bin",
+      "/usr/bin",
+      "/sbin",
+      "/usr/sbin",
+      "/lib",
+      "/usr/lib",
+      "/lib64",
+      "/usr/lib64",
+      "/etc",
+      "/usr/local/bin",
+      "/opt/claude/versions",
+      "/opt/claude-session",
+      "/opt/python/3.12",
+      "/opt/toolchain",
+      "/opt/plugins/review-kit",
+      "/work/main/.git",
+      "/work/main/.git/worktrees/repo"
+    ],
+    "allow_write": [
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/outbox",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/artifacts",
+      "/tmp/csession-1000/cs-aaaaaaaa"
+    ],
+    "available": true,
+    "deny_read": [
+      "/"
+    ],
+    "deny_write": [
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/secret",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/prompt.md",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/prompts",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/instructions.md",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/run.json",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/inputs",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/gh-empty",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/empty-gitconfig",
+      "/home/user/.local/state/claude-session/private",
+      "/work/main/.git",
+      "/work/main/.git/worktrees/repo",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.git",
+      "/opt/plugins/review-kit",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/.claude",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/.mcp.json",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/CLAUDE.md",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/CLAUDE.local.md",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.claude",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.mcp.json",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/CLAUDE.md",
+      "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/CLAUDE.local.md"
+    ],
+    "mode": "required",
+    "problems": []
+  },
+  "sandbox_lowered": false,
+  "settings": {
+    "hooks": {
+      "Notification": [
+        {
+          "hooks": [
+            {
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session Notification",
+              "timeout": 30,
+              "type": "command"
+            }
+          ],
+          "matcher": "permission_prompt"
+        },
+        {
+          "hooks": [
+            {
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session Notification",
+              "timeout": 30,
+              "type": "command"
+            }
+          ],
+          "matcher": "idle_prompt"
+        },
+        {
+          "hooks": [
+            {
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session Notification",
+              "timeout": 30,
+              "type": "command"
+            }
+          ],
+          "matcher": "elicitation_dialog"
+        }
+      ],
+      "PermissionRequest": [
+        {
+          "hooks": [
+            {
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session PermissionRequest",
+              "timeout": 30,
+              "type": "command"
+            }
+          ]
+        }
+      ],
+      "PostToolUse": [
+        {
+          "hooks": [
+            {
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session PostToolUse",
+              "timeout": 60,
+              "type": "command"
+            }
+          ]
+        }
+      ],
+      "SessionEnd": [
+        {
+          "hooks": [
+            {
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session SessionEnd",
+              "timeout": 30,
+              "type": "command"
+            }
+          ]
+        }
+      ],
+      "SessionStart": [
+        {
+          "hooks": [
+            {
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session SessionStart",
+              "timeout": 30,
+              "type": "command"
+            }
+          ]
+        }
+      ],
+      "Stop": [
+        {
+          "hooks": [
+            {
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session Stop",
+              "timeout": 60,
+              "type": "command"
+            }
+          ]
+        }
+      ],
+      "UserPromptSubmit": [
+        {
+          "hooks": [
+            {
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session UserPromptSubmit",
+              "timeout": 30,
+              "type": "command"
+            }
+          ]
+        }
+      ]
+    },
+    "permissions": {
+      "allow": [
+        "Agent",
+        "Task",
+        "Skill",
+        "Bash(claude-session report:*)",
+        "Bash(/opt/claude-session/bin/claude-session report:*)",
+        "Read(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/artifacts/**)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/artifacts/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/outbox/**)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/outbox/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/**)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/**)",
+        "Read(//opt/plugins/review-kit/**)"
+      ],
+      "blockReadsOutsideWorkingDirectories": true,
+      "defaultMode": "dontAsk",
+      "deny": [
+        "WebFetch",
+        "WebSearch",
+        "mcp__*",
+        "Bash(gh:*)",
+        "Bash(glab:*)",
+        "Bash(agent-spawn:*)",
+        "Bash(memoctl add:*)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/secret)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/secret)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/prompt.md)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/prompt.md)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/prompts/**)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/prompts/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/instructions.md)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/instructions.md)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/run.json)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/run.json)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/inputs/**)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/inputs/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/gh-empty/**)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/gh-empty/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/empty-gitconfig)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/empty-gitconfig)",
+        "Edit(//home/user/.local/state/claude-session/private/**)",
+        "Write(//home/user/.local/state/claude-session/private/**)",
+        "Edit(//opt/plugins/review-kit/**)",
+        "Write(//opt/plugins/review-kit/**)",
+        "Edit(//work/main/.git/**)",
+        "Write(//work/main/.git/**)",
+        "Edit(//work/main/.git/worktrees/repo/**)",
+        "Write(//work/main/.git/worktrees/repo/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.git)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.git)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.git/**)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.git/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/.claude/**)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/.claude/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/**/.claude/**)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/**/.claude/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/.mcp.json)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/.mcp.json)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/**/.mcp.json)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/**/.mcp.json)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/CLAUDE.md)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/CLAUDE.md)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/**/CLAUDE.md)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/**/CLAUDE.md)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/CLAUDE.local.md)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/CLAUDE.local.md)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/**/CLAUDE.local.md)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/**/CLAUDE.local.md)",
+        "Edit(//opt/plugins/review-kit/.claude/**)",
+        "Write(//opt/plugins/review-kit/.claude/**)",
+        "Edit(//opt/plugins/review-kit/**/.claude/**)",
+        "Write(//opt/plugins/review-kit/**/.claude/**)",
+        "Edit(//opt/plugins/review-kit/.mcp.json)",
+        "Write(//opt/plugins/review-kit/.mcp.json)",
+        "Edit(//opt/plugins/review-kit/**/.mcp.json)",
+        "Write(//opt/plugins/review-kit/**/.mcp.json)",
+        "Edit(//opt/plugins/review-kit/CLAUDE.md)",
+        "Write(//opt/plugins/review-kit/CLAUDE.md)",
+        "Edit(//opt/plugins/review-kit/**/CLAUDE.md)",
+        "Write(//opt/plugins/review-kit/**/CLAUDE.md)",
+        "Edit(//opt/plugins/review-kit/CLAUDE.local.md)",
+        "Write(//opt/plugins/review-kit/CLAUDE.local.md)",
+        "Edit(//opt/plugins/review-kit/**/CLAUDE.local.md)",
+        "Write(//opt/plugins/review-kit/**/CLAUDE.local.md)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.claude/**)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.claude/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/**/.claude/**)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/**/.claude/**)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.mcp.json)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.mcp.json)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/**/.mcp.json)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/**/.mcp.json)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/CLAUDE.md)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/CLAUDE.md)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/**/CLAUDE.md)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/**/CLAUDE.md)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/CLAUDE.local.md)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/CLAUDE.local.md)",
+        "Edit(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/**/CLAUDE.local.md)",
+        "Write(//home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/**/CLAUDE.local.md)",
+        "Read(//home/user/.ssh/**)",
+        "Read(//home/user/.aws/**)",
+        "Read(//home/user/.gnupg/**)",
+        "Read(//home/user/.kube/**)",
+        "Read(//home/user/.docker/**)",
+        "Read(//home/user/.config/**)",
+        "Read(//home/user/.claude/**)",
+        "Read(//home/user/.netrc)",
+        "Read(//home/user/.git-credentials)",
+        "Read(//home/user/.local/state/claude-session/private/**)"
+      ],
+      "disableAutoMode": "disable",
+      "disableBypassPermissionsMode": "disable"
+    },
+    "sandbox": {
+      "allowAppleEvents": false,
+      "allowNestedUserNamespaces": false,
+      "allowUnsandboxedCommands": false,
+      "autoAllowBashIfSandboxed": false,
+      "enableWeakerNestedSandbox": false,
+      "enableWeakerNetworkIsolation": false,
+      "enabled": true,
+      "failIfUnavailable": true,
+      "filesystem": {
+        "allowRead": [
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa",
+          "/usr",
+          "/bin",
+          "/usr/bin",
+          "/sbin",
+          "/usr/sbin",
+          "/lib",
+          "/usr/lib",
+          "/lib64",
+          "/usr/lib64",
+          "/etc",
+          "/usr/local/bin",
+          "/opt/claude/versions",
+          "/opt/claude-session",
+          "/opt/python/3.12",
+          "/opt/toolchain",
+          "/opt/plugins/review-kit",
+          "/work/main/.git",
+          "/work/main/.git/worktrees/repo"
+        ],
+        "allowWrite": [
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/outbox",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/artifacts",
+          "/tmp/csession-1000/cs-aaaaaaaa"
+        ],
+        "denyRead": [
+          "/"
+        ],
+        "denyWrite": [
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/secret",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/prompt.md",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/prompts",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/instructions.md",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/run.json",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/inputs",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/gh-empty",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/empty-gitconfig",
+          "/home/user/.local/state/claude-session/private",
+          "/work/main/.git",
+          "/work/main/.git/worktrees/repo",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.git",
+          "/opt/plugins/review-kit",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/.claude",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/.mcp.json",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/CLAUDE.md",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/CLAUDE.local.md",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.claude",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/.mcp.json",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/CLAUDE.md",
+          "/home/user/.local/state/claude-session/sessions/cs-aaaaaaaa/work/CLAUDE.local.md"
+        ],
+        "disabled": false
+      },
+      "network": {
+        "allowedDomains": [],
+        "strictAllowlist": true
+      }
+    }
+  },
+  "skill": null,
+  "taints": true,
+  "timeout": 7200.0,
+  "warnings": [],
+  "would_fail": null,
+  "would_refuse": null
+}

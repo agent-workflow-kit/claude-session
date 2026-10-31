@@ -134,7 +134,7 @@
     },
     "profile": {
       "$ref": "kinds.json#/$defs/profile",
-      "description": "Effective kind profile."
+      "description": "Effective kind profile. Its path is the computed PATH claude would receive and the one environment value shown. Its permission_profile is the plan's label, or the --permission-profile value as given when that file could not be read."
     },
     "origins": {
       "type": "object",
@@ -162,7 +162,7 @@
       "items": {
         "type": "string"
       },
-      "description": "argv for claude; session paths shown as they would be created."
+      "description": "argv for claude (argv[0] the bare name a launch executes); session paths shown as they would be created."
     },
     "env_names": {
       "type": "array",

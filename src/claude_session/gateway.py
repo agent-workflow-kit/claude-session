@@ -30,6 +30,9 @@ Rules every call follows:
   timeout its group gets SIGKILL. Either way a timeout ends everything still in the child's
   process group; a descendant that calls ``setsid``/``setpgid`` escapes (see
   ``GatewayTimeout``).
+- The ``claude --version`` probe adds ``kill_group_on_exit=True``: its group also gets SIGKILL
+  when ``claude`` exits normally (Linux: after the exit, before the leader is reaped, so the
+  group ID still names that group), so no descendant outlives the probe.
 
 ``die_with_parent`` (``spawn``, Linux only, ignored elsewhere) sets ``PR_SET_PDEATHSIG(SIGTERM)``
 in the child between fork and exec (through ``ctypes``, resolved before the fork, in
@@ -170,10 +173,16 @@ class Gateway(Protocol):
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        kill_group_on_exit: bool = False,
     ) -> Result:
         """Run to completion, capturing text output. ``new_process_group`` puts the child in
         its own process group, which a timeout ends as a whole; ``kill_grace`` (only with a
-        group) is the longest SIGTERM-to-SIGKILL delay (see ``GatewayTimeout``). An exception
+        group) is the longest SIGTERM-to-SIGKILL delay (see ``GatewayTimeout``).
+        ``kill_group_on_exit`` (only with a group) also SIGKILLs the group when the leader
+        exits normally, so no descendant outlives the run: on Linux it is sent once the
+        leader has exited but before it is reaped (the unreaped leader keeps the group ID
+        from being reused), and only to that group; without ``os.waitid`` (macOS) the
+        leader is reaped first and the group is not signaled (best effort). An exception
         while waiting (a signal handler raising, ``KeyboardInterrupt`` included) ends the child
         the same way, then propagates (on Linux; best effort without ``os.waitid``, see
         ``GatewayTimeout``); one raised during the grace still gets the group SIGKILL and the
@@ -252,8 +261,12 @@ def check_spawn_stdin(stdin: object) -> None:
         raise TypeError("spawn stdin=None is refused: pass INHERIT to share this process's stdin")
 
 
-def check_kill_grace(kill_grace: float | None, *, new_process_group: bool) -> None:
-    """``run``'s ``kill_grace`` contract, shared with the fakes."""
+def check_kill_grace(
+    kill_grace: float | None, *, new_process_group: bool, kill_group_on_exit: bool = False
+) -> None:
+    """``run``'s ``kill_grace`` and ``kill_group_on_exit`` contract, shared with the fakes."""
+    if kill_group_on_exit and not new_process_group:
+        raise ValueError("kill_group_on_exit needs new_process_group (it applies to the group)")
     if kill_grace is None:
         return
     if not new_process_group:
@@ -456,10 +469,16 @@ def _remaining(deadline: float | None) -> float | None:
 
 
 def _wait_exited(
-    popen: subprocess.Popen[bytes], deadline: float | None, timeout: float | None
+    popen: subprocess.Popen[bytes],
+    deadline: float | None,
+    timeout: float | None,
+    *,
+    kill_group: bool = False,
 ) -> None:
     """Wait until the child exited, leaving it unreaped (``os.waitid`` with ``WNOWAIT``), then
-    reap it. Without ``os.waitid`` (macOS), ``Popen.wait``, which reaps when interrupted."""
+    reap it; with ``kill_group``, SIGKILL its process group in between (the unreaped leader
+    keeps the group ID from naming another group). Without ``os.waitid`` (macOS),
+    ``Popen.wait``, which reaps when interrupted, and the group is not signaled."""
     waitid = getattr(os, "waitid", None)
     if waitid is None:
         popen.wait(_remaining(deadline))
@@ -477,11 +496,17 @@ def _wait_exited(
             raise subprocess.TimeoutExpired(popen.args, timeout)
         time.sleep(delay if remaining is None else min(delay, remaining))
         delay = min(delay * 2, _EXIT_POLL_MAX)
+    if kill_group:
+        _signal_group(popen, signal.SIGKILL)  # skipped once the leader was reaped elsewhere
     popen.wait()  # it has exited: returns at once
 
 
 def _exchange(
-    popen: subprocess.Popen[bytes], data: bytes | None, timeout: float | None
+    popen: subprocess.Popen[bytes],
+    data: bytes | None,
+    timeout: float | None,
+    *,
+    kill_group: bool = False,
 ) -> tuple[bytes, bytes]:
     """Like ``Popen.communicate``: write ``data`` to stdin, read stdout and stderr to EOF,
     wait for the exit; ``subprocess.TimeoutExpired`` after ``timeout`` seconds. Unlike it, the
@@ -524,7 +549,7 @@ def _exchange(
                 else:
                     selector.unregister(key.fd)
                     readers[key.fd].close()
-    _wait_exited(popen, deadline, timeout)
+    _wait_exited(popen, deadline, timeout, kill_group=kill_group)
     return b"".join(output[out_fd]), b"".join(output[err_fd])
 
 
@@ -576,9 +601,12 @@ class SystemGateway:
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        kill_group_on_exit: bool = False,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
-        check_kill_grace(kill_grace, new_process_group=new_process_group)
+        check_kill_grace(
+            kill_grace, new_process_group=new_process_group, kill_group_on_exit=kill_group_on_exit
+        )
         args = tuple(argv)
         data = None if stdin is None else stdin.encode("utf-8", "replace")
         with subprocess.Popen(
@@ -592,7 +620,7 @@ class SystemGateway:
             process_group=0 if new_process_group else None,
         ) as popen:
             try:
-                out, err = _exchange(popen, data, timeout)
+                out, err = _exchange(popen, data, timeout, kill_group=kill_group_on_exit)
             except subprocess.TimeoutExpired:
                 _end(popen, group=new_process_group, kill_grace=kill_grace)
                 raise GatewayTimeout(args, timeout) from None

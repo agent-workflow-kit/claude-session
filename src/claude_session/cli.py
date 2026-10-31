@@ -163,8 +163,7 @@ def _exec(args: argparse.Namespace) -> int:
         # TODO(#28): adoption of a pending run created by start.
         raise InternalError("exec --session-id is not implemented yet", detail="not_implemented")
     if args.dry_run:
-        # TODO(#27): the dry-run plan.
-        raise InternalError("exec --dry-run is not implemented yet", detail="not_implemented")
+        return _dry_run(args)
     if args.mode != "headless":
         # TODO(#17): interactive supervision (exec's default mode).
         raise InternalError(
@@ -192,6 +191,89 @@ def _exec(args: argparse.Namespace) -> int:
         _die_of_sigint()
     _print_outcome(outcome, args.json)
     return int(outcome["exit_code"]) if ended is None else ended.exit_code
+
+
+def _start(args: argparse.Namespace) -> int:
+    """``start``: only ``--dry-run`` of a new session so far."""
+    if args.dry_run and args.resume is None:
+        return _dry_run(args)
+    # TODO(#28): start and start --resume (and its --dry-run, with #29's carry-over).
+    raise InternalError("start is not implemented yet", detail="not_implemented")
+
+
+def _dry_run(args: argparse.Namespace) -> int:
+    """``exec``/``start --dry-run`` of a new session (interface.md, Dry run): the plan, exit
+    20 with ``would_refuse``, 12 with ``would_fail``, else 0. Nothing is allocated."""
+    from . import dryrun
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    plan, message = dryrun.new_session_plan(args, cfg, dryrun.current_process(SystemGateway()))
+    plan = dryrun.printable(plan)  # valid UTF-8 output, also for a non-UTF-8 path
+    if args.json:
+        print(json.dumps(plan, ensure_ascii=False, allow_nan=False))
+    else:
+        _print_plan(plan, dryrun.printable(message))
+    return dryrun.exit_code(plan)
+
+
+def _print_plan(plan: dict[str, Any], message: str | None) -> None:
+    """The short human-readable summary of a dry-run plan (untrusted strings escaped)."""
+    profile = plan["profile"]
+    kind = plan["run_kind"] + (" (unknown: review profile)" if profile["fallback"] else "")
+    sandbox = plan["sandbox"]
+    state = "available" if sandbox["available"] else "unavailable"
+    if sandbox["mode"] == "off":
+        state = "not used"
+    lines = [
+        f"dry run: kind {kind}, mode {plan['mode']}",
+        f"cwd: {plan['cwd']}",
+        f"sandbox: {sandbox['mode']} ({state})",
+        f"permission profile: {plan['permission_profile'] or 'from file'}",
+    ]
+    if plan["would_refuse"] is not None:
+        lines.append(f"result: a launch would be refused ({plan['would_refuse']})")
+    elif plan["would_fail"] is not None:
+        lines.append(f"result: a launch would fail ({plan['would_fail']}): {message or ''}")
+    else:
+        lines.append("result: a launch would pass the launch validations")
+    lines += [f"warning: {w}" for w in plan["warnings"] if not w.startswith("a launch would fail")]
+    for line in lines:
+        print(sanitize(line))
+
+
+def _kinds(args: argparse.Namespace) -> int:
+    """``kinds`` (interface.md, kinds): the effective kind profiles."""
+    from . import dryrun
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    process = dryrun.current_process(SystemGateway())
+    report = dryrun.printable(dryrun.kinds_report(cfg, process, kind=args.kind, repo=args.repo))
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, allow_nan=False))
+        return 0
+    claude = report["claude_bin_resolved"] or "not found"
+    version = report["claude_version"] or "unknown"
+    ok = {True: "ok", False: "too old", None: "unknown"}[report["claude_version_ok"]]
+    lines = [
+        f"claude: {claude} (version {version}, minimum {report['min_claude_version']}: {ok})",
+        f"default kind: {report['default_kind']}",
+    ]
+    for profile in report["kinds"]:
+        available = profile["sandbox_available"]
+        sandbox = profile["sandbox"] + (
+            "" if available is None else (" available" if available else " unavailable")
+        )
+        lines.append(
+            f"{profile['name']}: profile {profile['permission_profile']}, sandbox {sandbox},"
+            f" cwd {profile['cwd']}, third-party {'yes' if profile['reads_third_party'] else 'no'}"
+        )
+        lines += [f"  warning: {w}" for w in profile["warnings"]]
+    lines += [f"warning: {w}" for w in [*report["state_dir_warnings"], *report["warnings"]]]
+    for line in lines:
+        print(sanitize(line))
+    return 0
 
 
 def _die_of_sigint() -> NoReturn:
@@ -225,14 +307,15 @@ def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
 # Command name (as typed, nested commands joined by a space) -> handler.
 HANDLERS: dict[str, Handler] = {
     "exec": _exec,
-    "start": _not_implemented,
+    "start": _start,
+    # TODO(#29): resume (and resume --dry-run).
     "resume": _not_implemented,
     "stop": _not_implemented,
     "wait": _not_implemented,
     "report": _report,
     "status": _not_implemented,
     "list": _list,
-    "kinds": _not_implemented,
+    "kinds": _kinds,
     "label add": _not_implemented,
     "label remove": _not_implemented,
     "transcript": _not_implemented,
