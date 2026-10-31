@@ -47,6 +47,11 @@ class UsageError(CliError):
     exit_code = 2
 
 
+class OutcomeFileRejected(UsageError):
+    """Exit 2: an ``--outcome-file`` under a session-writable path (interface.md, Outcome
+    file). Its envelope is never written to that path."""
+
+
 class NotFoundError(CliError):
     """Exit 10: unknown or forgotten session, or ``--run`` out of range."""
 

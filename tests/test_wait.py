@@ -513,9 +513,13 @@ def run_wait(
     )
 
 
+# A trusted run: wait's outcome file is checked against the baseline only.
+TRUSTED = {"kind": "implement", "profile": {"sandbox": "off", "reads_third_party": False}}
+
+
 def stored_session(final: Final | None = None) -> str:
     with store.open_state() as st:
-        sid = session(st)
+        sid = session(st, resolved=TRUSTED)
         if final is not None:
             assert st.finalize_run(sid, 1, final)
     return sid
@@ -564,12 +568,16 @@ def test_the_command_writes_its_output_to_the_outcome_file(tmp_path: Path) -> No
     assert stat.S_IMODE(out_file.stat().st_mode) == 0o600
 
 
-def test_the_command_writes_a_not_found_envelope_to_the_outcome_file(tmp_path: Path) -> None:
-    """R1-7: wait's own output on exit 10 is the error envelope; so is its outcome file."""
+def test_the_command_writes_a_not_found_envelope_to_the_outcome_file(
+    tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """R1-7: wait's own output on exit 10 is the error envelope; so is its outcome file (not
+    under wait's cwd: before a run is bound, that is refused, see test_outcome_file.py)."""
     stored_session()
-    proc = run_wait(tmp_path, "cs-zzzzzzzz", "--json", "--outcome-file", "wait.json")
+    out_file = tmp_path_factory.mktemp("out") / "wait.json"
+    proc = run_wait(tmp_path, "cs-zzzzzzzz", "--json", "--outcome-file", str(out_file))
     assert proc.returncode == 10
-    written = json.loads((tmp_path / "wait.json").read_text())
+    written = json.loads(out_file.read_text())
     assert written == json.loads(proc.stdout)
     assert written["error"]["code"] == "not_found"
 
