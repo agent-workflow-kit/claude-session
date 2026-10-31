@@ -81,7 +81,7 @@ Normative sections: [Launch order](#launch-order), [Flags at start and adoption]
 
 `start` creates the session and run 1 as a pending run (no wrapper); `start --resume` creates run n as a pending run. `exec --session-id <id>` **adopts** the pending run. `exec` without `--session-id` and `resume` perform every step themselves.
 
-1. **Schema check** (every command, before anything else, except `report`, which never opens `state.db`, and `hook-event`, which never migrates): a database schema newer than this claude-session → error envelope `code: schema_newer`, exit 12; nothing is allocated. An older schema is migrated (see [Upgrades](#upgrades)).
+1. **Schema check** (every command, before anything else, except `report`, which never opens `state.db`, and `hook-event`, which never migrates): a database schema newer than this claude-session → error envelope `code: schema_newer`, exit 12; nothing is allocated. An older schema is migrated (see [Upgrades](#upgrades)). A missing `state.db` (and state directory) is created (directory 0700, file 0600) and migrated to the current schema. The check is also skipped when the first argument is not a known command (a usage error follows), and when an argument before any `--` is `-h`, `--help` or `--version` (they only print usage or text; an option value spelled `--help` therefore also skips it).
 2. **Parse and usage checks** → exit 2; nothing is allocated. Includes config loading and validation (an invalid config exits 2, `code: usage`, with `detail`); the [flag rules](#flag-rules); the TTY check of plain `exec` and `resume` in interactive mode (stdin and stdout must be TTYs; exit 2 with a hint; `start` never checks the TTY for the run, its caller is a program); human-only flags without a TTY or an explicit `--actor human:*`; prompt and input files larger than `input_max_bytes`; an isolated run's `--outcome-file` under a [session-writable path](#session-writable-paths).
 3. **Refusal checks** (`live`, `tainted`, `already_adopted`, `expired`) → exit 20 (10 unknown or forgotten, 21 ambiguous); nothing is allocated. `resume`, `start --resume` and `stop` run the inline [liveness check](#liveness) first.
 4. **Allocate and record** the session and run (the taint is committed here: [Taint](#taint)).
@@ -123,6 +123,8 @@ When a bootstrap prompt is sent as the first message:
 - headless resume without a prompt: `Your claude-session directory is <abs>. Continue the task. When you are finished, file your status report.` (an interactive resume without a prompt gets no initial message).
 
 Independently, the injected `SessionStart` hook always adds the trusted context line `claude-session directory: <abs>; run <n>; inputs: inputs/<n>/<a>, inputs/<n>/<b>` (the run's input files, if any; every source: `startup`, `resume`, `fork`, `clear`, `compact`), so the path, the run and the inputs are known even when no first message is sent.
+
+The bootstrap prompt is the last argument of the `claude` argv, preceded by `--`, so no option given before it (for example a `claude_args` entry such as `--debug` or `--allowedTools`) can take it as a value; without a prompt there is no `--`.
 
 Every run passes `--system-prompt-snapshot off` to `claude`, including the first: a resume with `off` uses the newly generated `instructions.md` (live test; a snapshot taken at creation would otherwise win).
 
@@ -186,6 +188,7 @@ Untrusted or agent-generated text is never accepted *only* as a flag value: prom
 - For isolated runs the path must not be under a [session-writable path](#session-writable-paths) (compared by realpath of the path or its nearest existing parent): exit 2 at `start`, `exec` and `resume`; at adoption a rejected `--outcome-file` exits 2 and the run stays pending. A rejected path is never written.
 - A refusal or usage error before a run is allocated writes its error envelope only to an `--outcome-file` given on that command line and not rejected.
 - A write failure never changes the run's outcome or the command's exit code: the command prints its normal output, adds a warning, and logs `outcome_file_failed`.
+- `schema_newer` and a `failed` at the schema check (step 1 of the [launch order](#launch-order)) write no outcome file: they precede parsing.
 
 `wait --outcome-file` writes `wait`'s own output (same rules).
 
@@ -345,7 +348,7 @@ Run by the agent inside its session. Requires `CSESSION_ID` and `CSESSION_DIR` (
 - `done` requires a non-empty summary; `blocked`, `failed` and `needs-input` require a reason (a summary is optional for them). A `--summary` text that begins with `-` must be given as `--summary=<text>`.
 - **Command forms.** Only a bare `claude-session report …` command matches the generated `Bash(claude-session report:*)` rule; the generated rules also allow `Bash(<absolute claude-session path> report:*)` (the install path is per machine, so the instructions may name it). A command prefixed with `cd … &&` or containing `$(…)` is denied (live test). The standard instructions show exactly these forms:
   - write the text with the Write tool to `$CSESSION_DIR/artifacts/summary.md` (or `reason.md`), then `claude-session report done --summary-file <path>`;
-  - `claude-session report done --summary "<one line>"`;
+  - `claude-session report done --summary="<one line>"`;
   - a heredoc: `claude-session report done --summary-file - <<'EOF'` … `EOF`;
   - the absolute path of `claude-session` in place of the bare name, as a fallback when `PATH` does not resolve it.
   The permissions for this are generated for every run ([Generated settings](#generated-settings)), so it works under `dontAsk`. `--summary` text is equally untrusted.
@@ -673,7 +676,7 @@ The schemas encode the consistency rules once, in `outcome.json` `$defs/outcome_
 
 ### Error codes
 
-`code` in the error envelope ([schemas/cli/error.json](../schemas/cli/error.json)): `usage` (2), `not_found` (10), `ambiguous` (21, with `matches`), `refused` (20, with `reason`), `launch_failed` (12, `start` only, with a launch-validation `end_reason` (never a hook, `canceled`, `never_adopted`, `launch_interrupted`, `no_tty` or `config_invalid` reason), `hint`, a non-null `csession_id` and `run`), `failed` (12, an operational failure outside a launch: no `crontab`, transcript read errors; optional `detail`), `schema_newer` (12, any command; nothing allocated), `internal` (1). An invalid config is `usage` (2) with `detail`. An outcome-file write failure is a warning, never an error code ([Outcome file](#outcome-file)).
+`code` in the error envelope ([schemas/cli/error.json](../schemas/cli/error.json)): `usage` (2), `not_found` (10), `ambiguous` (21, with `matches`), `refused` (20, with `reason`), `launch_failed` (12, `start` only, with a launch-validation `end_reason` (never a hook, `canceled`, `never_adopted`, `launch_interrupted`, `no_tty` or `config_invalid` reason), `hint`, a non-null `csession_id` and `run`), `failed` (12, an operational failure outside a launch: no `crontab`, transcript read errors; also when the state directory or `state.db` cannot be created, opened, is unsafe or is not a claude-session database, or the migration lease cannot be obtained or a migration cannot complete (lease lost, database locked) (`detail`: path and cause); optional `detail`), `schema_newer` (12, any command; nothing allocated), `internal` (1). An invalid config is `usage` (2) with `detail`. An outcome-file write failure is a warning, never an error code ([Outcome file](#outcome-file)).
 
 ## Hooks
 
@@ -764,6 +767,7 @@ The **session-writable paths** of a run are: its cwd when the run may write it (
 - A profile file passed with `--permission-profile <file>` has the same shape. It is read once, at the launch that names it, and snapshotted to the private directory; later runs use the snapshot. `status` shows it as `file:<sha256 prefix>`. For isolated runs, a profile file under a session-writable path is refused (`invalid_permission_profile`).
 - Profiles carry only kind-specific rules. No built-in profile makes the git directory writable.
 - Isolated runs' profiles may not set `sandbox.enabled`, `sandbox.failIfUnavailable`, `sandbox.allowUnsandboxedCommands`, `sandbox.excludedCommands`, `permissions.additionalDirectories`, `sandbox.autoAllowBashIfSandboxed: true`, or any refused path (`invalid_permission_profile`). For trusted runs only the refused paths apply.
+- Profile values must be valid for Claude Code, which otherwise discards the whole settings file, injected hooks included: `permissions.allow`, `deny`, `ask` and `additionalDirectories` are lists of strings, and `permissions.defaultMode` is one of `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`. Anything else fails the launch (`invalid_permission_profile`).
 - **Permission mode.** Every run's generated settings set `permissions.defaultMode` explicitly. Isolated runs: always `dontAsk`; a profile's mode is ignored. Trusted runs: the profile's mode (any mode, including `bypassPermissions`); without one, `default` when `setting_sources` excludes `user` (otherwise the user's settings decide). Reason (live test): with `--setting-sources ""` and no mode, Claude Code starts in a mode that silently allowed unknown commands.
 
 ### Path rules
@@ -775,6 +779,7 @@ All failures here end the launch `not-started` (exit 12) with the named end reas
 - **Generated read entries** (isolated runs; `unsafe_read_dir`): every entry `exec` adds to the sandbox `allowRead` list on its own (claude-session's install directories, the Python and `sys.path` set, the user site, `env.path_prepend` directories, the directories of the resolved tools, the git directory) passes the same refusal checks as `read_dirs`, after symlink resolution: not `/`, `$HOME` or an ancestor of `$HOME`; not containing or inside a credential path listed above; not the state root or inside it; not `/tmp/csession-<uid>` or inside it; not the caller's cwd unless it is the run's cwd. Empty (`''`), relative and cwd-derived `sys.path` entries are dropped first. A refused entry fails the launch.
 - **Profiles, `read_dirs`, `write_dirs`**: a path under the state root or `/tmp/csession-<uid>/` is refused (`invalid_permission_profile`), except paths inside the session's own `$CSESSION_DIR` and private temporary directory (generated denies still win). `write_dirs` under `$CSESSION_DIR` must be inside `outbox/`, `artifacts/` or `work/` and are created before launch if missing; other `write_dirs` must exist (a missing one produces a warning and is skipped).
 - **`PATH`** (isolated runs; `unsafe_path`): relative and empty `PATH` entries are dropped; the launch fails if any resolved `PATH` entry is inside a session-writable path. `claude_bin`, `bwrap`, `socat` and `git` are resolved to absolute paths outside session-writable paths at launch and checked again at adoption. Hooks and the notes command run with the same sanitized `PATH`.
+- **Paths in generated rules** (every run; `unsafe_path`): the state root and the absolute `claude-session` executable path appear in permission rules, so they must be absolute, normalized, valid UTF-8 and free of control characters and of `*`, `?`, `[`, `]`, `{`, `}`, `(`, `)` and `\`. The `claude-session` path must also need no shell quoting (no whitespace, shell metacharacters such as `` '"$`;&|<>!#~ `` or other characters outside `A-Z a-z 0-9 _ @ % + = : , . / -`): a quoted invocation never matches its `report` allow rule.
 - **cwd reuse**: the resolved cwd is stored per run; a resume always uses the previous run's resolved cwd (`--cwd` on a resume must resolve to the same path, else exit 2). A fork uses the source's resolved cwd, or the `--cwd` given, which passes these path rules like any new cwd. Forking without `--cwd` from a source whose cwd is a session `work/` directory is refused (`fork_cwd_unsupported`). The `respond` kind requires a git cwd (`no_git_cwd`).
 - **Git directory**: resolved at the session's first launch and stored, including "no git dir" as a resolved value; re-checked at every resume and adoption. A different git directory, or one that appeared where none was, fails the launch (`git_dir_changed`).
 - **`claude_args`**: isolated runs accept only `--verbose` and `--debug`; anything else fails the launch (`unsafe_claude_args`). Trusted runs: anything.
@@ -818,7 +823,7 @@ All failures here end the launch `not-started` (exit 12) with the named end reas
 ### File handling
 
 - The state root and every session, private and temporary directory are created with mode 0700, every file with mode 0600 (explicit modes).
-- Every file `exec` writes into `$CSESSION_DIR` (secret, `run.json`, `instructions.md`, prompts, inputs, `empty-gitconfig`; `gh-empty/` is recreated empty the same way on every isolated run) is written as a temporary file plus rename relative to a directory file descriptor with `O_NOFOLLOW|O_EXCL`; subdirectories are verified to be real directories owned by the user. Retention deletion is fd-based and never follows symlinks. A fork's copy of the source's `inputs/` is fd-based and rejects symlinks, non-regular files and files with more than one link.
+- Every file `exec` writes into `$CSESSION_DIR` (secret, `run.json`, `instructions.md`, prompts, inputs, `empty-gitconfig`; `gh-empty/` is recreated empty the same way on every isolated run) is written as a temporary file created with `O_NOFOLLOW|O_EXCL` in the private directory and renamed into place relative to directory file descriptors, so no temporary name is ever visible to the agent (the session and private directories must be on one file system, else exit 12); subdirectories are verified to be real directories owned by the user. Retention deletion is fd-based and never follows symlinks. A fork's copy of the source's `inputs/` is fd-based and rejects symlinks, non-regular files and files with more than one link.
 - `report` and ingestion apply the file checks in [`report`](#report) (outbox claim by rename, artifact copy through one `O_NOFOLLOW` descriptor before hashing and scanning).
 - Headless stderr is written to the private `stderr.log`, never to the caller.
 - Every git command claude-session itself runs (all read-only) uses `-c core.fsmonitor= -c core.sshCommand= -c credential.helper= -c core.hooksPath=/dev/null -c diff.external= -c core.pager=cat` and `GIT_CONFIG_NOSYSTEM=1`, and `--no-ext-diff --no-textconv` where they apply.
@@ -855,7 +860,7 @@ Sessions carry labels (`--label` on `exec`/`start`/`resume`, `label add/remove`,
 
 ## Upgrades
 
-Database migrations are additive within a schema major version. `hook-event` never migrates; with older code and a newer additive schema it keeps working. Every other command checks the schema first: it migrates an older database, and refuses a newer one (error code `schema_newer`, exit 12, nothing allocated).
+Database migrations are additive within a schema major version. `hook-event` never migrates; with older code and a newer additive schema it keeps working. Every other command checks the schema first: it migrates an older database, and refuses a newer one (error code `schema_newer`, exit 12, nothing allocated). The schema check migrates an older database under `--dry-run` too; a migration is not an allocation.
 
 Upgrade claude-session while no sessions are live: the injected hooks run a recorded interpreter path, and `reconcile` and `status` warn when a live run's recorded hook interpreter path no longer exists.
 
