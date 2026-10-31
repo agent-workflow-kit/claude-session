@@ -1291,6 +1291,18 @@ class Store:
             )
         return cursor.rowcount == 1
 
+    def clear_pending_cause(self, csession_id: str, run_no: int, cause: str) -> bool:
+        """Undo ``set_pending_cause`` when the signal it preceded was not sent: clears the
+        cause only while it is still ``cause`` and the run is not final. The caller clears
+        only a cause its own ``set_pending_cause`` recorded. Returns whether it was cleared."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET pending_cause = NULL WHERE csession_id = ? AND run_no = ? "
+                "AND pending_cause = ? AND ended_at IS NULL",
+                (csession_id, run_no, cause),
+            )
+        return cursor.rowcount == 1
+
     def set_auto_exit_cause(self, csession_id: str, run_no: int, event_id: int) -> bool:
         """The auto-exit re-check and its ``pending_cause`` in one compare-and-set: recorded
         only while the run is live with no cause, its report is ``done`` and ``event_id`` is
@@ -1633,6 +1645,35 @@ class Store:
             return self._finalize(
                 conn, csession_id, run_no, dataclasses.replace(NEVER_ADOPTED, cause=cause)
             )
+
+    def request_stop(self, csession_id: str, run_no: int) -> bool:
+        """``stop``'s request (interface.md, stop, step 1): set ``stop_requested_at`` on the
+        run unless it is final (an earlier request's time stands). ``exec`` reads it in both
+        phases: a SIGTERM or SIGHUP then ends the run ``stopped`` (session phase) or
+        ``canceled`` (launch phase). Returns whether the run was not final."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET stop_requested_at = COALESCE(stop_requested_at, ?) "
+                "WHERE csession_id = ? AND run_no = ? AND ended_at IS NULL",
+                (format_ts(self.clock()), csession_id, run_no),
+            )
+        return cursor.rowcount == 1
+
+    def cancel_pending(self, csession_id: str, run_no: int, final: Final) -> bool:
+        """``stop``'s cancel of a pending run (interface.md, stop, step 2): one ``BEGIN
+        IMMEDIATE`` compare-and-set on the run having no wrapper and not being final, the
+        condition ``adopt`` checks in its own transaction, so exactly one of them wins. A run
+        ``start`` still holds (its wrapper set until ``release_pending``) is not pending.
+        Returns whether this call finalized it with ``final``; the caller deletes the launch
+        spec, writes the outcome file and delivers the final event."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT wrapper_pid, ended_at FROM runs WHERE csession_id = ? AND run_no = ?",
+                (csession_id, run_no),
+            ).fetchone()
+            if row is None or row[0] is not None or row[1] is not None:
+                return False
+            return self._finalize(conn, csession_id, run_no, final, expect={"wrapper_pid": None})
 
     def release_pending(
         self,
@@ -2318,6 +2359,16 @@ NEVER_ADOPTED = Final(
     state="not-started",
     cause="adopt",
     message="the pending run was not adopted before it expired",
+)
+# A pending run canceled by ``stop`` (interface.md, Outcome mapping: launch).
+CANCELED = Final(
+    phase="launch",
+    outcome="not-started",
+    end_reason="canceled",
+    exit_code=12,
+    state="not-started",
+    cause="stop",
+    message="the pending run was canceled by stop",
 )
 
 

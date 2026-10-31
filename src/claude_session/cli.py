@@ -308,6 +308,45 @@ def _reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stop(args: argparse.Namespace) -> int:
+    """``stop <id> [--grace d] [--dry-run]`` (interface.md, stop): 0 when the run ended (or
+    was already final, or was canceled), 12 when it is still live after the wait."""
+    from . import launch, stopper
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    grace = None if args.grace is None else durations.parse(args.grace)
+    with store.open_state() as st:
+        stopped = stopper.Stop(
+            st,
+            cfg,
+            grace=grace,
+            actor=launch.default_actor(args.actor, cfg),
+            decision_ids=args.decision_id or [],
+            gateway=SystemGateway(),
+            environ=os.environ,
+        ).run(args.id, dry_run=args.dry_run)
+    output = stopped.as_json()
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False, allow_nan=False))
+        return stopped.exit_code
+    line = f"{output['csession_id']} run {output['run']}: "
+    if output["dry_run"]:
+        line += "dry run: "
+    if output["already_final"]:
+        line += "already final, "
+    elif output["canceled"]:
+        line += "canceled, "
+    for sent in output["signals"]:
+        line += f"{sent['signal']} to {sent['role']} {sent['pid']}, "
+    if output["ended"]:
+        line += f"{output['outcome']} ({output['end_reason']}), exit {output['run_exit_code']}"
+    else:
+        line += f"still {output['state']}"
+    print(sanitize(line))
+    return stopped.exit_code
+
+
 def _wait(args: argparse.Namespace) -> int:
     """``wait <id> [--run n] [--timeout d] [--outcome-file p]`` (interface.md, wait): the
     run's outcome code, or 22 when ``--timeout`` expired first. Ctrl-C ends it by the signal,
@@ -640,7 +679,7 @@ HANDLERS: dict[str, Handler] = {
     "exec": _exec,
     "start": _start,
     "resume": _resume,
-    "stop": _not_implemented,
+    "stop": _stop,
     "wait": _wait,
     "report": _report,
     "status": _not_implemented,

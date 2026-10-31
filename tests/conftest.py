@@ -10,9 +10,10 @@ returned, each one still running is SIGKILLed while it is still the process star
   only while the leader is still our unreaped child with the same start ticks (an unreaped
   leader pins the group ID; Linux cannot signal a group through a pidfd).
 
-Pidfds come from ``os.pidfd_open`` and ``signal.pidfd_send_signal`` where Python has them, and
-otherwise (Pythons built without them) straight from the syscalls through ``ctypes`` on x86_64
-and aarch64 Linux. Other machines and macOS have no pidfd.
+Pidfds come from ``gateway.pidfd_open`` and ``gateway.pidfd_send_signal``: ``os.pidfd_open`` and
+``signal.pidfd_send_signal`` where Python has them, and otherwise (Pythons built without them)
+straight from the syscalls through ``ctypes`` on x86_64 and aarch64 Linux. Other machines and
+macOS have no pidfd.
 
 The check before ``killpg``, and before ``kill`` where there is no pidfd, leaves a window: if
 the leader is reaped in it and its PID reused, the signal reaches the new process. Only a
@@ -36,7 +37,7 @@ Should a test run past ``WATCHDOG_SECONDS``, the watchdog writes the live tracke
 stderr, SIGKILLs every tracked process that has a pidfd (exact: a pidfd never names a reused
 PID, so this cannot race the test's own wait), and the test fails at teardown. It sends no
 other signal: without pidfds it only reports, and a test hung on something else stays hung.
-This module is test-only; nothing under ``src/`` imports it.
+This module is test-only; nothing under ``src/`` imports it (it imports ``gateway``).
 
 The other autouse fixtures keep every test off the user's real directories: its own
 ``XDG_STATE_HOME`` (``_private_state_dir``), ``HOME`` and ``XDG_CONFIG_HOME``
@@ -48,10 +49,7 @@ anything under the real ``/tmp/csession-<uid>``).
 from __future__ import annotations
 
 import contextlib
-import ctypes
-import errno
 import os
-import platform
 import select
 import shutil
 import signal
@@ -67,7 +65,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import pathrules
+from claude_session import gateway, pathrules
 
 pytest_plugins = ["pytester"]  # test_leftover_guard.py runs the guard in a pytest of its own
 
@@ -105,66 +103,11 @@ def _unreaped_child(pid: int) -> bool:
     return True
 
 
-# (SYS_pidfd_open, SYS_pidfd_send_signal) by platform.machine(), for Pythons without the
-# os/signal wrappers. Any other machine gets no pidfd.
-_PIDFD_SYSCALLS = {"x86_64": (434, 424), "aarch64": (434, 424)}
-
-
-def _libc_syscall() -> Any:
-    """libc's ``syscall``, or ``None`` when it is not needed or not available."""
-    if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
-        return None
-    if not LINUX or platform.machine() not in _PIDFD_SYSCALLS:
-        return None
-    try:
-        fn = ctypes.CDLL(None, use_errno=True).syscall
-    except (OSError, AttributeError):
-        return None
-    fn.restype = ctypes.c_long
-    return fn
-
-
-_SYSCALL = _libc_syscall()
-# Whether exact pidfds are available here (natively or through the syscalls).
-PIDFD = (hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")) or (
-    _SYSCALL is not None
-)
-
-
-def _check(result: int) -> int:
-    if result < 0:
-        err = ctypes.get_errno() or errno.EIO  # never 0: set_errno(0) precedes every call
-        raise OSError(err, os.strerror(err))  # ESRCH arrives as ProcessLookupError
-    return result
-
-
-def _pidfd_open(pid: int) -> int:
-    if _SYSCALL is None:
-        return os.pidfd_open(pid)
-    ctypes.set_errno(0)
-    return _check(
-        _SYSCALL(
-            ctypes.c_long(_PIDFD_SYSCALLS[platform.machine()][0]),
-            ctypes.c_int(pid),
-            ctypes.c_uint(0),
-        )
-    )
-
-
-def _pidfd_send_signal(fd: int, sig: int) -> None:
-    if _SYSCALL is None:
-        signal.pidfd_send_signal(fd, sig)
-        return
-    ctypes.set_errno(0)
-    _check(
-        _SYSCALL(
-            ctypes.c_long(_PIDFD_SYSCALLS[platform.machine()][1]),
-            ctypes.c_int(fd),
-            ctypes.c_int(sig),
-            ctypes.c_void_p(None),
-            ctypes.c_uint(0),
-        )
-    )
+# Exact pidfds: ``gateway``'s (the os and signal functions, else the syscalls through ctypes
+# on x86_64 and aarch64 Linux). Whether they are available here:
+PIDFD = gateway.pidfd_support() is not None
+_pidfd_open = gateway.pidfd_open
+_pidfd_send_signal = gateway.pidfd_send_signal
 
 
 def _pidfd(pid: int) -> int | None:
