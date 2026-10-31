@@ -1533,9 +1533,9 @@ class Store:
             if wrapper is not None:
                 return Adoption("already_adopted", current)
             if self.past_deadline(expires):
+                # The caller writes the outcome file and delivers the final event
+                # (lifecycle.ended_unadopted).
                 self._finalize(conn, csession_id, current, NEVER_ADOPTED)
-                # TODO(#21): write the run's outcome file with the never_adopted outcome.
-                # TODO(#20): the run's exactly one final post-state-change.
                 return Adoption("expired", current, expired_now=True)
             if forked_from is not None and claude_id is None:
                 try:
@@ -1547,8 +1547,6 @@ class Store:
                         " not third-party-reading is refused",
                     )
                     self._finalize(conn, csession_id, current, final)
-                    # TODO(#21): write the run's outcome file with the never_adopted outcome.
-                    # TODO(#20): the run's exactly one final post-state-change.
                     return Adoption("tainted", current, expired_now=True)
             cursor = conn.execute(
                 "UPDATE runs SET wrapper_pid = ?, wrapper_start = ?, "
@@ -1570,8 +1568,8 @@ class Store:
         TODO(#33): the liveness check and ``reconcile`` call this (``cause`` ``liveness`` or
         ``reconcile``) for every pending run they see, and delete the launch spec
         (``lifecycle.SPEC_NAME``) of each run this finalizes.
-        TODO(#21): write the run's outcome file with the never_adopted outcome.
-        TODO(#20): the run's exactly one final post-state-change."""
+        The caller writes the outcome file and delivers the final event of a run this
+        finalizes."""
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT wrapper_pid, ended_at, expires_at FROM runs "

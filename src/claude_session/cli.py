@@ -16,6 +16,7 @@ import signal
 import sys
 import traceback
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 
     from .config import Config
     from .launch import Allocated, Process
+    from .signals import ExecSignals
 
 PROG = "claude-session"
 DESCRIPTION = "Runs and supervises Claude Code sessions (terminal-agnostic)."
@@ -160,51 +162,54 @@ def _report(args: argparse.Namespace) -> int:
     return 0
 
 
-def _exec(args: argparse.Namespace) -> int:
-    """``exec`` of a new session: launch steps 2 to 7, then supervision (interface.md, Launch
-    order, exec and Signals). A launch-phase end exits 12 with the outcome object, also when a
-    signal interrupted the launch; a signal before allocation ends ``exec`` by that signal.
-    The signal handlers are installed before allocation and restored once the outcome is
-    printed (until then a late signal is only recorded)."""
-    if args.session_id is not None:
-        return _adopt(args)
-    if args.dry_run:
-        return _dry_run(args)
+@dataclass
+class _Begun:
+    """A launching command's allocated (or adopted) run: the config its events are delivered
+    with (None: not known; ``reconcile`` delivers them) and the call that launches and
+    supervises it (``launch.run``; None: the run ended in the launch phase)."""
+
+    alloc: Allocated
+    cfg: Config | None
+    run: Callable[[], Any]
+
+
+def _supervised(
+    args: argparse.Namespace,
+    begin: Callable[[store.Store, Process, ExecSignals], _Begun],
+) -> int:
+    """The shape every launching command shares (``exec``, the adopting ``exec`` and
+    ``resume``; interface.md, Launch order, exec and Signals): the signal handlers installed
+    before ``begin`` allocates (or adopts) the run, the launch and supervision, the delivery
+    of what the run's worker did not deliver, then the outcome object. A launch-phase end
+    exits 12 with the outcome object, also when a signal interrupted the launch; a signal
+    before allocation ends the command by that signal. The handlers are restored once the
+    outcome is printed (until then a late signal is only recorded)."""
     from . import launch, supervisor
     from .gateway import SystemGateway
     from .signals import ExecSignals, LaunchInterrupted
 
-    cfg = load_config(args)
     signals = ExecSignals()
     try:  # entered first: a signal during the install is handled and the handlers restored
         try:
             signals.install()  # before allocation (interface.md, Signals)
             with store.open_state() as st:
                 process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
-                req = launch.read_request(args, cfg)
-                resolved = launch.resolve_kind(req, cfg, process)
-                launch.check_outcome_file(req, resolved, process)
-                # From here an error envelope's outcome file is checked as the run's is.
-                args.outcome_file_writable = launch.step2_outcome_writable(resolved, process)
-                signals.defer()  # a signal during allocation acts once the run exists
-                alloc = launch.allocate(st, req, resolved, process)
+                begun = begin(st, process, signals)
+                alloc = begun.alloc
                 try:
-                    ended = launch.run(
-                        st,
-                        cfg,
-                        req,
-                        resolved,
-                        alloc,
-                        process,
-                        supervise=supervisor.run_session,
-                        signals=signals,
-                    )
+                    ended = begun.run()
                 except LaunchInterrupted as exc:
                     ended = None  # the run ended not-started: its outcome is in the store
                     signals.defer()
                     _end_interrupted_launch(st, alloc, process, exc)
+                except RefusedError:
+                    # Refused after allocation (a fork source tainted meanwhile): the run
+                    # ended not-started; its events are delivered before the envelope.
+                    signals.enter_delivery()
+                    _deliver_rest(st, begun.cfg, alloc, process, signals.delivery_canceled)
+                    raise
                 signals.enter_delivery()  # a signal now cancels the remaining delivery
-                _deliver_rest(st, cfg, alloc, process, signals.delivery_canceled)
+                _deliver_rest(st, begun.cfg, alloc, process, signals.delivery_canceled)
                 outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
         except LaunchInterrupted as exc:  # before allocation: nothing to record
             _die_of(exc.signum)
@@ -221,10 +226,46 @@ def _exec(args: argparse.Namespace) -> int:
     finally:
         signals.restore()
     if ended is not None:
-        return ended.exit_code
+        return int(ended.exit_code)
     if outcome["exit_code"] is None:  # a run that is still not final: never read as a code
         raise InternalError("the run has no outcome after its launch was interrupted")
     return int(outcome["exit_code"])
+
+
+def _exec(args: argparse.Namespace) -> int:
+    """``exec`` of a new session: launch steps 2 to 7, then supervision (``_supervised``)."""
+    if args.session_id is not None:
+        return _adopt(args)
+    if args.dry_run:
+        return _dry_run(args)
+    from . import launch, supervisor
+
+    cfg = load_config(args)
+
+    def begin(st: store.Store, process: Process, signals: ExecSignals) -> _Begun:
+        req = launch.read_request(args, cfg)
+        resolved = launch.resolve_kind(req, cfg, process)
+        launch.check_outcome_file(req, resolved, process)
+        # From here an error envelope's outcome file is checked as the run's is.
+        args.outcome_file_writable = launch.step2_outcome_writable(resolved, process)
+        signals.defer()  # a signal during allocation acts once the run exists
+        alloc = launch.allocate(st, req, resolved, process)
+        return _Begun(
+            alloc,
+            cfg,
+            lambda: launch.run(
+                st,
+                cfg,
+                req,
+                resolved,
+                alloc,
+                process,
+                supervise=supervisor.run_session,
+                signals=signals,
+            ),
+        )
+
+    return _supervised(args, begin)
 
 
 def _wait(args: argparse.Namespace) -> int:
@@ -272,21 +313,29 @@ def _wait(args: argparse.Namespace) -> int:
 
 def _adopt(args: argparse.Namespace) -> int:
     """``exec --session-id <id>``: adopt the pending run ``start`` created and launch it
-    (interface.md, Launch order); with ``--dry-run``, inspect it without adopting."""
-    from . import launch, lifecycle, supervisor
-    from .gateway import SystemGateway
+    (interface.md, Launch order; ``_supervised``); with ``--dry-run``, inspect it without
+    adopting."""
+    from . import lifecycle, supervisor
 
-    try:
+    if args.dry_run:
+        from . import launch
+        from .gateway import SystemGateway
+
         with store.open_state() as st:
             process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
-            if args.dry_run:
-                return _print_dry_run(args, *lifecycle.adoption_plan(st, args, process))
-            outcome, code = lifecycle.adopt(st, args, process, supervise=supervisor.run_session)
-    except KeyboardInterrupt:
-        # TODO(#17): as for plain exec (signal handling of the launch and session phases).
-        _die_of(signal.SIGINT)
-    _print_outcome(outcome, args.json)
-    return code
+            return _print_dry_run(args, *lifecycle.adoption_plan(st, args, process))
+
+    def begin(st: store.Store, process: Process, signals: ExecSignals) -> _Begun:
+        adopted = lifecycle.adopt(st, args, process, signals)
+        return _Begun(
+            adopted.alloc,
+            adopted.cfg,
+            lambda: lifecycle.launch_adopted(
+                st, adopted, process, supervise=supervisor.run_session, signals=signals
+            ),
+        )
+
+    return _supervised(args, begin)
 
 
 def _start(args: argparse.Namespace) -> int:
@@ -310,20 +359,30 @@ def _start(args: argparse.Namespace) -> int:
 def _resume(args: argparse.Namespace) -> int:
     """``resume <id>`` (interface.md, resume): a new run of the session (or with ``--fork`` a
     new session's run 1) built from the previous run (carry-over), launched and supervised
-    in the foreground like ``exec``; exits with the run's outcome code."""
+    in the foreground like ``exec`` (``_supervised``); exits with the run's outcome code."""
     if args.dry_run:
         return _resume_dry_run(args)
     from . import launch, resume, supervisor
-    from .gateway import SystemGateway
 
     cfg = load_config(args)
-    # TODO(#17): install the signal handlers (interface.md, Signals) here, before allocation.
-    try:
-        with store.open_state() as st:
-            process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
-            planned = resume.prepare(st, args, cfg, process)
-            alloc = resume.allocate(st, planned, process)
-            ended = launch.run(
+
+    def begin(st: store.Store, process: Process, signals: ExecSignals) -> _Begun:
+        planned = resume.prepare(st, args, cfg, process)
+        launch.check_outcome_file(planned.req, planned.resolved, process)
+        # From here an error envelope's outcome file is checked as the run's is.
+        args.outcome_file_writable = launch.step2_outcome_writable(planned.resolved, process)
+        # The inline liveness check and the delivery of what it changed run deferred (a hook
+        # is never cut short by the handler); a signal recorded meanwhile still ends resume
+        # before anything is allocated.
+        signals.defer()
+        resume.liveness(st, process, planned.source.csession_id, cfg)
+        signals.raise_pending()
+        signals.defer()  # a signal during allocation acts once the run exists
+        alloc = resume.allocate(st, planned, process, cfg=cfg)
+        return _Begun(
+            alloc,
+            cfg,
+            lambda: launch.run(
                 st,
                 cfg,
                 planned.req,
@@ -331,15 +390,11 @@ def _resume(args: argparse.Namespace) -> int:
                 alloc,
                 process,
                 supervise=supervisor.run_session,
-            )
-            outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
-            # TODO(#20): deliver the run's post-state-change events (toolhooks.deliver) for a
-            # run that ended without a live wrapper delivering them.
-    except KeyboardInterrupt:
-        # TODO(#17): as for plain exec (SIGINT forwarded, or ignored in interactive mode).
-        _die_of(signal.SIGINT)
-    _print_outcome(outcome, args.json)
-    return int(outcome["exit_code"]) if ended is None else ended.exit_code
+                signals=signals,
+            ),
+        )
+
+    return _supervised(args, begin)
 
 
 def _resume_dry_run(args: argparse.Namespace) -> int:
@@ -453,7 +508,7 @@ def _write_wait_outcome_file(
 
 def _deliver_rest(
     st: store.Store,
-    cfg: Config,
+    cfg: Config | None,
     alloc: Allocated,
     process: Process,
     cancel: threading.Event,
@@ -461,23 +516,22 @@ def _deliver_rest(
     """``post-state-change`` delivery of what the run's worker did not deliver: all of a
     launch-phase end (its ``launch`` and one final event; no worker ran), else normally
     nothing. A busy lease or a store error is retried for up to the lease TTL; ``cancel`` (a
-    signal) stops it. Best effort: whatever stays undelivered is delivered by the next
-    delivering command (``reconcile``); a hook failure never changes the outcome."""
+    signal) stops it. Best effort: whatever stays undelivered (all of it without ``cfg``) is
+    delivered by the next delivering command (``reconcile``); a hook failure never changes
+    the outcome."""
     from . import toolhooks
 
-    try:
-        toolhooks.deliver(
-            st,
-            cfg,
-            alloc.csession_id,
-            gateway=process.gateway,
-            environ=process.environ,
-            state_root=process.state_root,
-            cancel=cancel,
-            patience=toolhooks.LEASE_TTL,
-        )
-    except Exception:
-        st.rollback_open_transaction()
+    if cfg is None:
+        return
+    toolhooks.deliver_best_effort(
+        st,
+        cfg,
+        alloc.csession_id,
+        gateway=process.gateway,
+        environ=process.environ,
+        state_root=process.state_root,
+        cancel=cancel,
+    )
 
 
 def _end_interrupted_launch(

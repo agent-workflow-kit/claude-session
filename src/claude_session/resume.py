@@ -35,13 +35,10 @@ the refusal checks). Until it exists, a resume of a run that is not final is ref
 also when its wrapper died after allocation (that run then blocks every resume until #33
 finalizes it; ``--fork`` still works); only a pending run past its deadline is finalized
 here.
-TODO(#17): interactive resume (a TTY on stdin and stdout; ``claude`` on the terminal).
 TODO(#30): ``--allow-tainted`` (human-only, audited ``resume_tainted``); until then a tainted
 session is refused for a run that is not third-party-reading whatever the flags.
 TODO(#31): ``--override-escalation`` (human-only; only after a run that ended ``escalated``;
 it overrides that run's escalating ``pre-launch`` hooks).
-TODO(#20): deliver the ``post-state-change`` events of a run this module finalizes
-(``toolhooks.deliver``).
 """
 
 from __future__ import annotations
@@ -142,20 +139,32 @@ def lookup(st: store.Store, given: str) -> str:
     return ids.lookup_session_id(given, st.session_id_candidates)
 
 
-def liveness(st: store.Store, process: launch.Process, csession_id: str) -> None:
+def liveness(
+    st: store.Store, process: launch.Process, csession_id: str, cfg: Config | None = None
+) -> None:
     """The part of the inline liveness check this branch has, run just before allocation
     (after every step-2 check, so a usage error finalizes nothing): a current run still
     pending at or past its ``expires_at`` is finalized ``not-started`` (``never_adopted``,
-    cause ``liveness``) and its launch spec deleted. TODO(#33): the wrapper-lost rules (a
-    run whose wrapper died stays live until then, and is refused ``live``).
-    TODO(#21): the outcome file of the run finalized here. TODO(#20): its delivery."""
-    from . import lifecycle
+    cause ``liveness``), its launch spec deleted, its outcome file written and (with
+    ``cfg``) its events delivered. TODO(#33): the wrapper-lost rules (a run whose wrapper
+    died stays live until then, and is refused ``live``)."""
+    from . import lifecycle, outcomefile, toolhooks
 
     record = st.current_run(csession_id)
     if record is None or record["ended_at"] is not None or record["wrapper_pid"] is not None:
         return
     if st.expire_pending(csession_id, record["run_no"], cause="liveness"):
         lifecycle.discard_spec_at(process.state_root, csession_id, record["run_no"])
+        outcomefile.write_run(st, csession_id, record["run_no"])
+        if cfg is not None:
+            toolhooks.deliver_best_effort(
+                st,
+                cfg,
+                csession_id,
+                gateway=process.gateway,
+                environ=process.environ,
+                state_root=process.state_root,
+            )
 
 
 def load_source(st: store.Store, csession_id: str, state_root: str) -> Source:
@@ -402,17 +411,12 @@ def _read_request(
 ) -> launch.Request:
     """``launch.read_request`` in ``mode``: ``start --resume`` and dry runs read any mode
     (``dryrun.request``, with the interactive TTY checks of a launch); a plain interactive
-    ``resume`` needs a TTY on stdin and stdout (exit 2), then is not implemented yet."""
+    ``resume`` needs a TTY on stdin and stdout (exit 2)."""
     with_mode = argparse.Namespace(**{**vars(args), "mode": mode})
     if any_mode:
         return dryrun.request(with_mode, cfg)
     if mode == "interactive":
         dryrun.check_interactive_tty(with_mode)
-        # TODO(#17): interactive resume.
-        raise InternalError(
-            "interactive resume is not implemented yet; pass --mode headless",
-            detail="not_implemented",
-        )
     return launch.read_request(with_mode, cfg)
 
 
@@ -694,14 +698,16 @@ def allocate(
     process: launch.Process,
     *,
     pending: launch.Pending | None = None,
+    cfg: Config | None = None,
 ) -> launch.Allocated:
-    """Launch step 4, after the inline liveness check (``liveness``): a fork is a new
+    """Launch step 4, after the inline liveness check (``liveness``; with ``cfg``, what it
+    changed is delivered): a fork is a new
     session (``launch.allocate``; its git directory is checked against the source's when it
     runs in the source's cwd); a resume is run n + 1 (``launch.allocate_resume``, refusals
     in the same transaction). Any run of a fork may merge into the copied ``inputs/<run>/``;
     a resume that repeats a fork re-checks the source's taint before step 7."""
     source = planned.source
-    liveness(st, process, source.csession_id)
+    liveness(st, process, source.csession_id, cfg)
     git_dir = stored_git_dir(planned, process)
     if planned.fork:
         alloc = launch.allocate(

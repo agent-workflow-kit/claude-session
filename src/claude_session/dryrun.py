@@ -613,8 +613,8 @@ def request(args: argparse.Namespace, cfg: Config) -> launch.Request:
     """``launch.read_request`` for any mode: interactive mode gets its TTY checks here, then
     is read as headless (the rest of step 2 is the same).
 
-    TODO(#17): once ``read_request`` accepts interactive mode (with these TTY checks),
-    call it as it is and drop ``check_interactive_tty`` here."""
+    ``launch.read_request`` itself requires a terminal in interactive mode (plain ``exec``
+    and ``resume``), which ``start`` and the dry runs must not."""
     mode = args.mode or "interactive"
     if mode == "interactive":
         check_interactive_tty(args)

@@ -174,9 +174,13 @@ class Env:
             code = proc.wait(timeout=30)
         finally:
             os.close(master)
-        out = json.loads(b"".join(chunks).decode())
+        # The terminal also carries what claude wrote: the last JSON object line is ours.
+        lines = b"".join(chunks).decode(errors="replace").replace("\r", "").splitlines()
+        out = next(json.loads(line) for line in reversed(lines) if line.startswith('{"'))
         if "error" in out:
             validate(out, "claude-session/cli/error.json")
+        else:
+            validate_exec(out)
         return code, out
 
     def edit_spec(self, sid: str, change: Callable[[dict[str, Any]], None]) -> None:
@@ -757,17 +761,60 @@ def test_the_adopting_process_hook_interpreter_is_recorded(env: Env) -> None:
     assert env.run_row(sid)["hook_interpreter"] != "/old/python"
 
 
-def test_an_interactive_run_with_a_tty_stays_pending_until_supported(
-    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    from claude_session.cli import main
-
+def test_an_interactive_run_is_adopted_and_supervised_on_a_terminal(env: Env) -> None:
     sid = env.started("--mode", "interactive")["csession_id"]
-    monkeypatch.setattr(lifecycle, "has_tty", lambda: True)
-    assert main(["exec", "--session-id", sid, "--json"]) == 1
-    assert json.loads(capsys.readouterr().out)["error"]["detail"] == "not_implemented"
+    code, out = env.adopt_on_pty(sid)
+    assert (code, out["outcome"], out["phase"]) == (0, "done", "session"), out
     row = env.run_row(sid)
-    assert row["wrapper_pid"] is None and row["ended_at"] is None
+    assert (row["mode"], row["outcome"]) == ("interactive", "done")
+    assert row["wrapper_pid"] is not None and row["child_pid"] is not None
+
+
+def test_an_adopted_run_gets_the_frozen_timeout_as_its_bound(env: Env) -> None:
+    env.scenario([START, {"do": "hang"}])
+    sid = env.started("--mode", "headless", "--timeout", "1s")["csession_id"]
+    proc, out = env.adopt(sid)
+    assert (proc.returncode, out["outcome"], out["end_reason"]) == (16, "timeout", "timeout")
+
+
+def test_an_adoption_outcome_file_under_a_session_writable_path_exits_2_and_stays_pending(
+    env: Env,
+) -> None:
+    sid = env.started("--mode", "headless")["csession_id"]
+    target = env.state / "sessions" / sid / "out.json"
+    proc = env.cs(["exec", "--session-id", sid, "--json", "--outcome-file", str(target)])
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert json.loads(proc.stdout)["error"]["code"] == "usage"
+    row = env.run_row(sid)
+    assert row["wrapper_pid"] is None and row["ended_at"] is None and row["outcome_file"] is None
+    assert not target.exists()
+
+
+def test_an_adoption_outcome_file_is_written_after_the_run(env: Env, tmp_path: Path) -> None:
+    sid = env.started("--mode", "headless")["csession_id"]
+    target = tmp_path / "outcome.json"
+    proc, out = env.adopt(sid, "--outcome-file", str(target))
+    assert proc.returncode == 0, out
+    assert json.loads(target.read_text())["outcome"] == "done"
+
+
+def test_an_expired_adoption_writes_the_outcome_file_and_delivers_the_final_event(
+    env: Env, tmp_path: Path
+) -> None:
+    hooked = tmp_path / "hooked.jsonl"
+    env.write_config(
+        "lost_grace: 0.2s\nhooks:\n  post-state-change:\n"
+        f"    - cmd: cat >> {hooked}; echo >> {hooked}\n"
+    )
+    target = tmp_path / "outcome.json"
+    sid = env.started("--mode", "headless", "--outcome-file", str(target))["csession_id"]
+    time.sleep(0.5)
+    proc, out = env.adopt(sid)
+    assert (proc.returncode, out["error"]["reason"]) == (20, "expired")
+    assert json.loads(target.read_text())["end_reason"] == "never_adopted"
+    payloads = [json.loads(line) for line in hooked.read_text().splitlines() if line]
+    assert [p["final"] for p in payloads][-1] is True
+    assert env.rows("SELECT COUNT(*) FROM events WHERE delivered_at IS NULL") == [(0,)]
 
 
 # The launch spec, read back
@@ -1084,3 +1131,43 @@ def test_the_adoption_dry_run_refuses_a_symlinked_run_directory(env: Env) -> Non
     assert proc.returncode == 12
     assert out["error"]["code"] == "failed"
     assert "session directory" in out["error"]["message"]
+
+
+# Integration of start with outcome files (#21) and hook delivery (#20)
+
+
+def test_start_refuses_an_outcome_file_under_the_sessions_directory(env: Env) -> None:
+    (env.state / "sessions").mkdir(parents=True, exist_ok=True)
+    target = env.state / "sessions" / "out.json"
+    proc, out = env.start(("--mode", "headless", "--outcome-file", str(target)))
+    assert (proc.returncode, out["error"]["code"]) == (2, "usage")
+    assert env.rows("SELECT COUNT(*) FROM sessions") == [(0,)]
+    assert not target.exists()
+
+
+def test_start_delivers_the_events_of_its_pending_run(env: Env, tmp_path: Path) -> None:
+    hooked = tmp_path / "hooked.jsonl"
+    env.write_config(
+        f"hooks:\n  post-state-change:\n    - cmd: cat >> {hooked}; echo >> {hooked}\n"
+    )
+    sid = env.started("--mode", "headless")["csession_id"]
+    payloads = [json.loads(line) for line in hooked.read_text().splitlines() if line]
+    assert [(p["object_id"], p["pending"], p["cause"]) for p in payloads] == [(sid, True, "launch")]
+    assert env.rows("SELECT COUNT(*) FROM events WHERE delivered_at IS NULL") == [(0,)]
+
+
+def test_a_failed_start_writes_its_outcome_file_and_delivers_the_final_event(
+    env: Env, tmp_path: Path
+) -> None:
+    hooked = tmp_path / "hooked.jsonl"
+    env.config.write_text(
+        f"claude_bin: {tmp_path / 'missing'}\nhooks:\n  post-state-change:\n"
+        f"    - cmd: cat >> {hooked}; echo >> {hooked}\n",
+        encoding="utf-8",
+    )
+    target = tmp_path / "outcome.json"
+    proc, out = env.start(("--mode", "headless", "--outcome-file", str(target)))
+    assert (proc.returncode, out["error"]["end_reason"]) == (12, "claude_not_found")
+    assert json.loads(target.read_text())["end_reason"] == "claude_not_found"
+    payloads = [json.loads(line) for line in hooked.read_text().splitlines() if line]
+    assert payloads[-1]["final"] is True

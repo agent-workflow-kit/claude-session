@@ -1052,10 +1052,10 @@ def start_hanging(
     return proc
 
 
-def run_row_of(state: Path) -> dict[str, Any]:
+def run_row_of(state: Path, run: int = 1) -> dict[str, Any]:
     db = sqlite3.connect(f"file:{state / 'state.db'}?mode=ro", uri=True)
     try:
-        cursor = db.execute("SELECT * FROM runs")
+        cursor = db.execute("SELECT * FROM runs WHERE run_no = ? ORDER BY rowid LIMIT 1", (run,))
         names = [c[0] for c in cursor.description]
         return dict(zip(names, cursor.fetchone(), strict=True))
     finally:

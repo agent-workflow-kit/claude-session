@@ -714,6 +714,45 @@ def deliver(
     return d.deliver(csession_id)
 
 
+def deliver_best_effort(
+    st: store.Store,
+    cfg: Config,
+    csession_id: str,
+    *,
+    gateway: Gateway,
+    environ: Mapping[str, str],
+    state_root: str,
+    cancel: threading.Event | None = None,
+    patience: float = LEASE_TTL,
+) -> Delivery | None:
+    """``deliver`` with ``patience`` (default: the lease TTL) for a command that changed a run
+    with no live wrapper, never raising an ``Exception``: an error is logged and whatever stays
+    undelivered is left for the next delivering command (``reconcile``). Returns what was
+    done, or None after an error."""
+    try:
+        return deliver(
+            st,
+            cfg,
+            csession_id,
+            gateway=gateway,
+            environ=environ,
+            state_root=state_root,
+            cancel=cancel,
+            patience=patience,
+        )
+    except Exception as exc:
+        st.rollback_open_transaction()
+        _log(
+            logs.EventLog(os.path.join(state_root, LOG_NAME)),
+            "hook_failed",
+            level="warn",
+            csession_id=csession_id,
+            message=f"{POST_STATE_CHANGE} delivery failed ({type(exc).__name__}); the next"
+            " delivering command delivers the rest",
+        )
+        return None
+
+
 class Worker:
     """``exec``'s background delivery thread (design.md, Supervision): ``wake`` from the
     poll loop (non-blocking), ``close`` once the run is final (one last pass, retried while

@@ -45,9 +45,9 @@ outbox (a fork's run 1 places its inputs beside the copied ones). ``start --resu
 --dry-run`` is ``resume.plan``.
 TODO(#31): insert step 6 (the ``pre-launch`` hooks) of the adopting ``exec`` before its fork
 taint re-check (``launch.recheck_fork_taint``).
-TODO(#17): interactive adoption (signal handlers before the compare-and-set, the TTY handed
-to ``claude``); until then an adoptable interactive pending run with a TTY is refused before
-the compare-and-set (it stays pending).
+The adopting ``exec`` installs its signal handlers before the compare-and-set and defers
+them from just before it (a signal then acts once the run is its own, in the launch phase);
+an interactive run is handed the terminal as plain ``exec`` hands it.
 TODO(#32): ``stop`` canceling a pending run deletes its launch spec too (``discard_spec``).
 """
 
@@ -71,10 +71,13 @@ from . import (
     ids,
     kinds,
     launch,
+    outcomefile,
+    pathrules,
     permission_profiles,
     sessiondir,
     store,
     tmpdir,
+    toolhooks,
 )
 from .config import Config
 from .defaults import MAX_INTEGER
@@ -84,10 +87,12 @@ from .errors import (
     LaunchFailedError,
     LaunchValidationError,
     NotFoundError,
+    OutcomeFileRejected,
     RefusedError,
     UsageError,
 )
 from .sessiondir import InputFile, SessionDirs
+from .signals import ExecSignals
 
 SPEC_NAME = "launch-spec.json"
 SPEC_VERSION = 1
@@ -424,11 +429,13 @@ def start(
     if args.resume is not None:
         planned = resume.prepare(st, args, cfg, process, any_mode=True)
         req, resolved = planned.req, planned.resolved
-        alloc = resume.allocate(st, planned, process, pending=pending)
+        check_outcome_file(args, req, resolved, process)
+        alloc = resume.allocate(st, planned, process, pending=pending, cfg=cfg)
         forked_from = planned.source.csession_id if planned.fork else None
     else:
         req = dryrun.request(args, cfg)  # start never checks the run's TTY (any mode)
         resolved = launch.resolve_kind(req, cfg, process)
+        check_outcome_file(args, req, resolved, process)
         alloc = launch.allocate(st, req, resolved, process, pending=pending)
     resolution = resolved.resolution
     v: launch.Validated | None = None
@@ -451,6 +458,16 @@ def start(
         if v is not None:
             v.close_tmpdir_pin()
             v.dirs.close()
+        # The run is pending (no wrapper) or ended: start delivers its events itself
+        # (a launch-phase end included).
+        toolhooks.deliver_best_effort(
+            st,
+            cfg,
+            alloc.csession_id,
+            gateway=process.gateway,
+            environ=process.environ,
+            state_root=process.state_root,
+        )
     assert v is not None
     return {
         "csession_id": alloc.csession_id,
@@ -466,6 +483,19 @@ def start(
         "env_inherit": resolution.profile.env.inherit,
         "warnings": list(dict.fromkeys([*resolution.warnings, *warnings])),
     }
+
+
+def check_outcome_file(
+    args: argparse.Namespace,
+    req: launch.Request,
+    resolved: launch.Resolved,
+    process: launch.Process,
+) -> None:
+    """Launch step 2 of ``start``: the ``--outcome-file`` check of a launch
+    (``launch.check_outcome_file``, exit 2); from here an error envelope's outcome file is
+    checked as the run's is."""
+    launch.check_outcome_file(req, resolved, process)
+    args.outcome_file_writable = launch.step2_outcome_writable(resolved, process)
 
 
 def freeze(
@@ -943,37 +973,91 @@ def log_config_warnings(
         )
 
 
+@dataclass
+class Adopted:
+    """What ``adopt`` leaves: the adopted run (``alloc``) and, when it may launch, its
+    ``Adoption``; None when the run already ended ``not-started`` (its outcome is in the
+    store). ``cfg``: the config its ``post-state-change`` events are delivered with (None:
+    the stored config could not be loaded; ``reconcile`` delivers them later)."""
+
+    alloc: launch.Allocated
+    adoption: Adoption | None
+    cfg: Config | None
+
+
+def check_adoption_outcome_file(path: str, writable: Callable[[str], bool] | None) -> None:
+    """An ``--outcome-file`` given at adoption overrides the stored one and is checked again
+    before the compare-and-set (interface.md, Launch order), against the run's stored
+    session-writable paths (``outcomefile.run_writable``): a rejected path exits 2
+    (``OutcomeFileRejected``) and the run stays pending. When those paths cannot be
+    determined (an isolated run without a stored set) it is rejected too (fail closed)."""
+    if writable is None:
+        raise OutcomeFileRejected(
+            "--outcome-file cannot be checked: the run's session-writable paths are not known"
+        )
+    pathrules.check_outcome_file(path, writable)
+
+
+def stored_config(record: Mapping[str, Any], process: launch.Process) -> Config | None:
+    """The config at the path ``start`` stored, for delivering the events of a run that ends
+    without being adopted; None when it cannot be loaded (best effort)."""
+    path = record["config_path"]
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return None
+    try:
+        default = _invocation(record).get("config_default") is True
+        return config.Source(path=path, default=default).load(process.environ)
+    except Exception:
+        return None
+
+
+def ended_unadopted(
+    st: store.Store, process: launch.Process, record: Mapping[str, Any], run: int
+) -> None:
+    """After a compare-and-set that ended the pending run ``never_adopted`` (expired, or its
+    fork source tainted): its launch spec deleted, its outcome file written and its events
+    delivered (best effort)."""
+    sid = record["csession_id"]
+    discard_spec_at(process.state_root, sid, run)
+    outcomefile.write_run(st, sid, run)
+    cfg = stored_config(record, process)
+    if cfg is not None:
+        toolhooks.deliver_best_effort(
+            st,
+            cfg,
+            sid,
+            gateway=process.gateway,
+            environ=process.environ,
+            state_root=process.state_root,
+        )
+
+
 def adopt(
     st: store.Store,
     args: argparse.Namespace,
     process: launch.Process,
-    *,
-    supervise: Callable[..., Any],
-) -> tuple[dict[str, Any], int]:
-    """``exec --session-id <id>``: the compare-and-set, then the adopted run's launch (see
-    the module docs). Returns the outcome object and the exit code. Refusals raise
+    signals: ExecSignals,
+) -> Adopted:
+    """``exec --session-id <id>`` up to the adopted run's launch (see the module docs): the
+    ``--outcome-file`` re-check, the compare-and-set (``signals`` deferred from just before
+    it: a signal received from then on acts once ``launch_adopted`` enters the launch phase,
+    when the run is this process's), then the config, launch spec and TTY. Refusals raise
     ``RefusedError`` (exit 20) or ``NotFoundError`` (exit 10) and change nothing (an expired
-    pending run is finalized ``never_adopted`` first, and its launch spec deleted)."""
+    pending run is finalized ``never_adopted`` first, its launch spec deleted, its outcome
+    file written and its events delivered). A failure after the compare-and-set ends the run
+    ``not-started`` here (``Adopted.adoption`` None)."""
     sid, record = lookup(st, args.session_id)
     check_run(sid, record, args.run)
-    outcome_file = None if args.outcome_file is None else os.path.abspath(args.outcome_file)
-    # TODO(#21): an isolated run's --outcome-file under a session-writable path exits 2 here,
-    # before the compare-and-set, and the run stays pending.
-    if record["mode"] == "interactive" and has_tty():
-        # Refusals first: a final or expired run goes through the compare-and-set (which
-        # finalizes an expired one); a run that has a wrapper is refused as it stands (it
-        # may be start's, about to become pending).
-        found = refusal(record, st.past_deadline(record["expires_at"]))
-        if found == "already_adopted":
-            raise RefusedError(f"cannot adopt {sid}: already adopted", reason=found)
-        if found is None:
-            # TODO(#17): interactive supervision; the run stays pending until it exists.
-            raise InternalError(
-                "adopting an interactive run is not implemented yet", detail="not_implemented"
-            )
-    # TODO(#17): install the signal handlers (interface.md, Signals) here, before the CAS.
-    # TODO(#33): start_time() gives "" when the token cannot be read (as for plain exec);
-    # the liveness check must never take an empty token as matching a live process.
+    writable = outcomefile.run_writable(record, process.state_root)
+    # From here an error envelope's outcome file is checked as the run's is.
+    args.outcome_file_writable = writable
+    outcome_file = None
+    if args.outcome_file is not None:
+        outcome_file = outcomefile.absolute(args.outcome_file)
+        check_adoption_outcome_file(outcome_file, writable)
+    signals.defer()  # the compare-and-set and what follows: a signal acts once the run is ours
+    # An unreadable start token is stored as "": the liveness check then decides by the PID
+    # alone and keeps the run live while that PID exists (it never finalizes a live run).
     result = st.adopt(
         sid,
         wrapper_pid=os.getpid(),
@@ -986,9 +1070,7 @@ def adopt(
         raise NotFoundError(f"unknown session: {args.session_id}")
     if result.outcome != "adopted":
         if result.expired_now and result.run_no is not None:
-            discard_spec_at(process.state_root, sid, result.run_no)
-            # TODO(#21): write the run's outcome file with the never_adopted outcome.
-            # TODO(#20): the run's exactly one final post-state-change.
+            ended_unadopted(st, process, record, result.run_no)
         if result.outcome == "tainted":
             # A fork's source became tainted after start allocated the fork (interface.md,
             # Taint): the run was finalized never_adopted.
@@ -1003,9 +1085,9 @@ def adopt(
         raise RefusedError(f"cannot adopt {sid}: {reason.replace('_', ' ')}", reason=reason)
     assert result.run_no is not None
     run = result.run_no
-    # TODO(#33): a wrapper that dies between here and the spawn leaves an adopted run in the
-    # launch phase; the liveness check's wrapper-lost rule must cover it (launch_interrupted)
-    # and delete runs/<n>/launch-spec.json via discard_spec_at if it is still there.
+    # A wrapper that dies from here until the spawn leaves an adopted run in the launch phase
+    # (no child recorded): the liveness check ends it launch_interrupted and deletes the
+    # launch spec if it is still there.
     launch.log_best_effort(
         launch.event_log(process), "adopt", level="info", csession_id=sid, run=run
     )
@@ -1029,6 +1111,7 @@ def adopt(
         forked=forked,
         taint_source=forked_from if forks_conversation else None,
     )
+    adoption: Adoption | None = None
     try:
         adopted = st.current_run(sid)
         if adopted is None or adopted["run_no"] != run:
@@ -1045,41 +1128,55 @@ def adopt(
     except LaunchValidationError as error:
         discard_spec_at(process.state_root, sid, run)
         launch.end_launch(st, alloc, None, None, process, error)
-        return _outcome(st, sid, run)
+        return Adopted(alloc, None, _delivery_config(adoption, record, process))
     except Exception as exc:
         discard_spec_at(process.state_root, sid, run)
         launch.end_launch(st, alloc, None, None, process, launch.interrupted(exc), exc=exc)
-        return _outcome(st, sid, run)
+        return Adopted(alloc, None, _delivery_config(adoption, record, process))
     except BaseException as exc:
         discard_spec_at(process.state_root, sid, run)
         launch.end_launch(st, alloc, None, None, process, launch.interrupted(exc), exc=exc)
         raise
+    return Adopted(alloc, adoption, adoption.cfg)
+
+
+def _delivery_config(
+    adoption: Adoption | None, record: Mapping[str, Any], process: launch.Process
+) -> Config | None:
+    return adoption.cfg if adoption is not None else stored_config(record, process)
+
+
+def launch_adopted(
+    st: store.Store,
+    adopted: Adopted,
+    process: launch.Process,
+    *,
+    supervise: Callable[..., Any],
+    signals: ExecSignals,
+) -> Any:
+    """Steps 5 to 7 of the adopted run and its supervision (``launch.run`` with ``Adopting``
+    effects; the bound is the frozen resolution's ``timeout`` for the run's mode). None when
+    the run already ended (``Adopted.adoption`` None) or ended in the launch phase."""
+    adoption = adopted.adoption
+    if adoption is None:
+        return None
 
     def effects(s: store.Store, a: launch.Allocated, dirs: SessionDirs) -> launch.Effects:
+        assert adoption is not None
         return Adopting(s, a, dirs, adoption)
 
-    # TODO(#19): pass bound= to supervisor.run_session from the frozen resolution's timeout
-    # for the run's mode, as a headless launch passes bound=resolution.timeout(req.mode).
-    ended = launch.run(
+    return launch.run(
         st,
         adoption.cfg,
         adoption.req,
         adoption.resolved,
-        alloc,
+        adopted.alloc,
         process,
         supervise=supervise,
         effects=effects,
         staged=True,
+        signals=signals,
     )
-    outcome, code = _outcome(st, sid, run)
-    return outcome, code if ended is None else ended.exit_code
-
-
-def _outcome(st: store.Store, sid: str, run: int) -> tuple[dict[str, Any], int]:
-    from . import supervisor
-
-    outcome = supervisor.outcome_object(st, sid, run)
-    return outcome, int(outcome["exit_code"])
 
 
 # The adoption dry run

@@ -178,12 +178,14 @@ def start_terminal(
     patch: str = "",
     ignore: Sequence[int] = (),
     status_to: Path | None = None,
+    command_args: Sequence[str] = ("exec",),
 ) -> Terminal:
     """``controlling``: None (the terminal is only exec's stdin and stdout), ``"exec"`` (it
     is exec's controlling terminal, exec the session leader) or ``"leader"`` (``LEADER`` is
     the session leader, exec in its foreground process group). ``patch``: Python run in
     exec's process before its entry point (a fault injected into exec). ``ignore``: signals
-    exec inherits as ignored. ``status_to``: claude first copies its ``/proc`` status there
+    exec inherits as ignored. ``command_args``: the command run instead of ``exec`` (e.g.
+    ``resume <id>``). ``status_to``: claude first copies its ``/proc`` status there
     (a shell wrapper that then execs the fake, same PID)."""
     scenario = write_json(tmp_path / "scenario.json", {"steps": steps})
     fake = claude_bin(tmp_path / "fakebin", scenario, tmp_path / "fake.jsonl")
@@ -197,7 +199,7 @@ def start_terminal(
     command = claude_session_cmd()
     if patch:
         command = [*command[:-1], patch + "\n" + command[-1]]
-    argv = [*command, "exec", "--json", "--config", str(cfg), *args]
+    argv = [*command, *command_args, "--json", "--config", str(cfg), *args]
     if controlling == "leader":
         argv = [sys.executable, "-I", "-c", LEADER, *argv]
     master, slave = pty.openpty()
@@ -763,3 +765,22 @@ def test_a_sigint_during_the_interactive_spawn_is_dropped(
     assert run_row_of(state)["pending_cause"] is None
     assert fake_signals(term) == []
     assert signals_sent(term) == [] and signals_not_sent(term) == []
+
+
+# Interactive resume (#17 with #29)
+
+
+def test_an_interactive_resume_runs_claude_on_the_terminal(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    steps = [START, report("done"), STOP, HANG]
+    first = start_terminal(tmp_path, state, work, steps)
+    code, outcome, err = first.finish()
+    assert code == 0, err
+    sid = check_outcome(code, outcome, err)["csession_id"]
+    term = start_terminal(tmp_path, state, work, steps, command_args=("resume", sid))
+    code, outcome, err = term.finish()
+    outcome = check_outcome(code, outcome, err)
+    assert (code, outcome["run"], outcome["end_reason"]) == (0, 2, "auto_exit")
+    row = run_row_of(state, run=2)
+    assert row["mode"] == "interactive" and row["child_pid"] is not None
