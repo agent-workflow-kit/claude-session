@@ -1310,6 +1310,7 @@ def run(
             implicit_done=resolution.profile.implicit_done,
             auto_exit=resolution.profile.auto_exit,
             signals=signals,
+            bound=resolution.timeout(req.mode),
         )
     finally:
         if v is not None:

@@ -450,3 +450,226 @@ def test_the_loop_forwards_signals_and_kills_after_the_grace(st: Store, tmp_path
     r.child.wait = wait  # type: ignore[method-assign]
     assert r.sup.wait() == -9
     assert [s for s, _ in r.child.sent] == [signal.SIGTERM, signal.SIGKILL]
+
+
+# The run's bound and the session_start_timeout warning (#19)
+
+
+def bounded(
+    st: Store,
+    tmp_path: Path,
+    *,
+    bound: float | None = None,
+    session_start_timeout: float | None = None,
+    mode: str = "headless",
+    **cfg: Any,
+) -> Rig:
+    """A rig whose supervision has a bound and/or a session-start check, spawned at 100.0."""
+    r = rig(st, tmp_path, mode=mode, auto_exit=False, **cfg)
+    r.sup = supervisor.Supervision(
+        st,
+        Cfg(**cfg),  # type: ignore[arg-type]
+        r.sup.alloc,
+        r.child,
+        r.signals,
+        logs.EventLog(str(r.log)),
+        auto_exit=False,
+        monotonic=r.clock,
+        bound=bound,
+        session_start_timeout=session_start_timeout,
+        spawned_at=100.0,
+    )
+    return r
+
+
+def all_logs(r: Rig) -> list[dict[str, Any]]:
+    from .fakeclaude import read_jsonl
+    from .schemas import validate
+    from .test_logs import LOG_SCHEMA
+
+    records = [x for x in read_jsonl(r.log) if x["event"] != "migration"] if r.log.exists() else []
+    for record in records:
+        validate(record, LOG_SCHEMA)
+    return records
+
+
+def test_the_bound_records_timeout_before_sigterm_once_it_is_reached(
+    st: Store, tmp_path: Path
+) -> None:
+    r = bounded(st, tmp_path, bound=5.0, kill_grace=3.0)
+    r.sup.check_bound(104.999)
+    assert r.child.sent == [] and not r.sup.ended
+    r.sup.check_bound(105.0)
+    assert r.child.sent == [(signal.SIGTERM, "timeout")]
+    assert r.sup.ended
+    assert r.sup.kill_at == 100.0 + 3.0  # armed from the clock at the send
+    assert [(x["event"], x["signal"], x["message"]) for x in logs_of(r)] == [
+        ("signal_sent", "SIGTERM", "timeout")
+    ]
+
+
+def test_the_bound_counts_from_the_spawn_not_from_supervision(st: Store, tmp_path: Path) -> None:
+    r = bounded(st, tmp_path, bound=5.0)
+    r.clock.now = 104.0  # supervision began late; the bound still ends at spawn + 5
+    r.sup.check_bound(105.0)
+    assert r.child.sent == [(signal.SIGTERM, "timeout")]
+
+
+def test_no_bound_never_ends_the_run(st: Store, tmp_path: Path) -> None:
+    r = bounded(st, tmp_path, bound=None)
+    r.sup.check_bound(1e12)
+    assert r.child.sent == [] and not r.sup.ended
+
+
+def test_an_earlier_cause_stands_when_the_bound_is_reached(st: Store, tmp_path: Path) -> None:
+    r = bounded(st, tmp_path, bound=1.0)
+    assert st.set_pending_cause(r.sid, 1, "stopped")
+    r.sup.check_bound(101.0)
+    assert r.child.sent == [(signal.SIGTERM, "stopped")]
+
+
+def test_a_busy_store_at_the_bound_retries_at_the_next_poll(
+    st: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    r = bounded(st, tmp_path, bound=1.0)
+    real = st.set_pending_cause
+    calls: list[str] = []
+
+    def busy_once(sid: str, run_no: int, cause: str) -> bool:
+        calls.append(cause)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(sid, run_no, cause)
+
+    monkeypatch.setattr(st, "set_pending_cause", busy_once)
+    r.sup.check_bound(101.0)
+    assert r.child.sent == [] and not r.sup.ended  # nothing sent without the cause
+    r.sup.check_bound(101.5)
+    assert r.child.sent == [(signal.SIGTERM, "timeout")]
+    records = logs_of(r)
+    assert [(x["event"], x["level"]) for x in records] == [
+        ("signal_not_sent", "warn"),
+        ("signal_sent", "info"),
+    ]
+    assert "timeout" in records[0]["message"]
+
+
+def test_the_loop_ends_the_child_at_the_bound_and_kills_it_after_kill_grace(
+    st: Store, tmp_path: Path
+) -> None:
+    r = bounded(st, tmp_path, bound=2.0, kill_grace=1.0, poll_interval=0.5)
+
+    def wait(timeout: float | None = None) -> int | None:
+        r.clock.now += 0.25
+        if any(s == signal.SIGKILL for s, _ in r.child.sent):
+            return -9
+        return None
+
+    r.child.wait = wait  # type: ignore[method-assign]
+    assert r.sup.wait() == -9
+    assert r.child.sent == [(signal.SIGTERM, "timeout"), (signal.SIGKILL, "timeout")]
+    assert 102.0 <= r.clock.now <= 104.0
+
+
+def test_a_forwarded_signal_is_not_followed_by_a_bound_signal(st: Store, tmp_path: Path) -> None:
+    r = bounded(st, tmp_path, bound=1.0)
+    receive(r, signal.SIGTERM)
+    r.sup.check_bound(200.0)  # the loop only checks the bound before the child was signaled
+    assert [s for s, _ in r.child.sent] == [signal.SIGTERM]
+    assert st.run_record(r.sid, 1)["pending_cause"] == "forwarded_term"
+
+
+def started(st: Store, sid: str) -> None:
+    st.conn.execute(
+        "UPDATE runs SET session_started_at = '2026-01-01T00:00:00Z' WHERE csession_id = ?",
+        (sid,),
+    )
+
+
+def test_no_session_start_within_the_timeout_warns_once(st: Store, tmp_path: Path) -> None:
+    r = bounded(st, tmp_path, session_start_timeout=120.0)
+    r.sup.check_session_start(219.9)
+    assert st.run_record(r.sid, 1)["warnings_json"] in (None, "[]")
+    r.sup.check_session_start(220.0)
+    r.sup.check_session_start(221.0)
+    import json
+
+    warnings = json.loads(st.run_record(r.sid, 1)["warnings_json"])
+    assert len(warnings) == 1
+    assert "SessionStart" in warnings[0] and "120s" in warnings[0]
+    missing = [x for x in all_logs(r) if x["event"] == "session_start_missing"]
+    assert len(missing) == 1
+    assert (missing[0]["level"], missing[0]["csession_id"], missing[0]["run"]) == (
+        "warn",
+        r.sid,
+        1,
+    )
+    assert r.child.sent == []  # a warning only: the run goes on
+
+
+def test_a_session_start_in_time_gives_no_warning(st: Store, tmp_path: Path) -> None:
+    r = bounded(st, tmp_path, session_start_timeout=1.0)
+    started(st, r.sid)
+    r.sup.check_session_start(500.0)
+    assert st.run_record(r.sid, 1)["warnings_json"] in (None, "[]")
+    assert all_logs(r) == []
+
+
+def test_no_session_start_check_without_a_timeout(st: Store, tmp_path: Path) -> None:
+    """Interactive runs are exempt (they may wait at the trust dialog): run_session passes
+    no session_start_timeout for them."""
+    r = bounded(st, tmp_path, session_start_timeout=None, mode="interactive")
+    r.sup.check_session_start(1e12)
+    assert all_logs(r) == []
+
+
+def test_a_busy_store_at_the_session_start_warning_retries_and_logs_once(
+    st: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    r = bounded(st, tmp_path, session_start_timeout=1.0)
+    real = st.add_run_warnings
+    calls: list[int] = []
+
+    def busy_once(sid: str, run_no: int, warnings: Any) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        real(sid, run_no, warnings)
+
+    monkeypatch.setattr(st, "add_run_warnings", busy_once)
+    r.sup.check_session_start(101.0)
+    r.sup.check_session_start(102.0)
+    r.sup.check_session_start(103.0)
+    assert len(calls) == 2
+    assert st.run_record(r.sid, 1)["warnings_json"].count("SessionStart") == 1
+    assert len([x for x in all_logs(r) if x["event"] == "session_start_missing"]) == 1
+
+
+def test_the_loop_checks_the_session_start_and_keeps_supervising(st: Store, tmp_path: Path) -> None:
+    r = bounded(st, tmp_path, session_start_timeout=1.0, poll_interval=0.5)
+    ticks = iter(range(10))
+
+    def wait(timeout: float | None = None) -> int | None:
+        r.clock.now += 0.5
+        return 0 if next(ticks) == 5 else None
+
+    r.child.wait = wait  # type: ignore[method-assign]
+    assert r.sup.wait() == 0
+    assert r.child.sent == []
+    assert "SessionStart" in st.run_record(r.sid, 1)["warnings_json"]
+
+
+@pytest.mark.parametrize(
+    ("end_reason", "cause"),
+    [("timeout", "timeout"), ("auto_exit", "auto_exit"), ("max_turns", "exit"), ("normal", "exit")],
+)
+def test_the_final_events_cause_follows_the_end_reason(end_reason: str, cause: str) -> None:
+    from claude_session.endmap import HeadlessResult, Mapped
+
+    outcome = "timeout" if end_reason in ("timeout", "max_turns") else "done"
+    final = supervisor._final(Mapped(outcome, end_reason), HeadlessResult())
+    assert final.cause == cause
