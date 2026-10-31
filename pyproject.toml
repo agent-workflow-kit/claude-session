@@ -32,6 +32,13 @@ dev = [
     "types-pyyaml>=6.0.12.20261030",
 ]
 
+[tool.uv]
+# Isolated runs refuse an install whose package dir or venv site-packages holds a file with
+# more than one hard link (interface.md, Path rules: hook interpreter). uv hard-links from
+# its cache when both share a filesystem (as in CI), so the dev venv copies, like the README
+# install.
+link-mode = "copy"
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
