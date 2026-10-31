@@ -1059,3 +1059,67 @@ def test_a_backstop_is_never_taken_after_an_auto_rollback(
         run.stop_hook()
     assert run.run()["backstop_used"] == 0
     assert run.events() == []
+
+
+def _deep_tree(parent: Path, name: str, depth: int) -> None:
+    """A directory chain ``depth`` levels deep, made relative to directory fds so that no
+    path ever exceeds ``PATH_MAX``."""
+    fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for _ in range(depth):
+            os.mkdir(name, dir_fd=fd)
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            name = "d"
+        os.close(os.open("leaf", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=fd))
+    finally:
+        os.close(fd)
+
+
+def test_a_junk_tree_deeper_than_the_descriptor_limit_is_removed(run: Run) -> None:
+    """Removing a junk tree holds a bounded number of descriptors whatever its depth: a
+    tree nested deeper than ``RLIMIT_NOFILE`` neither fails the drain nor stays behind."""
+    resource = pytest.importorskip("resource")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    in_use = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else 32
+    limit = in_use + 32
+    if hard != resource.RLIM_INFINITY and limit > hard:
+        pytest.skip("descriptor limit too low")
+    _deep_tree(run.outbox, "junk", limit + 150)
+    run.report(summary="beside a deep tree")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
+    try:
+        assert run.post_tool_use() == ""
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    assert results(run) == ["ingested"]
+    assert listing(run.outbox) == []
+    assert malformed_counts(run) == [1]
+
+
+def test_an_error_removing_one_junk_entry_does_not_fail_the_drain(
+    run: Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``OSError`` while removing one junk tree leaves it for the next drain; the drain
+    still removes the other junk and ingests the request."""
+    (run.outbox / "bad" / "inner").mkdir(parents=True)
+    (run.outbox / "good" / "inner").mkdir(parents=True)
+    bad = os.stat(run.outbox / "bad" / "inner").st_ino
+    real = os.scandir
+
+    def failing(path: Any = ".") -> Any:
+        if isinstance(path, int) and os.fstat(path).st_ino == bad:
+            raise OSError(5, "injected")
+        return real(path)
+
+    run.report(summary="beside a broken tree")
+    monkeypatch.setattr(os, "scandir", failing)
+    assert run.post_tool_use() == ""
+    monkeypatch.undo()
+    assert results(run) == ["ingested"]
+    assert listing(run.outbox) == ["bad"]
+    assert malformed_counts(run) == [1]
+    run.post_tool_use()
+    assert listing(run.outbox) == []
+    assert malformed_counts(run) == [1, 1]

@@ -1231,7 +1231,9 @@ def _unlink_quietly(dir_fd: int, name: str) -> None:
 
 def _remove_entry(dir_fd: int, name: str, stop: Callable[[], bool]) -> bool:
     """Remove a malformed entry: a file, symlink or FIFO is unlinked, a directory removed
-    with its contents (``_remove_tree``). False when ``stop`` cut a tree removal short."""
+    with its contents (``_remove_tree``). False when a tree was not entirely removed (cut
+    short by ``stop`` or an error); the rest waits for the next drain. Never raises
+    ``OSError``."""
     try:
         os.unlink(name, dir_fd=dir_fd)
     except (IsADirectoryError, PermissionError):
@@ -1245,19 +1247,28 @@ _TREE_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 def _remove_tree(dir_fd: int, name: str, stop: Callable[[], bool]) -> bool:
-    """Remove a directory tree (fd-based, never following a symlink), checking ``stop``
-    before each entry: once it is true the walk ends and the rest of the tree stays for the
-    next drain (returns False). Iterative, so a deep tree cannot exhaust the Python stack;
-    an entry that cannot be removed is skipped."""
+    """Remove a directory tree, fd-based and never following a symlink; True once it is
+    gone. Holds one directory fd whatever the depth (plus ``scandir``'s): it descends by
+    opening the child relative to the current fd and closing the parent, and goes back up
+    through ``..``, which must still be the directory it descended from (its device and
+    inode are kept on a stack), or the removal is abandoned. ``stop`` is checked before
+    each entry; once it is true the walk ends. An entry that cannot be removed is skipped;
+    any other error ends the walk. Whatever is left waits for the next drain (False);
+    never raises ``OSError``."""
     try:
-        top = os.open(name, _TREE_FLAGS, dir_fd=dir_fd)
-    except OSError:
+        fd = os.open(name, _TREE_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
         return True
-    # Each frame: (parent fd, name in the parent, its fd, names that could not be removed).
-    stack: list[tuple[int, str, int, set[str]]] = [(dir_fd, name, top, set())]
+    except OSError:
+        return False
+    # Each frame: (name in its parent, device, inode, names that could not be removed),
+    # from the top of the tree down to the directory ``fd`` is open on.
+    stack: list[tuple[str, int, int, set[str]]] = []
     try:
-        while stack:
-            _, _, fd, skip = stack[-1]
+        info = os.fstat(fd)
+        stack.append((name, info.st_dev, info.st_ino, set()))
+        while True:
+            own_name, _, _, skip = stack[-1]
             child = None
             with os.scandir(fd) as scan:
                 for entry in scan:
@@ -1278,18 +1289,32 @@ def _remove_tree(dir_fd: int, name: str, stop: Callable[[], bool]) -> bool:
                 except OSError:
                     skip.add(child)
                     continue
-                stack.append((fd, child, child_fd, set()))
+                os.close(fd)
+                fd = child_fd
+                info = os.fstat(fd)
+                stack.append((child, info.st_dev, info.st_ino, set()))
                 continue
-            parent_fd, own_name, fd, _ = stack.pop()
+            stack.pop()
+            if not stack:
+                os.close(fd)
+                fd = -1
+                os.rmdir(own_name, dir_fd=dir_fd)
+                return True
+            parent_fd = os.open("..", _TREE_FLAGS, dir_fd=fd)
             os.close(fd)
+            fd = parent_fd
+            info = os.fstat(fd)
+            _, dev, ino, parent_skip = stack[-1]
+            if (info.st_dev, info.st_ino) != (dev, ino):
+                return False  # the tree was moved under the walk
             try:
-                os.rmdir(own_name, dir_fd=parent_fd)
+                os.rmdir(own_name, dir_fd=fd)
             except OSError:
-                if stack:
-                    stack[-1][3].add(own_name)
-        return True
+                parent_skip.add(own_name)
+    except OSError:
+        return False
     finally:
-        for _, _, fd, _ in stack:
+        if fd >= 0:
             os.close(fd)
 
 
