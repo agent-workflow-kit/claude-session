@@ -1338,3 +1338,116 @@ def test_schema_defaults_equal_the_example_file() -> None:
 def test_positive_duration_that_underflows_to_zero_is_refused(cfg_dir: Path) -> None:
     write(cfg_dir / "config.yaml", "lost_grace: 0." + "0" * 400 + "1s\n")
     assert "lost_grace" in str(invalid(cfg_dir).detail)
+
+
+# Environment rules: secret_env, claude_auth_env and the kind env keys (#10 review R1-R3, R7)
+
+_REPO_ENV = "repos: {example.com/x: {kinds: {respond: {env: %s}}}}\n"
+_INVALID_NAMES = ["GH_*", "TOK ", "A=B", "", "1A", "UNICODE_\u00e9"]
+
+# (config.yaml text, key path the detail must name). Each must also fail the JSON schema.
+ENV_INVALID: list[tuple[str, str]] = [
+    *((f"secret_env: [{name!r}]\n", "secret_env.0") for name in _INVALID_NAMES),
+    *((f"claude_auth_env: [{name!r}]\n", "claude_auth_env.0") for name in _INVALID_NAMES),
+    *(
+        (
+            f"kinds: {{implement: {{env: {{set: {{{name!r}: x}}}}}}}}\n",
+            "kinds.implement.env.set.<invalid variable name>",
+        )
+        for name in _INVALID_NAMES
+    ),
+    ("kinds: {implement: {env: {set: {CSESSION_ID: x}}}}\n", "kinds.implement.env.set.CSESSION_ID"),
+    ("kinds: {implement: {env: {set: {CSESSION_X: x}}}}\n", "kinds.implement.env.set.CSESSION_X"),
+    ("kinds: {implement: {env: {set: {CSESSION_: x}}}}\n", "kinds.implement.env.set.CSESSION_"),
+    (
+        "kinds: {implement: {env: {set: {CSESSION_POLL_INTERVAL: '1'}}}}\n",
+        "kinds.implement.env.set.CSESSION_POLL_INTERVAL",
+    ),
+    ('kinds: {implement: {env: {set: {X: "a\\0b"}}}}\n', "kinds.implement.env.set.X"),
+    *(
+        (f"kinds: {{implement: {{env: {{set: {{X: {value!r}}}}}}}}}\n", "kinds.implement.env.set.X")
+        for value in [
+            "${USER}",
+            "a${HOME}b${PWD}",
+            "${${HOME}}",
+            "${HOME",
+            "${ not closed",
+            "${}",
+            "${home}",
+            "${ HOME}",
+        ]
+    ),
+    *(
+        (f"kinds: {{rank: {{env: {{allow: [{pattern!r}]}}}}}}\n", "kinds.rank.env.allow.0")
+        for pattern in ["*", "A*B", "*FOO", "1BAD_*", "BAD-*", "", "A**", "LC_ *"]
+    ),
+    *(
+        (
+            f"kinds: {{implement: {{env: {{path_prepend: [{entry!r}]}}}}}}\n",
+            "kinds.implement.env.path_prepend.0",
+        )
+        for entry in ["", "relative/bin", "~/bin", "/a:/b", "${HOME}/bin"]
+    ),
+    (
+        'kinds: {implement: {env: {path_prepend: ["/a\\0b"]}}}\n',
+        "kinds.implement.env.path_prepend.0",
+    ),
+    (_REPO_ENV % "{set: {'A=B': x}}", "repos.example.com/x.kinds.respond.env.set"),
+    (_REPO_ENV % "{set: {CSESSION_X: x}}", "repos.example.com/x.kinds.respond.env.set.CSESSION_X"),
+    (_REPO_ENV % "{set: {X: '${USER}'}}", "repos.example.com/x.kinds.respond.env.set.X"),
+    (_REPO_ENV % "{allow: ['*']}", "repos.example.com/x.kinds.respond.env.allow.0"),
+    (_REPO_ENV % "{path_prepend: [bin]}", "repos.example.com/x.kinds.respond.env.path_prepend.0"),
+]
+
+
+@pytest.mark.parametrize(("text", "key"), ENV_INVALID)
+def test_invalid_env_rules_are_refused_at_load(cfg_dir: Path, text: str, key: str) -> None:
+    path = write(cfg_dir / "config.yaml", text)
+    error = invalid(cfg_dir)
+    assert error.exit_code == 2
+    assert error.code == "usage"
+    assert key in str(error.detail)
+    assert str(path) in str(error.detail)
+
+
+@pytest.mark.parametrize(("text", "key"), ENV_INVALID)
+def test_schema_rejects_the_same_env_rules(text: str, key: str) -> None:
+    with pytest.raises(jsonschema.ValidationError):
+        schemas.validate(yaml.safe_load(text), CONFIG_SCHEMA)
+
+
+ENV_VALID = [
+    "secret_env: [WEBHOOK_URL, _x1]\nclaude_auth_env: [MY_PROXY_TOKEN]\n",
+    "kinds: {implement: {env: {set: {X: '${CSESSION_DIR}/a:${CWD}${HOME}${GIT_DIR}'}}}}\n",
+    # '$' and '}' alone are literal; so is '{' not after '$'
+    "kinds: {implement: {env: {set: {X: 'plain $HOME $ } {x} $x{ ${HOME}}'}}}}\n",
+    "kinds: {rank: {env: {allow: [EDITOR, NPM_*, _*, LC_*]}}}\n",
+    "kinds: {implement: {env: {path_prepend: [/opt/a b/bin, /]}}}\n",
+    _REPO_ENV % "{set: {Y: '${CWD}'}, allow: [Z_*], path_prepend: [/p]}",
+]
+
+
+@pytest.mark.parametrize("text", ENV_VALID)
+def test_valid_env_rules_pass_loader_and_schema(cfg_dir: Path, text: str) -> None:
+    write(cfg_dir / "config.yaml", text)
+    load(cfg_dir)
+    schemas.validate(yaml.safe_load(text), CONFIG_SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'kinds: {implement: {env: {set: {"BAD\\nSENTINEL0secret\\x01": "${USER}"}}}}\n',
+        'repos: {example.com/x: {kinds: {respond: {env: {set: {"SENTINEL0secret=": x}}}}}}\n',
+        'secret_env: ["SENTINEL0secret*"]\n',
+        'claude_auth_env: ["SENTINEL0secret\\n"]\n',
+        'kinds: {rank: {env: {allow: ["SENTINEL0secret-*"]}}}\n',
+        'kinds: {implement: {env: {path_prepend: ["SENTINEL0secret"]}}}\n',
+        'kinds: {implement: {env: {set: {X: "SENTINEL0secret${USER}"}}}}\n',
+    ],
+)
+def test_invalid_env_rules_are_not_echoed(cfg_dir: Path, text: str) -> None:
+    write(cfg_dir / "config.yaml", text)
+    error = invalid(cfg_dir)
+    assert "SENTINEL0secret" not in str(error.detail)
+    assert "SENTINEL0secret" not in error.message

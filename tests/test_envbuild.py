@@ -69,6 +69,18 @@ def build(
     return envbuild.build(resolution, cfg, CALLER if environ is None else environ, **kw)
 
 
+def build_unvalidated(cfg: config.Config, **env_update: Any) -> envbuild.SessionEnv:
+    """Build ``implement`` with ``env`` fields that bypass config validation (the backstop)."""
+    profile = cfg.kinds["implement"]
+    bad = profile.model_copy(update={"env": profile.env.model_copy(update=env_update)}, deep=True)
+    resolution = kinds.Resolution(
+        kind="implement", builtin=True, fallback=False, repo=None, profile=bad, origins={}
+    )
+    return envbuild.build(
+        resolution, cfg, CALLER, csession_id=SID, csession_dir=SDIR, cwd=CWD, exe_dir=EXE_DIR
+    )
+
+
 def env_of(*args: Any, **kw: Any) -> dict[str, str]:
     return build(*args, **kw).env
 
@@ -125,19 +137,36 @@ def test_config_env_allow_names_and_globs(cfg_dir: Path) -> None:
 
 
 @pytest.mark.parametrize("pattern", ["*", "A*B", "*FOO", "1BAD_*", "BAD-*"])
+def test_malformed_allow_patterns_are_refused_at_load(cfg_dir: Path, pattern: str) -> None:
+    with pytest.raises(UsageError) as info:
+        load(
+            cfg_dir,
+            f"""
+            kinds:
+              rank:
+                env: {{inherit: false, allow: ["{pattern}"], set: {{}}, path_prepend: []}}
+            """,
+        )
+    assert "kinds.rank.env.allow.0" in str(info.value.detail)
+
+
+@pytest.mark.parametrize("pattern", ["*", "A*B", "*FOO", "1BAD_*", "BAD-*"])
 def test_malformed_allow_patterns_match_nothing_beyond_the_literal(
     cfg_dir: Path, pattern: str
 ) -> None:
-    cfg = load(
-        cfg_dir,
-        f"""
-        kinds:
-          rank:
-            env: {{inherit: false, allow: ["{pattern}"], set: {{}}, path_prepend: []}}
-        """,
+    # Backstop: a pattern that bypassed config validation still matches no other name.
+    cfg = load(cfg_dir)
+    profile = cfg.kinds["rank"]
+    bad = profile.model_copy(
+        update={"env": profile.env.model_copy(update={"allow": [pattern]})}, deep=True
+    )
+    resolution = kinds.Resolution(
+        kind="rank", builtin=True, fallback=False, repo=None, profile=bad, origins={}
     )
     environ = {"EDITOR": "vi", "AXB": "1", "AFOO": "1", "1BAD_X": "1", "BAD-X": "1"}
-    env = env_of(cfg, "rank", environ)
+    env = envbuild.build(
+        resolution, cfg, environ, csession_id=SID, csession_dir=SDIR, cwd=CWD, exe_dir=EXE_DIR
+    ).env
     assert set(env) - {"PATH"} == {"CSESSION_ID", "CSESSION_DIR", "CSESSION_KIND"}
 
 
@@ -268,12 +297,111 @@ def test_empty_provider_flag_is_not_set(cfg_dir: Path) -> None:
 
 
 def test_config_claude_auth_env_extends_builtin_list_by_exact_name(cfg_dir: Path) -> None:
-    cfg = load(cfg_dir, "claude_auth_env: [MY_PROXY_TOKEN, 'OTHER_*']\n")
+    cfg = load(cfg_dir, "claude_auth_env: [MY_PROXY_TOKEN, OTHER]\n")
     environ = {**CALLER, "MY_PROXY_TOKEN": "t", "OTHER_X": "o", "ANTHROPIC_API_KEY": "k"}
     result = build(cfg, "rank", environ)
     assert result.env["MY_PROXY_TOKEN"] == "t" and result.env["ANTHROPIC_API_KEY"] == "k"
     assert "OTHER_X" not in result.env
     assert set(result.auth_names) == {"MY_PROXY_TOKEN", "ANTHROPIC_API_KEY"}
+
+
+@pytest.mark.parametrize("key", ["claude_auth_env", "secret_env"])
+@pytest.mark.parametrize("entry", ["OTHER_*", "TOK ", "A=B", ""])
+def test_name_lists_refuse_globs_and_invalid_names(cfg_dir: Path, key: str, entry: str) -> None:
+    with pytest.raises(UsageError) as info:
+        load(cfg_dir, f"{key}: [{entry!r}]\n")
+    assert f"{key}.0" in str(info.value.detail)
+    assert "config.yaml" in str(info.value.detail)
+
+
+# R4: a provider is selected only by a true flag value as passed.
+
+
+@pytest.mark.parametrize("value", ["0", "false", "", "no", "off", "  ", "2", "False "])
+def test_false_provider_flags_select_nothing(cfg_dir: Path, value: str) -> None:
+    environ = {
+        **CALLER,
+        "CLAUDE_CODE_USE_BEDROCK": value,
+        "CLAUDE_CODE_USE_VERTEX": value,
+        "AWS_SECRET_ACCESS_KEY": SECRET,
+        "GOOGLE_APPLICATION_CREDENTIALS": "/c.json",
+        "CLOUD_ML_REGION": "r",
+    }
+    for kind, flags in (("rank", None), ("implement", {"reads_third_party": True})):
+        result = build(load(cfg_dir), kind, environ, flags=flags)
+        assert "AWS_SECRET_ACCESS_KEY" not in result.env
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in result.env
+        assert "CLOUD_ML_REGION" not in result.env
+
+
+@pytest.mark.parametrize("value", ["1", "TRUE", " 1 ", "yes", "On", "true\n"])
+def test_true_provider_flags_select_the_provider(cfg_dir: Path, value: str) -> None:
+    environ = {
+        **CALLER,
+        "CLAUDE_CODE_USE_BEDROCK": value,
+        "CLAUDE_CODE_USE_VERTEX": value,
+        "AWS_REGION": "us-east-1",
+        "CLOUD_ML_REGION": "r",
+    }
+    result = build(load(cfg_dir), "rank", environ)
+    assert result.env["AWS_REGION"] == "us-east-1" and result.env["CLOUD_ML_REGION"] == "r"
+    assert {"AWS_REGION", "CLOUD_ML_REGION"} <= set(result.auth_names)
+
+
+def test_provider_flag_in_secret_env_selects_nothing(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "secret_env: [CLAUDE_CODE_USE_BEDROCK, CLAUDE_CODE_USE_VERTEX]\n")
+    environ = {
+        **CALLER,
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "CLAUDE_CODE_USE_VERTEX": "1",
+        "AWS_REGION": "us-east-1",
+        "CLOUD_ML_REGION": "r",
+    }
+    env = env_of(cfg, "rank", environ)
+    assert "CLAUDE_CODE_USE_BEDROCK" not in env and "AWS_REGION" not in env
+    assert "CLAUDE_CODE_USE_VERTEX" not in env and "CLOUD_ML_REGION" not in env
+
+
+def test_provider_flag_unlocked_from_secret_env_selects(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir,
+        """
+        secret_env: [CLAUDE_CODE_USE_BEDROCK]
+        kinds:
+          rank:
+            env: {inherit: false, allow: [CLAUDE_CODE_USE_BEDROCK], set: {}, path_prepend: []}
+        """,
+    )
+    environ = {**CALLER, "CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "us-east-1"}
+    assert env_of(cfg, "rank", environ)["AWS_REGION"] == "us-east-1"
+
+
+# R10: auth_names come from the final environment.
+
+
+def test_auth_names_include_auth_variables_from_env_set(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir,
+        """
+        claude_auth_env: [MY_PROXY_TOKEN]
+        kinds:
+          rank:
+            env:
+              inherit: false
+              allow: []
+              set: {ANTHROPIC_BASE_URL: "https://proxy", MY_PROXY_TOKEN: "proxy-token-1"}
+              path_prepend: []
+        """,
+    )
+    result = build(cfg, "rank", CALLER)
+    assert set(result.auth_names) == {"ANTHROPIC_BASE_URL", "MY_PROXY_TOKEN"}
+
+
+def test_auth_names_exclude_unselected_provider_globs(cfg_dir: Path) -> None:
+    environ = {**CALLER, "AWS_REGION": "x", "ANTHROPIC_API_KEY": "k"}
+    result = build(load(cfg_dir), "implement", environ)
+    assert result.env["AWS_REGION"] == "x"  # inherited, but not an auth variable
+    assert set(result.auth_names) == {"ANTHROPIC_API_KEY"}
 
 
 # 3. secret_env
@@ -415,6 +543,8 @@ def test_secret_env_set_by_config_env_set_is_kept(cfg_dir: Path) -> None:
 THIRD_PARTY_NAMES = (
     "GH_TOKEN",
     "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
     "GITLAB_TOKEN",
     "GL_TOKEN",
     "TMUX",
@@ -472,6 +602,48 @@ def test_third_party_drop_applies_to_config_env_allow(cfg_dir: Path) -> None:
     assert "GH_TOKEN" not in env and "SSH_AUTH_SOCK" not in env
 
 
+THIRD_PARTY_SET = """
+kinds:
+  review:
+    env:
+      inherit: false
+      allow: []
+      set: {GH_TOKEN: lit-token, GH_ENTERPRISE_TOKEN: e, GH_CONFIG_DIR: /gh, GLAB_CONFIG_DIR: /gl,
+            SSH_AUTH_SOCK: /s, WEBHOOK_URL: "https://hook"}
+      path_prepend: []
+  implement:
+    env:
+      inherit: true
+      allow: []
+      set: {GH_TOKEN: lit-token, GLAB_CONFIG_DIR: /gl}
+      path_prepend: []
+secret_env: [WEBHOOK_URL]
+"""
+
+
+@pytest.mark.parametrize(
+    ("kind", "flags"), [("review", None), ("implement", {"reads_third_party": True})]
+)
+def test_third_party_removals_win_over_env_set(
+    cfg_dir: Path, kind: str, flags: dict[str, Any] | None
+) -> None:
+    env = env_of(load(cfg_dir, THIRD_PARTY_SET), kind, third_party_environ(), flags=flags)
+    for name in THIRD_PARTY_NAMES:
+        assert name not in env
+    assert env["GH_CONFIG_DIR"] == f"{SDIR}/gh-empty"
+    assert env["GLAB_CONFIG_DIR"] == f"{SDIR}/gh-empty"
+
+
+def test_env_set_secret_name_is_kept_on_third_party_runs(cfg_dir: Path) -> None:
+    env = env_of(load(cfg_dir, THIRD_PARTY_SET), "review", {**CALLER, "WEBHOOK_URL": SECRET})
+    assert env["WEBHOOK_URL"] == "https://hook"
+
+
+def test_trusted_runs_keep_env_set_tokens(cfg_dir: Path) -> None:
+    env = env_of(load(cfg_dir, THIRD_PARTY_SET), "implement", third_party_environ())
+    assert env["GH_TOKEN"] == "lit-token" and env["GLAB_CONFIG_DIR"] == "/gl"
+
+
 # 5. env.set, path_prepend, the executable directory
 
 
@@ -493,7 +665,7 @@ def test_env_set_expands_the_four_variables(cfg_dir: Path) -> None:
               set:
                 A: "${CSESSION_DIR}/x"
                 B: "${CWD}:${HOME}:${GIT_DIR}"
-                C: "plain $HOME ${ not closed"
+                C: "plain $HOME $ } {x} ${HOME}}"
                 D: "${CWD}${CWD}"
               path_prepend: []
         """,
@@ -501,7 +673,7 @@ def test_env_set_expands_the_four_variables(cfg_dir: Path) -> None:
     env = env_of(cfg, "implement", git_dir="/work/repo/.git")
     assert env["A"] == f"{SDIR}/x"
     assert env["B"] == f"{CWD}:{CALLER['HOME']}:/work/repo/.git"
-    assert env["C"] == "plain $HOME ${ not closed"
+    assert env["C"] == f"plain $HOME $ }} {{x}} {CALLER['HOME']}}}"
     assert env["D"] == CWD + CWD
 
 
@@ -530,61 +702,68 @@ def test_env_set_expansion_is_single_pass(cfg_dir: Path) -> None:
     assert env["X"] == "/w/${HOME}"
 
 
-def test_env_set_unknown_variable_is_refused_without_value(cfg_dir: Path) -> None:
-    cfg = load(
-        cfg_dir,
-        f"""
-        kinds:
-          implement:
-            env: {{inherit: true, allow: [], set: {{TOKEN: "{SECRET}${{USER}}"}}, path_prepend: []}}
-        """,
-    )
+@pytest.mark.parametrize("ref", ["${USER}", "${${HOME}}", "${HOME", "${}", "$${HOME}{"])
+def test_env_set_bad_reference_is_refused_at_load(cfg_dir: Path, ref: str) -> None:
     with pytest.raises(UsageError) as info:
-        build(cfg, "implement")
-    assert "env.set.TOKEN" in str(info.value) and "${USER}" in str(info.value)
+        load(
+            cfg_dir,
+            f"""
+            kinds:
+              implement:
+                env: {{inherit: true, allow: [], set: {{TOKEN: "{SECRET}{ref}"}}, path_prepend: []}}
+            """,
+        )
+    detail = str(info.value.detail)
+    assert "kinds.implement.env.set.TOKEN" in detail and "config.yaml" in detail
+    assert SECRET not in detail and SECRET not in str(info.value)
+
+
+@pytest.mark.parametrize("ref", ["${USER}", "${${HOME}}", "${HOME", "$${HOME}{"])
+def test_env_set_bad_reference_backstop(cfg_dir: Path, ref: str) -> None:
+    with pytest.raises(UsageError) as info:
+        build_unvalidated(load(cfg_dir), set={"TOKEN": SECRET + ref})
+    assert "env.set.TOKEN" in str(info.value)
     assert SECRET not in str(info.value)
 
 
-@pytest.mark.parametrize("key", ["", "A=B", "1A", "A B", "A\x00"])
-def test_env_set_invalid_name_is_refused(cfg_dir: Path, key: str) -> None:
-    cfg = load(cfg_dir)
-    profile = cfg.kinds["implement"]
-    bad = profile.model_copy(
-        update={"env": profile.env.model_copy(update={"set": {key: "v"}})}, deep=True
-    )
-    resolution = kinds.Resolution(
-        kind="implement", builtin=True, fallback=False, repo=None, profile=bad, origins={}
-    )
-    with pytest.raises(UsageError):
-        envbuild.build(
-            resolution, cfg, CALLER, csession_id=SID, csession_dir=SDIR, cwd=CWD, exe_dir=EXE_DIR
-        )
+@pytest.mark.parametrize(
+    "key", ["", "A=SENTINEL", "1SENTINEL", "SENTINEL B", "SENTINEL\x00", "SENTINEL\n\x1b"]
+)
+@pytest.mark.parametrize("value", ["v", "${USER}"])
+def test_env_set_invalid_name_is_refused(cfg_dir: Path, key: str, value: str) -> None:
+    # Backstop; the name is checked (and never echoed) before the value is expanded.
+    with pytest.raises(UsageError) as info:
+        build_unvalidated(load(cfg_dir), set={key: value})
+    assert "SENTINEL" not in str(info.value)
+    assert "variable name" in str(info.value)
 
 
 def test_env_set_nul_in_value_is_refused(cfg_dir: Path) -> None:
-    cfg = load(
-        cfg_dir,
-        """
-        kinds:
-          implement:
-            env: {inherit: true, allow: [], set: {X: "a\\0b"}, path_prepend: []}
-        """,
-    )
     with pytest.raises(UsageError, match="env.set.X"):
-        build(cfg, "implement")
+        build_unvalidated(load(cfg_dir), set={"X": "a\x00b"})
+    with pytest.raises(UsageError) as info:
+        load(
+            cfg_dir,
+            """
+            kinds:
+              implement:
+                env: {inherit: true, allow: [], set: {X: "a\\0b"}, path_prepend: []}
+            """,
+        )
+    assert "kinds.implement.env.set.X" in str(info.value.detail)
 
 
 def test_env_set_non_ascii_name_is_refused(cfg_dir: Path) -> None:
-    cfg = load(
-        cfg_dir,
-        """
-        kinds:
-          implement:
-            env: {inherit: true, allow: [], set: {"UNICODE_\u00e9": x}, path_prepend: []}
-        """,
-    )
-    with pytest.raises(UsageError, match="env.set"):
-        build(cfg, "implement")
+    with pytest.raises(UsageError) as info:
+        load(
+            cfg_dir,
+            """
+            kinds:
+              implement:
+                env: {inherit: true, allow: [], set: {"UNICODE_\u00e9": x}, path_prepend: []}
+            """,
+        )
+    assert "kinds.implement.env.set.<invalid variable name>" in str(info.value.detail)
 
 
 def test_env_set_overrides_caller_values_with_unicode(cfg_dir: Path) -> None:
@@ -635,18 +814,8 @@ def test_missing_or_empty_path_adds_no_empty_entry(cfg_dir: Path, caller_path: s
 
 @pytest.mark.parametrize("entry", ["", "relative/bin", "~/bin", "/a:/b", "/a\x00b"])
 def test_path_prepend_bad_entries_are_refused(cfg_dir: Path, entry: str) -> None:
-    cfg = load(cfg_dir)
-    profile = cfg.kinds["implement"]
-    bad = profile.model_copy(
-        update={"env": profile.env.model_copy(update={"path_prepend": [entry]})}, deep=True
-    )
-    resolution = kinds.Resolution(
-        kind="implement", builtin=True, fallback=False, repo=None, profile=bad, origins={}
-    )
     with pytest.raises(UsageError, match="path_prepend"):
-        envbuild.build(
-            resolution, cfg, CALLER, csession_id=SID, csession_dir=SDIR, cwd=CWD, exe_dir=EXE_DIR
-        )
+        build_unvalidated(load(cfg_dir), path_prepend=[entry])
 
 
 @pytest.mark.parametrize("exe_dir", ["", "bin", "/a:/b"])
@@ -677,16 +846,23 @@ def test_inherited_csession_variables_are_cleared_and_set(cfg_dir: Path) -> None
     }
 
 
+def test_csession_variables_in_env_set_are_refused_at_load(cfg_dir: Path) -> None:
+    with pytest.raises(UsageError) as info:
+        load(
+            cfg_dir,
+            """
+            kinds:
+              implement:
+                env: {inherit: true, allow: [], set: {CSESSION_POLL_INTERVAL: "1"}}
+            """,
+        )
+    assert "kinds.implement.env.set.CSESSION_POLL_INTERVAL" in str(info.value.detail)
+
+
 def test_csession_variables_from_env_set_are_cleared(cfg_dir: Path) -> None:
-    cfg = load(
-        cfg_dir,
-        """
-        kinds:
-          implement:
-            env: {inherit: true, allow: [], set: {CSESSION_POLL_INTERVAL: "1"}, path_prepend: []}
-        """,
-    )
-    assert "CSESSION_POLL_INTERVAL" not in env_of(cfg, "implement")
+    # Backstop: a CSESSION_* name that bypassed config validation is still cleared (step 8).
+    env = build_unvalidated(load(cfg_dir), set={"CSESSION_POLL_INTERVAL": "1"}).env
+    assert "CSESSION_POLL_INTERVAL" not in env
 
 
 def test_csession_kind_is_the_kind_as_given_on_fallback(cfg_dir: Path) -> None:
@@ -739,6 +915,36 @@ def test_values_are_never_expanded_from_the_caller(cfg_dir: Path) -> None:
     env = env_of(cfg, "implement", environ)
     assert env["X"] == "${CSESSION_DIR}"
     assert env["Y"] == "${CWD}"
+
+
+def test_repr_does_not_show_values(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "secret_env: [WEBHOOK_URL]\n")
+    environ = {**CALLER, "ANTHROPIC_API_KEY": SECRET, "WEBHOOK_URL": "hook-value-123"}
+    result = build(cfg, "implement", environ)
+    assert result.env["ANTHROPIC_API_KEY"] == SECRET
+    assert SECRET not in repr(result) and SECRET not in str(result)
+    assert "ANTHROPIC_API_KEY" in repr(result)  # names are fine
+
+
+@pytest.mark.parametrize("kind", ["implement", "rank"])
+def test_unpassable_environ_entries_are_dropped(cfg_dir: Path, kind: str) -> None:
+    environ = {
+        **CALLER,
+        "": "empty-name",
+        "A=B": "eq",
+        "LC_X=Y": "eq-glob",
+        "A\x00B": "nul-name",
+        "LC_NUL": "a\x00b",
+        "ANTHROPIC_API_KEY": "k\x00ey",
+        "GOOD": "ok",
+    }
+    result = build(load(cfg_dir), kind, environ)
+    for name in ("", "A=B", "LC_X=Y", "A\x00B", "LC_NUL", "ANTHROPIC_API_KEY"):
+        assert name not in result.env
+    assert all("\x00" not in value for value in result.env.values())
+    assert "ANTHROPIC_API_KEY" not in result.auth_names
+    if kind == "implement":
+        assert result.env["GOOD"] == "ok"
 
 
 def test_repeated_builds_are_identical(cfg_dir: Path) -> None:
