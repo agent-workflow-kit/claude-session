@@ -43,8 +43,10 @@ and allocation of ``resume``; its launch spec also freezes the conversation (``-
 ``--fork-session``, ``--session-id``), and its adopting ``exec`` drains the previous run's
 outbox (a fork's run 1 places its inputs beside the copied ones). ``start --resume
 --dry-run`` is ``resume.plan``.
-TODO(#31): insert step 6 (the ``pre-launch`` hooks) of the adopting ``exec`` before its fork
-taint re-check (``launch.recheck_fork_taint``).
+The adopting ``exec`` runs step 6 (the ``pre-launch`` hooks of the current config, plus the
+stored ``--hook pre-launch=...`` entries; ``launch.pre_launch``) inside ``launch.run``, before
+its fork taint re-check (``launch.recheck_fork_taint``); a frozen ``--override-escalation``
+is applied and audited there.
 The adopting ``exec`` installs its signal handlers before the compare-and-set and defers
 them from just before it (a signal then acts once the run is its own, in the launch phase);
 an interactive run is handed the terminal as plain ``exec`` hands it.
@@ -155,6 +157,9 @@ REQUEST_KEYS = frozenset(
         "conversation",
     }
 )
+# Request keys a spec may lack (written by a claude-session before they existed): absent means
+# off, the conservative value.
+OPTIONAL_REQUEST_KEYS = frozenset({"override_escalation"})
 CONVERSATION_KEYS = frozenset({"resume", "resume_from", "fork", "session_id"})
 PROFILE_KEYS = frozenset({"name", "content", "snapshot"})
 ORIGINS = frozenset(typing.get_args(kinds.Origin))
@@ -255,6 +260,7 @@ def spec_json(
             "has_prompt": req.prompt is not None,
             "input_files": [item.name for item in req.inputs],
             "conversation": dataclasses.asdict(req.conversation),
+            "override_escalation": req.override_escalation,
         },
         "caller_cwd": resolved.caller_cwd,
         "cwd": v.cwd,
@@ -873,7 +879,7 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
     place by step 7), so only their presence and names are known here."""
     data = frozen.request
     try:
-        _keys(data, REQUEST_KEYS)
+        _keys({k: v for k, v in data.items() if k not in OPTIONAL_REQUEST_KEYS}, REQUEST_KEYS)
         _check_request(frozen, data, record)
         flags = dict(_mapping(data["flags"]))
         inputs = tuple(InputFile(name=name, data=b"") for name in _texts(data["input_files"]))
@@ -894,6 +900,7 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
             hook_timeouts=tuple(_texts(data["hook_timeouts"])),
             outcome_file=record["outcome_file"],
             conversation=_conversation(data["conversation"], record),
+            override_escalation=_bool(data.get("override_escalation", False)),
         )
     except (KeyError, TypeError, ValueError, AttributeError, UsageError) as exc:
         raise sessiondir.SessionDirUnsafe(
@@ -949,6 +956,15 @@ def _check_request(frozen: Frozen, data: Mapping[str, Any], record: Mapping[str,
     args.decision_id = _texts(data["decision_ids"])
     args.hook = _texts(data["hooks"])
     args.hook_timeout = _texts(data["hook_timeouts"])
+    args.override_escalation = _bool(data.get("override_escalation", False))
+    # The run row records the flag too (``launch.new_run``; absent: off): an edited spec
+    # cannot turn the human's override on, and the frozen actor must still be a human.
+    if args.override_escalation != (_invocation(record).get("override_escalation") is True):
+        raise ValueError("the launch spec's --override-escalation is not the run's")
+    if args.override_escalation:
+        from .resume import check_human_only  # resume imports this module
+
+        check_human_only("--override-escalation", args.actor, tty=False)
     args.input_file = _texts(data["input_files"])
     args.prompt_file = SPEC_NAME if data["has_prompt"] else None  # any non-stdin name
     if _mapping(data["conversation"]).get("resume") is True:
@@ -1261,6 +1277,7 @@ def adoption_plan(
         cwd=found.checked.cwd if found.checked is not None else adoption.frozen.cwd,
         csession_id=sid,
         run=record["run_no"],
+        override_escalation=req.override_escalation,
     )
     plan["would_refuse"] = would_refuse
     plan["config_hash_changed"] = adoption.config_hash_changed

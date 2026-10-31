@@ -64,6 +64,7 @@ from . import (
     settings_builder,
     store,
     tmpdir,
+    toolhooks,
 )
 from .config import Config
 from .errors import LaunchValidationError, UsageError
@@ -627,37 +628,23 @@ def hooks_json(
 ) -> list[dict[str, Any]]:
     """The configured and per-invocation hook entries. ``selected``: the entry's ``kinds``,
     ``exclude_kinds`` and ``labels`` selectors match this run (its run kind and the
-    session's labels after the launch), decided by the runner's own match
-    (``toolhooks.selected``, without a state); ``states`` depends on the state change and is
-    not evaluated. Per-invocation entries have no selectors.
-
-    TODO(#31): the ``pre-launch`` runner uses the same ``toolhooks.selected``."""
-    from . import toolhooks
-
+    session's labels after the launch); ``states`` depends on the state change and is not
+    evaluated. Per-invocation entries have no selectors. The match is the hook runners' own
+    (``toolhooks.selected``), so the plan and a real run never disagree."""
     entries: list[dict[str, Any]] = []
     configured = (
-        ("pre-launch", cfg.hooks.pre_launch),
-        ("post-state-change", cfg.hooks.post_state_change),
+        (toolhooks.PRE_LAUNCH, toolhooks.pre_launch_config_entries(cfg)),
+        (toolhooks.POST_STATE_CHANGE, toolhooks.config_entries(cfg)),
     )
     for hook, items in configured:
         for item in items:
-            entry = toolhooks.Entry(
-                cmd=item.cmd,
-                timeout=item.timeout,
-                origin="config",
-                index=0,
-                kinds=None if item.kinds is None else tuple(item.kinds),
-                exclude_kinds=None if item.exclude_kinds is None else tuple(item.exclude_kinds),
-                labels=None if item.labels is None else tuple(item.labels),
-            )
-            selected = toolhooks.selected(entry, run_kind=run_kind, labels=labels)
             entries.append(
                 {
                     "hook": hook,
                     "cmd": item.cmd,
                     "timeout": item.timeout,
                     "source": "config",
-                    "selected": selected,
+                    "selected": toolhooks.selected(item, run_kind=run_kind, labels=labels),
                 }
             )
     timeouts: dict[str, float] = {}

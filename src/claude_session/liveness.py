@@ -13,7 +13,8 @@ finalizes it only when nobody owns it any more:
   ``exec`` that died between allocation or the adoption compare-and-set and the recording
   of its child; the spawn is gated, so such a child never ran ``claude``):
   ``not-started``, ``launch_interrupted``, its launch spec and secret index deleted before
-  the compare-and-set;
+  the compare-and-set (a run marked as having audited an escalation override gets that
+  record's ``result: error`` follow-up);
 - a run whose **wrapper is dead and child alive**: left live and reported as an **orphan**
   (``reconcile`` lists it; ``stop`` ends it); nothing is ever signaled here;
 - a run whose **wrapper and child are dead**: **salvaged** under the lease
@@ -70,13 +71,14 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from . import endmap, hookevent, logs, outbox, outcomefile, secretindex, sessiondir, store
+from . import audit, endmap, hookevent, logs, outbox, outcomefile, secretindex, sessiondir, store
 from .endmap import EXIT_CODES, HeadlessResult, Mapped
 
 if TYPE_CHECKING:
     from .config import Config
 
 LOG_NAME = "log.jsonl"
+AUDIT_NAME = "audit.jsonl"
 SALVAGE_LEASE = "salvage"
 # Final drains of one salvaged run at most (as ``supervisor.FINAL_DRAINS``).
 FINAL_DRAINS = 4
@@ -262,6 +264,7 @@ def _check_run(
         if st.finalize_run(sid, run, final, expect=_dead(row)):
             checked.changes.append(_change(st, sid, run, "marked_not_started", before))
             checked.changes += _after_launch_end(st, sid, run, state_root)
+            _audit_lost_override(st, sid, run, state_root)
         return checked
     return _salvage(st, row, state_root, cause=cause, patience=patience)
 
@@ -300,6 +303,36 @@ def _tmpdir_change(st: store.Store, sid: str, run: int) -> list[Change]:
     if reconcile.remove_tmpdir(st, sid, expected_run=run):
         return [Change(sid, run, "tmpdir_removed")]
     return []
+
+
+def _audit_lost_override(st: store.Store, sid: str, run: int, state_root: str) -> None:
+    """A run whose launch audited an escalation override (``result: ok``; the run's
+    ``override_audit`` mark, ``Store.record_override_audit``) and then died before the spawn:
+    the ``result: error`` follow-up with the same fields, as ``exec`` would have written it
+    (best effort; a failure is logged ``audit_failed``)."""
+    try:
+        invocation = json.loads(st.run_record(sid, run)["invocation_json"] or "{}")
+        mark = invocation.get("override_audit") if isinstance(invocation, dict) else None
+        if not isinstance(mark, dict):
+            return
+        audit.append(
+            os.path.join(state_root, AUDIT_NAME),
+            actor=mark["actor"],
+            target=sid,
+            action="launch_escalation_override",
+            result="error",
+            decision_ids=mark["decision_ids"],
+            inputs=mark["inputs"],
+        )
+    except Exception:
+        _log(
+            state_root,
+            "audit_failed",
+            "warn",
+            sid,
+            run,
+            "a launch_escalation_override error record could not be written",
+        )
 
 
 def _change(
