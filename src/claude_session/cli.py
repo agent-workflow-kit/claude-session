@@ -123,18 +123,51 @@ def _not_implemented(args: argparse.Namespace) -> int:
     raise InternalError(f"{args.handler} is not implemented yet", detail="not_implemented")
 
 
-def _list(args: argparse.Namespace) -> int:
+def _status(args: argparse.Namespace) -> int:
+    """``status <id> [--run n]`` (interface.md, status)."""
+    from . import views
+
     with store.open_state() as state:
-        sessions = state.list_sessions()
-    if sessions:
-        # TODO(#16): list items (current run, labels, liveness) and the list filters.
-        raise InternalError(
-            "list of existing sessions is not implemented yet", detail="not_implemented"
-        )
+        obj = views.status_object(state, args.id, args.run)
     if args.json:
-        print(json.dumps({"sessions": []}))
+        print(json.dumps(obj, allow_nan=False))
     else:
-        print("No sessions.")
+        print("\n".join(views.status_lines(obj)))
+    return 0
+
+
+def _list(args: argparse.Namespace) -> int:
+    """``list`` with its filters (interface.md, list)."""
+    from . import views
+
+    with store.open_state() as state:
+        forked_from = None
+        if args.forked_from is not None:
+            forked_from = ids.lookup_session_id(args.forked_from, state.session_id_candidates)
+        flt = views.ListFilter(
+            labels=tuple(ids.parse_label(text) for text in args.label or []),
+            states=tuple(args.state or ()),
+            kind=args.kind,
+            launch_kind=args.launch_kind,
+            run_kind=args.run_kind,
+            mode=args.mode,
+            needs_input=args.needs_input,
+            pending=args.pending,
+            repo=args.repo,
+            since=None if args.since is None else since_threshold(args.since),
+            limit=args.limit,
+            forked_from=forked_from,
+            report_statuses=tuple(
+                None if status == "none" else status for status in args.report_status or ()
+            ),
+            live=args.live,
+            tainted=args.tainted,
+        )
+        items = views.list_items(state, flt)
+    if args.json:
+        print(json.dumps({"sessions": items}, allow_nan=False))
+    else:
+        print("\n".join(views.list_lines(items)))
     return 0
 
 
@@ -230,7 +263,7 @@ HANDLERS: dict[str, Handler] = {
     "stop": _not_implemented,
     "wait": _not_implemented,
     "report": _report,
-    "status": _not_implemented,
+    "status": _status,
     "list": _list,
     "kinds": _not_implemented,
     "label add": _not_implemented,

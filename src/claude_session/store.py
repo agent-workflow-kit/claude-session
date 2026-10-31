@@ -933,14 +933,120 @@ class Store:
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """Sessions that are not forgotten, most recently updated first (raw ``sessions``
-        rows)."""
-        # TODO(#16): join the current run and labels, apply the list filters.
+        rows). ``list_records`` adds each one's current run, labels and run kinds."""
         cursor = self.conn.execute(
             "SELECT * FROM sessions WHERE forgotten_at IS NULL "
             "ORDER BY updated_at DESC, csession_id DESC"
         )
         names = [column[0] for column in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+    # Read views (status, list). One read transaction each, so a view is one snapshot; text
+    # is decoded leniently (``_lenient_text``) so stored bytes that are not UTF-8 never fail.
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """A deferred read transaction with lenient text decoding (restored afterwards)."""
+        previous = self.conn.text_factory
+        self.conn.text_factory = _lenient_text
+        try:
+            self.conn.execute("BEGIN")
+            try:
+                yield self.conn
+            finally:
+                if self.conn.in_transaction:
+                    self.conn.execute("ROLLBACK")  # nothing was written
+        finally:
+            self.conn.text_factory = previous
+
+    def status_record(self, csession_id: str, run_no: int | None = None) -> StatusRecord | None:
+        """The rows ``status`` shows: the session (forgotten or not; the caller resolved the
+        id), run ``run_no`` (default: the current run; None when it does not exist), the run
+        count, labels, Claude session ids and the last ``STATUS_EVENTS`` events (oldest
+        first). None when the session does not exist."""
+        with self._read_snapshot() as conn:
+            session = _one_dict(conn, "SELECT * FROM sessions WHERE csession_id = ?", csession_id)
+            if session is None:
+                return None
+            wanted = session["current_run"] if run_no is None else run_no
+            run = None
+            if isinstance(wanted, int) and 1 <= wanted <= MAX_SQLITE_INTEGER:
+                run = _one_dict(
+                    conn,
+                    "SELECT * FROM runs WHERE csession_id = ? AND run_no = ?",
+                    csession_id,
+                    wanted,
+                )
+            current = session["current_run"]
+            current_run = run
+            if run_no is not None and run_no != current:
+                current_run = _one_dict(
+                    conn,
+                    "SELECT * FROM runs WHERE csession_id = ? AND run_no = ?",
+                    csession_id,
+                    current,
+                )
+            (runs,) = conn.execute(
+                "SELECT COUNT(*) FROM runs WHERE csession_id = ?", (csession_id,)
+            ).fetchone()
+            labels = _labels(conn, csession_id)
+            claude_ids = _all_dicts(
+                conn,
+                "SELECT claude_session_id, run_no, source, transcript_path, seen_at "
+                "FROM claude_ids WHERE csession_id = ? ORDER BY seen_at, claude_session_id",
+                csession_id,
+            )
+            events = _all_dicts(
+                conn,
+                "SELECT * FROM (SELECT id, run_no, event_ts, from_state, to_state, "
+                "from_activity, to_activity, needs_input_reason, cause, final, delivered_at "
+                "FROM events WHERE csession_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id",
+                csession_id,
+                STATUS_EVENTS,
+            )
+        return StatusRecord(
+            session=session,
+            run=run,
+            current_run=current_run,
+            runs=int(runs),
+            labels=labels,
+            claude_ids=claude_ids,
+            events=events,
+        )
+
+    def list_records(self) -> list[ListRecord]:
+        """Every session that is not forgotten, in ``list_sessions`` order, with its current
+        run (None when the row is missing), labels and the kinds of all its runs."""
+        with self._read_snapshot() as conn:
+            sessions = self.list_sessions()
+            runs = _all_dicts(
+                conn,
+                "SELECT r.* FROM runs r JOIN sessions s ON s.csession_id = r.csession_id "
+                "AND r.run_no = s.current_run WHERE s.forgotten_at IS NULL",
+            )
+            labels: dict[str, list[str]] = {}
+            for sid, key, value in conn.execute(
+                "SELECT l.csession_id, l.key, l.value FROM labels l JOIN sessions s "
+                "ON s.csession_id = l.csession_id WHERE s.forgotten_at IS NULL "
+                "ORDER BY l.csession_id, l.key, l.value"
+            ):
+                labels.setdefault(sid, []).append(f"{key}={value}")
+            kinds: dict[str, set[str]] = {}
+            for sid, kind in conn.execute(
+                "SELECT DISTINCT r.csession_id, r.run_kind FROM runs r JOIN sessions s "
+                "ON s.csession_id = r.csession_id WHERE s.forgotten_at IS NULL"
+            ):
+                kinds.setdefault(sid, set()).add(kind)
+        current = {row["csession_id"]: row for row in runs}
+        return [
+            ListRecord(
+                session=session,
+                run=current.get(session["csession_id"]),
+                labels=labels.get(session["csession_id"], []),
+                run_kinds=frozenset(kinds.get(session["csession_id"], set())),
+            )
+            for session in sessions
+        ]
 
     # Runs
 
@@ -1509,6 +1615,66 @@ class HookRun:
     secret_sha256: str | None = None
     outbox_dev_ino: str | None = None
     artifacts_dev_ino: str | None = None
+
+
+@dataclass(frozen=True)
+class StatusRecord:
+    """``Store.status_record``: raw rows (column name -> value) for ``status``."""
+
+    session: dict[str, Any]
+    # The selected run (None: no such run) and the session's current run.
+    run: dict[str, Any] | None
+    current_run: dict[str, Any] | None
+    runs: int
+    labels: list[str]
+    claude_ids: list[dict[str, Any]]
+    events: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ListRecord:
+    """``Store.list_records``: one session for ``list``."""
+
+    session: dict[str, Any]
+    run: dict[str, Any] | None
+    labels: list[str]
+    run_kinds: frozenset[str]
+
+
+# ``status`` shows this many of a session's latest events (design.md, Data model).
+STATUS_EVENTS = 20
+# The largest value SQLite stores as an INTEGER; larger Python ints cannot be bound.
+MAX_SQLITE_INTEGER = 2**63 - 1
+
+
+def _lenient_text(raw: bytes) -> str:
+    """TEXT values for the read views: bytes that are not UTF-8 become U+FFFD, never an
+    error, so status and list print any stored value."""
+    return raw.decode("utf-8", errors="replace")
+
+
+def _one_dict(conn: sqlite3.Connection, sql: str, *params: Any) -> dict[str, Any] | None:
+    cursor = conn.execute(sql, params)
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return dict(zip([column[0] for column in cursor.description], row, strict=True))
+
+
+def _all_dicts(conn: sqlite3.Connection, sql: str, *params: Any) -> list[dict[str, Any]]:
+    cursor = conn.execute(sql, params)
+    names = [column[0] for column in cursor.description]
+    return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+
+def _labels(conn: sqlite3.Connection, csession_id: str) -> list[str]:
+    return [
+        f"{key}={value}"
+        for key, value in conn.execute(
+            "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+            (csession_id,),
+        )
+    ]
 
 
 def open_state(**kwargs: Any) -> Store:
