@@ -607,6 +607,33 @@ def test_an_interrupt_after_the_ok_record_writes_the_error_record(
     assert [r["result"] for r in audit_records(root)] == ["ok", "error"]
 
 
+def test_an_interrupt_after_the_commit_writes_no_error_record(
+    st: Store, root: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_session import forgetting
+    from claude_session.gateway import SystemGateway
+
+    sid = make(st, root)
+    original = Store.forget_session
+
+    def interrupted(self: Store, *args: Any, **kwargs: Any) -> Any:
+        original(self, *args, **kwargs)
+        raise KeyboardInterrupt  # after the transaction committed
+
+    monkeypatch.setattr(Store, "forget_session", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        forgetting.forget_session(
+            st,
+            config.load(None),
+            sid,
+            gateway=SystemGateway(),  # nothing to deliver: never runs a subprocess
+            environ={},
+            actor="auto:test",
+        )
+    assert forgotten_at(st, sid) is not None
+    assert [r["result"] for r in audit_records(root)] == ["ok"]
+
+
 def test_retention_keeps_the_taint_of_a_deleted_source_on_its_unforked_forks(
     st: Store, root: str, capsys: pytest.CaptureFixture[str], cfg: str
 ) -> None:

@@ -44,6 +44,7 @@ not live.
 from __future__ import annotations
 
 import os
+import sqlite3
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -169,6 +170,13 @@ class _Forgetter:
         except (OSError, ValueError):
             pass
 
+    def _forgotten(self, sid: str) -> bool:
+        """Whether ``sid`` is forgotten; False when that cannot be read."""
+        try:
+            return self.st.forgotten_since(sid) is not None
+        except (sqlite3.Error, OSError):
+            return False
+
     def refused(self, sid: str) -> RefusedError:
         """The ``live`` refusal of ``forget <id>``, its ``refused`` record written first
         (fails closed: ``InternalError`` when it cannot be; a dry run writes nothing)."""
@@ -213,9 +221,10 @@ class _Forgetter:
                 f"the audit record for {sid} could not be written ({exc}); it was not forgotten"
             ) from exc
         except BaseException:
-            # The update failed or was interrupted (a signal) after the ``ok`` record: the
-            # transaction rolled back, so nothing was forgotten.
-            if audited:
+            # The update failed or was interrupted (a signal) after the ``ok`` record. Before
+            # the commit the transaction rolled back and nothing was forgotten: the ``error``
+            # record says so. After the commit the session is forgotten and ``ok`` stands.
+            if audited and not self._forgotten(sid):
                 self._best_effort(sid, "error")
             raise
         if outcome != "forgotten":
