@@ -11,7 +11,8 @@ finalizes it only when nobody owns it any more:
 - a run whose **wrapper is dead** (gone or a zombie) and that has **no child** recorded (the
   launch phase: a ``start`` that died before the run became pending, an adopting or plain
   ``exec`` that died between allocation or the adoption compare-and-set and the spawn):
-  ``not-started``, ``launch_interrupted``, its launch spec deleted;
+  ``not-started``, ``launch_interrupted`` (``canceled`` when the run has a ``stop`` request:
+  ``stop`` during the launch window, interface.md, Outcome mapping), its launch spec deleted;
 - a run whose **wrapper is dead and child alive**: left live and reported as an **orphan**
   (``reconcile`` lists it; ``stop`` ends it); nothing is ever signaled here;
 - a run whose **wrapper and child are dead**: **salvaged** under the lease
@@ -44,8 +45,10 @@ nothing in a dry run (``dry_run``: the changes it would make, not applied).
 TODO(#16): ``views.check_liveness`` and ``views.check_liveness_all`` (``status``/``list``, on
 the #65 line) call ``check_session`` (and ``sessions_with_open_runs`` for ``list``) without
 delivering; ended runs keep their ``Store.known_liveness`` display.
-TODO(#32, #34): ``stop`` and ``forget`` run ``check_session`` (causes ``stop``/``forget`` for
-their own changes, ``liveness`` for this check's) and deliver what it changed.
+``stop`` (``stopper``) runs ``check_session`` first (cause ``liveness``) and again, with cause
+``stop``, to finalize a run whose wrapper it found gone or SIGKILLed.
+TODO(#34): ``forget`` runs ``check_session`` (cause ``forget`` for its own changes,
+``liveness`` for this check's) and delivers what it changed.
 TODO(#36): ``verify-secret`` keeps its fail-closed reading (a run is live only when its
 wrapper or child is confirmed alive by a non-empty token) and its constant-work probes; it may
 reuse ``open_run_live`` only with that reading.
@@ -78,6 +81,7 @@ SALVAGE_POLL = 0.1
 # End reasons whose final event keeps the cause exec recorded (as ``supervisor._FINAL_CAUSES``).
 FINAL_CAUSES = {"auto_exit": "auto_exit", "timeout": "timeout"}
 LAUNCH_LOST_MESSAGE = "the wrapper died before claude was spawned"
+LAUNCH_CANCELED_MESSAGE = "launch canceled by stop: the wrapper ended before claude was spawned"
 SECRET_NAME = sessiondir.SECRET
 
 # Verdicts of ``classify``.
@@ -234,14 +238,15 @@ def _check_run(
             checked.changes.append(_change(st, sid, run, "marked_not_started", before))
         return checked
     if verdict == LAUNCH_LOST:
+        stopped = row["stop_requested_at"] is not None
         final = store.Final(
             phase="launch",
             outcome="not-started",
-            end_reason="launch_interrupted",
+            end_reason="canceled" if stopped else "launch_interrupted",
             exit_code=EXIT_CODES["not-started"],
             state="not-started",
             cause=cause,
-            message=LAUNCH_LOST_MESSAGE,
+            message=LAUNCH_CANCELED_MESSAGE if stopped else LAUNCH_LOST_MESSAGE,
         )
         if st.finalize_run(sid, run, final, expect=_dead(row)):
             _after_launch_end(st, sid, run, state_root)
@@ -545,6 +550,12 @@ def _delete_index(state_root: str, sid: str, run: int) -> None:
 # Dry run
 
 
+def _launch_end_reason(row: dict[str, Any], verdict: str) -> str:
+    if verdict == EXPIRED:
+        return "never_adopted"
+    return "canceled" if row["stop_requested_at"] is not None else "launch_interrupted"
+
+
 def _predicted(st: store.Store, row: dict[str, Any], verdict: str, state_root: str) -> Change:
     """The change a check would make (nothing is read that a real one would ingest first, so
     the outcome is the one the run's state now maps to)."""
@@ -559,7 +570,7 @@ def _predicted(st: store.Store, row: dict[str, Any], verdict: str, state_root: s
             from_state=before,
             to_state="not-started",
             outcome="not-started",
-            end_reason="never_adopted" if verdict == EXPIRED else "launch_interrupted",
+            end_reason=_launch_end_reason(row, verdict),
             detail=detail,
         )
     headless = row["mode"] == "headless"

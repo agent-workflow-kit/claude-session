@@ -231,6 +231,7 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 | `dryrun` | `--dry-run` of a new session and `kinds`: `launch`'s step-2 functions, `launch.checks` with effects that record and create nothing, and `launch.generate`; the plan and `kinds` serializers (`exec-dry-run.json`, `kinds.json`). |
 | `claude_version` | `claude --version` (through `gateway`) and the `min_claude_version` comparison, for `kinds` and the launch's version check. |
 | `endmap` | The end mapping: pure functions over the pending cause, the report, the parsed `stream-json` result and the exit status (headless and wrapper-lost tables). |
+| `stopper` | `stop`: the inline liveness check, the audit record, `stop_requested_at`, the cancel compare-and-set of a pending run (against adoption), signals to exact verified PIDs only (pidfd on Linux), the grace and the SIGKILLs, and the end recorded through the liveness path when the wrapper is gone. |
 | `liveness` | The single-session liveness check shared by the inline callers (`status`, `list`, `wait`, `resume`, `start --resume`, `stop`, `forget`) and `reconcile`. |
 | `waiter` | `wait`: binds to the current run (or `--run`), polls it every `poll_interval` with one read of the store (never a write) and the inline liveness check, and builds the `wait` output (final, or `timed_out` with exit 22). |
 | `toolhooks` | Runs `pre-launch` and `post-state-change` hooks (`sh -c`, own process group, timeouts with SIGTERM to the group, `kill_grace`, SIGKILL to the group; selectors; outcome rules). |

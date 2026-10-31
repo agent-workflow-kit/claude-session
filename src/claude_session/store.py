@@ -1621,6 +1621,35 @@ class Store:
                 conn, csession_id, run_no, dataclasses.replace(NEVER_ADOPTED, cause=cause)
             )
 
+    def request_stop(self, csession_id: str, run_no: int) -> bool:
+        """``stop``'s request (interface.md, stop, step 1): set ``stop_requested_at`` on the
+        run unless it is final (an earlier request's time stands). ``exec`` reads it in both
+        phases: a SIGTERM or SIGHUP then ends the run ``stopped`` (session phase) or
+        ``canceled`` (launch phase). Returns whether the run was not final."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET stop_requested_at = COALESCE(stop_requested_at, ?) "
+                "WHERE csession_id = ? AND run_no = ? AND ended_at IS NULL",
+                (format_ts(self.clock()), csession_id, run_no),
+            )
+        return cursor.rowcount == 1
+
+    def cancel_pending(self, csession_id: str, run_no: int, final: Final) -> bool:
+        """``stop``'s cancel of a pending run (interface.md, stop, step 2): one ``BEGIN
+        IMMEDIATE`` compare-and-set on the run having no wrapper and not being final, the
+        condition ``adopt`` checks in its own transaction, so exactly one of them wins. A run
+        ``start`` still holds (its wrapper set until ``release_pending``) is not pending.
+        Returns whether this call finalized it with ``final``; the caller deletes the launch
+        spec, writes the outcome file and delivers the final event."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT wrapper_pid, ended_at FROM runs WHERE csession_id = ? AND run_no = ?",
+                (csession_id, run_no),
+            ).fetchone()
+            if row is None or row[0] is not None or row[1] is not None:
+                return False
+            return self._finalize(conn, csession_id, run_no, final, expect={"wrapper_pid": None})
+
     def release_pending(
         self,
         csession_id: str,
@@ -2297,6 +2326,16 @@ NEVER_ADOPTED = Final(
     state="not-started",
     cause="adopt",
     message="the pending run was not adopted before it expired",
+)
+# A pending run canceled by ``stop`` (interface.md, Outcome mapping: launch).
+CANCELED = Final(
+    phase="launch",
+    outcome="not-started",
+    end_reason="canceled",
+    exit_code=12,
+    state="not-started",
+    cause="stop",
+    message="the pending run was canceled by stop",
 )
 
 
