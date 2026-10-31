@@ -181,8 +181,11 @@
           ]
         },
         "cwd": {
-          "type": "string",
-          "description": "Resolved cwd of the run; a resume always reuses it; a fork reuses it unless given --cwd."
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Resolved cwd of the run; a resume always reuses it; a fork reuses it unless given --cwd. null until the working directory is resolved (pending runs, and runs that ended during launch)."
         },
         "repo": {
           "type": [
@@ -518,6 +521,7 @@
     },
     "recent_events": {
       "type": "array",
+      "description": "The last 20 events of the session, oldest first.",
       "items": {
         "type": "object",
         "properties": {

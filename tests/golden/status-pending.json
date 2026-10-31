@@ -38,7 +38,7 @@
     "child_alive": false,
     "child_pid": null,
     "cost_usd": null,
-    "cwd": "",
+    "cwd": null,
     "decision_ids": [],
     "end_reason": null,
     "ended_at": null,

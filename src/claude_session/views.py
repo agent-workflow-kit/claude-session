@@ -4,8 +4,8 @@ The JSON objects follow ``schemas/cli/status.json`` and ``schemas/cli/list.json`
 comes from ``state.db``; text written by the agent or derived from its input (report summaries
 and reasons, artifact names, messages, warnings, labels, paths) is untrusted. The JSON objects
 carry it as it is stored (the encoder escapes it; bytes that are not UTF-8 were already
-replaced by U+FFFD when read), and the human output passes every value through
-``display_text``.
+replaced by U+FFFD when read, and lone surrogates from JSON escapes are replaced here), and
+the human output passes every value through ``terminal.display``.
 """
 
 from __future__ import annotations
@@ -20,33 +20,14 @@ from typing import Any
 
 from . import endmap, ids, store
 from .errors import NotFoundError
+from .terminal import display, display_width, no_surrogates
 
 LIVE_STATES = frozenset({"starting", "working", "idle", "needs-input", "reported"})
 RESULT_FILE = endmap.RESULT_FILE
-
-# Characters the human output escapes besides C0 and C1 controls: line and paragraph
-# separators (they break lines like a newline) and the bidirectional formatting characters
-# (they reorder the text a terminal shows).
-_DISPLAY_ESCAPED = frozenset(
-    "\u2028\u2029\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
-)
-
-
-def display_text(value: object) -> str:
-    """``value`` as one line of human output: C0 and C1 control characters (so every terminal
-    escape sequence, which starts with ESC or C1 CSI), DEL, line separators and bidi controls
-    become ``\\xNN`` or ``\\uNNNN`` escapes."""
-    text = "-" if value is None else str(value)
-    return "".join(_escape(char) for char in text)
-
-
-def _escape(char: str) -> str:
-    code = ord(char)
-    if code < 0x20 or 0x7F <= code <= 0x9F:
-        return f"\\x{code:02x}"
-    if char in _DISPLAY_ESCAPED:
-        return f"\\u{code:04x}"
-    return char
+# `list` columns are separated by spaces and labels by commas: a cell escapes them, so no
+# value can pass for an extra column or label.
+_CELL_ESCAPED = " "
+_LABEL_ESCAPED = ","
 
 
 # The inline liveness check (interface.md, Liveness).
@@ -70,8 +51,12 @@ def check_liveness_all(st: store.Store) -> None:
 
 
 def _text(value: object) -> str | None:
-    if value is None or isinstance(value, str):
-        return value
+    """A stored value as text: never a lone surrogate (a JSON ``\\udXXX`` escape becomes
+    U+FFFD), so the JSON output always encodes as strict UTF-8."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return no_surrogates(value)
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return str(value)
@@ -100,7 +85,7 @@ def _json(value: object) -> Any:
         return None
     try:
         return json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: nested too deeply
         return None
 
 
@@ -174,12 +159,18 @@ def _report(run: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _alive(st: store.Store, pid: object, start: object) -> bool:
-    """Whether the exact process (PID and start-time token) still runs; read only."""
+def _alive(st: store.Store, pid: object, start: object, *, ended: bool) -> bool:
+    """Whether the exact process (PID and start-time token) still runs; read only. A PID
+    outside 1..``store.MAX_PID`` names no process. For an ended run, an empty token or a
+    check the platform cannot answer counts as gone (``store.pid_known_alive``): its PID may
+    have been reused."""
     number = _int(pid)
-    if number is None or number <= 0:
+    if number is None or not 0 < number <= store.MAX_PID:
         return False
-    return bool(st.liveness(number, _text(start) or ""))
+    token = _text(start) or ""
+    if ended:
+        return bool(token) and store.pid_known_alive(number, token)
+    return bool(st.liveness(number, token))
 
 
 # status
@@ -234,8 +225,9 @@ def status_object(st: store.Store, text: str, run_no: int | None) -> dict[str, A
 
 def _status_warnings(current: dict[str, Any] | None) -> list[str]:
     """A live run whose recorded hook interpreter no longer exists (an upgrade with live
-    sessions): its injected hooks fail until it ends."""
-    if not _live(current) or current is None:
+    sessions): its injected hooks fail until it ends. A pending run has no hooks injected
+    yet (adoption injects them)."""
+    if current is None or not _live(current) or _pending(current):
         return []
     interpreter = _text(current.get("hook_interpreter"))
     if not interpreter or os.path.exists(interpreter):
@@ -274,14 +266,14 @@ def _run_object(
         "reads_third_party": _flag(run.get("reads_third_party")),
         "implicit_done": resolved.get("implicit_done") is True,
         "mode": mode,
-        # TODO(#28): a run that ended before its cwd was resolved has none recorded; the
-        # schema has no null cwd, so it shows "" until the interface says otherwise.
-        "cwd": _text(run.get("cwd")) or "",
+        # Null until resolved: pending runs and runs that ended during launch.
+        # TODO(#28): adoption must record the resolved cwd.
+        "cwd": _text(run.get("cwd")) or None,
         "repo": _text(run.get("repo")),
         "model": _text(run.get("model")),
         "skill": _text(run.get("skill")),
         "has_prompt": _flag(run.get("has_prompt")),
-        "sandbox": _text(resolved.get("sandbox")) or "off",
+        "sandbox": _sandbox(resolved, run),
         "sandbox_active": _flag(run.get("sandbox_active")),
         "permission_profile": _text(run.get("permission_profile")),
         "decision_ids": _json_texts(run.get("decision_ids_json")),
@@ -300,9 +292,9 @@ def _run_object(
         "warnings": _json_texts(run.get("warnings_json")),
         "state_since": state_since,
         "wrapper_pid": _int(run.get("wrapper_pid")),
-        "wrapper_alive": _alive(st, run.get("wrapper_pid"), run.get("wrapper_start")),
+        "wrapper_alive": _alive(st, run.get("wrapper_pid"), run.get("wrapper_start"), ended=ended),
         "child_pid": _int(run.get("child_pid")),
-        "child_alive": _alive(st, run.get("child_pid"), run.get("child_start")),
+        "child_alive": _alive(st, run.get("child_pid"), run.get("child_start"), ended=ended),
         "backstop_used": _flag(run.get("backstop_used")),
         "report": _report(run),
         "outcome": _text(run.get("outcome")),
@@ -314,6 +306,15 @@ def _run_object(
         "num_turns": _int(run.get("num_turns")),
         "is_error": None if is_error is None else _flag(is_error),
     }
+
+
+def _sandbox(resolved: dict[str, Any], run: dict[str, Any]) -> str:
+    """The resolved sandbox setting. When the stored profile does not say (corrupt), never
+    less isolation than observed: ``required`` when the sandbox ran, else ``off``."""
+    value = _text(resolved.get("sandbox"))
+    if value in ("required", "preferred", "off"):
+        return value
+    return "required" if _flag(run.get("sandbox_active")) else "off"
 
 
 def _claude_id(row: dict[str, Any]) -> dict[str, Any]:
@@ -385,12 +386,17 @@ def list_items(st: store.Store, flt: ListFilter) -> list[dict[str, Any]]:
 
 def _since_text(when: datetime) -> str:
     """``when`` in ``updated_at``'s fixed-width form, so text order is time order. A time
-    outside what UTC can represent (an offset near year 1 or 9999) is clamped."""
+    outside what UTC can represent (an offset near year 1 or 9999) is clamped; one before
+    year 1000 (which ``%Y`` does not pad to four digits) is ``""``, before every time."""
     try:
-        return store.format_ts(when)
+        utc = when.astimezone(UTC)
     except OverflowError:
-        bound = datetime.min if when.year == 1 else datetime.max
-        return store.format_ts(bound.replace(tzinfo=UTC))
+        utc = datetime.min.replace(tzinfo=UTC) if when.year == 1 else None
+    if utc is None:
+        return store.format_ts(datetime.max.replace(tzinfo=UTC))
+    if utc.year < 1000:
+        return ""
+    return store.format_ts(utc)
 
 
 def _list_item(record: store.ListRecord) -> dict[str, Any]:
@@ -452,67 +458,67 @@ def _matches(
 
 def status_lines(obj: dict[str, Any]) -> list[str]:
     """``status`` without ``--json``: one ``name: value`` line per field, every value through
-    ``display_text``."""
+    ``terminal.display``."""
     run = obj["run"]
     state = _state_text(obj["state"], obj["activity"], obj["needs_input_reason"])
     lines = [
-        f"session:        {display_text(obj['csession_id'])}",
+        f"session:        {display(obj['csession_id'])}",
         f"state:          {state}",
         f"live:           {_yes(obj['live'])}",
-        f"launch kind:    {display_text(obj['launch_kind'])}",
-        f"mode:           {display_text(obj['mode'])}",
-        f"current run:    {display_text(obj['current_run'])} of {display_text(obj['runs'])}",
-        f"created:        {display_text(obj['created_at'])}",
-        f"updated:        {display_text(obj['updated_at'])}",
+        f"launch kind:    {display(obj['launch_kind'])}",
+        f"mode:           {display(obj['mode'])}",
+        f"current run:    {display(obj['current_run'])} of {display(obj['runs'])}",
+        f"created:        {display(obj['created_at'])}",
+        f"updated:        {display(obj['updated_at'])}",
         f"tainted:        {_yes(obj['tainted'])}",
-        f"forked from:    {display_text(obj['forked_from'])}",
-        f"repo:           {display_text(obj['repo'])}",
+        f"forked from:    {display(obj['forked_from'])}",
+        f"repo:           {display(obj['repo'])}",
         f"labels:         {_joined(obj['labels'])}",
-        f"session dir:    {display_text(obj['csession_dir'])}",
-        f"claude session: {display_text(obj['claude_session_id'])}",
+        f"session dir:    {display(obj['csession_dir'])}",
+        f"claude session: {display(obj['claude_session_id'])}",
     ]
     if obj["pending"]:
-        lines.append(f"pending until:  {display_text(obj['expires_at'])}")
+        lines.append(f"pending until:  {display(obj['expires_at'])}")
     lines += [
-        f"run {display_text(run['run'])}:",
-        f"  kind:         {display_text(run['run_kind'])}",
-        f"  state:        {display_text(run['state'])} (phase {display_text(run['phase'])})",
-        f"  cwd:          {display_text(run['cwd'])}",
-        f"  sandbox:      {display_text(run['sandbox'])} (active: {_yes(run['sandbox_active'])})",
-        f"  profile:      {display_text(run['permission_profile'])}",
-        f"  started:      {display_text(run['started_at'])}",
-        f"  ended:        {display_text(run['ended_at'])}",
+        f"run {display(run['run'])}:",
+        f"  kind:         {display(run['run_kind'])}",
+        f"  state:        {display(run['state'])} (phase {display(run['phase'])})",
+        f"  cwd:          {display(run['cwd'])}",
+        f"  sandbox:      {display(run['sandbox'])} (active: {_yes(run['sandbox_active'])})",
+        f"  profile:      {display(run['permission_profile'])}",
+        f"  started:      {display(run['started_at'])}",
+        f"  ended:        {display(run['ended_at'])}",
         f"  wrapper:      {_process(run['wrapper_pid'], run['wrapper_alive'])}",
         f"  child:        {_process(run['child_pid'], run['child_alive'])}",
     ]
     if run["outcome"] is not None:
         lines.append(
-            f"  outcome:      {display_text(run['outcome'])}"
-            f" ({display_text(run['end_reason'])}), exit {display_text(run['exit_code'])}"
+            f"  outcome:      {display(run['outcome'])}"
+            f" ({display(run['end_reason'])}), exit {display(run['exit_code'])}"
         )
     if run["cost_usd"] is not None:
         lines.append(f"  cost:         ${run['cost_usd']:.4f}")
     if run["message"]:
-        lines.append(f"  message:      {display_text(run['message'])}")
+        lines.append(f"  message:      {display(run['message'])}")
     report = run["report"]
     if report is not None:
         implicit = " (implicit)" if report["implicit"] else ""
         lines.append(
-            f"  report:       {display_text(report['status'])}{implicit}"
-            f" at {display_text(report['reported_at'])}"
+            f"  report:       {display(report['status'])}{implicit}"
+            f" at {display(report['reported_at'])}"
         )
         if report["summary"] is not None:
-            lines.append(f"    summary:    {display_text(report['summary'])}")
+            lines.append(f"    summary:    {display(report['summary'])}")
         if report["reason"] is not None:
-            lines.append(f"    reason:     {display_text(report['reason'])}")
+            lines.append(f"    reason:     {display(report['reason'])}")
         artifact = report["artifact"]
         if artifact is not None:
             lines.append(
-                f"    artifact:   {display_text(artifact['name'])}"
-                f" {display_text(artifact['path'])} sha256 {display_text(artifact['sha256'])}"
+                f"    artifact:   {display(artifact['name'])}"
+                f" {display(artifact['path'])} sha256 {display(artifact['sha256'])}"
             )
-    lines += [f"  warning:      {display_text(warning)}" for warning in run["warnings"]]
-    lines += [f"warning: {display_text(warning)}" for warning in obj["warnings"]]
+    lines += [f"  warning:      {display(warning)}" for warning in run["warnings"]]
+    lines += [f"warning: {display(warning)}" for warning in obj["warnings"]]
     return lines
 
 
@@ -524,30 +530,37 @@ def list_lines(items: Sequence[dict[str, Any]]) -> list[str]:
     for item in items:
         rows.append(
             (
-                display_text(item["csession_id"]),
-                _state_text(item["state"], item["activity"], item["needs_input_reason"]),
-                display_text(item["run_kind"]),
-                display_text(item["current_run"]),
-                display_text(item["mode"]),
-                display_text(item["updated_at"]),
+                display(item["csession_id"], _CELL_ESCAPED),
+                _state_text(item["state"], item["activity"], item["needs_input_reason"], cell=True),
+                display(item["run_kind"], _CELL_ESCAPED),
+                display(item["current_run"], _CELL_ESCAPED),
+                display(item["mode"], _CELL_ESCAPED),
+                display(item["updated_at"], _CELL_ESCAPED),
                 _joined(item["labels"]),
             )
         )
-    widths = [max(len(row[col]) for row in rows) for col in range(len(rows[0]) - 1)]
+    widths = [max(display_width(row[col]) for row in rows) for col in range(len(rows[0]) - 1)]
     return [
         "  ".join(
-            [*(cell.ljust(width) for cell, width in zip(row, widths, strict=False)), row[-1]]
+            [*(_pad(cell, width) for cell, width in zip(row, widths, strict=False)), row[-1]]
         ).rstrip()
         for row in rows
     ]
 
 
-def _state_text(state: object, activity: object, reason: object) -> str:
-    text = display_text(state)
+def _pad(cell: str, width: int) -> str:
+    return cell + " " * (width - display_width(cell))
+
+
+def _state_text(state: object, activity: object, reason: object, *, cell: bool = False) -> str:
+    """``state``, then ``(reason)`` or a differing ``[activity]`` (in a ``list`` cell with no
+    space before it, and spaces in the values escaped)."""
+    extra = _CELL_ESCAPED if cell else ""
+    text = display(state, extra)
     if reason is not None:
-        text += f"({display_text(reason)})"
+        text += f"({display(reason, extra)})"
     elif activity is not None and activity != state:
-        text += f" [{display_text(activity)}]"
+        text += f"{'' if cell else ' '}[{display(activity, extra)}]"
     return text
 
 
@@ -556,10 +569,11 @@ def _yes(value: object) -> str:
 
 
 def _joined(values: Iterable[object]) -> str:
-    return ",".join(display_text(value) for value in values) or "-"
+    """Labels joined by commas; a comma inside one is escaped."""
+    return ",".join(display(value, _LABEL_ESCAPED) for value in values) or "-"
 
 
 def _process(pid: object, alive: object) -> str:
     if pid is None:
         return "-"
-    return f"{display_text(pid)} ({'alive' if alive else 'gone'})"
+    return f"{display(pid)} ({'alive' if alive else 'gone'})"

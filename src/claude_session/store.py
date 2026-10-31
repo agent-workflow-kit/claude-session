@@ -60,6 +60,7 @@ APPLICATION_ID = 0x43536573
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # A session id or a prefix of one (ids.SESSION_ID is the full grammar).
 _SESSION_ID_PREFIX = re.compile(r"cs-[a-z2-7]{1,8}")
+_SESSION_ID = re.compile(r"cs-[a-z2-7]{8}")
 # Held while state.db is checked and, when missing, created: closing the create descriptor
 # drops this process's POSIX locks, so no other thread may connect before that close. Any
 # thread that takes it after the creator finds the file and closed descriptor; it is never
@@ -164,8 +165,9 @@ def _check_db_file(path: str, info: os.stat_result) -> None:
 
 
 def _prepare_db_file(path: str, *, migrate: bool) -> None:
-    """Check ``path`` without opening it; with ``migrate``, create it when missing and
-    tighten it (and an existing ``-wal``/``-shm``) to 0600.
+    """Check ``path`` without opening it; with ``migrate``, create it (0600) when missing and
+    tighten it (and an existing ``-wal``/``-shm``): group and other bits are cleared, owner
+    bits never added, so a mode is only ever tightened.
 
     No descriptor is ever held on an existing database: POSIX ``close`` drops all of this
     process's ``fcntl`` locks on the file, including those of live SQLite connections. A
@@ -189,20 +191,22 @@ def _prepare_db_file(path: str, *, migrate: bool) -> None:
     _check_db_file(path, info)
     if not migrate:
         return
-    if stat.S_IMODE(info.st_mode) != 0o600:
-        os.chmod(path, 0o600)
+    _tighten(path, info)
     for sidecar in (path + "-wal", path + "-shm"):
         try:
             side = os.lstat(sidecar)
         except FileNotFoundError:
             continue
         # Anything else is skipped: SQLite refuses a symlinked -wal/-shm itself.
-        if (
-            stat.S_ISREG(side.st_mode)
-            and side.st_uid == os.geteuid()
-            and stat.S_IMODE(side.st_mode) != 0o600
-        ):
-            os.chmod(sidecar, 0o600)
+        if stat.S_ISREG(side.st_mode) and side.st_uid == os.geteuid():
+            _tighten(sidecar, side)
+
+
+def _tighten(path: str, info: os.stat_result) -> None:
+    """Clear the group and other bits of ``path`` (never adds a bit)."""
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        os.chmod(path, mode & ~0o077)
 
 
 def _unsafe(path: str, cause: str) -> FailedError:
@@ -288,13 +292,18 @@ def current_holder() -> Holder:
     return Holder(pid=os.getpid(), start=start_time(os.getpid()))
 
 
+# The largest PID the kernel's pid_t can hold; a larger stored value names no process.
+MAX_PID = 2**31 - 1
+
+
 def pid_exists(pid: int) -> bool:
-    """Whether a process with ``pid`` exists (one we may not signal counts)."""
-    if pid <= 0:
+    """Whether a process with ``pid`` exists (one we may not signal counts). A PID outside
+    1..``MAX_PID`` names none."""
+    if not 0 < pid <= MAX_PID:
         return False
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
+    except (ProcessLookupError, OverflowError):
         return False
     except PermissionError:
         return True
@@ -318,6 +327,22 @@ def pid_alive(pid: int, start: str) -> bool:
     except (ProcInfoError, OSError, GatewayTimeout):
         return True
     except ValueError:  # not a valid PID
+        return False
+
+
+def pid_known_alive(pid: int, start: str) -> bool:
+    """Whether the exact process ``pid`` with the start-time token ``start`` is known to run:
+    for showing the processes of a run that has ended. Unlike ``pid_alive``, an unknown start
+    (``""``) or a check the platform cannot answer counts as gone: nothing is decided by it,
+    and a reused PID must not show an ended run's wrapper as alive."""
+    if start == "" or not 0 < pid <= MAX_PID:
+        return False
+    from .gateway import GatewayTimeout
+    from .procinfo import ProcInfoError
+
+    try:
+        return bool(system_procinfo().is_alive(pid, start))
+    except (ProcInfoError, OSError, GatewayTimeout, ValueError):
         return False
 
 
@@ -919,17 +944,24 @@ class Store:
         A range comparison on the primary key (``prefix <= id < upper``, where ``upper`` is
         ``prefix`` with its last character incremented), never ``LIKE``. Callers normalize
         and validate the prefix first (``ids.lookup_session_id``); a prefix outside
-        ``cs-[a-z2-7]{1,8}`` raises ``ValueError``.
+        ``cs-[a-z2-7]{1,8}`` raises ``ValueError``. Stored ids are decoded leniently and a
+        row whose id is not a valid session id (corrupt) is skipped, so it never breaks the
+        lookup of the others.
         """
         if _SESSION_ID_PREFIX.fullmatch(prefix) is None:
             raise ValueError(f"not a session id prefix: {prefix!r}")
         upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
-        rows = self.conn.execute(
-            "SELECT csession_id, forgotten_at IS NOT NULL FROM sessions "
-            "WHERE csession_id >= ? AND csession_id < ? ORDER BY csession_id",
-            (prefix, upper),
-        ).fetchall()
-        return [(sid, bool(forgotten)) for sid, forgotten in rows]
+        with self._lenient_decoding():
+            rows = self.conn.execute(
+                "SELECT csession_id, forgotten_at IS NOT NULL FROM sessions "
+                "WHERE csession_id >= ? AND csession_id < ? ORDER BY csession_id",
+                (prefix, upper),
+            ).fetchall()
+        return [
+            (sid, bool(forgotten))
+            for sid, forgotten in rows
+            if isinstance(sid, str) and _SESSION_ID.fullmatch(sid) is not None
+        ]
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """Sessions that are not forgotten, most recently updated first (raw ``sessions``
@@ -945,19 +977,26 @@ class Store:
     # is decoded leniently (``_lenient_text``) so stored bytes that are not UTF-8 never fail.
 
     @contextmanager
-    def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
-        """A deferred read transaction with lenient text decoding (restored afterwards)."""
+    def _lenient_decoding(self) -> Iterator[None]:
+        """Lenient text decoding on the shared connection (restored afterwards); usable
+        inside a caller's transaction."""
         previous = self.conn.text_factory
         self.conn.text_factory = _lenient_text
         try:
+            yield
+        finally:
+            self.conn.text_factory = previous
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """A deferred read transaction with lenient text decoding (restored afterwards)."""
+        with self._lenient_decoding():
             self.conn.execute("BEGIN")
             try:
                 yield self.conn
             finally:
                 if self.conn.in_transaction:
                     self.conn.execute("ROLLBACK")  # nothing was written
-        finally:
-            self.conn.text_factory = previous
 
     def status_record(self, csession_id: str, run_no: int | None = None) -> StatusRecord | None:
         """The rows ``status`` shows: the session (forgotten or not; the caller resolved the
@@ -1016,7 +1055,8 @@ class Store:
 
     def list_records(self) -> list[ListRecord]:
         """Every session that is not forgotten, in ``list_sessions`` order, with its current
-        run (None when the row is missing), labels and the kinds of all its runs."""
+        run, labels and the kinds of all its runs. A session whose current-run row is
+        missing (corrupt) is skipped, as ``status`` does not find it."""
         with self._read_snapshot() as conn:
             sessions = self.list_sessions()
             runs = _all_dicts(
@@ -1041,11 +1081,12 @@ class Store:
         return [
             ListRecord(
                 session=session,
-                run=current.get(session["csession_id"]),
+                run=current[session["csession_id"]],
                 labels=labels.get(session["csession_id"], []),
                 run_kinds=frozenset(kinds.get(session["csession_id"], set())),
             )
             for session in sessions
+            if session["csession_id"] in current
         ]
 
     # Runs

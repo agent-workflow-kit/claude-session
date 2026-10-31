@@ -50,7 +50,7 @@
     "child_alive": false,
     "child_pid": null,
     "cost_usd": null,
-    "cwd": "",
+    "cwd": null,
     "decision_ids": [],
     "end_reason": "claude_not_found",
     "ended_at": "2026-10-30T12:00:10.000000Z",
@@ -86,7 +86,7 @@
     "state_since": "2026-10-30T12:00:10.000000Z",
     "stop_requested_at": null,
     "warnings": [],
-    "wrapper_alive": true,
+    "wrapper_alive": false,
     "wrapper_pid": 4242
   },
   "run_kind": "implement",

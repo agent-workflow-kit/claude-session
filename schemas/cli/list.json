@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "claude-session/cli/list.json",
   "title": "claude-session list --json",
-  "description": "Newest first; no default limit. list never runs hooks.",
+  "description": "Most recently updated first; no default limit. list never runs hooks.",
   "type": "object",
   "properties": {
     "sessions": {

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 from . import durations, fsutil, ids, outbox, store
 from .defaults import MAX_INTEGER
 from .errors import CliError, InternalError, RefusedError, UsageError
+from .terminal import display
 
 if TYPE_CHECKING:
     from .config import Config
@@ -250,9 +251,9 @@ def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
     )
     if outcome["message"]:
         line += f": {outcome['message']}"
-    print(f"{PROG}: {sanitize(line)}", file=sys.stderr)
+    print(f"{PROG}: {display(line)}", file=sys.stderr)
     for warning in outcome["warnings"]:
-        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
 
 
 # Command name (as typed, nested commands joined by a space) -> handler.
@@ -737,16 +738,6 @@ def load_config(args: argparse.Namespace) -> Config:
 # Output
 
 
-def sanitize(text: str) -> str:
-    """Escape C0 and C1 control characters for human-readable output."""
-    return "".join(f"\\x{ord(c):02x}" if _is_control(c) else c for c in text)
-
-
-def _is_control(char: str) -> bool:
-    code = ord(char)
-    return code < 0x20 or 0x7F <= code <= 0x9F
-
-
 def _given(argv: Sequence[str], flag: str) -> bool:
     """Whether ``flag`` (or ``flag=...``) is in ``argv`` before any ``--``; used when parsing
     failed, so the error can still honor ``--json`` and ``--verbose``."""
@@ -782,14 +773,14 @@ def _write_outcome_file(path: str, error: CliError) -> None:
         # Not abspath: `..` must be resolved after symlinks (realpath in write_private_file).
         fsutil.write_private_file(os.path.join(os.getcwd(), path), data)
     except OSError as exc:
-        reason = sanitize(str(exc))
+        reason = display(str(exc))
         print(f"{PROG}: warning: could not write --outcome-file: {reason}", file=sys.stderr)
 
 
 def _print_error(error: CliError, json_mode: bool) -> None:
-    message = sanitize(error.message)
+    message = display(error.message)
     if error.detail is not None:
-        message = f"{message} ({sanitize(error.detail)})"
+        message = f"{message} ({display(error.detail)})"
     print(f"{PROG}: error: {message}", file=sys.stderr)
     if json_mode:
         print(json.dumps(error.envelope()))
@@ -851,11 +842,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = error.exit_code
         try:
             if args.verbose if args else _given(argv, "--verbose"):
-                traceback.print_exc(file=sys.stderr)
+                _print_traceback()
         except BrokenPipeError:
             pass
         _emit_error(error, args.json if args else _given(argv, "--json"))
         return code
+
+
+# Traceback chunks laid out by the traceback module itself (headers, frames, the messages
+# between chained exceptions): their own newlines separate lines.
+_TRACEBACK_LAYOUT = ("Traceback ", "  File ", "\n", "  [Previous line repeated")
+
+
+def _print_traceback() -> None:
+    """The current exception's traceback on stderr, every line through ``display``. An
+    exception's message (which may carry untrusted text) stays one line: a newline in it is
+    escaped, so it cannot fake a line of output."""
+    exc = sys.exc_info()[1]
+    if exc is None:
+        return
+    lines: list[str] = []
+    for chunk in traceback.TracebackException.from_exception(exc).format():
+        text = chunk.removesuffix("\n")
+        if chunk.startswith(_TRACEBACK_LAYOUT):
+            lines += [display(line) for line in text.split("\n")]
+        else:
+            lines.append(display(text))
+    print("\n".join(lines), file=sys.stderr)
 
 
 def _emit_error(error: CliError, json_mode: bool) -> None:

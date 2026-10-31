@@ -4,6 +4,7 @@ filters, id resolution and the safety of human and JSON output for any stored va
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import cli, store, views
+from claude_session import cli, store, terminal, views
 from claude_session.cli import main
 from claude_session.outbox import Frozen
 from claude_session.store import Final, NewRun, Store
@@ -24,7 +25,15 @@ STATUS_SCHEMA = "claude-session/cli/status.json"
 LIST_SCHEMA = "claude-session/cli/list.json"
 ERROR_SCHEMA = "claude-session/cli/error.json"
 SHA = "ab" * 32
-HOSTILE = "evil\x1b]0;pwned\x07\x1b[2J\r\nfake: line\x9b31m\u202eetc\u2028x\x00\x7f"
+HOSTILE = (
+    "evil\x1b]0;pwned\x07\x1b[2J\r\nfake: line\x9b31m\u202eetc\u2028x\x00\x7f"
+    "\x1b]8;;https://example.org/\x1b\\link\x1b]8;;\x1b\\"  # OSC 8 hyperlink
+    "\x1b]52;c;ZXZpbA==\x07"  # OSC 52 clipboard write
+    "zero\u200bwidth\ufeffbom\u00adshy\u2066iso\u2069\u2029para"
+    "\\x1b fake escape"  # a literal backslash: must not pass for an escape
+)
+# A JSON-escaped lone surrogate: json.loads yields a str that cannot be encoded as UTF-8.
+SURROGATE_JSON = '["w \\ud800 x"]'
 
 
 class Clock:
@@ -46,15 +55,17 @@ def clock() -> Clock:
 
 
 @pytest.fixture
-def alive(monkeypatch: pytest.MonkeyPatch) -> set[int]:
-    """PIDs the liveness check reports alive (every other process is gone)."""
-    pids: set[int] = set()
-    monkeypatch.setattr(store, "pid_alive", lambda pid, start: pid in pids)
-    return pids
+def alive(monkeypatch: pytest.MonkeyPatch) -> set[tuple[int, str]]:
+    """(PID, start-time token) pairs the liveness checks report alive (every other process,
+    including a reused PID with another token, is gone)."""
+    pairs: set[tuple[int, str]] = set()
+    monkeypatch.setattr(store, "pid_alive", lambda pid, start: (pid, start) in pairs)
+    monkeypatch.setattr(store, "pid_known_alive", lambda pid, start: (pid, start) in pairs)
+    return pairs
 
 
 @pytest.fixture
-def st(clock: Clock, alive: set[int]) -> Iterator[Store]:
+def st(clock: Clock, alive: set[tuple[int, str]]) -> Iterator[Store]:
     with store.open_state(clock=clock) as s:
         yield s
 
@@ -178,12 +189,12 @@ def run_json(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, 
     return code, json.loads(capsys.readouterr().out)
 
 
-def seed(st: Store, clock: Clock, alive: set[int]) -> None:
+def seed(st: Store, clock: Clock, alive: set[tuple[int, str]]) -> None:
     """Four sessions: working (live), done (final, reported), not started (launch failure),
     pending (start, not adopted)."""
     allocate(st, "cs-aaaaaaaa", clock, labels=("team=core", "prio=high"))
     to_working(st, "cs-aaaaaaaa", clock)
-    alive.update({4242, 5151})
+    alive.update({(4242, "boot:1"), (5151, "boot:2")})
     allocate(
         st,
         "cs-bbbbbbbb",
@@ -197,7 +208,16 @@ def seed(st: Store, clock: Clock, alive: set[int]) -> None:
     to_working(st, "cs-bbbbbbbb", clock, child=6161)
     report_done(st, "cs-bbbbbbbb", clock)
     finalize(st, "cs-bbbbbbbb", clock, DONE)
-    allocate(st, "cs-cccccccc", clock, mode="interactive", repo=None, labels=())
+    # Its wrapper's PID now belongs to another process (cs-aaaaaaaa's): not alive.
+    allocate(
+        st,
+        "cs-cccccccc",
+        clock,
+        mode="interactive",
+        repo=None,
+        labels=(),
+        wrapper_start="boot:0",
+    )
     finalize(st, "cs-cccccccc", clock, NOT_STARTED)
     allocate(st, "cs-dddddddd", clock, labels=("team=core",))
     sql(
@@ -210,7 +230,7 @@ def seed(st: Store, clock: Clock, alive: set[int]) -> None:
 
 
 @pytest.fixture
-def seeded(st: Store, clock: Clock, alive: set[int]) -> Store:
+def seeded(st: Store, clock: Clock, alive: set[tuple[int, str]]) -> Store:
     seed(st, clock, alive)
     return st
 
@@ -453,17 +473,31 @@ def poison(s: Store, sid: str) -> None:
         SHA,
         "2026-10-30T12:00:00.000000Z",
         HOSTILE,
-        json.dumps([HOSTILE]),
+        json.dumps([HOSTILE, "w \ud800 x"]),
         HOSTILE,
         sid,
     )
     sql(s, "INSERT INTO labels (csession_id, key, value) VALUES (?, 'x', ?)", sid, HOSTILE)
 
 
+def _unsafe_char(char: str) -> bool:
+    """Whether ``char`` must never reach a terminal from a stored value (a newline only
+    separates output lines, so callers check it by line)."""
+    code = ord(char)
+    return (
+        (code < 0x20 and char != "\n")
+        or 0x7F <= code <= 0x9F
+        or 0xD800 <= code <= 0xDFFF
+        or char in "\u2028\u2029\u034f\u115f\u1160\u3164\uffa0\u180e"
+        or unicodedata.category(char) == "Cf"
+    )
+
+
 def assert_inert(text: str) -> None:
-    for bad in ("\x1b", "\x07", "\x9b", "\r", "\x00", "\x7f", "\u202e", "\u2028"):
-        assert bad not in text, repr(bad)
+    bad = sorted({repr(char) for char in text if _unsafe_char(char)})
+    assert not bad, bad
     assert "\nfake: line" not in text
+    text.encode("utf-8")  # strict: no lone surrogate
 
 
 def test_status_human_output_escapes_control_and_escape_sequences(
@@ -474,6 +508,9 @@ def test_status_human_output_escapes_control_and_escape_sequences(
     out = capsys.readouterr().out
     assert_inert(out)
     assert "evil\\x1b]0;pwned\\x07\\x1b[2J\\x0d\\x0afake: line\\x9b31m\\u202eetc" in out
+    assert "zero\\u200bwidth\\ufeffbom\\u00adshy\\u2066iso\\u2069\\u2029para" in out
+    assert "\\\\x1b fake escape" in out  # the backslash itself is escaped
+    assert "w \ufffd x" in out  # a lone surrogate from JSON is U+FFFD
 
 
 def test_list_human_output_escapes_labels(
@@ -481,7 +518,59 @@ def test_list_human_output_escapes_labels(
 ) -> None:
     poison(seeded, "cs-aaaaaaaa")
     assert main(["list"]) == 0
-    assert_inert(capsys.readouterr().out)
+    out = capsys.readouterr().out
+    assert_inert(out)
+    assert "\\x1b]8;;https://example.org/\\x1b\\\\link" in out
+
+
+def test_status_human_output_with_a_lone_surrogate_exits_0(
+    seeded: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sql(
+        seeded,
+        "UPDATE runs SET warnings_json = ? WHERE csession_id = 'cs-aaaaaaaa'",
+        SURROGATE_JSON,
+    )
+    assert main(["status", "cs-aaaaaaaa"]) == 0
+    out = capsys.readouterr().out
+    out.encode("utf-8")
+    assert "  warning:      w \ufffd x" in out
+
+
+def test_error_messages_escape_hostile_input(
+    seeded: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["status", "cs-aaaa\u202e\x1b]52;c;eA==\x07\\x41\u200b"]) == 10
+    err = capsys.readouterr().err
+    assert_inert(err)
+    assert "cs-aaaa\\u202e\\x1b]52;c;eA==\\x07\\\\x41\\u200b" in err
+
+
+def test_error_message_names_the_stored_id_escaped(
+    st: Store, clock: Clock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    allocate(st, "cs-aaaaaaaa", clock)
+    sql(st, "UPDATE sessions SET current_run = 3 WHERE csession_id = 'cs-aaaaaaaa'")
+    assert main(["status", "cs-aaaa"]) == 10
+    err = capsys.readouterr().err
+    assert_inert(err)
+    assert err == "claude-session: error: session cs-aaaaaaaa has no current run record\n"
+
+
+def test_verbose_traceback_is_escaped_line_by_line(
+    seeded: Store, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def boom(*args: object) -> None:
+        raise RuntimeError(HOSTILE)
+
+    monkeypatch.setattr(views, "status_object", boom)
+    assert main(["status", "cs-aaaa", "--verbose"]) == 1
+    err = capsys.readouterr().err
+    assert_inert(err)
+    lines = err.splitlines()
+    assert lines[0] == "Traceback (most recent call last):"
+    assert any(line.startswith("RuntimeError: evil\\x1b]0;pwned") for line in lines)
+    assert lines[-1] == "claude-session: error: internal error: RuntimeError"
 
 
 def test_json_output_carries_hostile_text_escaped(
@@ -493,10 +582,44 @@ def test_json_output_carries_hostile_text_escaped(
     assert out.isascii() and "\x1b" not in out
     obj = json.loads(out)
     assert obj["run"]["report"]["summary"] == HOSTILE
+    assert obj["run"]["warnings"] == [HOSTILE, "w \ufffd x"]
     assert main(["list", "--json"]) == 0
     sessions = json.loads(capsys.readouterr().out)["sessions"]
     poisoned = next(item for item in sessions if item["csession_id"] == "cs-aaaaaaaa")
     assert f"x={HOSTILE}" in poisoned["labels"]
+
+
+def test_json_output_never_carries_a_lone_surrogate(
+    seeded: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sql(
+        seeded,
+        "UPDATE runs SET warnings_json = ?, decision_ids_json = ?, invocation_json = ? "
+        "WHERE csession_id = 'cs-aaaaaaaa'",
+        SURROGATE_JSON,
+        SURROGATE_JSON,
+        json.dumps({"input_files": ["\udfff.md"]}),
+    )
+    assert main(["status", "cs-aaaaaaaa", "--json"]) == 0
+    obj = json.loads(capsys.readouterr().out)
+    validate(obj, STATUS_SCHEMA)
+    assert obj["run"]["warnings"] == obj["run"]["decision_ids"] == ["w \ufffd x"]
+    assert obj["run"]["input_files"] == ["\ufffd.md"]
+    json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+
+def test_json_error_envelope_never_carries_a_lone_surrogate(
+    seeded: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An argv byte that is not UTF-8 arrives surrogate-escaped.
+    text = b"cs-aaaa\xff".decode("utf-8", errors="surrogateescape")
+    assert main(["status", text, "--json"]) == 10
+    captured = capsys.readouterr()
+    envelope = json.loads(captured.out)
+    validate(envelope, ERROR_SCHEMA)
+    assert envelope["error"]["message"] == "unknown session: cs-aaaa\ufffd"
+    captured.err.encode("utf-8")
+    assert "cs-aaaa\\udcff" in captured.err
 
 
 def test_json_stays_valid_for_bytes_that_are_not_utf8(
@@ -552,10 +675,21 @@ def test_corrupt_json_columns_do_not_fail(
     assert obj["run"]["input_files"] == [] and obj["run"]["sandbox"] == "off"
 
 
-def test_display_text_escapes_controls_and_keeps_text() -> None:
-    assert views.display_text("héllo wörld ✓") == "héllo wörld ✓"
-    assert views.display_text("a\tb\x85c\u200fd") == "a\\x09b\\x85c\\u200fd"
-    assert views.display_text(None) == "-"
+def test_display_escapes_controls_and_keeps_text() -> None:
+    assert terminal.display("héllo wörld ✓ 審査") == "héllo wörld ✓ 審査"
+    assert terminal.display("a\tb\x85c\u200fd") == "a\\x09b\\x85c\\u200fd"
+    assert terminal.display(None) == "-"
+    assert terminal.display("a\\x1b") == "a\\\\x1b"
+    assert terminal.display("\ud800\u2028\u00ad\U000e0001\u3164") == (
+        "\\ud800\\u2028\\u00ad\\U000e0001\\u3164"
+    )
+    assert terminal.display("a b,c", extra=" ,") == "a\\x20b\\x2cc"
+
+
+def test_display_width_counts_wide_characters_twice() -> None:
+    assert terminal.display_width("ab") == 2
+    assert terminal.display_width("審査") == 4
+    assert terminal.display_width("e\u0301") == 1
 
 
 # list --json
@@ -615,6 +749,12 @@ def listed(argv: list[str], capsys: pytest.CaptureFixture[str]) -> list[str]:
         (["--report-status", "done"], ["cs-bbbbbbbb"]),
         (["--report-status", "none"], ["cs-dddddddd", "cs-cccccccc", "cs-aaaaaaaa"]),
         (["--report-status", "failed"], []),
+        (["--report-status", "failed", "--report-status", "done"], ["cs-bbbbbbbb"]),
+        (
+            ["--report-status", "done", "--report-status", "none"],
+            ["cs-dddddddd", "cs-cccccccc", "cs-bbbbbbbb", "cs-aaaaaaaa"],
+        ),
+        (["--report-status", "blocked", "--report-status", "needs-input"], []),
         (["--live"], ["cs-dddddddd", "cs-aaaaaaaa"]),
         (["--tainted"], ["cs-bbbbbbbb"]),
         (["--live", "--tainted"], []),
@@ -672,7 +812,14 @@ def test_list_since_matches_updated_at(seeded: Store, capsys: pytest.CaptureFixt
 
 
 @pytest.mark.parametrize(
-    "since", ["0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-14:00", "0001-01-01"]
+    "since",
+    [
+        "0001-01-01T00:00:00+14:00",
+        "9999-12-31T23:59:59-14:00",
+        "0001-01-01",
+        "0999-01-01",
+        "0999-12-31T23:59:59-01:00",
+    ],
 )
 def test_list_since_at_the_edges_of_time(
     seeded: Store, since: str, capsys: pytest.CaptureFixture[str]
@@ -763,9 +910,9 @@ def test_status_record_missing_run_row_is_not_found(
     sql(st, "UPDATE sessions SET current_run = 3 WHERE csession_id = 'cs-aaaaaaaa'")
     code, _ = run_json(["status", "cs-aaaaaaaa"], capsys)
     assert code == 10
-    # list still shows it (its run fields fall back to null and launch).
-    code, obj = run_json(["list"], capsys)
-    assert code == 0 and obj["sessions"][0]["run_kind"] is None
+    # list skips it, as status does not find it.
+    allocate(st, "cs-bbbbbbbb", clock)
+    assert listed([], capsys) == ["cs-bbbbbbbb"]
 
 
 def test_store_status_record_unknown_session(st: Store) -> None:
@@ -812,3 +959,197 @@ def test_expires_at_is_null_once_the_run_is_not_pending(
     assert (obj["expires_at"], obj["run"]["expires_at"]) == (None, None)
     _, listing = run_json(["list", "--live"], capsys)
     assert [item["expires_at"] is None for item in listing["sessions"]] == [False, True]
+
+
+# Liveness of the run's processes
+
+
+def test_a_reused_pid_of_a_live_run_is_not_alive(
+    seeded: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PID 4242 exists, but with another start-time token.
+    sql(seeded, "UPDATE runs SET wrapper_start = 'boot:7' WHERE csession_id = 'cs-aaaaaaaa'")
+    _, obj = run_json(["status", "cs-aaaaaaaa"], capsys)
+    assert (obj["run"]["wrapper_alive"], obj["run"]["child_alive"]) == (False, True)
+
+
+def test_an_ended_run_with_no_start_token_is_not_alive(
+    seeded: Store, alive: set[tuple[int, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    sql(seeded, "UPDATE runs SET wrapper_start = '' WHERE csession_id = 'cs-bbbbbbbb'")
+    alive.add((4343, ""))  # some process has PID 4343
+    _, obj = run_json(["status", "cs-bbbbbbbb"], capsys)
+    assert obj["run"]["wrapper_alive"] is False
+    # A live run with no token still falls back to the PID alone.
+    sql(seeded, "UPDATE runs SET wrapper_start = '' WHERE csession_id = 'cs-aaaaaaaa'")
+    alive.add((4242, ""))
+    _, obj = run_json(["status", "cs-aaaaaaaa"], capsys)
+    assert obj["run"]["wrapper_alive"] is True
+
+
+def test_an_ended_run_is_not_alive_when_procinfo_cannot_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_session.procinfo import ProcInfoError
+
+    class Broken:
+        def is_alive(self, pid: int, start: str) -> bool:
+            raise ProcInfoError("cannot tell")
+
+    monkeypatch.setattr(store, "_procinfo", Broken())
+    assert store.pid_alive(12345, "x:1")  # a live run: assumed alive
+    assert not store.pid_known_alive(12345, "x:1")  # display of an ended run
+
+
+@pytest.mark.parametrize("pid", [2**31, 2**40, 2**63 - 1, -5])
+def test_an_out_of_range_pid_is_not_alive(
+    seeded: Store, alive: set[tuple[int, str]], pid: int, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sql(
+        seeded,
+        "UPDATE runs SET wrapper_pid = ?, child_pid = ? WHERE csession_id = 'cs-aaaaaaaa'",
+        pid,
+        pid,
+    )
+    alive.update({(pid, "boot:1"), (pid, "boot:2")})
+    code, obj = run_json(["status", "cs-aaaaaaaa"], capsys)
+    assert code == 0
+    assert (obj["run"]["wrapper_alive"], obj["run"]["child_alive"]) == (False, False)
+
+
+def test_pid_exists_is_false_for_an_out_of_range_pid() -> None:
+    assert not store.pid_exists(2**31)
+    assert not store.pid_exists(2**64)
+
+
+# Corrupt and odd stored values
+
+
+def test_deeply_nested_json_columns_do_not_fail(
+    seeded: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    deep = "[" * 100_000 + "]" * 100_000
+    sql(
+        seeded,
+        "UPDATE runs SET warnings_json = ?, resolved_json = ?, invocation_json = ? "
+        "WHERE csession_id = 'cs-aaaaaaaa'",
+        deep,
+        deep,
+        deep,
+    )
+    code, obj = run_json(["status", "cs-aaaaaaaa"], capsys)
+    assert code == 0
+    validate(obj, STATUS_SCHEMA)
+    assert obj["run"]["warnings"] == [] and obj["run"]["input_files"] == []
+
+
+def copy_session(s: Store, source: str, new_id: object) -> None:
+    """A copy of session ``source``'s row under the raw id ``new_id`` (TEXT, any bytes)."""
+    sql(s, "CREATE TEMP TABLE copied AS SELECT * FROM sessions WHERE csession_id = ?", source)
+    sql(s, "UPDATE copied SET csession_id = CAST(? AS TEXT)", new_id)
+    sql(s, "INSERT INTO sessions SELECT * FROM copied")
+    sql(s, "DROP TABLE copied")
+
+
+def test_a_corrupt_session_id_does_not_break_id_lookup(
+    seeded: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    copy_session(seeded, "cs-aaaaaaaa", b"cs-aaaaa\xff\xfe")  # not UTF-8
+    copy_session(seeded, "cs-bbbbbbbb", "cs-bbbbbbbbz")  # not a valid id
+    for text in ("cs-aaaa", "cs-aaaaaaaa", "aaaaa"):
+        code, obj = run_json(["status", text], capsys)
+        assert (code, obj["csession_id"]) == (0, "cs-aaaaaaaa"), text
+    assert run_json(["status", "cs-bbbb"], capsys)[0] == 0
+    assert listed(["--forked-from", "cs-bbbb"], capsys) == ["cs-dddddddd"]
+    assert seeded.session_id_candidates("cs-aaaa") == [("cs-aaaaaaaa", False)]
+
+
+def test_hook_interpreter_warning_skips_a_pending_run(
+    seeded: Store, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gone = str(tmp_path / "old-venv" / "python3")
+    sql(seeded, "UPDATE runs SET hook_interpreter = ? WHERE csession_id = 'cs-dddddddd'", gone)
+    _, obj = run_json(["status", "cs-dddddddd"], capsys)
+    assert obj["pending"] is True and obj["warnings"] == []
+
+
+@pytest.mark.parametrize(("active", "expected"), [(1, "required"), (0, "off")])
+def test_sandbox_fallback_never_claims_less_isolation_than_observed(
+    seeded: Store, active: int, expected: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sql(
+        seeded,
+        "UPDATE runs SET resolved_json = '{', sandbox_active = ? WHERE csession_id = 'cs-aaaaaaaa'",
+        active,
+    )
+    _, obj = run_json(["status", "cs-aaaaaaaa"], capsys)
+    assert (obj["run"]["sandbox"], obj["run"]["sandbox_active"]) == (expected, bool(active))
+
+
+def test_a_run_without_a_resolved_cwd_shows_none(
+    seeded: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for sid in ("cs-cccccccc", "cs-dddddddd"):
+        code, obj = run_json(["status", sid], capsys)
+        assert (code, obj["run"]["cwd"]) == (0, None)
+    assert main(["status", "cs-dddddddd"]) == 0
+    assert "  cwd:          -\n" in capsys.readouterr().out
+
+
+# list: needs-input and human-output layout
+
+
+def test_list_needs_input_filters(
+    seeded: Store, clock: Clock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    allocate(seeded, "cs-eeeeeeee", clock)
+    to_working(seeded, "cs-eeeeeeee", clock, child=7171)
+    clock.tick()
+    with seeded.transaction():
+        run = seeded.hook_run("cs-eeeeeeee")
+        assert run is not None
+        seeded.apply_state(
+            run,
+            state="needs-input",
+            activity="idle",
+            needs_input_reason="permission",
+            cause="Notification",
+        )
+    assert listed(["--needs-input"], capsys) == ["cs-eeeeeeee"]
+    assert listed(["--state", "needs-input"], capsys) == ["cs-eeeeeeee"]
+    assert listed(["--state", "needs-input", "--state", "working"], capsys) == [
+        "cs-eeeeeeee",
+        "cs-aaaaaaaa",
+    ]
+    assert listed(["--needs-input", "--state", "working"], capsys) == []
+
+
+def test_list_human_cells_cannot_fake_columns_or_labels(
+    seeded: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sql(seeded, "UPDATE runs SET run_kind = 'a b' WHERE csession_id = 'cs-aaaaaaaa'")
+    sql(
+        seeded,
+        "INSERT INTO labels (csession_id, key, value) VALUES ('cs-aaaaaaaa', 'x', 'a,team=prod')",
+    )
+    assert main(["list"]) == 0
+    line = capsys.readouterr().out.splitlines()[-1]
+    assert line.split()[:3] == ["cs-aaaaaaaa", "working", "a\\x20b"]
+    assert line.endswith("kind=implement,prio=high,team=core,x=a\\x2cteam=prod")
+    assert main(["status", "cs-aaaaaaaa"]) == 0
+    out = capsys.readouterr().out
+    assert "labels:         kind=implement,prio=high,team=core,x=a\\x2cteam=prod\n" in out
+
+
+def test_list_human_columns_align_with_wide_characters(
+    seeded: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sql(seeded, "UPDATE runs SET run_kind = '審査' WHERE csession_id = 'cs-aaaaaaaa'")
+    assert main(["list"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    column = lines[0].index("RUN")
+    for line in lines[1:]:
+        # Cells hold no spaces, so the fourth word is the RUN cell.
+        kind, run = line.split()[2:4]
+        at = line.index(f" {run} ", line.index(kind) + len(kind)) + 1
+        assert terminal.display_width(line[:at]) == column, line

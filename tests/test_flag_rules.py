@@ -135,7 +135,8 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     (["exec", "--input-file", "a/x.txt", "--input-file", "b/x.txt"], "duplicate --input-file"),
     (["exec", "--input-file", "a b.txt"], "--input-file name 'a b.txt' must match"),
     (["start", "--json", "--input-file", "dir/"], "--input-file name '' must match"),
-    (["exec", "--input-file", "x.txt\n"], "--input-file name 'x.txt\\n' must match"),
+    # stderr escapes the backslash of the repr: an escape it shows was always written there.
+    (["exec", "--input-file", "x.txt\n"], "--input-file name 'x.txt\\\\n' must match"),
     (["exec", "--input-file", "a/.."], "--input-file name '..' must match"),
     # setting sources
     (["exec", "--setting-sources", "user,global"], "unknown source 'global'"),

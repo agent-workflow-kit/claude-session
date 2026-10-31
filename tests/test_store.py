@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -249,6 +250,26 @@ def test_a_loose_db_is_tightened_to_0600(db: str) -> None:
     os.chmod(db, 0o644)
     open_as(db, ME).close()
     assert mode(db) == 0o600
+
+
+@pytest.mark.parametrize(("before", "after"), [(0o640, 0o600), (0o604, 0o600), (0o700, 0o700)])
+def test_tightening_only_clears_group_and_other_bits(db: str, before: int, after: int) -> None:
+    open_as(db, ME).close()
+    os.chmod(db, before)
+    open_as(db, ME).close()
+    assert mode(db) == after
+
+
+@pytest.mark.parametrize("before", [0o400, 0o444, 0o000])
+def test_tightening_never_adds_owner_bits(db: str, before: int) -> None:
+    open_as(db, ME).close()
+    os.chmod(db, before)
+    try:
+        with contextlib.suppress(FailedError):  # SQLite may refuse a read-only database
+            open_as(db, ME).close()
+        assert mode(db) == before & ~0o077
+    finally:
+        os.chmod(db, 0o600)
 
 
 def test_loose_wal_and_shm_files_are_tightened_to_0600(db: str) -> None:
