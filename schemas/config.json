@@ -218,7 +218,7 @@
           },
           "sandbox": {
             "type": "object",
-            "description": "Claude Code sandbox settings (network, filesystem). enabled, failIfUnavailable, allowUnsandboxedCommands, excludedCommands and autoAllowBashIfSandboxed: true are refused for third-party-reading or sandboxed runs (the generated autoAllowBashIfSandboxed is false); generated isolation keys always override profile content."
+            "description": "Claude Code sandbox settings (network, filesystem). enabled, failIfUnavailable, allowUnsandboxedCommands, excludedCommands, enableWeakerNestedSandbox, ignoreViolations, network.allowUnixSockets, network.allowAllUnixSockets, network.allowLocalBinding, network.httpProxyPort, network.socksProxyPort and autoAllowBashIfSandboxed: true are refused for third-party-reading or sandboxed runs (the generated autoAllowBashIfSandboxed is false); generated isolation keys always override profile content."
           }
         },
         "required": [],
