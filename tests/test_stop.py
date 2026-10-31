@@ -509,12 +509,11 @@ def on_first_kill_phase(monkeypatch: pytest.MonkeyPatch, action: Any) -> None:
     real = stopper.Stop._signal_child  # pyright: ignore[reportPrivateUsage]
     done: list[bool] = []
 
-    def signal_child(self: stopper.Stop, result: Any, record: dict[str, Any], sig: int) -> bool:
-        sent_now = real(self, result, record, sig)
+    def signal_child(self: stopper.Stop, result: Any, record: dict[str, Any], sig: int) -> None:
+        real(self, result, record, sig)
         if sig == signal.SIGKILL and record["child_pid"] is None and not done:
             done.append(True)
             action()
-        return sent_now
 
     monkeypatch.setattr(stopper.Stop, "_signal_child", signal_child)
 
@@ -524,11 +523,9 @@ def after_send(monkeypatch: pytest.MonkeyPatch, role: str, sig: int, action: Any
     real = stopper.Stop._send  # pyright: ignore[reportPrivateUsage]
     done: list[bool] = []
 
-    def send(
-        self: stopper.Stop, result: Any, record: dict[str, Any], role_: str, sig_: int
-    ) -> bool:
+    def send(self: stopper.Stop, result: Any, record: dict[str, Any], role_: str, sig_: int) -> str:
         sent_now = real(self, result, record, role_, sig_)
-        if sent_now and (role_, sig_) == (role, sig) and not done:
+        if sent_now == stopper.SENT and (role_, sig_) == (role, sig) and not done:
             done.append(True)
             action()
         return sent_now
@@ -731,15 +728,112 @@ def test_a_signal_not_sent_clears_the_cause_stop_recorded(
     root: str,
     procs: Procs,
 ) -> None:
+    """Not sent for a reason other than the target being gone (EPERM, a pidfd error): the
+    cause this stop recorded is cleared again."""
     config = tmp_path / "fast.yaml"
     config.write_text("kill_grace: 0.1s\npoll_interval: 0.05s\n", encoding="utf-8")
     child = procs.live()
     sid = session(st, root, wrapper=procs.dead(), child=child)
-    monkeypatch.setattr(stopper, "send_verified", lambda pid, token, sig: False)
+    monkeypatch.setattr(stopper, "deliver", lambda pid, token, sig: stopper.NOT_SENT)
     code, out = run_stop(capsys, config, sid, "--grace", "0.1s")
     assert (code, out["signals"]) == (12, [])
     assert run_row(st, sid)["pending_cause"] is None
     assert procs.running(child[0])
+
+
+def test_a_signal_to_a_gone_target_keeps_the_cause_stop_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    """The target is gone (ESRCH, or its token no longer matches): stop was requested, so the
+    cause it recorded stays."""
+    config = tmp_path / "fast.yaml"
+    config.write_text("kill_grace: 0.1s\npoll_interval: 0.05s\n", encoding="utf-8")
+    child = procs.live()
+    sid = session(st, root, wrapper=procs.dead(), child=child)
+    monkeypatch.setattr(stopper, "deliver", lambda pid, token, sig: stopper.GONE)
+    cleared: list[str] = []
+    real_clear = Store.clear_pending_cause
+
+    def clear(self: Store, csession_id: str, run_no: int, cause: str) -> bool:
+        cleared.append(cause)
+        return real_clear(self, csession_id, run_no, cause)
+
+    monkeypatch.setattr(Store, "clear_pending_cause", clear)
+    code, out = run_stop(capsys, config, sid, "--grace", "0.1s")
+    assert (code, out["signals"]) == (12, [])
+    assert cleared == []
+    assert run_row(st, sid)["pending_cause"] == "stopped"
+
+
+def test_a_cause_a_second_stop_relied_on_is_kept(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    """Two stops: this one records ``stopped``, then a second stop SIGKILLs the child (its own
+    set found the cause already there) before this one's send, which finds the child gone.
+    The cause stays, so the run's end reason is ``stopped``, never an unexplained signal."""
+    child = procs.live()
+    sid = session(st, root, wrapper=procs.dead(), child=child)
+    real = stopper.deliver
+    statuses: list[str] = []
+
+    def deliver(pid: Any, token: Any, sig: int) -> str:
+        if pid == child[0] and not statuses:
+            assert not st.set_pending_cause(sid, 1, "stopped")  # the second stop's set
+            proc = next(p for p in procs.started if p.pid == child[0])
+            proc.kill()  # the second stop's SIGKILL, to the exact process this test started
+            proc.wait(timeout=30)
+        status = real(pid, token, sig)
+        statuses.append(status)
+        return status
+
+    monkeypatch.setattr(stopper, "deliver", deliver)
+    code, out = run_stop(capsys, config, sid)
+    assert statuses[0] == stopper.GONE
+    assert (code, out["ended"], out["recorded_by_stop"], out["signals"]) == (0, True, True, [])
+    assert run_row(st, sid)["pending_cause"] == "stopped"
+    assert out["end_reason"] == "stopped"
+
+
+def test_an_unverifiable_wrapper_never_sees_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    """A live wrapper that cannot be verified, with a dead recorded child: stop neither
+    records ``pending_cause`` nor sends anything, on any poll (a live exec finalizing its
+    dead child must not read a transient ``stopped``)."""
+    config = tmp_path / "fast.yaml"
+    config.write_text("kill_grace: 0.1s\npoll_interval: 0.05s\n", encoding="utf-8")
+    wrapper_pid, _ = procs.live()
+    sid = session(st, root, wrapper=(wrapper_pid, ""), child=procs.dead())
+    calls: list[str] = []
+    real_set = Store.set_pending_cause
+
+    def spy(self: Store, csession_id: str, run_no: int, cause: str) -> bool:
+        calls.append(cause)
+        return real_set(self, csession_id, run_no, cause)
+
+    monkeypatch.setattr(Store, "set_pending_cause", spy)
+    code, out = run_stop(capsys, config, sid, "--grace", "0.1s")
+    assert (code, out["signals"]) == (12, [])
+    assert calls == []
+    assert run_row(st, sid)["pending_cause"] is None
+    assert procs.running(wrapper_pid)
+    kills = [r for r in log_records(root, "signal_not_sent") if r["signal"] == "SIGKILL"]
+    assert len([r for r in kills if "wrapper" in r["message"]]) == 1
 
 
 def test_clearing_the_cause_leaves_another_cause_alone(st: Store, root: str, procs: Procs) -> None:
@@ -919,6 +1013,41 @@ def test_without_a_pidfd_the_token_is_checked_before_kill(
     assert stopper.send_verified(pid, token, signal.SIGTERM)
     proc = next(p for p in procs.started if p.pid == pid)
     assert proc.wait(timeout=30) == -signal.SIGTERM
+
+
+def test_a_pidfd_error_other_than_esrch_falls_back_to_the_token_check(
+    monkeypatch: pytest.MonkeyPatch, procs: Procs
+) -> None:
+    """A seccomp profile refusing pidfd_open (EPERM) is no pidfd, not a gone process: the
+    token check then kill fallback signals the verified process."""
+    import errno
+
+    from claude_session import gateway
+
+    def refused(pid: int) -> int:
+        raise OSError(errno.EPERM, "refused")
+
+    monkeypatch.setattr(gateway, "pidfd_open", refused)
+    pid, token = procs.live()
+    assert stopper.deliver(pid, token, signal.SIGTERM) == stopper.SENT
+    proc = next(p for p in procs.started if p.pid == pid)
+    assert proc.wait(timeout=30) == -signal.SIGTERM
+
+
+def test_esrch_from_pidfd_open_is_a_gone_process(
+    monkeypatch: pytest.MonkeyPatch, procs: Procs
+) -> None:
+    import errno
+
+    from claude_session import gateway
+
+    def gone_(pid: int) -> int:
+        raise OSError(errno.ESRCH, "gone")
+
+    monkeypatch.setattr(gateway, "pidfd_open", gone_)
+    pid, token = procs.live()
+    assert stopper.deliver(pid, token, signal.SIGTERM) == stopper.GONE
+    assert procs.running(pid)
 
 
 def test_a_dead_pid_is_never_signaled(procs: Procs) -> None:

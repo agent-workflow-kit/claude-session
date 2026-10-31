@@ -26,7 +26,10 @@
    meanwhile gets its SIGKILL first, and the wrapper is SIGKILLed (``pending_cause``
    ``stopped`` first when a child is recorded), except while a recorded child's PID exists but
    cannot be verified: that wrapper is left to supervise it (``signal_not_sent``), the run
-   stays live. A cause this ``stop`` recorded is cleared again when its signal was not sent.
+   stays live. A cause is recorded only for a process verified first; the cause this
+   ``stop`` recorded is cleared again when its signal was not sent for a reason other than the
+   target being gone (a gone target keeps it: stop was requested, and a second ``stop`` may
+   have signaled that process relying on it).
    Whenever the wrapper is found gone, ``stop`` finalizes the run itself through the liveness
    path (cause ``stop``, ``recorded_by_stop``) and delivers its final event. A run ``start``
    released meanwhile (pending again) is canceled. A run found final before this ``stop``
@@ -38,7 +41,8 @@
 token (procinfo) match the running process: on Linux through a pidfd opened before the token is
 checked, so the signal can never reach a reused PID (``gateway.pidfd_open``: the os function,
 else the syscall through ``ctypes`` on x86_64 and aarch64). Without a pidfd (macOS, another
-machine, a Linux kernel before 5.3) the token is checked right before ``kill``, which leaves a
+machine, a Linux kernel before 5.3, or ``pidfd_open`` failing other than ESRCH, such as EPERM
+under a seccomp profile) the token is checked right before ``kill``, which leaves a
 PID-reuse window as long as that check.
 An empty token (not readable when it was recorded) is never a match: such a process is not
 signaled (``signal_not_sent`` is logged). Every signal sent is logged ``signal_sent`` with its
@@ -78,6 +82,10 @@ STOPPED = "stopped"
 LINUX = sys.platform.startswith("linux")
 # ``_pidfd``: no pidfd on this platform (never a valid descriptor).
 NO_PIDFD = -1
+# ``deliver``: the signal was sent; the target is gone; it was not sent for another reason.
+SENT = "sent"
+GONE = "gone"
+NOT_SENT = "not_sent"
 
 
 @dataclass
@@ -138,52 +146,76 @@ class Stopped:
 def verified(pid: Any, token: Any) -> bool:
     """Whether ``pid`` is running (not a zombie) with the start-time token ``token``. An empty
     or missing token, an invalid PID or a platform that cannot answer is never a match."""
+    return _match(pid, token) == SENT
+
+
+def _match(pid: Any, token: Any) -> str:
+    """The token check: ``SENT`` (a match: the process may be signaled), ``GONE`` (no running
+    process with that token: it exited or its PID was reused) or ``NOT_SENT`` (an invalid PID,
+    an empty or missing token, or a platform that cannot answer)."""
     if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid < 2**31:
-        return False
+        return NOT_SENT
     if not isinstance(token, str) or token == "":
-        return False
+        return NOT_SENT
     try:
-        return bool(store.system_procinfo().is_alive(pid, token))
+        alive = bool(store.system_procinfo().is_alive(pid, token))
     except Exception:
-        return False
+        return NOT_SENT
+    return SENT if alive else GONE
 
 
 def _pidfd(pid: int) -> int | None:
     """A pidfd for ``pid`` (``gateway.pidfd_open``: the os function, else the syscall through
-    ctypes on x86_64 and aarch64); None when the process is gone; ``NO_PIDFD`` when this
-    platform or kernel has none (another machine, a kernel before 5.3)."""
+    ctypes on x86_64 and aarch64); None when the process is gone (ESRCH); ``NO_PIDFD`` on any
+    other error: this platform or kernel has none (another machine, a kernel before 5.3), a
+    seccomp profile refuses the call (EPERM), or no descriptor is free. The token check right
+    before ``kill`` is the fallback then."""
     try:
         return gw.pidfd_open(pid)
     except OSError as exc:
-        return NO_PIDFD if exc.errno == errno.ENOSYS else None
+        return None if exc.errno == errno.ESRCH else NO_PIDFD
+
+
+def _failed(exc: OSError) -> str:
+    """A failed send: ``GONE`` when the target no longer exists (ESRCH), else ``NOT_SENT``."""
+    return GONE if exc.errno == errno.ESRCH else NOT_SENT
+
+
+def deliver(pid: Any, token: Any, sig: int) -> str:
+    """Send ``sig`` to the exact process ``pid`` with start-time token ``token``. On Linux the
+    pidfd is opened before the token is checked, so it names the verified process and never
+    a reused PID. Returns ``SENT``; ``GONE`` when the process is gone (ESRCH, or the token no
+    longer matches a running process); ``NOT_SENT`` when the signal was not sent for another
+    reason (an invalid PID or empty token, EPERM, a pidfd or procinfo error)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid < 2**31:
+        return NOT_SENT
+    fd = _pidfd(pid) if LINUX else NO_PIDFD
+    if fd is None:
+        return GONE
+    if fd != NO_PIDFD:
+        try:
+            match = _match(pid, token)
+            if match != SENT:
+                return match
+            gw.pidfd_send_signal(fd, sig)
+        except OSError as exc:
+            return _failed(exc)
+        finally:
+            os.close(fd)
+        return SENT
+    match = _match(pid, token)  # no pidfd: checked right before the kill
+    if match != SENT:
+        return match
+    try:
+        os.kill(pid, sig)
+    except OSError as exc:
+        return _failed(exc)
+    return SENT
 
 
 def send_verified(pid: Any, token: Any, sig: int) -> bool:
-    """Send ``sig`` to the exact process ``pid`` with start-time token ``token``. On Linux the
-    pidfd is opened before the token is checked, so it names the verified process and never
-    a reused PID. Returns whether the signal was sent."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid < 2**31:
-        return False
-    fd = _pidfd(pid) if LINUX else NO_PIDFD
-    if fd is None:
-        return False  # the process is gone
-    if fd != NO_PIDFD:
-        try:
-            if not verified(pid, token):
-                return False
-            gw.pidfd_send_signal(fd, sig)
-        except OSError:
-            return False
-        finally:
-            os.close(fd)
-        return True
-    if not verified(pid, token):  # no pidfd: checked right before the kill
-        return False
-    try:
-        os.kill(pid, sig)
-    except OSError:
-        return False
-    return True
+    """``deliver``: whether the signal was sent."""
+    return deliver(pid, token, sig) == SENT
 
 
 # The command
@@ -303,7 +335,7 @@ class Stop:
             elif verdict == liveness.LIVE:
                 if wrapper_kill_at is not None and now >= wrapper_kill_at:
                     self._kill_wrapper(result, sid, run)
-                elif not self._signal(result, record, "wrapper", signal.SIGTERM):
+                elif self._signal(result, record, "wrapper", signal.SIGTERM) != SENT:
                     # The wrapper cannot be verified: the verified child gets the SIGTERM
                     # instead (pending_cause first), as an orphan would.
                     if not kill_phase:
@@ -340,57 +372,58 @@ class Stop:
                 " supervise it",
             )
             return
-        key = ("wrapper", signal.SIGKILL, record["wrapper_pid"], record["wrapper_start"])
-        if key in self._sent:
-            return
-        recorded = self.st.set_pending_cause(sid, run, STOPPED)
-        if not self._signal(result, record, "wrapper", signal.SIGKILL) and recorded:
-            self.st.clear_pending_cause(sid, run, STOPPED)
+        self._signal_caused(result, record, "wrapper", signal.SIGKILL)
 
-    def _signal_child(self, result: Stopped, record: dict[str, Any], sig: int) -> bool:
+    def _signal_child(self, result: Stopped, record: dict[str, Any], sig: int) -> None:
+        """``sig`` to the verified child, ``pending_cause`` ``stopped`` recorded first."""
+        if record["child_pid"] is not None:
+            self._signal_caused(result, record, "child", sig)
+
+    def _signal_caused(self, result: Stopped, record: dict[str, Any], role: str, sig: int) -> None:
         """``pending_cause`` ``stopped`` (an earlier cause stands), then ``sig`` to the
-        verified child; the cause this call recorded is cleared again when the signal was
-        not sent. Returns whether it was sent (now or earlier)."""
-        pid, token = record["child_pid"], record["child_start"]
-        if pid is None:
-            return False
-        key = ("child", sig, pid, token)
-        if key in self._sent:
-            return True
-        if not verified(pid, token):
-            self._note(result, key, "the child is gone or cannot be verified")
-            return False
-        sid, run = result.csession_id, result.run
-        recorded = self.st.set_pending_cause(sid, run, STOPPED)
-        if self._signal(result, record, "child", sig):
-            return True
-        if recorded:
-            self.st.clear_pending_cause(sid, run, STOPPED)
-        return False
-
-    def _signal(self, result: Stopped, record: dict[str, Any], role: str, sig: int) -> bool:
-        """``sig`` to the ``role`` once per recorded (PID, start token): True when it was sent,
-        now or earlier. A send that did not happen is logged once and tried again later."""
+        ``role``, once per recorded (PID, start token). Nothing is recorded or sent unless the
+        process is verified first, so a process that cannot be verified never sees the cause.
+        The cause this call recorded is cleared again only when the signal was not sent for a
+        reason other than the target being gone: a target that is gone (ESRCH, or the token
+        no longer matches) leaves it, since stop was requested and another writer (a second
+        ``stop``) may have signaled that process relying on it."""
         key = (role, sig, record[f"{role}_pid"], record[f"{role}_start"])
         if key in self._sent:
-            return True
-        if not self._send(result, record, role, sig):
+            return
+        if not verified(key[2], key[3]):
             self._note(result, key, f"the {role} is gone or cannot be verified")
-            return False
-        self._sent.add(key)
-        return True
+            return
+        sid, run = result.csession_id, result.run
+        recorded = self.st.set_pending_cause(sid, run, STOPPED)
+        if self._signal(result, record, role, sig) == NOT_SENT and recorded:
+            self.st.clear_pending_cause(sid, run, STOPPED)
 
-    def _send(self, result: Stopped, record: dict[str, Any], role: str, sig: int) -> bool:
+    def _signal(self, result: Stopped, record: dict[str, Any], role: str, sig: int) -> str:
+        """``sig`` to the ``role`` once per recorded (PID, start token): ``SENT`` when it was
+        sent, now or earlier, else ``GONE`` or ``NOT_SENT`` (``deliver``). A send that did not
+        happen is logged once and tried again later."""
+        key = (role, sig, record[f"{role}_pid"], record[f"{role}_start"])
+        if key in self._sent:
+            return SENT
+        status = self._send(result, record, role, sig)
+        if status != SENT:
+            self._note(result, key, f"the {role} is gone or cannot be verified")
+            return status
+        self._sent.add(key)
+        return SENT
+
+    def _send(self, result: Stopped, record: dict[str, Any], role: str, sig: int) -> str:
         """One send to the exact recorded process; logged ``signal_sent`` when it happened."""
         pid, token = record[f"{role}_pid"], record[f"{role}_start"]
-        if not send_verified(pid, token, sig):
-            return False
+        status = deliver(pid, token, sig)
+        if status != SENT:
+            return status
         name = signal.Signals(sig).name
         result.signals.append({"pid": pid, "role": role, "signal": name})
         self._log(
             "signal_sent", result, pid=pid, signal=name, message=f"stop: {role}", level="info"
         )
-        return True
+        return SENT
 
     def _note(self, result: Stopped, key: tuple[Any, ...], why: str) -> None:
         """``signal_not_sent`` for ``key`` (role, signal, PID, token), once per key."""
