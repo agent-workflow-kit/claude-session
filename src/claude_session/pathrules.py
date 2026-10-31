@@ -324,6 +324,15 @@ def session_writable(
     return SessionWritable(paths)
 
 
+def profile_write_entries(profile: Mapping[str, Any]) -> list[str]:
+    """The strings of a profile (before expansion) that can make a path writable: its sandbox
+    ``allowWrite`` entries and every allow rule (whose target is placed after expansion)."""
+    return [
+        *_strings(profile, "sandbox", "filesystem", "allowWrite"),
+        *_strings(profile, "permissions", "allow"),
+    ]
+
+
 def _profile_writes(profile: Mapping[str, Any], *, cwd: str, home: str) -> list[str]:
     targets = [
         sandbox_path(entry, home=home)

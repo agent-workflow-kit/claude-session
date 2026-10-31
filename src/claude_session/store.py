@@ -10,9 +10,9 @@ the hook path may import it (design.md, Hook-event fast path), but never migrate
   version it brings the database to, so an interrupted migration resumes where it stopped.
 - A database whose schema is newer than this code is refused with ``schema_newer`` (exit 12)
   before claude-session writes any data to it (interface.md, Launch order and Upgrades).
-- Leases (``migrate``, ``reconcile``, ``delivery:<id>``) record the holder's PID, process
-  start time and a per-``Store`` token, and expire ``LEASE_TTL`` after their last renewal; a
-  dead holder's lease may be taken over at once.
+- Leases (``migrate``, ``reconcile``, ``delivery:<id>``, ``outcome-file:<id>:<run>``) record
+  the holder's PID, process start time and a per-``Store`` token, and expire ``LEASE_TTL``
+  after their last renewal; a dead holder's lease may be taken over at once.
 - Open refuses, with ``FailedError`` (exit 12), a state directory or ``state.db`` that is
   unsafe (a symlink, not ours, hard-linked, not a regular file), unusable or not a
   claude-session database (``PRAGMA application_id``); claude-session writes no data to such
@@ -484,7 +484,16 @@ def _migration_1_0(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX events_undelivered ON events (delivered_at, id)")
 
 
-MIGRATIONS: tuple[Migration, ...] = (Migration((1, 0), _migration_1_0),)
+def _migration_1_1(conn: sqlite3.Connection) -> None:
+    """``runs.writable_json``: the run's session-writable paths, stored for the outcome-file
+    writers (design.md, Data model)."""
+    conn.execute("ALTER TABLE runs ADD COLUMN writable_json TEXT")
+
+
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration((1, 0), _migration_1_0),
+    Migration((1, 1), _migration_1_1),
+)
 
 
 def code_version(migrations: Sequence[Migration] | None = None) -> Version:
@@ -1167,25 +1176,18 @@ class Store:
         rows = self.conn.execute(sql + " ORDER BY csession_id, run_no", params).fetchall()
         return [(str(sid), int(run_no)) for sid, run_no in rows]
 
-    def mark_outcome_file_written(self, csession_id: str, run_no: int) -> bool:
-        """Set ``outcome_file_written_at`` of a final run once (compare-and-set on it being
-        unset). Returns whether this call set it."""
+    def claim_outcome_file(self, csession_id: str, run_no: int) -> bool:
+        """Claim the one write of a final run's outcome file: set ``outcome_file_written_at``
+        (compare-and-set on it being unset) before the file is written. Returns whether this
+        call claimed it; only the claimant writes."""
         with self.transaction() as conn:
             cursor = conn.execute(
                 "UPDATE runs SET outcome_file_written_at = ? WHERE csession_id = ? "
-                "AND run_no = ? AND ended_at IS NOT NULL AND outcome_file_written_at IS NULL",
+                "AND run_no = ? AND ended_at IS NOT NULL AND outcome_file IS NOT NULL "
+                "AND outcome_file_written_at IS NULL",
                 (format_ts(self.clock()), csession_id, run_no),
             )
         return cursor.rowcount == 1
-
-    def drop_outcome_file(self, csession_id: str, run_no: int) -> None:
-        """Forget the run's ``outcome_file`` (a path rejected after allocation): no
-        finalizer or backfill ever writes it."""
-        with self.transaction() as conn:
-            conn.execute(
-                "UPDATE runs SET outcome_file = NULL WHERE csession_id = ? AND run_no = ?",
-                (csession_id, run_no),
-            )
 
     def set_implicit_report(self, csession_id: str, run_no: int, artifact: Frozen) -> bool:
         """Store an implicit done (headless ``result`` accepted as done): status ``done``,
@@ -1247,6 +1249,7 @@ class Store:
             )
             if cursor.rowcount != 1:
                 return False
+            self._record_with_final(conn, csession_id, run_no, final)
             row = conn.execute(
                 "SELECT s.state, s.activity, r.report_status FROM sessions s JOIN runs r "
                 "ON r.csession_id = s.csession_id AND r.run_no = ? WHERE s.csession_id = ?",
@@ -1285,6 +1288,32 @@ class Store:
                 ),
             )
         return True
+
+    @staticmethod
+    def _record_with_final(
+        conn: sqlite3.Connection, csession_id: str, run_no: int, final: Final
+    ) -> None:
+        """The parts of ``final`` recorded with the compare-and-set (see ``Final``)."""
+        key = (csession_id, run_no)
+        if final.drop_outcome_file:
+            conn.execute(
+                "UPDATE runs SET outcome_file = NULL WHERE csession_id = ? AND run_no = ?", key
+            )
+        if final.writable is not None:
+            conn.execute(
+                "UPDATE runs SET writable_json = COALESCE(writable_json, ?) "
+                "WHERE csession_id = ? AND run_no = ?",
+                (json.dumps(list(final.writable), ensure_ascii=False), *key),
+            )
+        if final.warnings:
+            (current,) = conn.execute(
+                "SELECT warnings_json FROM runs WHERE csession_id = ? AND run_no = ?", key
+            ).fetchone()
+            merged = list(dict.fromkeys([*json.loads(current or "[]"), *final.warnings]))
+            conn.execute(
+                "UPDATE runs SET warnings_json = ? WHERE csession_id = ? AND run_no = ?",
+                (json.dumps(merged, ensure_ascii=False), *key),
+            )
 
     def run_record(self, csession_id: str, run_no: int) -> dict[str, Any]:
         """The run row joined with its session's ``forked_from``, ``claude_session_id`` and
@@ -1552,6 +1581,7 @@ RUN_FIELDS = frozenset(
         "backstop_used",
         "pending_cause",
         "message",
+        "writable_json",
     }
 )
 SESSION_FIELDS = frozenset({"tmp_dir", "git_dir"})
@@ -1599,6 +1629,13 @@ class Final:
     num_turns: int | None = None
     is_error: bool | None = None
     message: str | None = None
+    # Recorded in the same transaction as the compare-and-set (design.md, Data model):
+    # warnings known before it (merged into ``warnings_json``, so the outcome file carries
+    # them), the run's session-writable paths when none are stored yet (``writable_json``),
+    # and the drop of an ``--outcome-file`` launch step 5 rejected.
+    warnings: tuple[str, ...] = ()
+    writable: tuple[str, ...] | None = None
+    drop_outcome_file: bool = False
 
 
 @dataclass(frozen=True)

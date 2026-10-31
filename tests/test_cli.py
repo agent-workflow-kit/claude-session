@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import __version__, cli
+from claude_session import __version__, cli, outcomefile
 from claude_session.cli import build_parser, main
 from claude_session.errors import (
     AmbiguousError,
@@ -512,12 +512,15 @@ def test_parse_error_is_written_to_outcome_file_from_argv(
     assert read_envelope(out)["error"]["message"] == "unrecognized arguments: --bogus"
 
 
-def test_relative_outcome_file_is_made_absolute(
+def test_an_outcome_file_in_the_cwd_is_refused_before_the_kind_is_known(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """An isolated kind's agent may write the cwd, and the kind is not resolved yet: the
+    envelope is not written there (fail closed), with a warning; the exit code stands."""
     monkeypatch.chdir(tmp_path)
     assert main(["start", "--outcome-file", "o.json"]) == 2
-    assert read_envelope(tmp_path / "o.json")["error"]["message"] == "start requires --json"
+    assert outcomefile.REJECTED in capsys.readouterr().err
+    assert not (tmp_path / "o.json").exists()
 
 
 def test_refusal_is_written_to_outcome_file(
@@ -591,8 +594,9 @@ def test_outcome_file_dotdot_is_resolved_after_symlinks(
 ) -> None:
     (tmp_path / "deep" / "real").mkdir(parents=True)
     (tmp_path / "link").symlink_to(tmp_path / "deep" / "real")
-    monkeypatch.chdir(tmp_path)
-    assert main(["exec", "--timeout", "0", "--outcome-file", "link/../o.json"]) == 2
+    (tmp_path / "cwd").mkdir()
+    monkeypatch.chdir(tmp_path / "cwd")
+    assert main(["exec", "--timeout", "0", "--outcome-file", f"{tmp_path}/link/../o.json"]) == 2
     assert read_envelope(tmp_path / "deep" / "o.json")["error"]["code"] == "usage"
     assert not (tmp_path / "o.json").exists()
 
@@ -602,16 +606,20 @@ def test_outcome_file_prescan_accepts_a_negative_number(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     assert main(["exec", "--bogus", "--outcome-file", "-1"]) == 2
-    assert read_envelope(tmp_path / "-1")["error"]["code"] == "usage"
+    # Taken as the path (and refused: it is in the cwd, see above).
+    assert outcomefile.REJECTED in capsys.readouterr().err
+    assert not (tmp_path / "-1").exists()
 
 
-@pytest.mark.parametrize("value", [".", "sub/.."])
+@pytest.mark.parametrize("value", ["", "/sub/.."])
 def test_outcome_file_naming_a_directory_is_a_warning(
     value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     (tmp_path / "sub").mkdir()
-    monkeypatch.chdir(tmp_path)
-    assert main(["exec", "--timeout", "0", "--outcome-file", value, "--json"]) == 2
+    (tmp_path / "cwd").mkdir()
+    monkeypatch.chdir(tmp_path / "cwd")
+    path = f"{tmp_path}{value}"
+    assert main(["exec", "--timeout", "0", "--outcome-file", path, "--json"]) == 2
     captured = capsys.readouterr()
     assert json.loads(captured.out)["error"]["code"] == "usage"
     assert "warning: could not write --outcome-file" in captured.err

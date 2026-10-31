@@ -735,11 +735,15 @@ def test_a_missing_secret_index_fails_the_drains_visibly(
             result_step(),
         ],
         config=FAST + "kinds:\n  implement:\n    implicit_done: false\n",
+        args=["--outcome-file", str(tmp_path / "outcome.json")],
     )
     # Nothing is ingested without the scan: no report, and the caller is told.
     assert run.outcome["report"] is None
     assert run.outcome["end_reason"] == "no_report"
     assert any("not ingested" in w for w in run.outcome["warnings"])
+    # Known before the finalization: recorded with it, so the outcome file carries it too.
+    written = json.loads((tmp_path / "outcome.json").read_text())
+    assert any("not ingested" in w for w in written["warnings"])
     assert list((run.private_run / "claimed").iterdir())  # the request stays claimed
 
 

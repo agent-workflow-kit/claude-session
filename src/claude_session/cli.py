@@ -186,6 +186,8 @@ def _exec(args: argparse.Namespace) -> int:
                 req = launch.read_request(args, cfg)
                 resolved = launch.resolve_kind(req, cfg, process)
                 launch.check_outcome_file(req, resolved, process)
+                # From here an error envelope's outcome file is checked as the run's is.
+                args.outcome_file_writable = launch.step2_outcome_writable(resolved, process)
                 signals.defer()  # a signal during allocation acts once the run exists
                 alloc = launch.allocate(st, req, resolved, process)
                 try:
@@ -235,16 +237,25 @@ def _wait(args: argparse.Namespace) -> int:
     timeout = durations.parse_bound(args.timeout)
     try:
         with store.open_state() as st:
-            waited = waiter.wait_for_run(
-                st, args.id, run_no=args.run, timeout=timeout, poll_interval=cfg.poll_interval
-            )
             state_root = os.path.dirname(st.path)
-            row = st.run_record(waited.output["csession_id"], waited.output["run"])
-            writable = outcomefile.run_writable(row, state_root)
+
+            def bound(row: dict[str, Any]) -> None:
+                # Once bound, an error envelope is checked against the waited run's paths.
+                args.outcome_file_writable = outcomefile.run_writable(row, state_root)
+
+            waited = waiter.wait_for_run(
+                st,
+                args.id,
+                run_no=args.run,
+                timeout=timeout,
+                poll_interval=cfg.poll_interval,
+                on_row=bound,
+            )
     except KeyboardInterrupt:
         _die_of(signal.SIGINT)
     output = waited.output
     if args.outcome_file is not None:
+        writable = outcomefile.run_writable(waited.row, state_root)
         _write_wait_outcome_file(args.outcome_file, output, state_root, writable)
     if args.json:
         print(json.dumps(output, ensure_ascii=False, allow_nan=False))
@@ -260,12 +271,12 @@ def _wait(args: argparse.Namespace) -> int:
 
 
 def _write_wait_outcome_file(
-    path: str, output: dict[str, Any], state_root: str, writable: Callable[[str], bool]
+    path: str, output: dict[str, Any], state_root: str, writable: Callable[[str], bool] | None
 ) -> None:
     """``wait --outcome-file``: ``wait``'s own output (interface.md, Outcome file), never to a
-    path the waited run's agent could write (``outcomefile.run_writable``); a rejected or
-    failed write adds a warning to the output and logs ``outcome_file_failed``, and never
-    changes the exit code."""
+    path the waited run's agent could write (``outcomefile.run_writable``; None: not
+    determined, not written); a rejected, skipped or failed write adds a warning to the output
+    and logs ``outcome_file_failed``, and never changes the exit code."""
     warning = outcomefile.write(outcomefile.absolute(path), outcomefile.encode(output), writable)
     if warning is not None:
         output["warnings"] = [*output["warnings"], warning]
@@ -821,30 +832,52 @@ def _outcome_file_from_argv(argv: Sequence[str]) -> str | None:
     """The last ``--outcome-file`` value in ``argv`` (as argparse would take it)."""
     if not argv or argv[0] not in OUTCOME_FILE_COMMANDS:
         return None
+    return _value_from_argv(argv, "--outcome-file")
+
+
+def _value_from_argv(argv: Sequence[str], flag: str) -> str | None:
+    """The last value of ``flag`` in ``argv`` before any ``--`` (as argparse would take it)."""
     found: str | None = None
     for index, token in enumerate(argv):
         if token == "--":
             break
-        if token == "--outcome-file" and index + 1 < len(argv):
+        if token == flag and index + 1 < len(argv):
             value = argv[index + 1]
             if not value.startswith("-") or NEGATIVE_NUMBER.match(value):
                 found = value
-        elif token.startswith("--outcome-file="):
+        elif token.startswith(flag + "="):
             found = token.partition("=")[2]
     return found
 
 
-def _write_outcome_file(path: str, error: CliError) -> None:
-    """An error envelope to ``--outcome-file`` (``outcomefile.write``): never to a path an
-    agent could write (``<state>/sessions``, the tmp root), and never for the rejection of
-    that path itself. A rejected or failed write is a warning on stderr, logged
+def _envelope_writable(
+    args: argparse.Namespace | None, argv: Sequence[str], state_root: str
+) -> Callable[[str], bool] | None:
+    """What an error envelope's ``--outcome-file`` write refuses: what the command set once it
+    knew (``args.outcome_file_writable``: ``exec`` once the kind is resolved, ``wait`` once the
+    run is bound), else, failing closed, ``<state>/sessions``, the tmp root, this process's
+    cwd and ``--cwd`` (an isolated run's agent may write either; the kind may not be known)."""
+    if args is not None and hasattr(args, "outcome_file_writable"):
+        return args.outcome_file_writable  # type: ignore[no-any-return]
+    cwd = os.getcwd()
+    given = getattr(args, "cwd", None) if args else _value_from_argv(argv, "--cwd")
+    extra = [cwd, *([os.path.join(cwd, given)] if given else [])]
+    return outcomefile.baseline_writable(state_root, *(os.path.realpath(p) for p in extra))
+
+
+def _write_outcome_file(path: str, error: CliError, writable: Callable[[str], bool] | None) -> None:
+    """An error envelope to ``--outcome-file`` (``outcomefile.write``): never to a path
+    ``writable`` refuses (None: not determined, never written), and never for the rejection
+    of that path itself. A rejected, skipped or failed write is a warning on stderr, logged
     ``outcome_file_failed`` (best effort)."""
     if isinstance(error, OutcomeFileRejected):
         return
     state_root = store.state_dir()
-    writable = outcomefile.baseline_writable(state_root)
     data = (json.dumps(error.envelope()) + "\n").encode()
-    warning = outcomefile.write(outcomefile.absolute(path), data, writable)
+    try:
+        warning = outcomefile.write(outcomefile.absolute(path), data, writable)
+    except OSError as exc:  # no cwd to make the path absolute against
+        warning = f"{outcomefile.NOT_WRITTEN}: {exc.strerror or type(exc).__name__}"
     if warning is not None:
         print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
         outcomefile.log_failure(state_root, warning)
@@ -942,8 +975,13 @@ def _write_error_outcome_file(
 ) -> None:
     """Write ``error``'s envelope to the ``--outcome-file`` given, if any."""
     path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
-    if path:
-        _write_outcome_file(path, error)
+    if not path:
+        return
+    try:
+        writable = _envelope_writable(args, argv, store.state_dir())
+    except (OSError, ValueError):  # no cwd to refuse: fail closed
+        writable = None
+    _write_outcome_file(path, error, writable)
 
 
 def _emit_error(error: CliError, json_mode: bool) -> None:
