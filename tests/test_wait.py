@@ -231,7 +231,10 @@ def test_run_selects_another_run(st: Store, clock: Clock) -> None:
     assert clock.slept == []
 
 
-@pytest.mark.parametrize("run_no", [0, -1, 2, 9007199254740991, 2**63, 99999999999999999999])
+@pytest.mark.parametrize(
+    "run_no",
+    [0, -1, 2, 9007199254740991, 2**63, 99999999999999999999, -(2**63) - 1, -99999999999999999999],
+)
 def test_a_run_that_does_not_exist_is_not_found(st: Store, clock: Clock, run_no: int) -> None:
     sid = session(st)
     with pytest.raises(NotFoundError, match=f"has no run {run_no}"):
@@ -596,6 +599,46 @@ def test_a_session_forgotten_mid_wait_writes_the_not_found_envelope(
     written = json.loads(out_file.read_text())
     assert written["error"]["code"] == "not_found"
     assert stat.S_IMODE(out_file.stat().st_mode) == 0o600
+
+
+def test_an_internal_error_in_wait_writes_the_internal_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """R2-2: the generic `internal` envelope wait prints also goes to its outcome file."""
+    from claude_session import cli
+
+    sid = stored_session()
+
+    def broken(*_args: Any, **_kwargs: Any) -> waiter.Waited:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(waiter, "wait_for_run", broken)
+    out_file = tmp_path / "wait.json"
+    code = cli.main(["wait", sid, "--json", "--outcome-file", str(out_file)])
+    assert code == 1
+    printed = json.loads(capsys.readouterr().out)
+    written = json.loads(out_file.read_text())
+    assert written == printed
+    assert written["error"]["code"] == "internal"
+    assert stat.S_IMODE(out_file.stat().st_mode) == 0o600
+
+
+def test_an_internal_error_with_an_unwritable_outcome_file_still_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from claude_session import cli
+
+    sid = stored_session()
+
+    def broken(*_args: Any, **_kwargs: Any) -> waiter.Waited:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(waiter, "wait_for_run", broken)
+    code = cli.main(["wait", sid, "--json", "--outcome-file", str(tmp_path / "no" / "x.json")])
+    assert code == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"]["code"] == "internal"
+    assert "--outcome-file" in captured.err
 
 
 def test_an_outcome_file_failure_is_a_warning(tmp_path: Path, state: Path) -> None:

@@ -61,8 +61,9 @@ def wait_for_run(
     clock = clock or SystemClock()
     deadline = None if timeout is None else clock.monotonic() + timeout
     sid = ids.lookup_session_id(text, st.session_id_candidates)
-    if run_no is not None and run_no > SQLITE_INTEGER_MAX:
-        # No such run (a query with it would raise OverflowError).
+    if run_no is not None and not 1 <= run_no <= SQLITE_INTEGER_MAX:
+        # No such run (runs count from 1; a query with a value past SQLite's 64-bit integer
+        # range would raise OverflowError).
         raise NotFoundError(f"session {sid} has no run {run_no}")
     check_liveness(st, sid)
     row = st.waited_run(sid, run_no)

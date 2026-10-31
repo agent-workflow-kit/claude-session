@@ -909,11 +909,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # `wait --outcome-file` gets any error envelope wait prints after the schema check
         # (interface.md, Outcome file); the other commands' outcome files only usage errors
         # and refusals.
-        is_wait = (args.handler if args else (argv[0] if argv else None)) == "wait"
+        is_wait = _command_name(args, argv) == "wait"
         if (is_wait and schema_checked) or isinstance(error, (UsageError, RefusedError)):
-            path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
-            if path:
-                _write_outcome_file(path, error)
+            _write_error_outcome_file(args, argv, error)
         code = error.exit_code
         _emit_error(error, args.json if args else _given(argv, "--json"))
         return code
@@ -922,6 +920,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:  # last resort: any bug is reported as `internal` (exit 1)
         error = InternalError(f"internal error: {type(exc).__name__}")
         code = error.exit_code
+        if schema_checked and _command_name(args, argv) == "wait":
+            # wait's outcome file gets this envelope too (interface.md, Outcome file); a
+            # write failure only warns.
+            _write_error_outcome_file(args, argv, error)
         try:
             if args.verbose if args else _given(argv, "--verbose"):
                 traceback.print_exc(file=sys.stderr)
@@ -929,6 +931,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             pass
         _emit_error(error, args.json if args else _given(argv, "--json"))
         return code
+
+
+def _command_name(args: argparse.Namespace | None, argv: Sequence[str]) -> str | None:
+    """The command being run: the parsed handler, else the first argument."""
+    if args:
+        return str(args.handler)
+    return argv[0] if argv else None
+
+
+def _write_error_outcome_file(
+    args: argparse.Namespace | None, argv: Sequence[str], error: CliError
+) -> None:
+    """Write ``error``'s envelope to the ``--outcome-file`` given, if any."""
+    path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
+    if path:
+        _write_outcome_file(path, error)
 
 
 def _emit_error(error: CliError, json_mode: bool) -> None:

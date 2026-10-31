@@ -120,19 +120,18 @@ def test_a_child_ignoring_sigterm_at_the_bound_is_killed_after_kill_grace(
     assert gone(row["child_pid"])
 
 
-def test_a_report_keeps_its_outcome_at_the_bound(tmp_path: Path, state: Path, work: Path) -> None:
-    """With a report the outcome is the report's; the end reason and the final event's cause
-    are still timeout (interface.md, Outcome mapping)."""
-    steps = [START, {"do": "report", "args": ["done", "--summary", "finished"]}, HANG]
-    # 5s: the report lands right after the start, long before the bound.
-    run = run_exec(tmp_path, state, work, steps, args=["--timeout", "5s"], config=FAST)
+def test_a_report_keeps_its_outcome_under_a_bound(tmp_path: Path, state: Path, work: Path) -> None:
+    """A bounded run that reports and then ends on its own keeps the report's outcome and
+    never reaches the bound (30s, far beyond the run). The bound ending a reported run is
+    covered with the injectable clock in ``test_supervision``."""
+    report = {"do": "report", "args": ["done", "--summary", "finished"]}
+    steps = [START, report, {"do": "stop"}, {"do": "result"}]
+    run = run_exec(tmp_path, state, work, steps, args=["--timeout", "30s"], config=FAST)
     assert run.code == 0, run.proc.stderr
-    assert (run.outcome["outcome"], run.outcome["end_reason"], run.outcome["state"]) == (
-        "done",
-        "timeout",
-        "exited",
-    )
-    assert final_cause(run) == "timeout"
+    assert (run.outcome["outcome"], run.outcome["state"]) == ("done", "exited")
+    assert run.outcome["report"]["summary"] == "finished"
+    assert run.run_row()["pending_cause"] is None
+    assert final_cause(run) == "exit"
 
 
 def test_no_session_start_within_the_timeout_warns_and_the_run_goes_on(

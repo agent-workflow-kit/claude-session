@@ -532,6 +532,36 @@ def test_an_earlier_cause_stands_when_the_bound_is_reached(st: Store, tmp_path: 
     ]
 
 
+def test_a_report_keeps_its_outcome_when_the_bound_ends_the_run(st: Store, tmp_path: Path) -> None:
+    """A done report recorded before the bound: the bound still ends the run (cause timeout),
+    but the outcome is the report's, exit 0 (interface.md, Outcome mapping)."""
+    from claude_session.endmap import HeadlessResult, map_headless
+
+    r = bounded(st, tmp_path, bound=5.0)
+    done(st, r.sid)
+    r.sup.check_bound(104.0)
+    assert r.child.sent == []
+    r.sup.check_bound(105.0)
+    assert r.child.sent == [(signal.SIGTERM, "timeout")]
+    record = st.run_record(r.sid, 1)
+    mapped = map_headless(
+        pending_cause=record["pending_cause"],
+        report_status=record["report_status"],
+        result=HeadlessResult(),
+        returncode=-signal.SIGTERM,
+        session_started=True,
+        implicit_done=False,
+    )
+    final = supervisor._final(mapped, HeadlessResult())
+    assert (final.outcome, final.end_reason, final.exit_code, final.state, final.cause) == (
+        "done",
+        "timeout",
+        0,
+        "exited",
+        "timeout",
+    )
+
+
 def busy_store(st: Store, monkeypatch: pytest.MonkeyPatch, name: str, message: str) -> list[int]:
     """Make ``st.<name>`` always raise ``OperationalError(message)``; returns its calls."""
     import sqlite3
