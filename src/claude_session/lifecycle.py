@@ -76,6 +76,7 @@ from . import (
     permission_profiles,
     sessiondir,
     store,
+    taint,
     tmpdir,
     toolhooks,
 )
@@ -894,6 +895,8 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
             hook_timeouts=tuple(_texts(data["hook_timeouts"])),
             outcome_file=record["outcome_file"],
             conversation=_conversation(data["conversation"], record),
+            # From the run row, never the spec file: the store decides by the row too.
+            allow_tainted=taint.AllowTainted.from_invocation(_invocation(record)),
         )
     except (KeyError, TypeError, ValueError, AttributeError, UsageError) as exc:
         raise sessiondir.SessionDirUnsafe(
@@ -934,6 +937,10 @@ def _check_request(frozen: Frozen, data: Mapping[str, Any], record: Mapping[str,
         raise ValueError("the launch spec's mode is not the run's")
     if frozen.resolution.kind != record["run_kind"]:
         raise ValueError("the launch spec's kind is not the run's")
+    # The taint checks decide by the row's reads_third_party: a spec that launches the run
+    # with another profile would run a trusted profile where the store saw an isolated one.
+    if frozen.resolution.profile.reads_third_party != bool(record["reads_third_party"]):
+        raise ValueError("the launch spec's reads_third_party is not the run's")
     if _bool(data["has_prompt"]) != bool(record["has_prompt"]):
         raise ValueError("the launch spec's prompt presence is not the run's")
     flags = dict(_mapping(data["flags"]))
@@ -1259,6 +1266,7 @@ def adoption_plan(
         sandbox=sandbox,
         preview=dryrun.plan_preview(cfg, resolution, process, found, writable),
         cwd=found.checked.cwd if found.checked is not None else adoption.frozen.cwd,
+        allow_tainted=req.allow_tainted is not None,
         csession_id=sid,
         run=record["run_no"],
     )

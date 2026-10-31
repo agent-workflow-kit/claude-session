@@ -34,8 +34,8 @@ The inline liveness check (``liveness``) runs right before allocation: a run who
 died is finalized (and salvaged) there, so only a run that is still live (or pending) refuses a
 resume ``live``. The source is read earlier, at step 2: a run the check will finalize already
 counts as final there (``liveness.classify``), and as ``not-started`` when it never spawned.
-TODO(#30): ``--allow-tainted`` (human-only, audited ``resume_tainted``); until then a tainted
-session is refused for a run that is not third-party-reading whatever the flags.
+``--allow-tainted`` is checked human-only at step 2 (``taint.from_args``, exit 2) and recorded
+on the run; the store lifts the ``tainted`` refusal for it (``taint``).
 TODO(#31): ``--override-escalation`` (human-only; only after a run that ended ``escalated``;
 it overrides that run's escalating ``pre-launch`` hooks).
 """
@@ -51,7 +51,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from . import dryrun, gitinfo, ids, kinds, launch, sessiondir, store
+from . import dryrun, gitinfo, ids, kinds, launch, sessiondir, store, taint
 from . import liveness as check_liveness
 from .config import Config
 from .errors import InternalError, LaunchValidationError, NotFoundError, UsageError
@@ -604,6 +604,7 @@ def prepare(
     exit 2 before anything is allocated or finalized."""
     given = args.id if getattr(args, "id", None) is not None else args.resume
     fork = bool(getattr(args, "fork", False))
+    allow_tainted = taint.from_args(args)  # human-only (exit 2), before the lookup
     sid = lookup(st, given)
     source = load_source(st, sid, process.state_root)
     origin = load_origin(st, source) if not fork and source.reforks else None
@@ -632,6 +633,7 @@ def prepare(
         plugin_dirs=req.plugin_dirs if args.plugin_dir is not None else carried.plugin_dirs,
         carried=carried.flags,
         conversation=talk,
+        allow_tainted=allow_tainted,
     )
     _check_merged_inputs(source, req, args, process, fork=fork, cap=cfg.input_max_bytes)
     previous = kinds.Previous(
@@ -740,10 +742,12 @@ def allocate(
 def would_refuse(planned: Planned) -> str | None:
     """The refusal a launch would get, without changing anything (interface.md, resume):
     ``live`` (not with ``--fork``; a pending run past its deadline is not live: the
-    liveness check would end it), then ``tainted``."""
+    liveness check would end it), then ``tainted`` (not with ``--allow-tainted``)."""
     source = planned.source
     if not planned.fork and not source.final:
         return "live"
+    if planned.req.allow_tainted is not None:
+        return None
     trusted = not planned.resolved.resolution.profile.reads_third_party
     if trusted and (source.tainted or (planned.origin is not None and planned.origin.tainted)):
         return "tainted"
@@ -830,7 +834,7 @@ def plan(
         sandbox=sandbox,
         preview=dryrun.plan_preview(cfg, resolution, process, found, writable),
         cwd=cwd,
-        allow_tainted=bool(getattr(args, "allow_tainted", False)),
+        allow_tainted=req.allow_tainted is not None,
         override_escalation=bool(getattr(args, "override_escalation", False)),
         csession_id=None if planned.fork else source.csession_id,
         run=alloc.run,

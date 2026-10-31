@@ -1031,9 +1031,11 @@ class Store:
         A fork (``forked_from``: the source session) records ``forked_from`` and copies the
         source's taint, read in this transaction: an unknown or forgotten source raises
         ``NotFoundError``, and a tainted source forked into a run that is not
-        third-party-reading raises ``RefusedError`` (``tainted``)."""
+        third-party-reading raises ``RefusedError`` (``tainted``) unless the run records
+        ``--allow-tainted`` (``ALLOW_TAINTED``); the fork is tainted either way."""
         if run.wrapper_pid is None or run.wrapper_start is None:
             raise ValueError("a run is allocated with its wrapper")
+        allow = _allows_tainted(run.invocation)
         with self.transaction() as conn:
             now = format_ts(self.clock())
             taint = (
@@ -1047,7 +1049,7 @@ class Store:
                 if source is None or source[0] is not None:
                     raise NotFoundError(f"unknown session: {forked_from}")
                 if source[1]:
-                    _refuse_tainted(forked_from, run.reads_third_party)
+                    _refuse_tainted(forked_from, run.reads_third_party, allow)
                     # The fork inherits the source's taint (and its time); no run of the
                     # fork caused it.
                     taint = (1, source[2] or now, None)
@@ -1092,7 +1094,8 @@ class Store:
         and not be forgotten (``NotFoundError``); its current run must still be
         ``previous_run`` (the run the carry-over was computed from) and final, else
         ``RefusedError`` ``live``; a tainted session resumed into a run that is not
-        third-party-reading is refused ``tainted``. Then the run row (with its wrapper set,
+        third-party-reading is refused ``tainted`` unless the run records ``--allow-tainted``
+        (``ALLOW_TAINTED``). Then the run row (with its wrapper set,
         as ``allocate``), the session's current run and state ``starting``, the taint of a
         third-party-reading run, the given labels (added) and the ``launch`` event. Returns
         the new run number."""
@@ -1121,7 +1124,8 @@ class Store:
                     f"cannot resume {csession_id}: it is live; {LIVE_HINT}", reason="live"
                 )
             if tainted:
-                _refuse_tainted(csession_id, run.reads_third_party)
+                allow = _allows_tainted(run.invocation)
+                _refuse_tainted(csession_id, run.reads_third_party, allow)
             run_no = previous_run + 1
             now = format_ts(self.clock())
             self._insert_run(conn, csession_id, run_no, run, now, None)
@@ -1247,22 +1251,44 @@ class Store:
                 (json.dumps(invocation, ensure_ascii=False), csession_id, run_no),
             )
 
-    def recheck_fork_taint(self, csession_id: str, source: str, *, reads_third_party: bool) -> None:
-        """Right before step 7 of a run that forks ``source``'s conversation (a fork's run 1,
-        or a later run of a fork that never captured a Claude id): the source's taint read
-        again in one transaction (it may have been tainted since the fork was allocated).
-        A tainted source and a third-party-reading run: the taint is copied onto the fork
-        (when it is not tainted yet); a run that is not third-party-reading is refused
-        ``tainted`` (``_refuse_tainted``, ``RefusedError``)."""
+    def recheck_fork_taint(self, csession_id: str, run_no: int, source: str | None) -> bool:
+        """Right before step 7 of every run: the taint read again in one transaction, with
+        the run's own ``reads_third_party`` and ``--allow-tainted`` as its row records them
+        (never the launch spec file). For a run that forks ``source``'s conversation (a
+        fork's run 1, or a later run of a fork that never captured a Claude id), the
+        source's taint (it may have been tainted since the fork was allocated): a tainted
+        source that does not refuse the run copies its taint onto the fork. Then the
+        session's own taint. A tainted one with a run that is not third-party-reading is
+        refused ``tainted`` (``_refuse_tainted``, ``RefusedError``) unless the run recorded
+        ``--allow-tainted``. Returns whether only ``--allow-tainted`` lets the run go ahead
+        (its ``resume_tainted`` record is then due)."""
         with self.transaction() as conn:
-            _recheck_fork_taint(conn, csession_id, source, reads_third_party)
+            row = conn.execute(
+                "SELECT r.reads_third_party, r.invocation_json FROM runs r "
+                "WHERE r.csession_id = ? AND r.run_no = ?",
+                (csession_id, run_no),
+            ).fetchone()
+            if row is None:
+                raise InternalError(f"no run {run_no} of session {csession_id}")
+            third_party, allow = bool(row[0]), allows_tainted(row[1])
+            lifted = False
+            if source is not None:
+                lifted = _recheck_fork_taint(conn, csession_id, source, third_party, allow)
+            tainted = conn.execute(
+                "SELECT tainted FROM sessions WHERE csession_id = ?", (csession_id,)
+            ).fetchone()
+            if tainted is not None and tainted[0]:
+                lifted = _refuse_tainted(csession_id, third_party, allow) or lifted
+            return lifted
 
     def fork_source_taints(self, csession_id: str) -> bool:
         """Whether adopting the session's current run now would be refused ``tainted`` by
         the fork re-check (``adopt``): the run forks its source's conversation, is not
-        third-party-reading, and the source is tainted. Reads only (a dry run)."""
+        third-party-reading, did not record ``--allow-tainted``, and the source is tainted.
+        Reads only (a dry run)."""
         row = self.conn.execute(
-            "SELECT s.forked_from, s.claude_session_id, r.reads_third_party, src.tainted "
+            "SELECT s.forked_from, s.claude_session_id, r.reads_third_party, src.tainted, "
+            "r.invocation_json "
             "FROM sessions s JOIN runs r "
             "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
             "LEFT JOIN sessions src ON src.csession_id = s.forked_from "
@@ -1271,12 +1297,13 @@ class Store:
         ).fetchone()
         if row is None:
             return False
-        forked_from, claude_id, third_party, source_tainted = row
+        forked_from, claude_id, third_party, source_tainted, invocation = row
         return (
             forked_from is not None
             and claude_id is None
             and not third_party
             and bool(source_tainted)
+            and not allows_tainted(invocation)
         )
 
     def set_pending_cause(self, csession_id: str, run_no: int, cause: str) -> bool:
@@ -1546,7 +1573,8 @@ class Store:
           with ``never_adopted`` in this transaction (cause ``adopt``), then ``expired``;
         - a pending run that forks its source's conversation (a fork's run 1, or a later run
           of a fork that never captured a Claude id) whose source is tainted now while the
-          run is not third-party-reading (``_refuse_tainted``): finalized ``not-started``
+          run is not third-party-reading and did not record ``--allow-tainted``
+          (``_refuse_tainted``): finalized ``not-started``
           with ``never_adopted`` (cause ``adopt``) in this transaction, then ``tainted``;
         - otherwise the wrapper is set (this process), and ``outcome_file`` and
           ``hook_interpreter`` (the adopting process's, written into the injected hooks),
@@ -1555,7 +1583,7 @@ class Store:
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT s.forgotten_at, r.run_no, r.wrapper_pid, r.ended_at, r.expires_at, "
-                "s.forked_from, s.claude_session_id, r.reads_third_party "
+                "s.forked_from, s.claude_session_id, r.reads_third_party, r.invocation_json "
                 "FROM sessions s JOIN runs r "
                 "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
                 "WHERE s.csession_id = ?",
@@ -1563,7 +1591,7 @@ class Store:
             ).fetchone()
             if row is None or row[0] is not None:
                 return Adoption("not_found", None)
-            _, current, wrapper, ended, expires, forked_from, claude_id, third_party = row
+            _, current, wrapper, ended, expires, forked_from, claude_id, third_party, inv = row
             if run_no is not None and run_no != current:
                 return Adoption("expired", run_no)
             if ended is not None:
@@ -1577,7 +1605,9 @@ class Store:
                 return Adoption("expired", current, expired_now=True)
             if forked_from is not None and claude_id is None:
                 try:
-                    _recheck_fork_taint(conn, csession_id, forked_from, bool(third_party))
+                    _recheck_fork_taint(
+                        conn, csession_id, forked_from, bool(third_party), allows_tainted(inv)
+                    )
                 except RefusedError:
                     final = dataclasses.replace(
                         NEVER_ADOPTED,
@@ -2181,39 +2211,71 @@ DELIVERY_LEASE_PREFIX = "delivery:"
 
 
 LIVE_HINT = "resume --fork still works"
+# The key of ``runs.invocation_json`` that records ``--allow-tainted`` (``taint.AllowTainted``).
+ALLOW_TAINTED = "allow_tainted"
 # The run columns a finalization compare-and-set may also require unchanged (``expect``).
 EXPECTABLE = frozenset({"wrapper_pid", "wrapper_start", "child_pid", "child_start"})
 
 
 def _recheck_fork_taint(
-    conn: sqlite3.Connection, csession_id: str, source: str, reads_third_party: bool
-) -> None:
+    conn: sqlite3.Connection,
+    csession_id: str,
+    source: str,
+    reads_third_party: bool,
+    allow_tainted: bool = False,
+) -> bool:
     """``Store.recheck_fork_taint`` inside the caller's transaction. An unknown source (its
-    rows deleted by retention) has nothing to re-check."""
+    rows deleted by retention) has nothing to re-check. A tainted source that does not
+    refuse the run (third-party-reading, or ``--allow-tainted``) copies its taint onto the
+    fork: the fork's conversation holds what tainted it. Returns whether only
+    ``--allow-tainted`` let the run go ahead (``_refuse_tainted``)."""
     row = conn.execute(
         "SELECT tainted, tainted_at FROM sessions WHERE csession_id = ?", (source,)
     ).fetchone()
     if row is None or not row[0]:
-        return
-    _refuse_tainted(source, reads_third_party)
+        return False
+    lifted = _refuse_tainted(source, reads_third_party, allow_tainted)
     conn.execute(
         "UPDATE sessions SET tainted = 1, tainted_at = ?, tainted_by_run = NULL "
         "WHERE csession_id = ? AND tainted = 0",
         (row[1], csession_id),
     )
+    return lifted
 
 
-def _refuse_tainted(csession_id: str, reads_third_party: bool) -> None:
+def allows_tainted(invocation_json: str | None) -> bool:
+    """Whether the run row recorded ``--allow-tainted`` (``ALLOW_TAINTED`` in its
+    ``invocation_json``: an object with a boolean ``tty``; ``taint.AllowTainted``). Anything
+    malformed counts as not given (the refusal stands)."""
+    try:
+        invocation = json.loads(invocation_json or "{}")
+    except ValueError:
+        return False
+    return _allows_tainted(invocation)
+
+
+def _allows_tainted(invocation: object) -> bool:
+    if not isinstance(invocation, Mapping):
+        return False
+    value = invocation.get(ALLOW_TAINTED)
+    return isinstance(value, Mapping) and isinstance(value.get("tty"), bool)
+
+
+def _refuse_tainted(csession_id: str, reads_third_party: bool, allow_tainted: bool = False) -> bool:
     """A tainted session resumed or forked into a run that is not third-party-reading is
-    refused (interface.md, Taint).
-
-    TODO(#30): ``--allow-tainted`` (human-only, audited ``resume_tainted``) lifts this
-    refusal; until then it is refused whatever the flags."""
-    if not reads_third_party:
-        raise RefusedError(
-            f"{csession_id} is tainted: a run of a kind that is not third-party-reading is refused",
-            reason="tainted",
-        )
+    refused (interface.md, Taint), unless the run recorded ``--allow-tainted`` (human-only,
+    checked at launch step 2). The single refusal point: the allocation, the adoption
+    compare-and-set and the check right before step 7 all decide here. Returns whether the
+    refusal was lifted by ``--allow-tainted`` (the run then owes its ``resume_tainted``
+    audit record, written right before step 7: ``launch.recheck_fork_taint``)."""
+    if reads_third_party:
+        return False
+    if allow_tainted:
+        return True
+    raise RefusedError(
+        f"{csession_id} is tainted: a run of a kind that is not third-party-reading is refused",
+        reason="tainted",
+    )
 
 
 # Run and session columns ``exec`` sets after allocation (``update_run``, ``update_session``).

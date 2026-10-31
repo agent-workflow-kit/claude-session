@@ -69,6 +69,7 @@ from . import (
     sessiondir,
     settings_builder,
     store,
+    taint,
     tmpdir,
 )
 from .config import Config
@@ -188,6 +189,9 @@ class Request:
     outcome_file: str | None
     carried: Mapping[str, Any] = field(default_factory=dict)
     conversation: Conversation = field(default_factory=Conversation)
+    # --allow-tainted (resume and start --resume), human-checked at step 2; recorded in the
+    # run row's invocation_json, where the store reads it (store.ALLOW_TAINTED).
+    allow_tainted: taint.AllowTainted | None = None
 
 
 def _actor(given: str | None, cfg: Config) -> str:
@@ -498,6 +502,8 @@ def new_run(
         "outcome_file": req.outcome_file,
         "input_files": [item.name for item in req.inputs],
     }
+    if req.allow_tainted is not None:
+        invocation[store.ALLOW_TAINTED] = req.allow_tainted.invocation()
     if req.conversation.fork:
         # The conversation a fork forked: a later run of a fork that never captured a
         # Claude id forks it again (interface.md, Resume and fork carry-over).
@@ -2002,17 +2008,41 @@ def _cleanup(alloc: Allocated, v: Validated | None) -> list[str]:
     return warnings
 
 
-def recheck_fork_taint(st: store.Store, alloc: Allocated, resolution: kinds.Resolution) -> None:
-    """Right before step 7 of a run that forks a conversation (``alloc.taint_source``): the
-    source's taint read again (``Store.recheck_fork_taint``; it may have been tainted since
-    allocation). Raises ``RefusedError`` (``tainted``) for a run that is not
-    third-party-reading."""
-    if alloc.taint_source is not None:
-        st.recheck_fork_taint(
-            alloc.csession_id,
-            alloc.taint_source,
-            reads_third_party=resolution.profile.reads_third_party,
+def recheck_fork_taint(
+    st: store.Store,
+    alloc: Allocated,
+    resolution: kinds.Resolution,
+    *,
+    process: Process,
+    req: Request,
+    secrets: Sequence[str],
+) -> None:
+    """Right before step 7 of every run: the taint read again (``Store.recheck_fork_taint``):
+    the source's of a run that forks a conversation (``alloc.taint_source``; it may have been
+    tainted since allocation), and the session's own. Raises ``RefusedError`` (``tainted``)
+    for a run that is not third-party-reading without ``--allow-tainted``. A run that goes
+    ahead only because of ``--allow-tainted`` gets its ``resume_tainted`` audit record here,
+    before anything of step 7 (raises when it cannot be written: the run then ends
+    ``launch_interrupted`` and ``claude`` is never spawned)."""
+    if not st.recheck_fork_taint(alloc.csession_id, alloc.run, alloc.taint_source):
+        return
+    allow = req.allow_tainted
+    if allow is None:  # the row recorded the flag, but this process was not given it
+        raise InternalError(
+            f"run {alloc.run} of {alloc.csession_id} records --allow-tainted its request lacks"
         )
+    taint.audit_resume_tainted(
+        process.state_root,
+        AUDIT_NAME,
+        actor=req.actor,
+        decision_ids=req.decision_ids,
+        target=alloc.csession_id,
+        run=alloc.run,
+        run_kind=resolution.kind,
+        forked_from=alloc.taint_source,
+        allow=allow,
+        secrets=secrets,
+    )
 
 
 def _refused_end(refused: RefusedError) -> LaunchValidationError:
@@ -2080,7 +2110,7 @@ def run(
                 audit_sandbox_lowered(process, req, resolution, alloc, secrets)
                 st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
                 # TODO(#31): insert step 6 (pre-launch hooks) before this re-check.
-                recheck_fork_taint(st, alloc, resolution)
+                recheck_fork_taint(st, alloc, resolution, process=process, req=req, secrets=secrets)
                 prepared = prepare(st, cfg, req, resolution, alloc, v, process)
                 st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
                 signals.defer()  # the supervisor raises a signal from here before the spawn
