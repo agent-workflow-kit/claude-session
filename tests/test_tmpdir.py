@@ -622,3 +622,56 @@ def test_remove_refuses_a_root_with_a_wrong_mode(base: Path) -> None:
         assert (root / SID).is_dir()
     finally:
         root.chmod(0o700)
+
+
+def test_a_late_remove_spares_the_next_runs_tmpdir_created_after_the_identity_check(
+    base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run n's late removal checks the entry against its pin; run n + 1 then clears run n's
+    # directory and creates its own before the removal: run n + 1's directory survives.
+    first = tmpdir.create_pinned(SID, base=str(base))
+    later: list[tmpdir.Created] = []
+    real_identity = tmpdir._identity_at
+
+    def swapping(dir_fd: int, name: str) -> tuple[int, int] | None:
+        found = real_identity(dir_fd, name)
+        if not later:
+            later.append(tmpdir.create_pinned(SID, base=str(base)))
+            (Path(later[0].path) / "f").write_text("run n + 1")
+        return found
+
+    monkeypatch.setattr(tmpdir, "_identity_at", swapping)
+    try:
+        assert tmpdir.remove(SID, base=str(base), pin=first.pin) is True
+        assert (Path(later[0].path) / "f").read_text() == "run n + 1"
+        assert stale_entries(base) == []
+    finally:
+        os.close(first.pin)
+        for created in later:
+            os.close(created.pin)
+
+
+def test_a_late_remove_puts_back_the_next_runs_tmpdir_it_moved_aside(
+    base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run n + 1 creates its directory right before run n's removal moves the entry aside:
+    # the moved entry is not run n's, so it is put back under the session's name.
+    first = tmpdir.create_pinned(SID, base=str(base))
+    later: list[tmpdir.Created] = []
+    real_rename = os.rename
+
+    def swapping(src: str, dst: str, **kwargs: object) -> None:
+        if not later:
+            later.append(tmpdir.create_pinned(SID, base=str(base)))
+            (Path(later[0].path) / "f").write_text("run n + 1")
+        real_rename(src, dst, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "rename", swapping)
+    try:
+        assert tmpdir.remove(SID, base=str(base), pin=first.pin) is False
+        assert (Path(later[0].path) / "f").read_text() == "run n + 1"
+        assert stale_entries(base) == []
+    finally:
+        os.close(first.pin)
+        for created in later:
+            os.close(created.pin)

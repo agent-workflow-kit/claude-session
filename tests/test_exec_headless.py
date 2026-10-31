@@ -1182,6 +1182,54 @@ def test_a_leftover_tmpdir_after_a_launch_failure_is_a_warning(
     assert any("could not be removed; remove it: rm -rf" in w for w in outcome["warnings"])
 
 
+def test_a_failure_right_after_the_tmpdir_is_created_removes_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    state: Path,
+    work: Path,
+) -> None:
+    # Recording the tmpdir on the session fails right after the self-check created it: the
+    # tmpdir is removed and its pin closed, and the run ends not-started as before.
+    from claude_session import store, tmpdir
+
+    created: list[tuple[tmpdir.Created, tuple[int, int]]] = []
+    real_create = tmpdir.create_pinned
+    real_update = store.Store.update_session
+
+    def recording(*args: Any, **kwargs: Any) -> tmpdir.Created:
+        made = real_create(*args, **kwargs)
+        info = os.fstat(made.pin)
+        created.append((made, (info.st_dev, info.st_ino)))
+        return made
+
+    def failing(self: store.Store, csession_id: str, **fields: Any) -> None:
+        if "tmp_dir" in fields:
+            raise RuntimeError("database is locked")
+        real_update(self, csession_id, **fields)
+
+    monkeypatch.setattr(tmpdir, "create_pinned", recording)
+    monkeypatch.setattr(store.Store, "update_session", failing)
+    code, outcome = exec_in_process(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        work,
+        [START, result_step()],
+        args=["--sandbox", "preferred"],
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    assert code == 12 and outcome["end_reason"] == "launch_interrupted", outcome
+    ((made, identity),) = created
+    assert not os.path.lexists(made.path)
+    try:  # the pin is closed (its number may have been reused since)
+        info = os.fstat(made.pin)
+    except OSError:
+        pass
+    else:
+        assert (info.st_dev, info.st_ino) != identity
+
+
 def test_a_report_committed_while_the_end_is_mapped_is_not_lost(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

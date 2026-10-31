@@ -43,7 +43,8 @@ and allocation of ``resume``; its launch spec also freezes the conversation (``-
 ``--fork-session``, ``--session-id``), and its adopting ``exec`` drains the previous run's
 outbox (a fork's run 1 places its inputs beside the copied ones). ``start --resume
 --dry-run`` is ``resume.plan``.
-TODO(#31): the ``pre-launch`` hooks of the adopting ``exec`` (launch step 6).
+TODO(#31): insert step 6 (the ``pre-launch`` hooks) of the adopting ``exec`` before its fork
+taint re-check (``launch.recheck_fork_taint``).
 TODO(#17): interactive adoption (signal handlers before the compare-and-set, the TTY handed
 to ``claude``); until then an adoptable interactive pending run with a TTY is refused before
 the compare-and-set (it stays pending).
@@ -993,7 +994,12 @@ def adopt(
         launch.event_log(process), "adopt", level="info", csession_id=sid, run=run
     )
     # Any run of a fork may merge into an inputs/<run>/ the fork copy made.
-    forked = record["session_forked_from"] is not None
+    forked_from = record["session_forked_from"]
+    forked = forked_from is not None
+    # A run that forks the source's conversation (a fork's run 1, or a later run of a fork
+    # that never captured a Claude id: it repeats the fork) re-checks the source's taint
+    # right before step 7, as a plain resume --fork does.
+    forks_conversation = forked and record["session_claude_session_id"] is None
     alloc = launch.Allocated(
         csession_id=sid,
         run=run,
@@ -1005,6 +1011,7 @@ def adopt(
         # its inputs beside the ones start copied from the source.
         previous_run=run - 1 if run > 1 else None,
         forked=forked,
+        taint_source=forked_from if forks_conversation else None,
     )
     try:
         adopted = st.current_run(sid)

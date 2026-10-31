@@ -901,6 +901,74 @@ def test_a_fork_whose_source_became_tainted_before_the_spawn_is_refused(
     assert len(starts(env)) == 1
 
 
+def adopt_in_process(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], sid: str
+) -> tuple[int, dict[str, Any]]:
+    """``cli.main`` of the adopting ``exec`` in this process (so a test can patch launch
+    steps)."""
+    from claude_session import cli
+
+    monkeypatch.chdir(env.work)
+    monkeypatch.setattr(sys, "argv", [str(CLAUDE_SESSION)])
+    for key, value in private_home(env.tmp_path).items():
+        monkeypatch.setenv(key, value)
+    capsys.readouterr()
+    code = cli.main(["exec", "--session-id", sid, "--json"])
+    return code, json.loads(capsys.readouterr().out)
+
+
+def taint_after_validate(env: Env, monkeypatch: pytest.MonkeyPatch, source: str) -> None:
+    """A third-party-reading run of ``source`` taints it between step 5 and step 7."""
+    real_validate = launch.validate
+
+    def tainting(*args: Any, **kwargs: Any) -> launch.Validated:
+        validated = real_validate(*args, **kwargs)
+        env.write_db(
+            "UPDATE sessions SET tainted = 1, tainted_at = '2026-01-01T00:00:00Z' "
+            "WHERE csession_id = ?",
+            (source,),
+        )
+        return validated
+
+    monkeypatch.setattr(launch, "validate", tainting)
+
+
+def test_an_adopted_fork_whose_source_became_tainted_before_the_spawn_is_refused(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = exec_session(env)["csession_id"]
+    proc, out = run_cs(env, ["start", "--json", "--resume", sid, "--fork"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    fork = out["csession_id"]
+    # The source is tainted after the adoption's compare-and-set, before step 7.
+    taint_after_validate(env, monkeypatch, sid)
+    code, out = adopt_in_process(env, monkeypatch, capsys, fork)
+    assert code == 20 and out["error"]["reason"] == "tainted", out
+    row = env.run_row(fork)
+    assert (row["outcome"], row["end_reason"]) == ("not-started", "launch_interrupted")
+    assert "tainted" in row["message"]
+    assert len(starts(env)) == 1  # the source's run; the fork never started
+
+
+def test_an_adopted_repeated_fork_whose_source_became_tainted_before_the_spawn_is_refused(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = exec_session(env, "--cwd", "session-dir")["csession_id"]
+    proc, out = resume(env, sid, "--fork")
+    assert_not_started(proc, out, "fork_cwd_unsupported")
+    fork = out["csession_id"]
+    assert claude_id(env, fork) is None
+    # start --resume of the fork repeats the fork; its source is tainted before step 7.
+    proc, out = run_cs(env, ["start", "--json", "--resume", fork, "--cwd", str(env.work)])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    taint_after_validate(env, monkeypatch, sid)
+    code, out = adopt_in_process(env, monkeypatch, capsys, fork)
+    assert code == 20 and out["error"]["reason"] == "tainted", out
+    row = env.run_row(fork, 2)
+    assert (row["outcome"], row["end_reason"]) == ("not-started", "launch_interrupted")
+    assert len(starts(env)) == 1
+
+
 def test_a_resume_of_a_fork_that_never_started_repeats_the_fork(env: Env) -> None:
     sid = exec_session(env, "--cwd", "session-dir")["csession_id"]
     source_claude = claude_id(env, sid)

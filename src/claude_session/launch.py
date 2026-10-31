@@ -1228,10 +1228,30 @@ class Recording(Effects):
     def sandbox(
         self, resolution: kinds.Resolution, alloc: Allocated, tools: Tools, process: Process
     ) -> selfcheck.SelfCheck:
+        """The self-check, then the created tmpdir recorded on the session. When recording
+        fails, the tmpdir is removed (with its pin) and the pin closed before the error is
+        re-raised: the run's ``Validated`` never exists, so ``_cleanup`` cannot."""
         check = check_sandbox(resolution, alloc, tools, process)
         if check.tmpdir is not None:
-            self.st.update_session(alloc.csession_id, tmp_dir=check.tmpdir)
+            try:
+                self.st.update_session(alloc.csession_id, tmp_dir=check.tmpdir)
+            except BaseException:
+                _discard_tmpdir(alloc.csession_id, check.tmpdir_pin)
+                raise
         return check
+
+
+def _discard_tmpdir(csession_id: str, pin: int | None) -> None:
+    """Remove the tmpdir a failed step 5 created (best effort; a leftover is cleared by the
+    next ``tmpdir.create``) and close its pin."""
+    if pin is None:
+        return
+    try:
+        tmpdir.remove(csession_id, pin=pin)
+    except OSError:
+        pass
+    finally:
+        os.close(pin)
 
 
 def checks(
@@ -1732,8 +1752,10 @@ def _cleanup(alloc: Allocated, v: Validated | None) -> list[str]:
     effort; a leftover tmpdir is reported as a run warning and is reconcile's, #33). Only
     the tmpdir this run created is removed (``tmpdir.remove`` with its pin): the run
     is final by now, so the next run of the session may already have created its own. A
-    run whose ``validate`` did not return created none (the self-check is the last action
-    of step 5); a leftover of an earlier run is cleared by the next ``tmpdir.create``."""
+    run whose ``validate`` did not return left none: the self-check, which creates it, is
+    the last action of step 5, and a failure to record it removes it
+    (``Recording.sandbox``); a leftover of an earlier run is cleared by the next
+    ``tmpdir.create``."""
     warnings: list[str] = []
     if v is not None:
         try:
@@ -1807,7 +1829,7 @@ def run(
             # used for the log from here on, is that set plus the run secret.
             audit_sandbox_lowered(process, req, resolution, alloc, secrets)
             st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
-            # TODO(#31): the pre-launch hooks (step 6) run before this re-check.
+            # TODO(#31): insert step 6 (pre-launch hooks) before this re-check.
             recheck_fork_taint(st, alloc, resolution)
             prepared = prepare(st, cfg, req, resolution, alloc, v, process)
             st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
