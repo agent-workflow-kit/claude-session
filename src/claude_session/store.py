@@ -1204,6 +1204,16 @@ class Store:
         names = [column[0] for column in cursor.description]
         return dict(zip(names, row, strict=True))
 
+    def session_labels(self, csession_id: str) -> list[tuple[str, str]]:
+        """The session's labels as ``(key, value)`` pairs, ordered by key, then value."""
+        return [
+            (key, value)
+            for key, value in self.conn.execute(
+                "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+                (csession_id,),
+            )
+        ]
+
     # The hook path (hookevent). Call these inside one ``transaction()``; they read and write
     # only columns of schema 1.0, so a newer additive schema keeps working (design.md, Data
     # model: hook-event never migrates).

@@ -29,7 +29,11 @@ CAPS = {"summary_max_bytes": 65536, "artifact_max_bytes": 10485760}
 
 
 def hookconf(inputs: list[str]) -> bytes:
-    return hookevent.hookconf_bytes(inputs, **CAPS)
+    return hookevent.hookconf_bytes(
+        inputs,
+        summary_max_bytes=CAPS["summary_max_bytes"],
+        artifact_max_bytes=CAPS["artifact_max_bytes"],
+    )
 
 
 class Env:

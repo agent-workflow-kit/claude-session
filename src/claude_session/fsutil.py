@@ -11,7 +11,6 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
-import secrets
 import stat
 import sys
 import time
@@ -27,6 +26,13 @@ _SUBDIR_FLAGS = _DIR_FLAGS | os.O_NONBLOCK
 
 class UnsafePathError(OSError):
     """A directory that is not a real directory owned by this user."""
+
+
+def token_hex(nbytes: int) -> str:
+    """``nbytes`` random bytes as hex, as ``secrets.token_hex`` makes them and from the same
+    source: this module is imported on every hook, and importing ``secrets`` costs
+    milliseconds there."""
+    return os.urandom(nbytes).hex()
 
 
 def _check_segment(name: str) -> None:
@@ -178,7 +184,7 @@ def write_private_file_at(
     removed) and ``ValueError`` when ``name`` is not one path segment."""
     _check_segment(name)
     tmp_fd = dir_fd if tmp_dir_fd is None else tmp_dir_fd
-    tmp_name = f".{secrets.token_hex(4)}.tmp"
+    tmp_name = f".{token_hex(4)}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(tmp_name, flags, 0o600, dir_fd=tmp_fd)
     try:

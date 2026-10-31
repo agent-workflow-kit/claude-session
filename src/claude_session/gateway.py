@@ -26,10 +26,11 @@ Rules every call follows:
   child never consumes the hook payload on ``hook-event``'s stdin.
 - Lifecycle hooks use ``run(..., new_process_group=True, kill_grace=...)``: on timeout the
   group gets SIGTERM, then SIGKILL after ``kill_grace`` (interface.md, Hooks). The notes command
-  uses ``run(..., new_process_group=True)`` with no grace (interface.md specifies none): on
-  timeout its group gets SIGKILL. Either way a timeout ends everything still in the child's
-  process group; a descendant that calls ``setsid``/``setpgid`` escapes (see
-  ``GatewayTimeout``).
+  uses ``run(..., new_process_group=True, kill_over_bytes=...)`` with no grace (interface.md
+  specifies none): on timeout, or once its stdout passes ``kill_over_bytes`` bytes
+  (``GatewayOutputLimit``), its group gets SIGKILL. Either way a timeout ends everything
+  still in the child's process group; a descendant that calls ``setsid``/``setpgid`` escapes
+  (see ``GatewayTimeout``).
 
 ``die_with_parent`` (``spawn``, Linux only, ignored elsewhere) sets ``PR_SET_PDEATHSIG(SIGTERM)``
 in the child between fork and exec (through ``ctypes``, resolved before the fork, in
@@ -112,6 +113,17 @@ class Result:
     stderr: str
 
 
+class GatewayOutputLimit(Exception):
+    """``run``'s child wrote more than ``kill_over_bytes`` bytes to stdout. The child was ended as
+    on a timeout (see ``GatewayTimeout``) before this is raised, so an endless writer never
+    fills this process's memory."""
+
+    def __init__(self, argv: Sequence[str], limit: int) -> None:
+        super().__init__(f"{argv[0]} wrote more than {limit} bytes")
+        self.argv = tuple(argv)
+        self.limit = limit
+
+
 class GatewayTimeout(Exception):
     """``run`` exceeded its timeout. Before this is raised:
 
@@ -170,6 +182,7 @@ class Gateway(Protocol):
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        kill_over_bytes: int | None = None,
     ) -> Result:
         """Run to completion, capturing text output. ``new_process_group`` puts the child in
         its own process group, which a timeout ends as a whole; ``kill_grace`` (only with a
@@ -177,8 +190,9 @@ class Gateway(Protocol):
         while waiting (a signal handler raising, ``KeyboardInterrupt`` included) ends the child
         the same way, then propagates (on Linux; best effort without ``os.waitid``, see
         ``GatewayTimeout``); one raised during the grace still gets the group SIGKILL and the
-        leader reaped first. Raises ``GatewayTimeout``, and ``OSError`` when the
-        program cannot be started."""
+        leader reaped first. ``kill_over_bytes`` bounds what is kept: more stdout than that ends the
+        child the same way and raises ``GatewayOutputLimit``; stderr past it is dropped.
+        Raises ``GatewayTimeout``, and ``OSError`` when the program cannot be started."""
         ...
 
     def spawn(
@@ -260,6 +274,12 @@ def check_kill_grace(kill_grace: float | None, *, new_process_group: bool) -> No
         raise ValueError("kill_grace needs new_process_group (it applies to the group)")
     if kill_grace < 0:
         raise ValueError(f"kill_grace must not be negative, got {kill_grace}")
+
+
+def check_kill_over_bytes(kill_over_bytes: int | None) -> None:
+    """``run``'s ``kill_over_bytes`` contract, shared with the fakes."""
+    if kill_over_bytes is not None and kill_over_bytes < 0:
+        raise ValueError(f"kill_over_bytes must not be negative, got {kill_over_bytes}")
 
 
 def _child_env(
@@ -480,17 +500,27 @@ def _wait_exited(
     popen.wait()  # it has exited: returns at once
 
 
+class _OutputLimit(Exception):
+    """stdout passed ``kill_over_bytes`` (``_exchange``)."""
+
+
 def _exchange(
-    popen: subprocess.Popen[bytes], data: bytes | None, timeout: float | None
+    popen: subprocess.Popen[bytes],
+    data: bytes | None,
+    timeout: float | None,
+    kill_over_bytes: int | None = None,
 ) -> tuple[bytes, bytes]:
     """Like ``Popen.communicate``: write ``data`` to stdin, read stdout and stderr to EOF,
     wait for the exit; ``subprocess.TimeoutExpired`` after ``timeout`` seconds. Unlike it, the
-    child is never reaped before it has exited, even when interrupted (see the module docs)."""
+    child is never reaped before it has exited, even when interrupted (see the module docs).
+    With ``kill_over_bytes``: ``_OutputLimit`` as soon as stdout passes it, and stderr past it is
+    dropped as it arrives."""
     deadline = None if timeout is None else time.monotonic() + timeout
     assert popen.stdout is not None and popen.stderr is not None
     out_fd, err_fd = popen.stdout.fileno(), popen.stderr.fileno()
     readers = {out_fd: popen.stdout, err_fd: popen.stderr}
     output: dict[int, list[bytes]] = {fd: [] for fd in readers}
+    kept = {fd: 0 for fd in readers}
     pending = memoryview(data or b"")
     with selectors.DefaultSelector() as selector:
         for fd in readers:
@@ -520,6 +550,11 @@ def _exchange(
                     continue
                 chunk = os.read(key.fd, _READ_SIZE)
                 if chunk:
+                    if kill_over_bytes is not None:
+                        if key.fd == out_fd and kept[out_fd] + len(chunk) > kill_over_bytes:
+                            raise _OutputLimit
+                        chunk = chunk[: max(0, kill_over_bytes - kept[key.fd])]
+                    kept[key.fd] += len(chunk)
                     output[key.fd].append(chunk)
                 else:
                     selector.unregister(key.fd)
@@ -576,9 +611,11 @@ class SystemGateway:
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        kill_over_bytes: int | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(kill_grace, new_process_group=new_process_group)
+        check_kill_over_bytes(kill_over_bytes)
         args = tuple(argv)
         data = None if stdin is None else stdin.encode("utf-8", "replace")
         with subprocess.Popen(
@@ -592,10 +629,14 @@ class SystemGateway:
             process_group=0 if new_process_group else None,
         ) as popen:
             try:
-                out, err = _exchange(popen, data, timeout)
+                out, err = _exchange(popen, data, timeout, kill_over_bytes)
             except subprocess.TimeoutExpired:
                 _end(popen, group=new_process_group, kill_grace=kill_grace)
                 raise GatewayTimeout(args, timeout) from None
+            except _OutputLimit:
+                assert kill_over_bytes is not None  # raised only with a limit
+                _end(popen, group=new_process_group, kill_grace=kill_grace)
+                raise GatewayOutputLimit(args, kill_over_bytes) from None
             except BaseException:
                 _end(popen, group=new_process_group, kill_grace=kill_grace)
                 raise

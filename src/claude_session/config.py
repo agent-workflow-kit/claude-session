@@ -151,10 +151,22 @@ def _no_leading_dash(value: str) -> str:
     return value
 
 
+def _has_controls(value: str) -> bool:
+    """Whether ``value`` holds a C0 (NUL included), DEL or C1 control character."""
+    return any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value)
+
+
 def _no_controls(value: str) -> str:
     """Non-empty, no C0, DEL or C1 control characters (``claude_bin``, ``model``)."""
-    if not value or any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
+    if not value or _has_controls(value):
         raise ValueError("must be non-empty and contain no control characters")
+    return value
+
+
+def _no_control_items(value: list[str]) -> list[str]:
+    """No item holds a control character (``notes_context_cmd``: argv, passed to exec)."""
+    if any(_has_controls(item) for item in value):
+        raise ValueError("items must contain no control characters")
     return value
 
 
@@ -366,7 +378,7 @@ class Config(_Model):
     default_kind: KindName  # also names a built-in or configured kind (checked by ``load``)
     claude_auth_env: list[EnvName]
     secret_env: list[EnvName]
-    notes_context_cmd: Annotated[list[str], Field(min_length=1)]
+    notes_context_cmd: Annotated[list[str], Field(min_length=1), AfterValidator(_no_control_items)]
     notes_context_timeout: PositiveDuration
     notes_context_max_bytes: Count
     notes_context_sources: list[Literal["startup", "resume", "fork", "clear", "compact", "other"]]

@@ -39,12 +39,14 @@ claude_auth_env: []
 secret_env: []
 
 # Session-start notes context (kinds with notes_context: true). argv list, no shell;
-# claude-session appends --repo=<repo-id> (one token) and one --label key=value per session label.
-# Exit 0 and 10 are success; other exits are logged at warn and the session starts without notes.
+# claude-session appends --repo=<repo-id> (one token) and one --label=<key>=<value> token per
+# session label. Exit 0 and 10 are success; other exits are logged at warn and the session starts
+# without notes.
 notes_context_cmd: [memoctl, context]
-notes_context_timeout: 5s
-notes_context_max_bytes: 16384
-notes_context_sources: [startup]   # SessionStart sources: startup, resume, fork, clear, compact, other
+notes_context_timeout: 5s          # at most 15s is used (the SessionStart hook's budget)
+notes_context_max_bytes: 16384     # at most 1 MiB (1048576) is used
+# SessionStart sources: startup, resume, fork, clear, compact (other is accepted, never matches)
+notes_context_sources: [startup]
 
 summary_max_bytes: 65536      # cap for a report summary and reason (UTF-8 bytes each)
 artifact_max_bytes: 10485760  # cap for a reported artifact (10 MiB)

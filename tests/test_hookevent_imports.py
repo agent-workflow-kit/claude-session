@@ -17,7 +17,7 @@ from claude_session import store
 # Modules hook-event must never import, whether or not they are installed.
 FORBIDDEN = ("pydantic", "yaml", "argparse", "claude_session.cli", "claude_session.config")
 # claude_session modules hook-event may load (design.md: stdlib, store, outbox's ingestion
-# side and its secretindex, gateway; plus the stdlib-only errors, logs and fsutil helpers).
+# side and its secretindex, notes, gateway; plus the stdlib-only errors, logs and fsutil helpers).
 ALLOWED_PACKAGE_MODULES = {
     "claude_session",
     "claude_session.__main__",
@@ -26,6 +26,7 @@ ALLOWED_PACKAGE_MODULES = {
     "claude_session.outbox",
     "claude_session.secretindex",
     "claude_session.gateway",
+    "claude_session.notes",
     "claude_session.errors",
     "claude_session.logs",
     "claude_session.fsutil",
@@ -232,4 +233,28 @@ def test_entry_module_does_not_import_re() -> None:
     preloaded, loaded = proc.stdout.split()
     if preloaded == "1":
         pytest.skip("the interpreter loads re at startup")
+    assert loaded == "0"
+
+
+def test_hook_event_does_not_import_secrets() -> None:
+    """``hookevent`` (with ``notes``, ``outbox`` and ``fsutil``) is imported on every hook:
+    nonces and temporary names come from ``os.urandom``, since importing ``secrets`` costs
+    milliseconds."""
+    script = (
+        "import sys\n"
+        "preloaded = 'secrets' in sys.modules\n"
+        "import claude_session.hookevent\n"
+        "print(int(preloaded), int('secrets' in sys.modules))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    preloaded, loaded = proc.stdout.split()
+    if preloaded == "1":
+        pytest.skip("the interpreter loads secrets at startup")
     assert loaded == "0"
