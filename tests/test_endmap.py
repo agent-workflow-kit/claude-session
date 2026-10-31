@@ -8,9 +8,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from claude_session import endmap
 from claude_session.endmap import HeadlessResult, Mapped
+
+from .schemas import registry
 
 
 def line(obj: Any) -> bytes:
@@ -430,16 +433,37 @@ def test_interactive_session_rows(kwargs: dict[str, Any], expected: Mapped) -> N
     assert interactive(**kwargs) == expected
 
 
+OUTCOME_SCHEMA = "claude-session/cli/outcome.json"
+
+
+def outcome_def_validator(name: str) -> Draft202012Validator:
+    """A validator for ``$defs/<name>`` of schemas/cli/outcome.json."""
+    return Draft202012Validator({"$ref": f"{OUTCOME_SCHEMA}#/$defs/{name}"}, registry=registry())
+
+
 def test_every_interactive_mapping_passes_the_outcome_rules() -> None:
-    """Each interactive row gives an end reason its outcome allows (outcome.json
-    ``$defs/outcome_rules``): checked through the final state and the end-reason enum."""
-    for started in (True, False):
-        for end in (None, "prompt_input_exit", "clear"):
-            for report in (None, *sorted(endmap.REPORT_OUTCOMES)):
-                for code in (0, 1, 255, 130, -15):
-                    mapped = interactive(code=code, started=started, end=end, report=report)
-                    if report is None:
-                        assert mapped.outcome in ("exited-unreported", "killed")
-                    else:
-                        assert mapped.outcome == report
-                    assert mapped.end_reason not in ("auto_exit", "wrapper_lost", "lost")
+    """Each interactive row, recorded causes included, gives an end reason in outcome.json
+    ``$defs/end_reason`` that its outcome allows (``$defs/outcome_rules``)."""
+    end_reasons = outcome_def_validator("end_reason")
+    rules = outcome_def_validator("outcome_rules")
+    for cause in (None, *sorted(endmap.CAUSES)):
+        for started in (True, False):
+            for end in (None, "prompt_input_exit", "clear"):
+                for report in (None, *sorted(endmap.REPORT_OUTCOMES)):
+                    if cause == "auto_exit" and report is None:
+                        continue  # auto_exit is set only after a done report
+                    for code in (0, 1, 255, 130, -15):
+                        mapped = interactive(
+                            cause=cause, code=code, started=started, end=end, report=report
+                        )
+                        end_reasons.validate(mapped.end_reason)
+                        rules.validate(
+                            {
+                                "outcome": mapped.outcome,
+                                "end_reason": mapped.end_reason,
+                                "phase": "session",
+                                "report": None if report is None else {"status": report},
+                            }
+                        )
+                        if report is not None:
+                            assert mapped.outcome == report

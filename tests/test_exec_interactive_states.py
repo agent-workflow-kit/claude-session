@@ -377,13 +377,16 @@ def test_a_forwarded_signal_after_user_exit_keeps_its_cause(
     tmp_path: Path, state: Path, work: Path, sig: signal.Signals
 ) -> None:
     """A recorded ``forwarded_*`` cause wins over a SessionEnd ``prompt_input_exit`` (the
-    cause rows come first)."""
+    cause rows come first). The fake exits on either signal without firing SessionEnd (its
+    default SIGTERM handler would fire ``other``), so the recorded reason is still
+    ``prompt_input_exit`` and only the row order decides."""
     marker = tmp_path / "ended"
     term = start_terminal(
         tmp_path,
         state,
         work,
         [START, {"do": "session_end", "reason": "prompt_input_exit"}, touch(marker), HANG],
+        signals={"TERM": {"exit": 128 + signal.SIGTERM}},
     )
     try:
         wait_marker(term, marker)
@@ -391,9 +394,6 @@ def test_a_forwarded_signal_after_user_exit_keeps_its_cause(
     finally:
         got, outcome, err = term.finish()
     outcome = check_outcome(got, outcome, err)
+    assert run_row_of(state)["session_end_reason"] == "prompt_input_exit"
     cause = "forwarded_term" if sig == signal.SIGTERM else "forwarded_hup"
     assert (got, outcome["outcome"], outcome["end_reason"]) == (15, "killed", cause)
-    # The fake's SIGTERM fires SessionEnd ``other``; its SIGHUP fires none, so the recorded
-    # reason is still ``prompt_input_exit`` and only the cause decides.
-    expected = "other" if sig == signal.SIGTERM else "prompt_input_exit"
-    assert run_row_of(state)["session_end_reason"] == expected
