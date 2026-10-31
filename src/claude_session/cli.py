@@ -852,6 +852,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 # Traceback chunks laid out by the traceback module itself (headers, frames, the messages
 # between chained exceptions): their own newlines separate lines.
 _TRACEBACK_LAYOUT = ("Traceback ", "  File ", "\n", "  [Previous line repeated")
+# The margin of a chunk inside an exception group ("  | ", "  + ", deeper: "    | ").
+_GROUP_MARGIN = re.compile(r"(?: *[|+] )*")
 
 
 def _print_traceback() -> None:
@@ -864,7 +866,7 @@ def _print_traceback() -> None:
     lines: list[str] = []
     for chunk in traceback.TracebackException.from_exception(exc).format():
         text = chunk.removesuffix("\n")
-        if chunk.startswith(_TRACEBACK_LAYOUT):
+        if _GROUP_MARGIN.sub("", chunk, count=1).startswith(_TRACEBACK_LAYOUT):
             lines += [display(line) for line in text.split("\n")]
         else:
             lines.append(display(text))

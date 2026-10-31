@@ -630,6 +630,7 @@ class Store:
         holder: Holder | None,
         liveness: Liveness,
         clock: Clock,
+        known_liveness: Liveness = pid_known_alive,
     ) -> None:
         self.conn = conn
         self.path = path
@@ -638,6 +639,8 @@ class Store:
         # Lease ownership is (pid, start, token): two stores of one process never share one.
         self.token = uuid.uuid4().hex
         self.liveness = liveness
+        # For display only (an ended run's processes): "cannot tell" counts as gone.
+        self.known_liveness = known_liveness
         self.clock = clock
 
     @classmethod
@@ -652,6 +655,7 @@ class Store:
         liveness: Liveness | None = None,
         clock: Clock | None = None,
         migrate_wait: float = MIGRATE_WAIT,
+        known_liveness: Liveness | None = None,
     ) -> Store:
         """Open (creating it, mode 0600 in a 0700 directory) the database at ``path``.
 
@@ -673,6 +677,7 @@ class Store:
             holder=holder,
             liveness=liveness or pid_alive,
             clock=clock or utc_now,
+            known_liveness=known_liveness or pid_known_alive,
         )
         try:
             if migrate:

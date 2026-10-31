@@ -162,14 +162,14 @@ def _report(run: dict[str, Any]) -> dict[str, Any] | None:
 def _alive(st: store.Store, pid: object, start: object, *, ended: bool) -> bool:
     """Whether the exact process (PID and start-time token) still runs; read only. A PID
     outside 1..``store.MAX_PID`` names no process. For an ended run, an empty token or a
-    check the platform cannot answer counts as gone (``store.pid_known_alive``): its PID may
-    have been reused."""
+    check the platform cannot answer counts as gone (the store's ``known_liveness``, by default
+    ``store.pid_known_alive``): its PID may have been reused."""
     number = _int(pid)
     if number is None or not 0 < number <= store.MAX_PID:
         return False
     token = _text(start) or ""
     if ended:
-        return bool(token) and store.pid_known_alive(number, token)
+        return bool(token) and bool(st.known_liveness(number, token))
     return bool(st.liveness(number, token))
 
 

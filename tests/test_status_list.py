@@ -573,6 +573,28 @@ def test_verbose_traceback_is_escaped_line_by_line(
     assert lines[-1] == "claude-session: error: internal error: RuntimeError"
 
 
+def test_verbose_exception_group_traceback_keeps_frames_and_escapes_messages(
+    seeded: Store, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def boom(*args: object) -> None:
+        inner = ExceptionGroup("inner", [ValueError("v\nfake: line")])
+        raise ExceptionGroup("outer", [RuntimeError("evil\nfake: line"), inner])
+
+    monkeypatch.setattr(views, "status_object", boom)
+    assert main(["status", "cs-aaaa", "--verbose"]) == 1
+    err = capsys.readouterr().err
+    assert_inert(err)
+    lines = err.splitlines()
+    # Frames of the group are separate lines, not one escaped chunk.
+    assert any(line.startswith("  |   File ") for line in lines)
+    assert any(line.startswith("  |     raise ExceptionGroup(") for line in lines)
+    assert not any("\\x0a" in line for line in lines if "File " in line)
+    # A message's newline stays escaped, nested or not.
+    assert any(line.startswith("    | RuntimeError: evil\\x0a") for line in lines)
+    assert any(line.startswith("      | ValueError: v\\x0a") for line in lines)
+    assert lines[-1] == "claude-session: error: internal error: ExceptionGroup"
+
+
 def test_json_output_carries_hostile_text_escaped(
     seeded: Store, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -999,6 +1021,26 @@ def test_an_ended_run_is_not_alive_when_procinfo_cannot_answer(
     monkeypatch.setattr(store, "_procinfo", Broken())
     assert store.pid_alive(12345, "x:1")  # a live run: assumed alive
     assert not store.pid_known_alive(12345, "x:1")  # display of an ended run
+
+
+def test_an_ended_run_uses_the_stores_known_liveness_seam(seeded: Store, clock: Clock) -> None:
+    asked: list[tuple[int, str]] = []
+
+    def known(pid: int, start: str) -> bool:
+        asked.append((pid, start))
+        return (pid, start) == (4343, "boot:1")
+
+    with store.open_state(
+        clock=clock, liveness=lambda pid, start: False, known_liveness=known
+    ) as s:
+        obj = views.status_object(s, "cs-bbbbbbbb", None)
+        assert obj["run"]["wrapper_alive"] is True
+        assert (4343, "boot:1") in asked
+        # An empty start token is never alive for an ended run, whatever the checker says.
+        sql(s, "UPDATE runs SET wrapper_start = '' WHERE csession_id = 'cs-bbbbbbbb'")
+        asked.clear()
+        assert views.status_object(s, "cs-bbbbbbbb", None)["run"]["wrapper_alive"] is False
+        assert (4343, "") not in asked
 
 
 @pytest.mark.parametrize("pid", [2**31, 2**40, 2**63 - 1, -5])
