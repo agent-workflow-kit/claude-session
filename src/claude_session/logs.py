@@ -314,12 +314,17 @@ def timestamp(now: datetime | None = None) -> str:
     return now.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def append_record(path: str, record: Mapping[str, JSONValue]) -> None:
+def append_record(
+    path: str, record: Mapping[str, JSONValue], *, max_bytes: int | None = None
+) -> None:
     """Append the already validated and redacted ``record`` to the JSONL file ``path`` as one
     line (ASCII JSON, so control characters are always escaped and a record never spans lines;
-    NaN and infinities raise ``ValueError``)."""
-    line = json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n"
-    fsutil.append_private_line(path, line.encode("ascii"))
+    NaN and infinities raise ``ValueError``). A line (newline included) longer than
+    ``max_bytes`` raises ``ValueError`` and nothing is written."""
+    line = (json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n").encode("ascii")
+    if max_bytes is not None and len(line) > max_bytes:
+        raise ValueError(f"record is longer than {max_bytes} bytes")
+    fsutil.append_private_line(path, line)
 
 
 def _truncate(message: str, *, force: bool = False) -> str:
