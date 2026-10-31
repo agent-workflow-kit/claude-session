@@ -75,3 +75,18 @@ def test_launch_validation_error_keyword_overrides_the_class_default() -> None:
 def test_launch_validation_error_needs_an_end_reason() -> None:
     with pytest.raises(TypeError, match="end_reason"):
         LaunchValidationError("no reason")
+
+
+def test_launch_validation_error_hint_defaults_to_none() -> None:
+    error = LaunchValidationError("cwd contains *", end_reason="unsafe_cwd")
+    assert error.hint is None
+
+
+def test_launch_validation_error_hint_is_kept_out_of_the_failed_envelope() -> None:
+    error = LaunchValidationError(
+        "no bwrap", end_reason="sandbox_unavailable", hint="sudo apt install bubblewrap socat"
+    )
+    assert error.hint == "sudo apt install bubblewrap socat"
+    envelope = error.envelope()
+    assert "hint" not in envelope["error"]
+    validate(envelope, "claude-session/cli/error.json")

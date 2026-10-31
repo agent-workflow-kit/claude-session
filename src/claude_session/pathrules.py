@@ -83,8 +83,10 @@ OWN_WRITABLE = (sessiondir.WORK, sessiondir.OUTBOX, sessiondir.ARTIFACTS)
 WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 FILE_TOOLS = WRITE_TOOLS | {"Read", "Glob", "Grep", "NotebookRead"}
 GRANT_LISTS = ("allow", "ask")
-# The parent of every session's private temporary directory: /tmp/csession-<uid>.
+# The parent of every session's private temporary directory: /tmp/csession-<uid>. The only
+# definition of that name (tmpdir builds its per-uid root from tmp_root_name).
 TMP_ROOT = "/tmp"
+TMP_ROOT_PREFIX = "csession-"
 CASE_INSENSITIVE = sys.platform == "darwin"
 
 # A permission rule: ``Tool`` or ``Tool(content)``.
@@ -95,9 +97,15 @@ _GLOB = re.compile(r"[*?\[\]{}\\]")
 _Identity = tuple[int, int]
 
 
+def tmp_root_name(uid: int) -> str:
+    """``csession-<uid>``: the name of the per-uid root of private temporary directories."""
+    return f"{TMP_ROOT_PREFIX}{uid}"
+
+
 def tmp_parent(uid: int | None = None) -> str:
-    """``/tmp/csession-<uid>`` (default: this process's uid), as given (not resolved)."""
-    return os.path.join(TMP_ROOT, f"csession-{os.getuid() if uid is None else uid}")
+    """``/tmp/csession-<uid>`` (default: this process's effective uid, the owner of the
+    directories ``tmpdir`` creates), as given (not resolved)."""
+    return os.path.join(TMP_ROOT, tmp_root_name(os.geteuid() if uid is None else uid))
 
 
 # Resolved paths
