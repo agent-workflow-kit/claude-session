@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -25,7 +27,7 @@ from typing import Any
 import pytest
 
 from claude_session import config, ids, logs, store, toolhooks
-from claude_session.gateway import SystemGateway
+from claude_session.gateway import Result, SystemGateway
 from claude_session.store import Final, NewRun, Store
 from claude_session.toolhooks import Entry
 
@@ -340,7 +342,7 @@ def test_sh_is_resolved_to_an_absolute_path() -> None:
     assert toolhooks.resolve_sh({"PATH": "/nonexistent"}) is None
 
 
-def test_run_entry_uses_sh_c_its_own_group_the_timeout_and_discards_output(tmp_path: Path) -> None:
+def test_run_entry_uses_sh_c_its_own_group_the_timeout_and_no_output_pipes(tmp_path: Path) -> None:
     gw = FakeGateway()
     gw.on(["sh", "-c", "notify"], stdout="x" * 100)
     e = Entry(cmd="notify", timeout=3.0, origin="config", index=1)
@@ -351,7 +353,7 @@ def test_run_entry_uses_sh_c_its_own_group_the_timeout_and_discards_output(tmp_p
     (call,) = gw.calls
     assert call.argv == ("sh", "-c", "notify") and call.executable == "/bin/sh"
     assert call.new_process_group and call.kill_grace == 2.0 and call.timeout == 3.0
-    assert call.cwd == str(tmp_path) and call.stdin == "{}" and call.output_limit == 0
+    assert call.cwd == str(tmp_path) and call.stdin == "{}" and call.discard_output
 
 
 def test_run_entry_without_sh_fails_without_running_anything() -> None:
@@ -764,6 +766,115 @@ def test_the_lease_is_renewed_while_a_long_hook_runs(tmp_path: Path, root: Path,
     assert len(done.delivered) == 1
 
 
+def test_a_renewal_store_error_mid_hook_keeps_waiting_and_order(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    log = tmp_path / "hook.jsonl"
+    cfg = load_config(tmp_path, hooks_config({"cmd": hook_cmd(log, "--sleep", "0.5")}))
+    sid = allocate(st, root)
+    change(st, sid, "working", "working", "SessionStart")
+    real_renew = st.renew_lease
+    calls: list[int] = []
+
+    def renew(name: str) -> bool:
+        calls.append(1)
+        if len(calls) == 2:  # the first renewal while the first hook runs
+            raise sqlite3.OperationalError("database is locked")
+        return real_renew(name)
+
+    st.renew_lease = renew  # type: ignore[method-assign]
+    done = deliverer(st, cfg, root, renew_interval=0.1).deliver(sid)
+    assert done.delivered == event_ids(st, sid) and not done.lease_lost
+    first, second = records(log)
+    assert [first["payload"]["event_id"], second["payload"]["event_id"]] == done.delivered
+    assert second["time"] >= first["time"] + 0.5  # started after the first one ended
+    warned = [r for r in log_records(root) if r["event"] == "hook_failed"]
+    assert len(warned) == 1 and "renewal failed (OperationalError)" in warned[0]["message"]
+
+
+def hold_lease_for(st: Store, sid: str, seconds: float) -> threading.Thread:
+    """Another store takes the session's delivery lease, then releases it after ``seconds``."""
+    taken = threading.Event()
+
+    def hold() -> None:
+        with Store.open(st.path) as other:
+            assert other.take_lease(toolhooks.lease_name(sid))
+            taken.set()
+            time.sleep(seconds)
+            other.release_lease(toolhooks.lease_name(sid))
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert taken.wait(10)
+    return thread
+
+
+def test_a_patient_delivery_waits_out_a_busy_lease(tmp_path: Path, root: Path, st: Store) -> None:
+    log = tmp_path / "hook.jsonl"
+    cfg = load_config(tmp_path, hooks_config({"cmd": hook_cmd(log)}))
+    sid = allocate(st, root)
+    finalize(st, sid)
+    holder = hold_lease_for(st, sid, 1.0)
+    try:
+        done = toolhooks.deliver(
+            st,
+            cfg,
+            sid,
+            gateway=SystemGateway(),
+            environ=dict(os.environ),
+            state_root=str(root),
+            patience=toolhooks.LEASE_TTL,
+        )
+    finally:
+        holder.join(20)
+    assert len(done.delivered) == 2 and undelivered(st, sid) == []
+
+
+def test_a_patient_delivery_gives_up_after_its_patience(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    cfg = load_config(tmp_path)
+    sid = allocate(st, root)
+    holder = hold_lease_for(st, sid, 1.5)
+    try:
+        done = deliverer(st, cfg, root).deliver_all(sid, patience=0.5)
+    finally:
+        holder.join(20)
+    assert done.lease_busy and undelivered(st, sid) != []
+    (gave_up,) = [r for r in log_records(root) if r["event"] == "hook_failed"]
+    assert "gave up after 0.5 s (the delivery lease is busy)" in gave_up["message"]
+
+
+def test_a_store_error_and_a_failed_release_are_retried_and_the_lease_taken_again(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    cfg = load_config(tmp_path)
+    sid = allocate(st, root)
+    finalize(st, sid)
+    real_mark, real_release = st.mark_delivered, st.release_lease
+    failures = {"mark": 1, "release": 1}
+
+    def mark(event_id: int, lease: str) -> bool:
+        if failures["mark"]:
+            failures["mark"] -= 1
+            raise sqlite3.OperationalError("database is locked")
+        return real_mark(event_id, lease)
+
+    def release(name: str) -> None:
+        if failures["release"]:
+            failures["release"] -= 1
+            raise sqlite3.OperationalError("database is locked")
+        real_release(name)
+
+    st.mark_delivered = mark  # type: ignore[method-assign]
+    st.release_lease = release  # type: ignore[method-assign]
+    done = deliverer(st, cfg, root).deliver_all(sid, patience=toolhooks.LEASE_TTL)
+    # The lease this store could not release is still its own: the retry takes it again.
+    assert len(done.delivered) == 2 and undelivered(st, sid) == []
+    assert failures == {"mark": 0, "release": 0}
+    assert st.lease_holder(toolhooks.lease_name(sid)) is None
+
+
 # Live wrappers
 
 
@@ -802,12 +913,271 @@ def test_an_async_entry_does_not_hold_up_the_next_one(
     sid = allocate(st, root)
     d = deliverer(st, cfg, root)
     try:
+        start = time.monotonic()
         done = d.deliver(sid, wait_async=False)
+        # Well under the slow hook's 20 s wait: it held up neither the next entry nor deliver.
+        assert time.monotonic() - start < 10
         assert len(done.delivered) == 1
+        assert "fast" in {r["name"] for r in records(log)}  # before the slow one may end
         wait_until(lambda: {r["name"] for r in records(log)} == {"slow", "fast"})
     finally:
         marker.touch()
         d.wait_async()
+
+
+class _BlockingGateway:
+    """A gateway whose ``run`` blocks before the hook gets its payload, until released."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def run(self, argv: Any, **kw: Any) -> Result:
+        self.entered.set()
+        assert self.release.wait(20)
+        kw["on_started"]()
+        return Result(tuple(argv), 0, "", "")
+
+    def spawn(self, argv: Any, **kw: Any) -> Any:
+        raise AssertionError("hooks are run, never spawned")
+
+
+def test_an_async_event_is_marked_only_once_its_hook_got_the_payload(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    cfg = load_config(tmp_path, hooks_config({"cmd": "true", "async": True}))
+    sid = allocate(st, root)
+    (launch,) = event_ids(st, sid)
+    gw = _BlockingGateway()
+    result: list[toolhooks.Delivery] = []
+
+    def deliver_in_thread() -> None:
+        with Store.open(st.path) as own:
+            result.append(deliverer(own, cfg, root, gateway=gw).deliver(sid))
+
+    thread = threading.Thread(target=deliver_in_thread)
+    thread.start()
+    try:
+        assert gw.entered.wait(10)
+        time.sleep(0.3)
+        # A deliverer killed now must leave the event for the next one: not yet marked.
+        assert undelivered(st, sid) == [launch]
+    finally:
+        gw.release.set()
+        thread.join(20)
+    assert result[0].delivered == [launch] and undelivered(st, sid) == []
+
+
+def test_an_async_hook_that_cannot_start_is_logged_and_the_event_delivered(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    cfg = load_config(tmp_path, hooks_config({"cmd": "true", "async": True}))
+    gw = FakeGateway()
+    gw.on(["sh"], error=OSError("no such file"))
+    sid = allocate(st, root)
+    done = deliverer(st, cfg, root, gateway=gw).deliver(sid)
+    assert len(done.delivered) == 1
+    (failed,) = [r for r in log_records(root) if r["event"] == "hook_failed"]
+    assert "could not start sh (OSError)" in failed["message"]
+
+
+@pytest.mark.skipif(not LINUX, reason="process groups are checked through /proc")
+def test_an_async_hook_timeout_ends_its_process_group(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    log = tmp_path / "hook.jsonl"
+    cmd = hook_cmd(log, "--ignore-term", "--child", "--sleep", "30")
+    cfg = load_config(
+        tmp_path,
+        hooks_config({"cmd": cmd, "timeout": "1s", "async": True}, extra="kill_grace: 0.5s\n"),
+    )
+    sid = allocate(st, root)
+    start = time.monotonic()
+    done = deliverer(st, cfg, root).deliver(sid)  # waits for the async hook
+    assert 1.0 <= time.monotonic() - start < 10
+    assert len(done.delivered) == 1
+    (record,) = records(log)
+    wait_until(lambda: not running(record["pid"]) and not running(record["child"]), 5)
+    assert [r["event"] for r in log_records(root) if r["level"] == "warn"] == ["hook_timeout"]
+
+
+def test_finished_async_threads_are_dropped_as_new_ones_start(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    cfg = load_config(tmp_path, hooks_config({"cmd": "true", "async": True}))
+    gw = FakeGateway()
+    gw.on(["sh"])
+    sid = allocate(st, root)
+    for n in range(5):
+        state = "working" if n % 2 else "idle"
+        change(st, sid, state, state, "Stop")
+    d = deliverer(st, cfg, root, gateway=gw)
+    assert len(d.deliver(sid, wait_async=False).delivered) == 6
+    assert len(d._async) <= 2  # pyright: ignore[reportPrivateUsage]
+    d.wait_async()
+
+
+# Payload time, redelivery, background output, long timeouts and runner errors
+
+
+def test_each_entry_gets_its_own_delivery_time(tmp_path: Path, root: Path, st: Store) -> None:
+    log = tmp_path / "hook.jsonl"
+    cfg = load_config(
+        tmp_path,
+        hooks_config(
+            {"cmd": hook_cmd(log, "--name", "first", "--sleep", "0.3")},
+            {"cmd": hook_cmd(log, "--name", "second")},
+        ),
+    )
+    sid = allocate(st, root)
+    deliverer(st, cfg, root).deliver(sid)
+    first, second = (r["payload"] for r in records(log))
+    assert second["ts"] > first["ts"]
+    assert first["event_ts"] == second["event_ts"]
+
+
+def test_a_redelivered_event_keeps_its_event_fields(tmp_path: Path, root: Path, st: Store) -> None:
+    log = tmp_path / "hook.jsonl"
+    cfg = load_config(tmp_path, hooks_config({"cmd": hook_cmd(log)}))
+    sid = allocate(st, root)
+    change(st, sid, "idle", "idle", "Stop")
+    deliverer(st, cfg, root).deliver(sid)
+    with st.transaction() as conn:  # a crash before the mark, and the run moved on meanwhile
+        conn.execute("UPDATE events SET delivered_at = NULL")
+        conn.execute(
+            "UPDATE runs SET report_status = 'done', report_implicit = 0, "
+            "report_summary = 'later', reported_at = '2026-10-31T00:00:00.000000Z'"
+        )
+    deliverer(st, cfg, root).deliver(sid)
+    got = [r["payload"] for r in records(log)]
+    assert len(got) == 4
+    event_fields = [
+        "event_id",
+        "event_ts",
+        "state",
+        "activity",
+        "needs_input_reason",
+        "previous_state",
+        "previous_activity",
+        "cause",
+        "final",
+        "live",
+        "labels",
+    ]
+    for before, again in ((got[0], got[2]), (got[1], got[3])):
+        assert {k: before[k] for k in event_fields} == {k: again[k] for k in event_fields}
+        assert before["report"] is None and again["report"]["summary"] == "later"
+
+
+@pytest.mark.skipif(not LINUX, reason="the background process is checked through /proc")
+def test_a_hook_leaving_a_process_in_the_background_finishes_when_sh_exits(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    pidfile = tmp_path / "pid"
+    cmd = f"/bin/sleep 30 & echo $! > {shlex.quote(str(pidfile))}; exit 0"
+    cfg = load_config(tmp_path, hooks_config({"cmd": cmd, "timeout": "2s"}))
+    sid = allocate(st, root)
+    start = time.monotonic()
+    try:
+        done = deliverer(st, cfg, root).deliver(sid)
+        assert time.monotonic() - start < 2
+        assert len(done.delivered) == 1
+        hooks = [r for r in log_records(root) if r["event"].startswith("hook_")]
+        assert [r["event"] for r in hooks] == ["hook_delivered"]
+        assert hooks[0]["message"].endswith(": exit 0")
+    finally:
+        wait_until(lambda: pidfile.exists() and pidfile.read_text().strip() != "", 5)
+        pid = int(pidfile.read_text())
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:  # the exact sleep this test started
+            assert fh.read().split(b"\0")[0].endswith(b"sleep")
+        os.kill(pid, signal.SIGKILL)
+
+
+def test_a_hook_timeout_longer_than_one_wait_delivers_normally(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    log = tmp_path / "hook.jsonl"
+    cfg = load_config(tmp_path, hooks_config({"cmd": hook_cmd(log), "timeout": "30d"}))
+    sid = allocate(st, root)
+    assert len(deliverer(st, cfg, root).deliver(sid).delivered) == 1
+    assert len(records(log)) == 1
+    assert [r["event"] for r in log_records(root) if r["event"].startswith("hook_")] == [
+        "hook_delivered"
+    ]
+
+
+class _BrokenGateway:
+    def run(self, argv: Any, **kw: Any) -> Result:
+        raise RuntimeError("a runner bug")
+
+    def spawn(self, argv: Any, **kw: Any) -> Any:
+        raise AssertionError("hooks are run, never spawned")
+
+
+@pytest.mark.parametrize("async_", [False, True])
+def test_a_runner_exception_is_logged_hook_failed_and_never_escapes(
+    tmp_path: Path, root: Path, st: Store, monkeypatch: pytest.MonkeyPatch, async_: bool
+) -> None:
+    escaped: list[Any] = []
+    monkeypatch.setattr(threading, "excepthook", escaped.append)
+    cfg = load_config(tmp_path, hooks_config({"cmd": "true", "async": async_}))
+    sid = allocate(st, root)
+    done = deliverer(st, cfg, root, gateway=_BrokenGateway()).deliver(sid)
+    assert len(done.delivered) == 1 and escaped == []
+    (failed,) = [r for r in log_records(root) if r["event"] == "hook_failed"]
+    assert failed["message"].endswith("could not run the hook (RuntimeError)")
+    assert "a runner bug" not in failed["message"]
+
+
+def test_a_cmd_with_a_nul_byte_is_logged_hook_failed(
+    tmp_path: Path, root: Path, st: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    escaped: list[Any] = []
+    monkeypatch.setattr(threading, "excepthook", escaped.append)
+    sid = allocate(st, root)
+    d = deliverer(st, load_config(tmp_path), root)
+    d.entries = [Entry(cmd="true\x00false", timeout=5.0, origin="config", index=1)]
+    assert len(d.deliver(sid).delivered) == 1 and escaped == []
+    (failed,) = [r for r in log_records(root) if r["event"] == "hook_failed"]
+    assert failed["message"].endswith("could not run the hook (ValueError)")
+
+
+# Cancel
+
+
+@pytest.mark.skipif(not LINUX, reason="process groups are checked through /proc")
+def test_cancel_ends_the_running_hook_and_leaves_the_event_undelivered(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    log = tmp_path / "hook.jsonl"
+    cfg = load_config(
+        tmp_path,
+        hooks_config({"cmd": hook_cmd(log, "--child", "--sleep", "30")}, extra="kill_grace: 1s\n"),
+    )
+    sid = allocate(st, root)
+    change(st, sid, "idle", "idle", "Stop")
+    cancel = threading.Event()
+    result: list[toolhooks.Delivery] = []
+
+    def deliver_in_thread() -> None:
+        with Store.open(st.path) as own:
+            result.append(deliverer(own, cfg, root, cancel=cancel).deliver(sid))
+
+    thread = threading.Thread(target=deliver_in_thread)
+    thread.start()
+    wait_until(lambda: len(records(log)) == 1)
+    start = time.monotonic()
+    cancel.set()
+    thread.join(20)
+    assert time.monotonic() - start < 1 + 3
+    (done,) = result
+    assert done.canceled and done.delivered == []
+    (record,) = records(log)
+    wait_until(lambda: not running(record["pid"]) and not running(record["child"]), 5)
+    assert len(undelivered(st, sid)) == 2  # the interrupted event and the next one
+    assert st.lease_holder(toolhooks.lease_name(sid)) is None
+    events = [r["event"] for r in log_records(root) if r["event"].startswith("hook_")]
+    assert events == ["hook_failed"]  # never hook_delivered
 
 
 # Real concurrent processes and crashes
@@ -816,7 +1186,7 @@ def test_an_async_entry_does_not_hold_up_the_next_one(
 DELIVER = """\
 import os, sys
 from claude_session import config, store, toolhooks
-from claude_session.gateway import SystemGateway
+from claude_session.gateway import Result, SystemGateway
 db, cfg_path, sid = sys.argv[1:4]
 cfg = config.load(cfg_path)
 with store.Store.open(db) as st:
@@ -932,6 +1302,49 @@ def test_the_worker_delivers_on_wake_and_everything_on_close(
     assert records(log)[-1]["payload"]["final"] is True
     assert undelivered(st, sid) == []
     worker.close()  # idempotent
+
+
+def test_the_worker_close_waits_out_a_busy_lease_for_the_final_event(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    log = tmp_path / "hook.jsonl"
+    cfg = load_config(tmp_path, hooks_config({"cmd": hook_cmd(log)}))
+    sid = allocate(st, root)
+    holder = hold_lease_for(st, sid, 1.0)  # e.g. a reconcile delivering at the same time
+    worker = toolhooks.start_worker(
+        st, cfg, sid, gateway=SystemGateway(), environ=dict(os.environ), state_root=str(root)
+    )
+    try:
+        finalize(st, sid)
+        start = time.monotonic()
+        worker.close()
+        assert time.monotonic() - start < 10
+    finally:
+        holder.join(20)
+    assert undelivered(st, sid) == []
+    assert records(log)[-1]["payload"]["final"] is True
+
+
+def test_a_canceled_worker_stops_without_delivering_the_rest(
+    tmp_path: Path, root: Path, st: Store
+) -> None:
+    log = tmp_path / "hook.jsonl"
+    cfg = load_config(tmp_path, hooks_config({"cmd": hook_cmd(log)}))
+    sid = allocate(st, root)
+    cancel = threading.Event()
+    cancel.set()
+    worker = toolhooks.start_worker(
+        st,
+        cfg,
+        sid,
+        gateway=SystemGateway(),
+        environ=dict(os.environ),
+        state_root=str(root),
+        cancel=cancel,
+    )
+    finalize(st, sid)
+    worker.close()
+    assert records(log) == [] and len(undelivered(st, sid)) == 2
 
 
 def test_a_worker_that_cannot_open_the_store_logs_and_never_raises(

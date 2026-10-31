@@ -18,22 +18,42 @@ the payload on stdin and the state root as cwd: on timeout the hook's process gr
 SIGTERM, then SIGKILL after ``kill_grace`` (the only group this tool signals). The environment
 (``hook_env``) is claude-session's minus every ``CSESSION_*`` and ``secret_env`` variable, with
 the sanitized ``PATH`` and ``CSESSION_HOOK``, ``CSESSION_ID``, ``CSESSION_OBJECT_TYPE=session``.
-Hook output is untrusted and unused: it is drained and discarded (``output_limit=0``), never
-logged. A failing or timed-out hook is logged (``hook_failed``/``hook_timeout``, warn) and
-never fatal: ``post-state-change`` cannot veto.
+Hook output is untrusted and unused: stdout and stderr go to ``/dev/null``
+(``discard_output``), never logged, and an entry has finished when its ``sh`` has exited
+(processes it leaves in the background are not waited for). A failing or timed-out hook, or one
+the runner could not run at all, is logged (``hook_failed``/``hook_timeout``, warn) and never
+fatal: ``post-state-change`` cannot veto. The payload's ``ts`` is taken just before each entry
+runs.
 
 **Delivery** (``Deliverer``): at least once, in event-id order per session. A deliverer takes
 the session's lease ``delivery:<id>`` (the store's lease: holder PID + start time + token,
 60 s expiry, a dead holder's lease taken over at once), runs the selected entries of each
 undelivered event in order, renewing the lease every ``LEASE_RENEW_INTERVAL`` while a hook
-runs, and marks the event delivered (``events.delivered_at``) in the transaction that renews
-the lease, only while it still holds it. A crash between a hook and the mark leaves the event
-undelivered: the next deliverer runs it again, so receivers deduplicate on ``event_id``. An
-event whose run has a live wrapper other than this process stops the pass (that ``exec``
-delivers it; later events wait behind it). Entries with ``async: true`` do not hold up later
-entries or events: each runs on a thread of its own (its timeout and group kill still apply)
-and the event is marked once it was started; the deliverer waits for them before it returns
-(``deliver``) or stops (``Worker.close``), so no hook is left unsupervised.
+runs (a renewal that fails with a store error is retried at the next interval; the lease counts
+as lost only when a renewal finds it lost or its expiry has passed, and a running hook is
+always waited for), and marks the event delivered (``events.delivered_at``) in the transaction
+that renews the lease, only while it still holds it. A crash between a hook and the mark leaves
+the event undelivered: the next deliverer runs it again, so receivers deduplicate on
+``event_id``. An event whose run has a live wrapper other than this process stops the pass
+(that ``exec`` delivers it; later events wait behind it). Entries with ``async: true`` do not
+hold up later entries or events: each runs on a thread of its own (its timeout and group kill
+still apply) and the event is marked once its hook has started and received its payload (stdin
+written and closed, or the runner ended without starting it); the deliverer waits for them
+before it returns (``deliver``) or stops (``Worker.close``). A deliverer that is itself killed
+(SIGKILL, crash) leaves the hook it was running unsupervised in its own process group; the next
+deliverer redelivers that event, so the two copies can overlap: ordering holds only while no
+deliverer dies mid-hook.
+
+**Cancel.** A deliverer given a ``cancel`` event (``exec`` after a SIGTERM, SIGINT or SIGHUP
+once its child was reaped) starts no further hook once it is set, ends the running hooks'
+process groups (SIGTERM, then SIGKILL after ``kill_grace``), leaves the interrupted event
+unmarked, releases the lease and returns; the remaining events stay for the next delivering
+command.
+
+**Closing passes** (``Worker.close``, ``deliver(..., patience=...)``): a pass that finds the
+lease busy or fails with a store error is retried every ``RETRY_DELAY`` until the session has
+no undelivered event, ``patience`` seconds passed (then it gives up and logs) or it is
+canceled.
 
 ``exec`` delivers on a background thread (``Worker``, its own store connection) woken by the
 poll loop, so a slow hook delays later hooks, never supervision, and never the hook-event fast
@@ -50,14 +70,16 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from . import durations, ids, logs, pathrules, store
 from .endmap import REPORT_OUTCOMES
-from .gateway import DEFAULT_PATH, Gateway, GatewayTimeout
+from .gateway import DEFAULT_PATH, Gateway, GatewayCanceled, GatewayTimeout
 
 if TYPE_CHECKING:
     from .config import Config
@@ -70,6 +92,9 @@ LOG_NAME = "log.jsonl"
 # Events read per query of a delivery pass.
 BATCH = 100
 LEASE_RENEW_INTERVAL = store.LEASE_RENEW_INTERVAL.total_seconds()
+LEASE_TTL = store.LEASE_TTL.total_seconds()
+# Pause between the retries of a closing pass that found the lease busy or the store failing.
+RETRY_DELAY = 0.3
 
 
 def lease_name(csession_id: str) -> str:
@@ -231,8 +256,8 @@ def resolve_sh(env: Mapping[str, str]) -> str | None:
 
 @dataclass(frozen=True)
 class Ran:
-    """How one entry ran: ``ok``, ``failed`` (non-zero exit, or could not start) or
-    ``timeout``; ``detail`` is fixed text and numbers, never hook output."""
+    """How one entry ran: ``ok``, ``failed`` (non-zero exit, or could not start or run),
+    ``timeout`` or ``canceled``; ``detail`` is fixed text and numbers, never hook output."""
 
     result: str
     detail: str
@@ -247,8 +272,12 @@ def run_entry(
     cwd: str,
     payload: str,
     kill_grace: float,
+    on_started: Callable[[], None] | None = None,
+    canceled: Callable[[], bool] | None = None,
 ) -> Ran:
-    """Run ``entry`` once (see the module docs). Never raises for the hook's own failure."""
+    """Run ``entry`` once (see the module docs). Never raises for the hook's own failure.
+    ``on_started`` is called once ``sh`` has started and its stdin was written and closed;
+    ``canceled`` ends the hook's group early (``Ran("canceled")``)."""
     if sh is None:
         return Ran("failed", "sh not found on the sanitized PATH")
     try:
@@ -261,10 +290,14 @@ def run_entry(
             timeout=entry.timeout,
             new_process_group=True,
             kill_grace=kill_grace,
-            output_limit=0,
+            discard_output=True,
+            on_started=on_started,
+            canceled=canceled,
         )
     except GatewayTimeout:
         return Ran("timeout", f"timed out after {entry.timeout:g} s; process group ended")
+    except GatewayCanceled:
+        return Ran("canceled", "canceled by a signal; process group ended")
     except OSError as exc:
         return Ran("failed", f"could not start sh ({type(exc).__name__})")
     if result.returncode != 0:
@@ -378,6 +411,7 @@ class Delivery:
     lease_busy: bool = False  # another live holder delivers: nothing done
     lease_lost: bool = False  # the lease was lost mid-pass: the rest is left undelivered
     blocked: bool = False  # stopped at an event of a run another live wrapper delivers
+    canceled: bool = False  # stopped by ``cancel``: the rest is left undelivered
 
 
 def _log(log: logs.EventLog, event: str, **fields: Any) -> None:
@@ -385,6 +419,11 @@ def _log(log: logs.EventLog, event: str, **fields: Any) -> None:
         log.write(event, **fields)
     except (OSError, ValueError):
         pass  # best effort: delivery never fails for its log
+
+
+def _joined(thread: threading.Thread, timeout: float) -> bool:
+    thread.join(timeout)
+    return not thread.is_alive()
 
 
 class Deliverer:
@@ -401,13 +440,20 @@ class Deliverer:
         state_root: str,
         log: logs.EventLog | None = None,
         renew_interval: float = LEASE_RENEW_INTERVAL,
+        cancel: threading.Event | None = None,
     ) -> None:
         self.st, self.cfg, self.gateway = st, cfg, gateway
         self.environ, self.state_root = environ, state_root
         self.log = log or logs.EventLog(os.path.join(state_root, LOG_NAME))
         self.renew_interval = renew_interval
+        self.cancel = cancel
         self.entries = config_entries(cfg)
         self._async: list[threading.Thread] = []
+        # When the lease expires (time.monotonic), as of the last successful take or renewal.
+        self._expiry = 0.0
+
+    def canceled(self) -> bool:
+        return self.cancel is not None and self.cancel.is_set()
 
     def deliver(self, csession_id: str, *, wait_async: bool = True) -> Delivery:
         """Take the session's delivery lease and deliver its undelivered events in id order,
@@ -416,9 +462,14 @@ class Deliverer:
         done = Delivery()
         lease = lease_name(csession_id)
         try:
+            if self.canceled():
+                done.canceled = True
+                return done
+            asked = time.monotonic()
             if not self.st.take_lease(lease):
                 done.lease_busy = True
                 return done
+            self._expiry = asked + LEASE_TTL
             try:
                 self._pass(csession_id, lease, done)
             finally:
@@ -427,6 +478,47 @@ class Deliverer:
             if wait_async:
                 self.wait_async()
         return done
+
+    def deliver_all(
+        self, csession_id: str, *, patience: float, wait_async: bool = True
+    ) -> Delivery:
+        """``deliver``, retried every ``RETRY_DELAY`` while the lease is busy or the store
+        fails, until the session has no undelivered event, ``patience`` seconds passed (then
+        it gives up and logs) or it is canceled. Other errors propagate."""
+        deadline = time.monotonic() + patience
+        try:
+            while True:
+                try:
+                    done = self.deliver(csession_id, wait_async=False)
+                    if not done.lease_busy:
+                        return done
+                    problem = "the delivery lease is busy"
+                except sqlite3.Error as exc:
+                    self.st.rollback_open_transaction()
+                    done = Delivery()
+                    problem = f"store error {type(exc).__name__}"
+                if self.canceled():
+                    done.canceled = True
+                    return done
+                try:
+                    if not self.st.has_undelivered(csession_id):
+                        return done
+                except sqlite3.Error:
+                    self.st.rollback_open_transaction()
+                if time.monotonic() >= deadline:
+                    _log(
+                        self.log,
+                        "hook_failed",
+                        level="warn",
+                        csession_id=csession_id,
+                        message=f"{POST_STATE_CHANGE} delivery gave up after {patience:g} s "
+                        f"({problem}); the next delivering command delivers the rest",
+                    )
+                    return done
+                time.sleep(RETRY_DELAY)
+        finally:
+            if wait_async:
+                self.wait_async()
 
     def wait_async(self) -> None:
         """Wait for every async entry started (each is bounded by its own timeout)."""
@@ -440,13 +532,19 @@ class Deliverer:
             if not events:
                 return
             for event in events:
+                if self.canceled():
+                    done.canceled = True
+                    return
                 record = self.st.delivery_record(sid, int(event["run_no"]))
                 if record is not None and self._other_live_wrapper(record, me):
                     done.blocked = True
                     return
-                if record is not None and not self._run_event(sid, lease, event, record):
-                    done.lease_lost = True
-                    return
+                if record is not None:
+                    result = self._run_event(sid, lease, event, record)
+                    if result != "done":
+                        done.lease_lost = result == "lost"
+                        done.canceled = result == "canceled"
+                        return
                 if not self.st.mark_delivered(int(event["id"]), lease):
                     done.lease_lost = True
                     return
@@ -463,8 +561,9 @@ class Deliverer:
 
     def _run_event(
         self, sid: str, lease: str, event: Mapping[str, Any], record: Mapping[str, Any]
-    ) -> bool:
-        """Run the event's selected entries in order; False when the lease was lost."""
+    ) -> str:
+        """Run the event's selected entries in order: ``done``, ``lost`` (the lease was lost)
+        or ``canceled``. Never returns while a synchronous entry's hook still runs."""
         labels = stored_labels(event["labels_json"])
         entries = [*self.entries, *invocation_entries(record["invocation_json"])]
         chosen = [
@@ -473,19 +572,21 @@ class Deliverer:
             if selected(entry, run_kind=record["run_kind"], labels=labels, state=event["to_state"])
         ]
         if not chosen:
-            return True
-        now = store.format_ts(self.st.clock())
-        payload = json.dumps(
-            build_payload(event, record, csession_id=sid, labels=labels, now=now),
-            ensure_ascii=False,
-        )
+            return "done"
         env = hook_env(
             self.environ, secret_env=self.cfg.secret_env, hook=POST_STATE_CHANGE, csession_id=sid
         )
         sh = resolve_sh(env)
         for entry in chosen:
-            if not self.st.renew_lease(lease):
-                return False
+            if self.canceled():
+                return "canceled"
+            if not self._renew(lease, sid):
+                return "lost"
+            now = store.format_ts(self.st.clock())  # per entry: when this one is delivered
+            payload = json.dumps(
+                build_payload(event, record, csession_id=sid, labels=labels, now=now),
+                ensure_ascii=False,
+            )
             hook = _Hook(
                 self,
                 entry,
@@ -499,30 +600,61 @@ class Deliverer:
             thread = threading.Thread(
                 target=hook.run, name=f"hook {entry.name}, event {event['id']}"
             )
-            thread.start()
             if entry.async_:
+                self._async = [t for t in self._async if t.is_alive()]
                 self._async.append(thread)
-                continue
-            if not self._wait(thread, lease):
-                return False
-        return True
+                thread.start()
+                # Marked only once the hook got its payload (or its runner ended).
+                held = self._wait(hook.started.wait, lease, sid)
+            else:
+                thread.start()
+                try:
+                    held = self._wait(lambda t, thread=thread: _joined(thread, t), lease, sid)
+                finally:
+                    thread.join()
+            if self.canceled():
+                return "canceled"
+            if not held:
+                return "lost"
+        return "done"
 
-    def _wait(self, thread: threading.Thread, lease: str) -> bool:
-        """Wait for a hook thread, renewing the lease every ``renew_interval``; False when a
-        renewal found the lease lost (the hook still runs to its end or timeout)."""
+    def _wait(self, ready: Callable[[float], bool], lease: str, sid: str) -> bool:
+        """Wait until ``ready(renew_interval)`` is true, renewing the lease every
+        ``renew_interval``; False when the lease was lost meanwhile (waiting goes on)."""
         held = True
-        while True:
-            thread.join(self.renew_interval)
-            if not thread.is_alive():
-                return held
-            if held and not self.st.renew_lease(lease):
+        while not ready(self.renew_interval):
+            if held and not self._renew(lease, sid):
                 held = False
+        return held
+
+    def _renew(self, lease: str, sid: str) -> bool:
+        """Renew the lease. False when a renewal finds it lost, or when a renewal fails with a
+        store error (logged; retried at the next call) after its expiry has passed."""
+        asked = time.monotonic()
+        try:
+            held = self.st.renew_lease(lease)
+        except sqlite3.Error as exc:
+            self.st.rollback_open_transaction()
+            _log(
+                self.log,
+                "hook_failed",
+                level="warn",
+                csession_id=sid,
+                message=f"{POST_STATE_CHANGE} delivery lease renewal failed "
+                f"({type(exc).__name__}); retried",
+            )
+            return time.monotonic() < self._expiry
+        if held:
+            self._expiry = asked + LEASE_TTL
+        return held
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Hook:
     """One entry run for one event, on its own thread: run it, then log how it ran
-    (``hook_delivered``; ``hook_failed`` or ``hook_timeout`` at ``warn`` as well)."""
+    (``hook_delivered``; ``hook_failed`` or ``hook_timeout`` at ``warn`` as well; a canceled
+    hook only ``hook_failed``). ``started`` is set once the hook got its payload, or when the
+    thread ends without that."""
 
     deliverer: Deliverer
     entry: Entry
@@ -532,24 +664,34 @@ class _Hook:
     sid: str
     run_no: int
     event_id: int
+    started: threading.Event = field(default_factory=threading.Event)
 
     def run(self) -> None:
         d = self.deliverer
-        ran = run_entry(
-            d.gateway,
-            self.entry,
-            sh=self.sh,
-            env=self.env,
-            cwd=d.state_root,
-            payload=self.payload,
-            kill_grace=d.cfg.kill_grace,
-        )
-        message = f"{POST_STATE_CHANGE} {self.entry.name}, event {self.event_id}: {ran.detail}"
-        fields: dict[str, Any] = {"csession_id": self.sid, "run": int(self.run_no)}
-        _log(d.log, "hook_delivered", message=message, **fields)
-        if ran.result != "ok":
-            failure = "hook_timeout" if ran.result == "timeout" else "hook_failed"
-            _log(d.log, failure, level="warn", message=message, **fields)
+        try:
+            try:
+                ran = run_entry(
+                    d.gateway,
+                    self.entry,
+                    sh=self.sh,
+                    env=self.env,
+                    cwd=d.state_root,
+                    payload=self.payload,
+                    kill_grace=d.cfg.kill_grace,
+                    on_started=self.started.set,
+                    canceled=None if d.cancel is None else d.cancel.is_set,
+                )
+            except Exception as exc:  # never escapes the thread unlogged (e.g. a NUL in cmd)
+                ran = Ran("failed", f"could not run the hook ({type(exc).__name__})")
+            message = f"{POST_STATE_CHANGE} {self.entry.name}, event {self.event_id}: {ran.detail}"
+            fields: dict[str, Any] = {"csession_id": self.sid, "run": int(self.run_no)}
+            if ran.result != "canceled":
+                _log(d.log, "hook_delivered", message=message, **fields)
+            if ran.result != "ok":
+                failure = "hook_timeout" if ran.result == "timeout" else "hook_failed"
+                _log(d.log, failure, level="warn", message=message, **fields)
+        finally:
+            self.started.set()
 
 
 def deliver(
@@ -560,19 +702,25 @@ def deliver(
     gateway: Gateway,
     environ: Mapping[str, str],
     state_root: str,
+    cancel: threading.Event | None = None,
+    patience: float = 0.0,
 ) -> Delivery:
     """Synchronous delivery for a command that changed a run with no live wrapper (or
-    ``exec`` after its run ended)."""
-    return Deliverer(st, cfg, gateway=gateway, environ=environ, state_root=state_root).deliver(
-        csession_id
-    )
+    ``exec`` after its run ended). With ``patience``, a busy lease or a store error is
+    retried up to that many seconds (``Deliverer.deliver_all``)."""
+    d = Deliverer(st, cfg, gateway=gateway, environ=environ, state_root=state_root, cancel=cancel)
+    if patience > 0:
+        return d.deliver_all(csession_id, patience=patience)
+    return d.deliver(csession_id)
 
 
 class Worker:
     """``exec``'s background delivery thread (design.md, Supervision): ``wake`` from the
-    poll loop (non-blocking), ``close`` once the run is final (one last pass, then waits for
-    the hooks, each bounded by its timeout). Uses a store connection of its own; never
-    raises into ``exec``: an error is logged and retried at the next wake."""
+    poll loop (non-blocking), ``close`` once the run is final (one last pass, retried while
+    the lease is busy or the store fails, up to ``patience`` seconds; then waits for the
+    hooks, each bounded by its timeout). Uses a store connection of its own; never raises
+    into ``exec``: an error is logged and retried at the next wake. Once ``cancel`` is set it
+    stops (see the module docs)."""
 
     def __init__(
         self,
@@ -585,10 +733,13 @@ class Worker:
         state_root: str,
         idle: float = LEASE_RENEW_INTERVAL,
         renew_interval: float = LEASE_RENEW_INTERVAL,
+        cancel: threading.Event | None = None,
+        patience: float = LEASE_TTL,
     ) -> None:
         self.open_store, self.cfg, self.csession_id = open_store, cfg, csession_id
         self.gateway, self.environ, self.state_root = gateway, environ, state_root
         self.idle, self.renew_interval = idle, renew_interval
+        self.cancel, self.patience = cancel, patience
         self.log = logs.EventLog(os.path.join(state_root, LOG_NAME))
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -623,13 +774,20 @@ class Worker:
                 state_root=self.state_root,
                 log=self.log,
                 renew_interval=self.renew_interval,
+                cancel=self.cancel,
             )
             try:
                 while True:
                     stopping = self._stop.is_set()  # read before the pass: close() comes last
                     self._wake.clear()
+                    if deliverer.canceled():
+                        return
                     try:
-                        if st.has_undelivered(self.csession_id):
+                        if stopping:
+                            deliverer.deliver_all(
+                                self.csession_id, patience=self.patience, wait_async=False
+                            )
+                        elif st.has_undelivered(self.csession_id):
                             deliverer.deliver(self.csession_id, wait_async=False)
                     except Exception as exc:
                         st.rollback_open_transaction()
@@ -660,6 +818,7 @@ def start_worker(
     gateway: Gateway,
     environ: Mapping[str, str],
     state_root: str,
+    cancel: threading.Event | None = None,
 ) -> Worker:
     """A started ``Worker`` for ``exec``'s session, on a new connection to ``st``'s database
     (same liveness check and clock)."""
@@ -675,4 +834,5 @@ def start_worker(
         environ=environ,
         state_root=state_root,
         idle=min(cfg.poll_interval, LEASE_RENEW_INTERVAL),
+        cancel=cancel,
     ).start()

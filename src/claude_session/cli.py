@@ -24,6 +24,8 @@ from .defaults import MAX_INTEGER
 from .errors import CliError, InternalError, RefusedError, UsageError
 
 if TYPE_CHECKING:
+    import threading
+
     from .config import Config
     from .launch import Allocated, Process
 
@@ -200,7 +202,8 @@ def _exec(args: argparse.Namespace) -> int:
                     ended = None  # the run ended not-started: its outcome is in the store
                     signals.defer()
                     _end_interrupted_launch(st, alloc, process, exc)
-                _deliver_rest(st, cfg, alloc, process)
+                signals.enter_delivery()  # a signal now cancels the remaining delivery
+                _deliver_rest(st, cfg, alloc, process, signals.delivery_canceled)
                 outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
         except LaunchInterrupted as exc:  # before allocation: nothing to record
             _die_of(exc.signum)
@@ -223,11 +226,18 @@ def _exec(args: argparse.Namespace) -> int:
     return int(outcome["exit_code"])
 
 
-def _deliver_rest(st: store.Store, cfg: Config, alloc: Allocated, process: Process) -> None:
+def _deliver_rest(
+    st: store.Store,
+    cfg: Config,
+    alloc: Allocated,
+    process: Process,
+    cancel: threading.Event,
+) -> None:
     """``post-state-change`` delivery of what the run's worker did not deliver: all of a
     launch-phase end (its ``launch`` and one final event; no worker ran), else normally
-    nothing. Best effort: whatever stays undelivered is delivered by the next delivering
-    command (``reconcile``); a hook failure never changes the outcome."""
+    nothing. A busy lease or a store error is retried for up to the lease TTL; ``cancel`` (a
+    signal) stops it. Best effort: whatever stays undelivered is delivered by the next
+    delivering command (``reconcile``); a hook failure never changes the outcome."""
     from . import toolhooks
 
     try:
@@ -238,6 +248,8 @@ def _deliver_rest(st: store.Store, cfg: Config, alloc: Allocated, process: Proce
             gateway=process.gateway,
             environ=process.environ,
             state_root=process.state_root,
+            cancel=cancel,
+            patience=toolhooks.LEASE_TTL,
         )
     except Exception:
         st.rollback_open_transaction()

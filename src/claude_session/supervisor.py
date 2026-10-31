@@ -40,7 +40,8 @@ headless spawn must precede any thread), a background worker delivers the sessio
 order; the poll loop only wakes it, so a slow hook never delays supervision. Once the run is
 final the worker delivers what is left, the final event included, and stops (``exec`` waits
 for it, each hook bounded by its own timeout). A launch-phase end is delivered synchronously
-by ``exec`` (``cli``).
+by ``exec`` (``cli``). A SIGTERM, SIGINT or SIGHUP once the child was reaped cancels the
+remaining delivery (``ExecSignals.enter_delivery``; ``toolhooks``, Cancel).
 TODO(#21): write ``--outcome-file`` right after the finalization compare-and-set.
 """
 
@@ -614,15 +615,18 @@ def run_session(
             pid=child.pid,
             decision_ids=list(_decision_ids(record)),
         )
-        worker = _start_worker(st, cfg, alloc, process)
+        worker = _start_worker(st, cfg, alloc, process, signals)
         returncode = Supervision(
             st, cfg, alloc, child, signals, log, auto_exit=auto_exit, deliver=worker.wake
         ).wait()
-        signals.defer()  # the child is gone: later signals are recorded and dropped
+        # The child is gone: later signals are recorded, and cancel the remaining delivery.
+        signals.enter_delivery()
     except BaseException:
-        _internal_error(st, cfg, alloc, v, child)
-        if worker is not None:
-            worker.close()
+        try:
+            _internal_error(st, cfg, alloc, v, child)
+        finally:
+            if worker is not None:
+                worker.close()
         raise
     try:
         return finish(
@@ -644,9 +648,14 @@ def run_session(
 
 
 def _start_worker(
-    st: store.Store, cfg: Config, alloc: launch.Allocated, process: launch.Process
+    st: store.Store,
+    cfg: Config,
+    alloc: launch.Allocated,
+    process: launch.Process,
+    signals: ExecSignals,
 ) -> toolhooks.Worker:
-    """The started ``post-state-change`` worker of the run's session (after the spawn)."""
+    """The started ``post-state-change`` worker of the run's session (after the spawn); a
+    signal after the child was reaped cancels its remaining delivery."""
     return toolhooks.start_worker(
         st,
         cfg,
@@ -654,6 +663,7 @@ def _start_worker(
         gateway=process.gateway,
         environ=process.environ,
         state_root=process.state_root,
+        cancel=signals.delivery_canceled,
     )
 
 

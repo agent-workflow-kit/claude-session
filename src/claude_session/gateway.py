@@ -52,6 +52,15 @@ child has exec'd (or failed to); a handler (for a signal another thread took) th
 (Linux) starts its child the same way, without the death signal, so a handler that raises in
 ``exec``'s launch phase does so only once ``run`` holds the ``Popen`` and ends its child.
 
+``run(..., discard_output=True)`` connects stdout and stderr to ``/dev/null`` (no pipes): it
+then waits only for the child itself to exit, never for descendants that keep the output open
+(``post-state-change`` hooks, whose output is unused). ``on_started`` is called once the child
+was started and its ``stdin`` text written and closed (at once without ``stdin`` text), so a
+caller can tell a child that got its input from one that never started. ``canceled`` is polled
+while waiting: once it returns true the child is ended as on a timeout and ``GatewayCanceled``
+is raised. Every single wait is at most ``MAX_WAIT`` seconds (looped up to the deadline), so a
+long timeout never overflows ``select``/``poll``.
+
 ``run`` reads the child's output with its own loop rather than ``Popen.communicate``, which
 reaps the child when a ``KeyboardInterrupt`` interrupts it: on Linux the child stays unreaped
 until it has exited, so its process group can still be ended safely when an exception escapes.
@@ -101,6 +110,11 @@ _GRACE_POLL_MAX = 0.5
 _EXIT_POLL_FIRST = 0.001
 _EXIT_POLL_MAX = 0.05
 _READ_SIZE = 32768
+# The longest single wait (select/poll/sleep): a longer timeout is waited in such chunks, as
+# epoll and poll take milliseconds in a C int.
+MAX_WAIT: Final = 86400.0
+# How often ``canceled`` is polled while waiting.
+_CANCEL_POLL = 0.05
 _PIPE_BUF = getattr(select, "PIPE_BUF", 512)  # a write this small never blocks once writable
 
 
@@ -134,6 +148,15 @@ class GatewayTimeout(Exception):
         super().__init__(f"{argv[0]} timed out after {timeout} s")
         self.argv = tuple(argv)
         self.timeout = timeout
+
+
+class GatewayCanceled(Exception):
+    """``run``'s ``canceled`` returned true before the child exited. The child was ended as on
+    a timeout (see ``GatewayTimeout``) before this is raised."""
+
+    def __init__(self, argv: Sequence[str]) -> None:
+        super().__init__(f"{argv[0]} was canceled")
+        self.argv = tuple(argv)
 
 
 @runtime_checkable
@@ -173,6 +196,9 @@ class Gateway(Protocol):
         kill_grace: float | None = None,
         executable: str | None = None,
         output_limit: int | None = None,
+        discard_output: bool = False,
+        on_started: Callable[[], None] | None = None,
+        canceled: Callable[[], bool] | None = None,
     ) -> Result:
         """Run to completion, capturing text output. ``output_limit`` (bytes, per stream) keeps
         only that prefix of stdout and of stderr; the rest is read and discarded, so untrusted
@@ -183,8 +209,10 @@ class Gateway(Protocol):
         while waiting (a signal handler raising, ``KeyboardInterrupt`` included) ends the child
         the same way, then propagates (on Linux; best effort without ``os.waitid``, see
         ``GatewayTimeout``); one raised during the grace still gets the group SIGKILL and the
-        leader reaped first. Raises ``GatewayTimeout``, and ``OSError`` when the
-        program cannot be started."""
+        leader reaped first. ``discard_output`` sends stdout and stderr to ``/dev/null`` (the
+        result has empty output) and only the child's own exit is waited for; ``on_started``
+        and ``canceled``: see the module docs. Raises ``GatewayTimeout``, ``GatewayCanceled``,
+        and ``OSError`` when the program cannot be started."""
         ...
 
     def spawn(
@@ -474,15 +502,53 @@ def _remaining(deadline: float | None) -> float | None:
     return None if deadline is None else deadline - time.monotonic()
 
 
+def _chunk(remaining: float | None, canceled: Callable[[], bool] | None) -> float:
+    """The length of one wait: at most ``MAX_WAIT``, the time left and, with ``canceled``, its
+    poll interval."""
+    limits = [MAX_WAIT]
+    if canceled is not None:
+        limits.append(_CANCEL_POLL)
+    if remaining is not None:
+        limits.append(max(remaining, 0.0))
+    return min(limits)
+
+
+def _check(
+    popen: subprocess.Popen[bytes],
+    deadline: float | None,
+    timeout: float | None,
+    canceled: Callable[[], bool] | None,
+) -> None:
+    """Raise when waiting must end: ``GatewayCanceled`` once ``canceled()``,
+    ``subprocess.TimeoutExpired`` past the deadline."""
+    if canceled is not None and canceled():
+        args = popen.args
+        raise GatewayCanceled(
+            [str(a) for a in args] if isinstance(args, list | tuple) else [str(args)]
+        )
+    remaining = _remaining(deadline)
+    if remaining is not None and remaining <= 0:
+        assert timeout is not None  # a deadline comes from a timeout
+        raise subprocess.TimeoutExpired(popen.args, timeout)
+
+
 def _wait_exited(
-    popen: subprocess.Popen[bytes], deadline: float | None, timeout: float | None
+    popen: subprocess.Popen[bytes],
+    deadline: float | None,
+    timeout: float | None,
+    canceled: Callable[[], bool] | None = None,
 ) -> None:
     """Wait until the child exited, leaving it unreaped (``os.waitid`` with ``WNOWAIT``), then
     reap it. Without ``os.waitid`` (macOS), ``Popen.wait``, which reaps when interrupted."""
     waitid = getattr(os, "waitid", None)
     if waitid is None:
-        popen.wait(_remaining(deadline))
-        return
+        while True:
+            _check(popen, deadline, timeout, canceled)
+            try:
+                popen.wait(_chunk(_remaining(deadline), canceled))
+            except subprocess.TimeoutExpired:
+                continue
+            return
     delay = _EXIT_POLL_FIRST
     while True:
         try:
@@ -490,11 +556,8 @@ def _wait_exited(
                 break
         except ChildProcessError:  # reaped elsewhere; Popen.wait copes
             break
-        remaining = _remaining(deadline)
-        if remaining is not None and remaining <= 0:
-            assert timeout is not None  # a deadline comes from a timeout
-            raise subprocess.TimeoutExpired(popen.args, timeout)
-        time.sleep(delay if remaining is None else min(delay, remaining))
+        _check(popen, deadline, timeout, canceled)
+        time.sleep(min(delay, _chunk(_remaining(deadline), canceled)))
         delay = min(delay * 2, _EXIT_POLL_MAX)
     popen.wait()  # it has exited: returns at once
 
@@ -504,33 +567,44 @@ def _exchange(
     data: bytes | None,
     timeout: float | None,
     output_limit: int | None = None,
+    *,
+    on_started: Callable[[], None] | None = None,
+    canceled: Callable[[], bool] | None = None,
 ) -> tuple[bytes, bytes]:
-    """Like ``Popen.communicate``: write ``data`` to stdin, read stdout and stderr to EOF,
-    wait for the exit; ``subprocess.TimeoutExpired`` after ``timeout`` seconds. Unlike it, the
-    child is never reaped before it has exited, even when interrupted (see the module docs).
-    With ``output_limit``, at most that many bytes of each stream are kept."""
+    """Like ``Popen.communicate``: write ``data`` to stdin, read stdout and stderr (those that
+    are pipes) to EOF, wait for the exit; ``subprocess.TimeoutExpired`` after ``timeout``
+    seconds, ``GatewayCanceled`` once ``canceled()``. Unlike it, the child is never reaped
+    before it has exited, even when interrupted (see the module docs). With ``output_limit``,
+    at most that many bytes of each stream are kept. ``on_started`` is called once stdin is
+    written and closed (at once without stdin)."""
     deadline = None if timeout is None else time.monotonic() + timeout
-    assert popen.stdout is not None and popen.stderr is not None
-    out_fd, err_fd = popen.stdout.fileno(), popen.stderr.fileno()
-    readers = {out_fd: popen.stdout, err_fd: popen.stderr}
+    fds = [None if f is None else f.fileno() for f in (popen.stdout, popen.stderr)]
+    readers = {f.fileno(): f for f in (popen.stdout, popen.stderr) if f is not None}
     output: dict[int, list[bytes]] = {fd: [] for fd in readers}
     pending = memoryview(data or b"")
+    started = False
+
+    def fed() -> None:
+        nonlocal started
+        if not started:
+            started = True
+            if on_started is not None:
+                on_started()
+
     with selectors.DefaultSelector() as selector:
         for fd in readers:
             selector.register(fd, selectors.EVENT_READ)
         stdin = popen.stdin
         in_fd = -1 if stdin is None else stdin.fileno()
-        if stdin is not None:
-            if pending:
-                selector.register(in_fd, selectors.EVENT_WRITE)
-            else:
+        if stdin is not None and pending:
+            selector.register(in_fd, selectors.EVENT_WRITE)
+        else:
+            if stdin is not None:
                 stdin.close()
+            fed()
         while selector.get_map():
-            remaining = _remaining(deadline)
-            if remaining is not None and remaining <= 0:
-                assert timeout is not None  # a deadline comes from a timeout
-                raise subprocess.TimeoutExpired(popen.args, timeout)
-            for key, _ in selector.select(remaining):
+            _check(popen, deadline, timeout, canceled)
+            for key, _ in selector.select(_chunk(_remaining(deadline), canceled)):
                 if key.fd == in_fd:
                     try:
                         pending = pending[os.write(key.fd, pending[:_PIPE_BUF]) :]
@@ -540,6 +614,7 @@ def _exchange(
                         selector.unregister(key.fd)
                         assert stdin is not None
                         stdin.close()
+                        fed()
                     continue
                 chunk = os.read(key.fd, _READ_SIZE)
                 if chunk:
@@ -551,8 +626,12 @@ def _exchange(
                 else:
                     selector.unregister(key.fd)
                     readers[key.fd].close()
-    _wait_exited(popen, deadline, timeout)
-    return b"".join(output[out_fd]), b"".join(output[err_fd])
+    _wait_exited(popen, deadline, timeout, canceled)
+    out_fd, err_fd = fds
+    return (
+        b"" if out_fd is None else b"".join(output[out_fd]),
+        b"" if err_fd is None else b"".join(output[err_fd]),
+    )
 
 
 def _text(data: bytes) -> str:
@@ -630,6 +709,9 @@ class SystemGateway:
         kill_grace: float | None = None,
         executable: str | None = None,
         output_limit: int | None = None,
+        discard_output: bool = False,
+        on_started: Callable[[], None] | None = None,
+        canceled: Callable[[], bool] | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(kill_grace, new_process_group=new_process_group)
@@ -637,14 +719,16 @@ class SystemGateway:
         args = tuple(argv)
         data = None if stdin is None else stdin.encode("utf-8", "replace")
 
+        output = DEVNULL if discard_output else subprocess.PIPE
+
         def start(preexec: Callable[[], None] | None) -> subprocess.Popen[bytes]:
             try:
                 return subprocess.Popen(
                     args,
                     executable=executable,
                     stdin=DEVNULL if stdin is None else subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=output,
+                    stderr=output,
                     env=_child_env(env, extra_env),
                     cwd=cwd,
                     process_group=0 if new_process_group else None,
@@ -662,7 +746,14 @@ class SystemGateway:
         try:
             with popen:
                 try:
-                    out, err = _exchange(popen, data, timeout, output_limit)
+                    out, err = _exchange(
+                        popen,
+                        data,
+                        timeout,
+                        output_limit,
+                        on_started=on_started,
+                        canceled=canceled,
+                    )
                 except subprocess.TimeoutExpired:
                     _end(popen, group=new_process_group, kill_grace=kill_grace)
                     raise GatewayTimeout(args, timeout) from None

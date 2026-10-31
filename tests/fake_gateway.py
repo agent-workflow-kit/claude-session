@@ -15,7 +15,7 @@ a polling test can script, say, "alive, alive, gone". With ``clock``, a scripted
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from claude_session.gateway import (
@@ -55,6 +55,7 @@ class Call:
     kill_grace: float | None = None  # run only
     executable: str | None = None  # the program run when argv[0] is only its name
     output_limit: int | None = None  # run only
+    discard_output: bool = False  # run only
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,9 @@ class FakeGateway:
         kill_grace: float | None = None,
         executable: str | None = None,
         output_limit: int | None = None,
+        discard_output: bool = False,
+        on_started: Callable[[], None] | None = None,
+        canceled: Callable[[], bool] | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(kill_grace, new_process_group=new_process_group)
@@ -189,11 +193,14 @@ class FakeGateway:
                 kill_grace=kill_grace,
                 executable=executable,
                 output_limit=output_limit,
+                discard_output=discard_output,
             )
         )
         response = self._answer(args)
         if response.error is not None:
             raise response.error
+        if on_started is not None:  # as the real gateway: the child got its stdin
+            on_started()
         if response.timeout:
             if timeout is None:
                 raise AssertionError(
@@ -204,6 +211,8 @@ class FakeGateway:
                 self._clock.advance(timeout + (kill_grace or 0))
             raise GatewayTimeout(args, timeout)
         out, err = response.stdout, response.stderr
+        if discard_output:
+            out, err = "", ""
         if output_limit is not None:  # as the real gateway: a byte prefix of each stream
             out = out.encode()[:output_limit].decode("utf-8", "replace")
             err = err.encode()[:output_limit].decode("utf-8", "replace")

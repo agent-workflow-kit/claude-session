@@ -6,11 +6,12 @@
 Writes its start record (as the fake ``claude`` does: an empty ``<pid>.<start ticks>`` file in
 ``$FAKE_CLAUDE_STARTED_DIR``, so the suite ends and reports a hook that outlives its test),
 reads the payload from stdin and appends one JSON line to ``--log``: ``name``, ``pid``,
-``pgid``, ``cwd``, the parsed ``payload``, ``env`` (every variable) and, with ``--child``, the
-PID of a child it started in its own process group that sleeps forever (``child``; also with
-a start record). Then: ``--ignore-term`` ignores SIGTERM; waits until ``--wait-for`` exists
-(at most 20 s); sleeps ``--sleep``; writes ``--stderr-bytes`` bytes to stderr and stdout;
-exits ``--exit``. Standard library only.
+``pgid``, ``cwd``, ``time`` (``time.time()`` once the payload was read), the parsed
+``payload``, ``env`` (every variable) and, with ``--child``, the PID of a child it started in
+its own process group that sleeps forever (``child``; also with a start record). Then:
+``--ignore-term`` ignores SIGTERM; waits until ``--wait-for`` exists (at most 20 s); sleeps
+``--sleep``; writes ``--stderr-bytes`` bytes to stderr and stdout; exits ``--exit``.
+Standard library only.
 """
 
 from __future__ import annotations
@@ -80,6 +81,7 @@ def main(argv: list[str]) -> int:
             "pid": os.getpid(),
             "pgid": os.getpgid(0),
             "cwd": os.getcwd(),
+            "time": time.time(),
             "payload": payload,
             "env": dict(os.environ),
             "child": None if child is None else child.pid,
