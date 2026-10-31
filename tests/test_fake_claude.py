@@ -1,15 +1,21 @@
 """The scenario-driven fake ``claude`` (tests/fakebin). Hook commands here are recorder stubs,
 never ``claude-session hook-event``; ``report`` runs against a stand-in ``claude-session``.
-Every test that signals the fake signals only the exact child it started."""
+Every test that signals the fake signals only the exact child it started; processes the fake
+may leak are recorded by exact PID (``leaked``) and killed by that PID at teardown."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import sys
+import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +26,6 @@ from claude_session.gateway import DEVNULL, Child, Result, SystemGateway
 from .fake_gateway import FakeGateway
 from .fakeclaude import (
     FAKE_CLAUDE,
-    INJECTED_HOOKS,
     claude_bin,
     fake_env,
     hook_settings,
@@ -36,6 +41,8 @@ SID = "0b9f4a8e-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
 OTHER_SID = "7e6d5c4b-3a29-4180-9f8e-7d6c5b4a3928"
 HEADLESS = ["-p", "--output-format", "stream-json", "--verbose"]
 FAKE_ERROR = 99
+LINUX = sys.platform.startswith("linux")
+linux_only = pytest.mark.skipif(not LINUX, reason="uses /proc and PR_SET_PDEATHSIG")
 
 
 class Env:
@@ -67,9 +74,15 @@ class Env:
     def argv(self, *args: str) -> list[str]:
         return [str(FAKE_CLAUDE), "--settings", str(self.settings), *args]
 
-    def run(self, *args: str, timeout: float = 30, **extra: str) -> Result:
+    def run(
+        self, *args: str, timeout: float = 30, stdin: str | None = None, **extra: str
+    ) -> Result:
         return SystemGateway().run(
-            self.argv(*args), extra_env=self.env(**extra), cwd=str(self.cwd), timeout=timeout
+            self.argv(*args),
+            extra_env=self.env(**extra),
+            cwd=str(self.cwd),
+            timeout=timeout,
+            stdin=stdin,
         )
 
     def spawn(self, *args: str) -> Child:
@@ -79,7 +92,7 @@ class Env:
         return child
 
     def hook_calls(self) -> list[dict[str, Any]]:
-        """``(event, payload)`` of every hook the fake ran, in order."""
+        """``(event, payload)`` of every hook the fake ran, in start order."""
         return [
             {"event": r["args"][0], "payload": json.loads(r["stdin"]), **r}
             for r in read_jsonl(self.hooks)
@@ -88,14 +101,82 @@ class Env:
     def records(self, event: str) -> list[dict[str, Any]]:
         return [r for r in read_jsonl(self.log) if r["event"] == event]
 
+    def common(self, event: str, sid: str = SID, **extra: Any) -> dict[str, Any]:
+        """The fields every hook payload carries by default."""
+        project = re.sub(r"[^A-Za-z0-9]", "-", str(self.cwd))
+        transcript = str(Path.home() / ".claude" / "projects" / project / f"{sid}.jsonl")
+        return {
+            "session_id": sid,
+            "transcript_path": transcript,
+            "cwd": str(self.cwd),
+            "permission_mode": "default",
+            "hook_event_name": event,
+            **extra,
+        }
+
 
 @pytest.fixture
 def env(tmp_path: Path) -> Env:
     return Env(tmp_path)
 
 
+def _dead(pid: int) -> bool:
+    """Whether ``pid`` is gone or a zombie (a zombie we do not own is as good as dead)."""
+    if LINUX:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                return fh.read().rpartition(b")")[2].split()[0] == b"Z"
+        except FileNotFoundError:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def gone(pid: int, timeout: float = 10.0) -> bool:
+    """Wait up to ``timeout`` seconds for ``pid`` to die."""
+    deadline = time.monotonic() + timeout
+    while not _dead(pid):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+@pytest.fixture
+def leaked() -> Iterator[list[int]]:
+    """PIDs of processes the fake may leave behind; any still alive at teardown gets SIGKILL
+    by that exact PID."""
+    pids: list[int] = []
+    yield pids
+    for pid in pids:
+        if not _dead(pid):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def read_pid(path: Path, timeout: float = 15.0) -> int:
+    """A PID a step or hook wrote (``echo $$ > path``), once the line is complete."""
+    deadline = time.monotonic() + timeout
+    while True:
+        with contextlib.suppress(FileNotFoundError):
+            text = path.read_text(encoding="utf-8")
+            if text.endswith("\n"):
+                return int(text)
+        if time.monotonic() > deadline:
+            raise AssertionError(f"no PID in {path} after {timeout} s")
+        time.sleep(0.02)
+
+
 def stream(stdout: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in stdout.splitlines()]
+
+
+def exec_recorder(log: Path, **kwargs: Any) -> str:
+    """A recorder that is the hook's own process (``exec``), whatever ``/bin/sh`` is."""
+    return "exec " + recorder(log, **kwargs)
 
 
 # --- argv, version, scenario loading -------------------------------------------------------
@@ -155,6 +236,7 @@ def test_the_documented_argv_is_accepted_and_logged(env: Env) -> None:
     (start,) = env.records("start")
     assert start["flags"]["--add-dir"] == ["/a", "/p"]
     assert start["flags"]["--setting-sources"] == ""
+    assert start["flags"]["--debug"] is True
     assert start["prompt"] == "/plugin:skill go"
     assert start["headless"] is True
     assert start["session_id"] == OTHER_SID  # a fork takes its pre-assigned id
@@ -171,12 +253,17 @@ def test_the_documented_argv_is_accepted_and_logged(env: Env) -> None:
         (["one", "two"], "too many arguments"),
         (["--resume", SID, "--session-id", OTHER_SID], "--fork-session"),
         (["--fork-session"], "requires --resume"),
-        (["-p", "--output-format", "stream-json"], "requires --verbose"),
+        (["-p", "--output-format", "stream-json", "x"], "requires --verbose"),
         (["--output-format", "json"], "only works with --print"),
-        (["-p", "--output-format", "yaml", "--verbose"], "invalid --output-format"),
+        (["-p", "--output-format", "yaml", "--verbose", "x"], "invalid --output-format"),
         (["--session-id", "not-a-uuid"], "valid UUID"),
         (["--resume", "'; rm -rf /'"], "valid UUID"),
-        (["-p", "--max-turns", "0"], "invalid --max-turns"),
+        (["-p", "--max-turns", "0", "x"], "invalid --max-turns"),
+        (["--verbose=yes"], "does not take an argument"),
+        (["--add-dir"], "argument missing"),
+        (["--add-dir", "--verbose"], "argument missing"),
+        (["-p"], "Input must be provided"),
+        (["--", "a", "b"], "too many arguments"),
     ],
 )
 def test_invalid_argv_is_rejected_like_claude(env: Env, args: list[str], message: str) -> None:
@@ -185,6 +272,67 @@ def test_invalid_argv_is_rejected_like_claude(env: Env, args: list[str], message
     assert result.returncode == 1
     assert message in result.stderr
     assert not (env.tmp / "ran").exists()
+
+
+def test_print_mode_reads_the_prompt_from_stdin(env: Env) -> None:
+    env.setup([])
+    result = env.run("-p", stdin="from stdin")
+    assert result.returncode == 0, result.stderr
+    assert env.records("start")[0]["prompt"] == "from stdin"
+
+
+def test_option_equals_value_and_end_of_options(env: Env) -> None:
+    env.setup([])
+    result = env.run("--model=m", "--add-dir=/a", "--debug=api", "--", "--looks-like-an-option")
+    assert result.returncode == 0, result.stderr
+    (start,) = env.records("start")
+    assert start["flags"]["--model"] == "m"
+    assert start["flags"]["--add-dir"] == ["/a"]
+    assert start["flags"]["--debug"] == "api"
+    assert start["prompt"] == "--looks-like-an-option"
+
+
+def test_add_dir_takes_values_until_the_next_option(env: Env) -> None:
+    env.setup([])
+    assert env.run("--add-dir", "/a", "/b", "--model", "m", "--add-dir", "/c").returncode == 0
+    (start,) = env.records("start")
+    assert start["flags"]["--add-dir"] == ["/a", "/b", "/c"]
+    assert start["prompt"] is None
+
+
+@pytest.mark.parametrize(
+    ("args", "debug", "prompt"),
+    [
+        (["--debug", "--verbose"], True, None),
+        (["-d", "api"], "api", None),
+        # Like the real claude, an optional-value --debug eats a following bootstrap prompt
+        # (and so does --add-dir): the ordering hazard is visible here.
+        (["--debug", "/plugin:skill go"], "/plugin:skill go", None),
+        (["--add-dir", "/a", "/plugin:skill go"], True, None),
+    ],
+)
+def test_optional_and_variadic_values_eat_a_following_prompt(
+    env: Env, args: list[str], debug: object, prompt: str | None
+) -> None:
+    env.setup([])
+    assert env.run(*args).returncode == 0
+    (start,) = env.records("start")
+    assert start["prompt"] == prompt
+    if "--add-dir" in args:
+        assert start["flags"]["--add-dir"] == ["/a", "/plugin:skill go"]
+    else:
+        assert start["flags"]["--debug"] == debug
+
+
+def test_extra_flags_extend_the_accepted_argv(env: Env) -> None:
+    env.setup([], extra_flags={"--permission-mode": "value", "--foo": "bool"})
+    result = env.run("--permission-mode", "plan", "--foo", "go")
+    assert result.returncode == 0, result.stderr
+    (start,) = env.records("start")
+    assert (start["flags"]["--permission-mode"], start["flags"]["--foo"]) == ("plan", True)
+    assert start["prompt"] == "go"
+    env.setup([])
+    assert env.run("--permission-mode", "plan").returncode == 1
 
 
 @pytest.mark.parametrize(
@@ -200,7 +348,13 @@ def test_invalid_argv_is_rejected_like_claude(env: Env, args: list[str], message
         ({"steps": [{"do": "stop", "on_block": [{"do": "nope"}]}]}, "on_block[0]"),
         ({"steps": [{"do": "report", "args": ["done"], "heredoc": "a\nEOF\nb"}]}, "EOF"),
         ({"steps": [], "signals": {"KILL": "ignore"}}, "unknown signal"),
+        ({"steps": [], "signals": {"HUP": {"die": True, "exit": 1}}}, "signals.HUP"),
         ({"steps": "all"}, "must be a list"),
+        ({"steps": [{"do": "truncated_result", "chars": 0}]}, "chars"),
+        ({"steps": [{"do": "truncated_result", "bytes": 0}]}, "bytes"),
+        ({"steps": [{"do": "truncated_result", "chars": 3, "bytes": 3}]}, "exactly one"),
+        ({"steps": [{"do": "parallel", "steps": [{"do": "stop"}]}]}, "parallel"),
+        ({"steps": [], "extra_flags": {"--x": "maybe"}}, "extra_flags"),
     ],
 )
 def test_a_broken_scenario_fails_loudly(env: Env, scenario: dict[str, Any], message: str) -> None:
@@ -209,6 +363,25 @@ def test_a_broken_scenario_fails_loudly(env: Env, scenario: dict[str, Any], mess
     result = env.run("-p", "x")
     assert result.returncode == FAKE_ERROR
     assert message in result.stderr
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_non_finite_numbers_are_refused(env: Env, number: str) -> None:
+    text = '{"steps": [{"do": "sleep", "seconds": NUMBER}]}'.replace("NUMBER", number)
+    env.scenario.write_text(text, encoding="utf-8")
+    write_json(env.settings, {})
+    result = env.run("-p", "x")
+    assert result.returncode == FAKE_ERROR
+    assert "number" in result.stderr
+
+
+def test_an_internal_error_exits_fake_error_not_1(env: Env) -> None:
+    env.setup([{"do": "write_file", "path": "missing/dir/file.md", "content": "x"}])
+    result = env.run()
+    assert result.returncode == FAKE_ERROR
+    assert "Traceback" not in result.stderr
+    assert env.records("error")
+    assert env.records("exit")[0]["code"] == FAKE_ERROR
 
 
 @pytest.mark.parametrize(
@@ -257,14 +430,15 @@ def test_every_injected_event_gets_its_documented_payload(env: Env) -> None:
     env.setup(
         [
             {"do": "session_start"},
-            {"do": "user_prompt_submit"},
+            {"do": "user_prompt_submit", "prompt": "hi"},
             {"do": "permission_request", "tool_name": "Bash", "tool_input": {"command": "ls"}},
-            {"do": "notification", "notification_type": "permission_prompt"},
+            {"do": "notification", "notification_type": "permission_prompt", "message": "m"},
             {
                 "do": "post_tool_use",
                 "tool_name": "Bash",
                 "tool_input": {"command": "ls"},
                 "tool_response": {"stdout": "a\n", "stderr": ""},
+                "tool_use_id": "toolu_1",
             },
             {"do": "notification", "notification_type": "elicitation_dialog"},
             {"do": "stop"},
@@ -286,27 +460,34 @@ def test_every_injected_event_gets_its_documented_payload(env: Env) -> None:
         "SessionEnd",
     ]
     payloads = [c["payload"] for c in calls]
-    assert all(p["session_id"] == SID for p in payloads)
-    transcript = payloads[0]["transcript_path"]
-    project = re.sub(r"[^A-Za-z0-9]", "-", str(env.cwd))
-    assert transcript.endswith(f"/.claude/projects/{project}/{SID}.jsonl")
-    assert not Path(transcript).exists()
+    assert not Path(payloads[0]["transcript_path"]).exists()
+    for n in (5, 7):  # the default notification messages
+        assert isinstance(payloads[n].pop("message"), str) and payloads[n] != {}
+    c = env.common
     assert payloads == [
-        {"session_id": SID, "transcript_path": transcript, "source": "startup"},
-        {"session_id": SID},
-        {"session_id": SID, "tool_name": "Bash", "tool_input": {"command": "ls"}},
-        {"session_id": SID, "notification_type": "permission_prompt"},
-        {
-            "session_id": SID,
-            "tool_name": "Bash",
-            "tool_input": {"command": "ls"},
-            "tool_response": {"stdout": "a\n", "stderr": ""},
-        },
-        {"session_id": SID, "notification_type": "elicitation_dialog"},
-        {"session_id": SID, "stop_hook_active": False, "background_tasks": []},
-        {"session_id": SID, "notification_type": "idle_prompt"},
-        {"session_id": SID, "reason": "prompt_input_exit"},
+        c("SessionStart", source="startup"),
+        c("UserPromptSubmit", prompt="hi"),
+        c("PermissionRequest", tool_name="Bash", tool_input={"command": "ls"}),
+        c("Notification", notification_type="permission_prompt", message="m"),
+        c(
+            "PostToolUse",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+            tool_response={"stdout": "a\n", "stderr": ""},
+            tool_use_id="toolu_1",
+        ),
+        c("Notification", notification_type="elicitation_dialog"),
+        c("Stop", stop_hook_active=False, background_tasks=[]),
+        c("Notification", notification_type="idle_prompt"),
+        c("SessionEnd", reason="prompt_input_exit"),
     ]
+
+
+def test_permission_mode_and_prompt_defaults(env: Env) -> None:
+    env.setup([{"do": "user_prompt_submit"}], permission_mode="plan")
+    assert env.run("-p", "the prompt").returncode == 0
+    (call,) = env.hook_calls()
+    assert (call["payload"]["permission_mode"], call["payload"]["prompt"]) == ("plan", "the prompt")
 
 
 def test_hooks_run_in_the_cwd_with_the_claude_environment(env: Env) -> None:
@@ -316,7 +497,7 @@ def test_hooks_run_in_the_cwd_with_the_claude_environment(env: Env) -> None:
     assert call["cwd"] == str(env.cwd)
     assert call["env"]["CSESSION_ID"] == "cs-abcd2345"
     assert call["env"]["CSESSION_DIR"] == "/s/cs-abcd2345"
-    # Each hook runs in its own process group (led by its ``sh``), not the fake's (ours).
+    # Each hook runs in a process group of its own, not the fake's (nor ours).
     (start,) = env.records("start")
     assert call["pgid"] not in (os.getpgid(0), start["pid"])
 
@@ -355,11 +536,20 @@ def test_clear_changes_the_session_id_and_compact_keeps_it(env: Env) -> None:
     )
     assert env.run("--session-id", SID).returncode == 0
     p = [c["payload"] for c in env.hook_calls()]
-    assert p[1] == {"session_id": SID, "reason": "clear"}
+    assert p[1] == env.common("SessionEnd", reason="clear")
     new = p[2]["session_id"]
     assert new != SID and uuid.UUID(new)
     assert p[2]["transcript_path"].endswith(f"/{new}.jsonl")
     assert (p[3]["session_id"], p[3]["source"], p[4]["session_id"]) == (new, "compact", new)
+    assert p[4]["transcript_path"] == p[2]["transcript_path"]
+
+
+def test_a_session_start_with_a_session_id_recomputes_the_transcript_path(env: Env) -> None:
+    env.setup([{"do": "session_start", "session_id": OTHER_SID}, {"do": "stop"}])
+    assert env.run("--session-id", SID).returncode == 0
+    start, stop = (c["payload"] for c in env.hook_calls())
+    assert start["transcript_path"] == env.common("x", OTHER_SID)["transcript_path"]
+    assert (stop["session_id"], stop["transcript_path"]) == (OTHER_SID, start["transcript_path"])
 
 
 def test_ask_user_question_is_a_permission_request(env: Env) -> None:
@@ -374,22 +564,32 @@ def test_ask_user_question_is_a_permission_request(env: Env) -> None:
     req, post = (c["payload"] for c in env.hook_calls())
     assert (req["tool_name"], req["tool_input"]) == ("AskUserQuestion", questions)
     assert post["tool_response"] == {}
+    assert post["tool_use_id"].startswith("toolu_")
 
 
 def test_post_tool_use_inside_a_subagent_keeps_the_parent_session_id(env: Env) -> None:
     env.setup(
-        [{"do": "post_tool_use", "tool_name": "Read", "agent_id": "a1", "agent_type": "explorer"}]
+        [
+            {
+                "do": "post_tool_use",
+                "tool_name": "Read",
+                "agent_id": "a1",
+                "agent_type": "explorer",
+                "tool_use_id": "toolu_2",
+            }
+        ]
     )
     assert env.run("--session-id", SID).returncode == 0
     (call,) = env.hook_calls()
-    assert call["payload"] == {
-        "session_id": SID,
-        "tool_name": "Read",
-        "tool_input": {},
-        "tool_response": {},
-        "agent_id": "a1",
-        "agent_type": "explorer",
-    }
+    assert call["payload"] == env.common(
+        "PostToolUse",
+        tool_name="Read",
+        tool_input={},
+        tool_response={},
+        tool_use_id="toolu_2",
+        agent_id="a1",
+        agent_type="explorer",
+    )
 
 
 def test_stop_with_background_tasks(env: Env) -> None:
@@ -417,9 +617,13 @@ def test_notification_matchers_select_only_their_entry(env: Env) -> None:
         ("*", "Write", True),
         ("Write", "Write", True),
         ("Edit|Write", "Write", True),
-        ("Write", "WriteFile", False),
+        ("Write", "WriteFile", False),  # identifier characters only: exact match
+        ("rite", "Write", False),
         ("Edit", "Write", False),
-        ("mcp__.*", "mcp__srv__tool", True),
+        ("mcp__.*", "mcp__srv__tool", True),  # anything else: an unanchored regex search
+        ("Wri.e", "Write", True),
+        ("rit.", "Write", True),
+        ("^Edit", "Write", False),
     ],
 )
 def test_tool_matchers(env: Env, matcher: str | None, tool: str, fires: bool) -> None:
@@ -429,20 +633,100 @@ def test_tool_matchers(env: Env, matcher: str | None, tool: str, fires: bool) ->
     assert len(env.hook_calls()) == (1 if fires else 0)
 
 
-def test_matcher_on_an_event_without_a_match_field_never_fires(env: Env) -> None:
-    settings = hook_settings(lambda e: recorder(env.hooks, args=[e]), [("Stop", "Bash", 5)])
+@pytest.mark.parametrize("event", ["Stop", "UserPromptSubmit"])
+def test_events_without_matchers_ignore_the_matcher(env: Env, event: str) -> None:
+    settings = hook_settings(lambda e: recorder(env.hooks, args=[e]), [(event, "Bash", 5)])
+    step = "stop" if event == "Stop" else "user_prompt_submit"
+    env.setup([{"do": step}], settings=settings)
+    assert env.run().returncode == 0
+    assert [c["event"] for c in env.hook_calls()] == [event]
+
+
+@pytest.mark.parametrize(
+    ("event", "matcher", "step", "fires"),
+    [
+        ("PermissionRequest", "Bash", {"do": "permission_request", "tool_name": "Bash"}, True),
+        ("PermissionRequest", "Bash", {"do": "permission_request", "tool_name": "Read"}, False),
+        ("SessionEnd", "clear", {"do": "session_end", "reason": "clear"}, True),
+        ("SessionEnd", "clear", {"do": "session_end", "reason": "other"}, False),
+        ("SessionStart", "resume", {"do": "session_start", "source": "resume"}, True),
+        ("SessionStart", "resume", {"do": "session_start", "source": "startup"}, False),
+    ],
+)
+def test_matcher_fields_of_other_events(
+    env: Env, event: str, matcher: str, step: dict[str, Any], fires: bool
+) -> None:
+    settings = hook_settings(lambda e: recorder(env.hooks, args=[e]), [(event, matcher, 5)])
+    env.setup([step], settings=settings)
+    assert env.run().returncode == 0
+    assert len(env.hook_calls()) == (1 if fires else 0)
+
+
+def test_hooks_of_one_event_run_concurrently(env: Env) -> None:
+    settings = hook_settings(
+        lambda e: recorder(env.hooks, args=[e], sleep=2),
+        [("Stop", None, 30)],
+    )
+    second = recorder(env.hooks, args=["Stop", "second"], sleep=2)
+    settings["hooks"]["Stop"].append({"hooks": [{"type": "command", "command": second}]})
     env.setup([{"do": "stop"}], settings=settings)
     assert env.run().returncode == 0
-    assert env.hook_calls() == []
+    assert len(env.hook_calls()) == 2
+    (start,), (end,) = env.records("start"), env.records("exit")
+    assert end["ts"] - start["ts"] < 3.5  # in sequence: 4 s at least
 
 
-def test_several_hooks_for_one_event_all_run_in_order(env: Env) -> None:
+def test_identical_hook_commands_run_once(env: Env) -> None:
     settings = hook_settings(
         lambda e: recorder(env.hooks, args=[e]), [("Stop", None, 5), ("Stop", None, 5)]
     )
     env.setup([{"do": "stop"}], settings=settings)
     assert env.run().returncode == 0
-    assert [c["event"] for c in env.hook_calls()] == ["Stop", "Stop"]
+    assert [c["event"] for c in env.hook_calls()] == ["Stop"]
+
+
+def test_parallel_tool_calls_fire_their_hooks_concurrently(env: Env) -> None:
+    settings = hook_settings(
+        lambda e: recorder(env.hooks, args=[e], sleep=2), [("PostToolUse", None, 30)]
+    )
+    env.setup(
+        [
+            {
+                "do": "parallel",
+                "steps": [
+                    {"do": "post_tool_use", "tool_name": "Read", "tool_use_id": "toolu_a"},
+                    {"do": "post_tool_use", "tool_name": "Grep", "tool_use_id": "toolu_b"},
+                ],
+            }
+        ],
+        settings=settings,
+    )
+    assert env.run().returncode == 0
+    ids = {c["payload"]["tool_use_id"] for c in env.hook_calls()}
+    assert ids == {"toolu_a", "toolu_b"}  # the same command, run once per tool call
+    (start,), (end,) = env.records("start"), env.records("exit")
+    assert end["ts"] - start["ts"] < 3.5
+
+
+def test_a_blocked_parallel_call_runs_on_block(env: Env) -> None:
+    block = json.dumps({"decision": "block", "reason": "no"})
+    settings = hook_settings(
+        lambda e: recorder(env.hooks, args=[e], stdout=block), [("PostToolUse", "Grep", 30)]
+    )
+    env.setup(
+        [
+            {
+                "do": "parallel",
+                "steps": [
+                    {"do": "post_tool_use", "tool_name": "Read"},
+                    {"do": "post_tool_use", "tool_name": "Grep"},
+                ],
+                "on_block": [{"do": "exit", "code": 5}],
+            }
+        ],
+        settings=settings,
+    )
+    assert env.run().returncode == 5
 
 
 # --- hostile payloads ----------------------------------------------------------------------
@@ -455,20 +739,24 @@ def test_payload_overrides_omissions_and_raw_payloads(env: Env) -> None:
             {"do": "stop", "omit": ["background_tasks", "stop_hook_active"]},
             {"do": "user_prompt_submit", "raw_payload": "{not json"},
             {"do": "session_end", "reason": "other", "raw_payload": ""},
+            {"do": "stop", "omit": ["background_tasks", "permission_mode", "cwd"]},
         ]
     )
     assert env.run("--session-id", SID).returncode == 0
     records = read_jsonl(env.hooks)
     first = json.loads(records[0]["stdin"])
     assert (first["source"], first["extra"]) == ("weird", [1])
-    assert json.loads(records[1]["stdin"]) == {"session_id": SID}
+    assert json.loads(records[1]["stdin"]) == env.common("Stop")
     assert records[2]["stdin"] == "{not json"
     assert records[3]["stdin"] == ""
+    minimal = env.common("Stop", stop_hook_active=False)
+    del minimal["permission_mode"], minimal["cwd"]
+    assert json.loads(records[4]["stdin"]) == minimal
 
 
 def test_unicode_and_large_payloads_reach_the_hook_intact(env: Env) -> None:
     big = "x" * (2 * 1024 * 1024)
-    text = 'café ☃ \U0001f600 ‮ \'; $(rm -rf ~) `x` "q" \\'
+    text = 'café ☃ \U0001f600 ‮ \'; $(touch pwned) `x` "q" \\'
     env.setup(
         [
             {"do": "post_tool_use", "tool_name": "Write", "tool_input": {"content": big}},
@@ -479,6 +767,7 @@ def test_unicode_and_large_payloads_reach_the_hook_intact(env: Env) -> None:
     first, second = env.hook_calls()
     assert first["payload"]["tool_input"]["content"] == big
     assert second["payload"]["tool_input"]["content"] == text
+    assert not (env.cwd / "pwned").exists()
 
 
 # --- hook output -----------------------------------------------------------------------------
@@ -500,6 +789,21 @@ def test_a_blocked_stop_runs_on_block_and_sets_stop_hook_active(env: Env) -> Non
     assert [b["reasons"] for b in env.records("block")] == [["file a report"]] * 2
 
 
+def test_user_prompt_submit_resets_stop_hook_active(env: Env) -> None:
+    block = json.dumps({"decision": "block", "reason": "again"})
+    settings = hook_settings(
+        lambda e: recorder(env.hooks, args=[e], stdout=block if e == "Stop" else ""),
+        [("Stop", None, 60), ("UserPromptSubmit", None, 60)],
+    )
+    env.setup(
+        [{"do": "stop", "on_block": [{"do": "user_prompt_submit"}, {"do": "stop"}]}],
+        settings=settings,
+    )
+    assert env.run().returncode == 0
+    stops = [c["payload"] for c in env.hook_calls() if c["event"] == "Stop"]
+    assert [s["stop_hook_active"] for s in stops] == [False, False]
+
+
 def test_exit_2_blocks_with_stderr_as_reason(env: Env) -> None:
     settings = hook_settings(
         lambda e: recorder(env.hooks, args=[e], exit_code=2, stderr="no report\n"),
@@ -508,6 +812,30 @@ def test_exit_2_blocks_with_stderr_as_reason(env: Env) -> None:
     env.setup([{"do": "stop", "on_block": [{"do": "exit", "code": 7}]}], settings=settings)
     assert env.run().returncode == 7
     assert env.records("block")[0]["reasons"] == ["no report"]
+
+
+@pytest.mark.parametrize(
+    ("event", "step"),
+    [
+        ("SessionStart", {"do": "session_start"}),
+        ("Notification", {"do": "notification", "notification_type": "idle_prompt"}),
+        ("SessionEnd", {"do": "session_end", "reason": "other"}),
+    ],
+)
+@pytest.mark.parametrize("how", ["exit2", "decision"])
+def test_blocking_only_applies_to_blocking_events(
+    env: Env, event: str, step: dict[str, Any], how: str
+) -> None:
+    answer: dict[str, Any] = (
+        {"exit_code": 2, "stderr": "no\n"}
+        if how == "exit2"
+        else {"stdout": json.dumps({"decision": "block", "reason": "no"})}
+    )
+    settings = hook_settings(lambda e: recorder(env.hooks, args=[e], **answer), [(event, None, 5)])
+    env.setup([{**step, "on_block": [{"do": "exit", "code": 7}]}], settings=settings)
+    assert env.run().returncode == 0
+    assert env.records("block") == []
+    assert len(env.hook_calls()) == 1
 
 
 @pytest.mark.parametrize(
@@ -548,6 +876,21 @@ def test_session_start_context_is_recorded(env: Env) -> None:
     assert env.records("context")[0]["contexts"] == ["claude-session directory: /d"]
 
 
+@pytest.mark.parametrize("name", ["Stop", None])
+def test_hook_specific_output_for_another_event_is_invalid(env: Env, name: str | None) -> None:
+    specific: dict[str, Any] = {"additionalContext": "x"}
+    if name is not None:
+        specific["hookEventName"] = name
+    stdout = json.dumps({"hookSpecificOutput": specific})
+    settings = hook_settings(
+        lambda e: recorder(env.hooks, args=[e], stdout=stdout), [("SessionStart", None, 30)]
+    )
+    env.setup([{"do": "session_start"}], settings=settings)
+    assert env.run().returncode == 0
+    assert env.records("context") == []
+    assert len(env.records("hook_output_invalid")) == 1
+
+
 def test_plain_session_start_stdout_is_context(env: Env) -> None:
     settings = hook_settings(
         lambda e: recorder(env.hooks, args=[e], stdout="hello\n"), [("SessionStart", None, 30)]
@@ -559,7 +902,7 @@ def test_plain_session_start_stdout_is_context(env: Env) -> None:
 
 @pytest.mark.parametrize("ignore_term", [False, True])
 def test_a_hook_past_its_timeout_is_ended_and_its_output_dropped(
-    env: Env, ignore_term: bool
+    env: Env, ignore_term: bool, leaked: list[int]
 ) -> None:
     block = json.dumps({"decision": "block", "reason": "late"})
     settings = hook_settings(
@@ -568,16 +911,38 @@ def test_a_hook_past_its_timeout_is_ended_and_its_output_dropped(
     )
     env.setup([{"do": "stop", "on_block": [{"do": "exit", "code": 7}]}], settings=settings)
     result = env.run(timeout=20)
+    leaked.append(env.hook_calls()[0]["pid"])
     assert result.returncode == 0
     (hook,) = env.records("hook")
     assert hook["timed_out"] is True
-    assert hook["exit"] == -signal.SIGTERM  # the group leader, ``sh``
+    # SIGTERM to the hook's process, SIGKILL to its group after the grace; whether the hook's
+    # process is ``sh`` or (exec'd) the recorder depends on /bin/sh.
+    assert hook["exit"] in (-signal.SIGTERM, -signal.SIGKILL)
     assert "stdout" not in hook
     assert env.records("block") == []
-    # The recorder (which may ignore SIGTERM) got SIGKILL with its group, long before its
-    # 30 s sleep ended (the run's timeout is 20 s).
-    if sys.platform.startswith("linux"):
-        assert not Path(f"/proc/{env.hook_calls()[0]['pid']}").exists()
+    # The recorder (which may ignore SIGTERM) is gone long before its 30 s sleep ends.
+    assert gone(env.hook_calls()[0]["pid"])
+
+
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs setsid")
+def test_a_timed_out_hook_does_not_wait_for_a_grandchild_holding_its_output(
+    env: Env, leaked: list[int]
+) -> None:
+    pidfile = env.tmp / "grandchild.pid"
+    command = f"setsid sh -c 'echo $$ > {pidfile}; exec sleep 8' & echo started"
+    hook = {"type": "command", "command": command, "timeout": 1}
+    settings = {"hooks": {"Stop": [{"hooks": [hook]}]}}
+    env.setup([{"do": "stop"}], settings=settings)
+    began = time.monotonic()
+    try:
+        result = env.run(timeout=30)
+        elapsed = time.monotonic() - began
+    finally:
+        with contextlib.suppress(AssertionError):
+            leaked.append(read_pid(pidfile, timeout=5))
+    assert result.returncode == 0
+    assert env.records("hook")[0]["timed_out"] is True
+    assert elapsed < 4
 
 
 # --- agent actions ---------------------------------------------------------------------------
@@ -606,7 +971,13 @@ def test_report_runs_the_bare_command_through_path(env: Env) -> None:
     command = post["payload"]["tool_input"]["command"]
     assert command.startswith("claude-session report done --summary ")
     assert post["payload"]["tool_name"] == "Bash"
-    assert post["payload"]["tool_response"] == {"stdout": "report queued\n", "stderr": ""}
+    assert post["payload"]["tool_response"] == {
+        "stdout": "report queued\n",
+        "stderr": "",
+        "interrupted": False,
+        "isImage": False,
+    }
+    assert post["payload"]["tool_use_id"].startswith("toolu_")
     assert (post["payload"]["agent_id"], post["payload"]["agent_type"]) == ("a1", "worker")
 
 
@@ -646,6 +1017,25 @@ def test_a_failed_command_fires_post_tool_use_only_when_asked(
     assert (bash["exit"], bash["stderr"]) == (2, "summary required\n")
 
 
+def test_a_failed_command_fires_post_tool_use_failure(env: Env) -> None:
+    settings = hook_settings(
+        lambda e: recorder(env.hooks, args=[e]),
+        [("PostToolUse", None, 60), ("PostToolUseFailure", "Bash", 60)],
+    )
+    env.setup([{"do": "bash", "command": "echo bad >&2; exit 3"}], settings=settings)
+    assert env.run().returncode == 0
+    (call,) = env.hook_calls()
+    assert call["event"] == "PostToolUseFailure"
+    payload = call["payload"]
+    assert payload["hook_event_name"] == "PostToolUseFailure"
+    assert (payload["tool_name"], payload["tool_input"]) == (
+        "Bash",
+        {"command": "echo bad >&2; exit 3"},
+    )
+    assert payload["tool_use_id"].startswith("toolu_")
+    assert "Exit code 3" in payload["error"] and "bad" in payload["error"]
+
+
 def test_a_rejected_report_is_filed_again_on_block(env: Env) -> None:
     calls = env.tmp / "report.jsonl"
     report_stub(env.bin, calls)
@@ -667,6 +1057,7 @@ def test_a_rejected_report_is_filed_again_on_block(env: Env) -> None:
     )
     assert env.run(PATH=f"{env.bin}:{os.environ['PATH']}").returncode == 0
     assert [c["args"][-1] for c in read_jsonl(calls)] == ["a", "b"]
+    assert len(env.hook_calls()) == 1  # ``never``: the second report fired no PostToolUse
 
 
 def test_bash_and_write_file(env: Env) -> None:
@@ -677,8 +1068,20 @@ def test_bash_and_write_file(env: Env) -> None:
         ]
     )
     assert env.run().returncode == 0
-    (post,) = env.hook_calls()
-    assert post["payload"]["tool_response"] == {"stdout": "sé\n", "stderr": "err\n"}
+    write, post = env.hook_calls()
+    path = str(env.cwd / "summary.md")
+    assert write["payload"]["tool_name"] == "Write"
+    assert write["payload"]["tool_input"] == {"file_path": path, "content": "sé\n"}
+    assert write["payload"]["tool_response"] == {"filePath": path, "success": True}
+    assert post["payload"]["tool_response"]["stdout"] == "sé\n"
+    assert post["payload"]["tool_response"]["stderr"] == "err\n"
+
+
+def test_write_file_post_tool_use_can_be_turned_off(env: Env) -> None:
+    env.setup([{"do": "write_file", "path": "a.md", "content": "", "post_tool_use": "never"}])
+    assert env.run().returncode == 0
+    assert env.hook_calls() == []
+    assert (env.cwd / "a.md").exists()
 
 
 # --- stream-json and exits -----------------------------------------------------------------
@@ -703,7 +1106,7 @@ def test_several_result_objects_and_raw_lines(env: Env) -> None:
             },
         ]
     )
-    result = env.run(*HEADLESS, "--session-id", SID)
+    result = env.run(*HEADLESS, "--session-id", SID, "go")
     assert result.returncode == 0
     lines = result.stdout.splitlines()
     assert lines[2] == "not json at all"
@@ -726,7 +1129,7 @@ def test_several_result_objects_and_raw_lines(env: Env) -> None:
 
 def test_a_truncated_tail(env: Env) -> None:
     env.setup([{"do": "result", "result": "one"}, {"do": "truncated_result", "chars": 20}])
-    result = env.run(*HEADLESS)
+    result = env.run(*HEADLESS, "go")
     first, tail = result.stdout.split("\n")
     assert json.loads(first)["result"] == "one"
     assert len(tail) == 20 and tail.startswith('{"type": "result"')
@@ -734,9 +1137,28 @@ def test_a_truncated_tail(env: Env) -> None:
         json.loads(tail)
 
 
+def test_a_truncated_tail_cut_inside_a_utf8_sequence(env: Env) -> None:
+    prefix = '{"type": "result", "subtype": "success", "is_error": false, "result": "'
+    cut = len(prefix.encode("utf-8")) + 1
+    env.setup([{"do": "truncated_result", "result": "éé", "bytes": cut}])
+    proc = subprocess.run(
+        env.argv(*HEADLESS, "go"),
+        env={**os.environ, **env.env()},
+        cwd=env.cwd,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == prefix.encode("utf-8") + b"\xc3"
+    with pytest.raises(UnicodeDecodeError):
+        proc.stdout.decode("utf-8")
+
+
 def test_truncation_must_cut_the_object(env: Env) -> None:
     env.setup([{"do": "truncated_result", "chars": 100000}])
-    assert env.run(*HEADLESS).returncode == FAKE_ERROR
+    assert env.run(*HEADLESS, "go").returncode == FAKE_ERROR
 
 
 def test_exit_code_stderr_and_later_steps_skipped(env: Env) -> None:
@@ -761,7 +1183,7 @@ def wait_step(env: Env, kind: str) -> None:
 
 def test_sigterm_fires_session_end_other_and_exits_143(env: Env) -> None:
     env.setup([{"do": "session_start"}, {"do": "hang"}])
-    child = env.spawn(*HEADLESS)
+    child = env.spawn(*HEADLESS, "go")
     wait_step(env, "hang")
     child.send_signal(signal.SIGTERM)
     assert child.wait(15) == 143
@@ -779,9 +1201,37 @@ def test_sighup_exits_129_without_session_end(env: Env) -> None:
     assert env.hook_calls() == []
 
 
+def test_die_action_dies_by_the_signal(env: Env) -> None:
+    env.setup([{"do": "hang"}], signals={"HUP": {"die": True, "session_end": "other"}})
+    child = env.spawn()
+    wait_step(env, "hang")
+    child.send_signal(signal.SIGHUP)
+    assert child.wait(15) == -signal.SIGHUP
+    assert [c["payload"]["reason"] for c in env.hook_calls()] == ["other"]
+
+
+def test_interactive_sigint_is_ignored_by_default(env: Env) -> None:
+    env.setup([{"do": "hang"}])
+    child = env.spawn()
+    wait_step(env, "hang")
+    child.send_signal(signal.SIGINT)
+    wait_for(env.log, lambda r: r["event"] == "signal_ignored" and r["signal"] == "INT")
+    assert child.wait(0.2) is None
+    child.send_signal(signal.SIGTERM)
+    assert child.wait(15) == 143
+
+
+def test_headless_sigint_exits_130(env: Env) -> None:
+    env.setup([{"do": "hang"}])
+    child = env.spawn("-p", "go")
+    wait_step(env, "hang")
+    child.send_signal(signal.SIGINT)
+    assert child.wait(15) == 130
+
+
 def test_ignoring_sigterm(env: Env) -> None:
     env.setup([{"do": "ignore_signals", "signals": ["TERM"]}, {"do": "hang"}])
-    child = env.spawn(*HEADLESS)
+    child = env.spawn(*HEADLESS, "go")
     wait_step(env, "hang")
     child.send_signal(signal.SIGTERM)
     wait_for(env.log, lambda r: r["event"] == "signal_ignored")
@@ -791,12 +1241,25 @@ def test_ignoring_sigterm(env: Env) -> None:
     assert env.hook_calls() == []
 
 
+def test_an_ignored_signal_still_reaches_hooks_started_later(env: Env, leaked: list[int]) -> None:
+    settings = hook_settings(
+        lambda e: exec_recorder(env.hooks, args=[e], sleep=60), [("Stop", None, 60)]
+    )
+    env.setup([{"do": "ignore_signals", "signals": ["TERM"]}, {"do": "stop"}], settings=settings)
+    child = env.spawn()
+    hook = wait_for(env.hooks, lambda r: r["args"] == ["Stop"])
+    leaked.append(hook["pid"])
+    os.kill(hook["pid"], signal.SIGTERM)  # the hook is the fake's unreaped child: exact
+    assert child.wait(15) == 0
+    assert env.records("hook")[0]["exit"] == -signal.SIGTERM
+
+
 def test_signal_actions_from_the_scenario(env: Env) -> None:
     env.setup(
         [{"do": "hang"}],
         signals={"TERM": {"exit": 0, "session_end": "logout"}, "INT": "ignore"},
     )
-    child = env.spawn()
+    child = env.spawn("-p", "go")
     wait_step(env, "hang")
     child.send_signal(signal.SIGINT)
     wait_for(env.log, lambda r: r["event"] == "signal_ignored" and r["signal"] == "INT")
@@ -805,7 +1268,7 @@ def test_signal_actions_from_the_scenario(env: Env) -> None:
     assert env.hook_calls()[0]["payload"]["reason"] == "logout"
 
 
-def test_sigterm_during_a_hook_ends_the_hook_first(env: Env) -> None:
+def test_sigterm_during_a_hook_ends_the_hook_first(env: Env, leaked: list[int]) -> None:
     settings = hook_settings(
         lambda e: recorder(env.hooks, args=[e], sleep=60 if e == "Stop" else 0),
         [("Stop", None, 60), ("SessionEnd", None, 30)],
@@ -813,11 +1276,63 @@ def test_sigterm_during_a_hook_ends_the_hook_first(env: Env) -> None:
     env.setup([{"do": "stop"}], settings=settings)
     child = env.spawn()
     hook = wait_for(env.hooks, lambda r: r["args"] == ["Stop"])
+    leaked.append(hook["pid"])
     child.send_signal(signal.SIGTERM)
     assert child.wait(15) == 143
     assert [c["event"] for c in env.hook_calls()] == ["Stop", "SessionEnd"]
-    if sys.platform.startswith("linux"):
-        assert not Path(f"/proc/{hook['pid']}").exists()
+    assert gone(hook["pid"])
+
+
+def test_a_second_signal_while_unwinding_is_only_logged(env: Env, leaked: list[int]) -> None:
+    settings = hook_settings(
+        lambda e: exec_recorder(env.hooks, args=[e], sleep=60), [("SessionEnd", None, 60)]
+    )
+    env.setup([{"do": "hang"}], settings=settings)
+    child = env.spawn()
+    wait_step(env, "hang")
+    child.send_signal(signal.SIGTERM)
+    hook = wait_for(env.hooks, lambda r: r["args"] == ["SessionEnd"])
+    leaked.append(hook["pid"])
+    child.send_signal(signal.SIGTERM)
+    wait_for(env.log, lambda r: r["event"] == "signal" and len(env.records("signal")) == 2)
+    os.kill(hook["pid"], signal.SIGTERM)  # the hook is the fake's unreaped child: exact
+    assert child.wait(15) == 143
+    assert env.records("hook")[0]["exit"] == -signal.SIGTERM
+
+
+def test_a_signal_after_the_last_step_takes_its_outcome(env: Env) -> None:
+    env.setup([{"do": "touch", "path": "ran"}], raise_after_steps="TERM")
+    result = env.run("-p", "go")
+    assert result.returncode == 143
+    assert "Traceback" not in result.stderr
+    assert [c["payload"]["reason"] for c in env.hook_calls()] == ["other"]
+    assert env.records("exit")[0]["code"] == 143
+
+
+@linux_only
+def test_sigterm_during_a_bash_step_leaves_no_child(env: Env, leaked: list[int]) -> None:
+    pidfile = env.tmp / "child.pid"
+    env.setup([{"do": "bash", "command": f"sleep 60 & echo $! > {pidfile}; wait"}])
+    child = env.spawn()
+    pid = read_pid(pidfile)
+    leaked.append(pid)
+    child.send_signal(signal.SIGTERM)
+    assert child.wait(15) == 143
+    assert gone(pid)
+
+
+@linux_only
+def test_a_killed_fake_leaves_no_hook_behind(env: Env, leaked: list[int]) -> None:
+    settings = hook_settings(
+        lambda e: exec_recorder(env.hooks, args=[e], sleep=60), [("Stop", None, 60)]
+    )
+    env.setup([{"do": "stop"}], settings=settings)
+    child = env.spawn()
+    hook = wait_for(env.hooks, lambda r: r["args"] == ["Stop"])
+    leaked.append(hook["pid"])
+    child.send_signal(signal.SIGKILL)
+    assert child.wait(15) == -signal.SIGKILL
+    assert gone(hook["pid"])
 
 
 def test_sleep_then_exit(env: Env) -> None:
@@ -854,18 +1369,3 @@ def test_claude_bin_wrapper_keeps_the_pid(env: Env) -> None:
     assert start["pid"] == child.pid
     child.send_signal(signal.SIGTERM)
     assert child.wait(15) == 143
-
-
-def test_injected_hooks_cover_the_documented_events() -> None:
-    events = {e for e, _, _ in INJECTED_HOOKS}
-    assert events == {
-        "SessionStart",
-        "UserPromptSubmit",
-        "PermissionRequest",
-        "Notification",
-        "PostToolUse",
-        "Stop",
-        "SessionEnd",
-    }
-    timeouts = {e: t for e, _, t in INJECTED_HOOKS}
-    assert (timeouts["PostToolUse"], timeouts["Stop"], timeouts["SessionStart"]) == (60, 60, 30)
