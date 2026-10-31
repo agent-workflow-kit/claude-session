@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import errno
 import signal
 import sys
 
 import pytest
 
-from claude_session.gateway import DEVNULL, INHERIT, Gateway, GatewayTimeout, SystemGateway
+from claude_session.gateway import (
+    DEVNULL,
+    GATE_EXEC_FAILED,
+    INHERIT,
+    Gateway,
+    GatewayTimeout,
+    SystemGateway,
+)
 
 from .fake_clock import FakeClock
 from .fake_gateway import FAKE_PID_BASE, FakeChild, FakeGateway, Response
@@ -74,6 +82,24 @@ def test_spawn_via_starts_the_real_program_and_records_it() -> None:
     child = fake.spawn([sys.executable, "-I", "-c", "raise SystemExit(7)"], stdin=DEVNULL)
     assert child.wait(timeout=30) == 7
     assert fake.calls[0].kind == "spawn"
+
+
+def test_a_gated_spawn_is_recorded_and_its_release_seen() -> None:
+    fake = FakeGateway()
+    fake.on(["/opt/claude"], timeout=True)
+    child = fake.spawn(["/opt/claude"], gated=True)
+    assert fake.calls[0].gated
+    assert isinstance(child, FakeChild) and not child.released
+    child.release()
+    assert child.released
+
+
+def test_spawn_via_passes_the_gate_through() -> None:
+    fake = FakeGateway(spawn_via=SystemGateway())
+    child = fake.spawn([sys.executable, "-I", "-c", "raise SystemExit(7)"], gated=True)
+    assert child.wait(timeout=0.2) is None  # waits at its gate
+    child.release()
+    assert child.wait(timeout=30) == 7
 
 
 @pytest.mark.parametrize("argv", ["/usr/bin/git", b"/usr/bin/git"])
@@ -201,3 +227,33 @@ def test_a_scripted_timeout_without_a_timeout_fails() -> None:
     fake.on(["/bin/sh"], timeout=True)
     with pytest.raises(AssertionError):
         fake.run(["/bin/sh", "-c", "hook"], new_process_group=True)
+
+
+def test_a_gated_child_reports_no_exit_before_its_release() -> None:
+    fake = FakeGateway()
+    fake.on(["/opt/claude"], returncode=3)
+    child = fake.spawn(["/opt/claude"], gated=True)
+    assert child.poll() is None and child.wait(timeout=1) is None  # waits at its gate
+    with pytest.raises(AssertionError):
+        child.wait()  # would block forever, as the real one
+    child.release()
+    assert child.poll() == 3 and child.wait() == 3
+
+
+def test_a_scripted_release_error_is_raised_and_the_child_exits_gate_exec_failed() -> None:
+    fake = FakeGateway()
+    error = FileNotFoundError(errno.ENOENT, "No such file or directory", "/opt/claude")
+    fake.on(["/opt/claude"], release_error=error)
+    child = fake.spawn(["/opt/claude"], gated=True)
+    with pytest.raises(FileNotFoundError):
+        child.release()
+    assert child.wait() == GATE_EXEC_FAILED
+    child.release()  # idempotent
+
+
+def test_a_release_error_needs_a_gated_spawn() -> None:
+    fake = FakeGateway()
+    fake.on(["/opt/claude"], release_error=OSError(errno.ENOEXEC, "Exec format error"))
+    child = fake.spawn(["/opt/claude"])
+    child.release()  # an ungated child: a no-op, as the real one
+    assert child.wait() == 0

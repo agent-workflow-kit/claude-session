@@ -478,7 +478,7 @@ def _resume(args: argparse.Namespace) -> int:
         resume.liveness(st, process, planned.source.csession_id, cfg)
         signals.raise_pending()
         signals.defer()  # a signal during allocation acts once the run exists
-        alloc = resume.allocate(st, planned, process, cfg=cfg)
+        alloc = resume.allocate(st, planned, process, cfg=cfg, check=False)  # checked above
         return _Begun(
             alloc,
             cfg,

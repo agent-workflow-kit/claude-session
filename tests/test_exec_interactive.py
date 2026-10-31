@@ -32,6 +32,8 @@ from typing import Any
 
 import pytest
 
+from claude_session.store import start_time
+
 from .fakeclaude import claude_bin, read_jsonl, wait_for, write_json
 from .test_exec_headless import (
     START,
@@ -179,6 +181,7 @@ def start_terminal(
     ignore: Sequence[int] = (),
     status_to: Path | None = None,
     command_args: Sequence[str] = ("exec",),
+    claude: Path | None = None,
 ) -> Terminal:
     """``controlling``: None (the terminal is only exec's stdin and stdout), ``"exec"`` (it
     is exec's controlling terminal, exec the session leader) or ``"leader"`` (``LEADER`` is
@@ -186,9 +189,10 @@ def start_terminal(
     exec's process before its entry point (a fault injected into exec). ``ignore``: signals
     exec inherits as ignored. ``command_args``: the command run instead of ``exec`` (e.g.
     ``resume <id>``). ``status_to``: claude first copies its ``/proc`` status there
-    (a shell wrapper that then execs the fake, same PID)."""
+    (a shell wrapper that then execs the fake, same PID). ``claude``: the ``claude_bin``
+    used instead of the fake (``steps`` then unused)."""
     scenario = write_json(tmp_path / "scenario.json", {"steps": steps})
-    fake = claude_bin(tmp_path / "fakebin", scenario, tmp_path / "fake.jsonl")
+    fake = claude or claude_bin(tmp_path / "fakebin", scenario, tmp_path / "fake.jsonl")
     if status_to is not None:
         fake = script(
             tmp_path / "wrapbin" / "claude",
@@ -696,6 +700,46 @@ def test_an_inherited_ignored_sighup_stays_ignored_for_exec_and_claude(
     assert signals_not_sent(term) == []
 
 
+def test_an_interactive_claude_inherits_an_ignored_sigterm(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """G2: the gated spawn keeps an ignored SIGTERM for interactive claude (only a headless
+    claude starts with SIGTERM at its default action, for its death signal)."""
+    status = tmp_path / "claude-status"
+    term = start_terminal(
+        tmp_path,
+        state,
+        work,
+        [START, {"do": "exit", "code": 0}],
+        ignore=[signal.SIGTERM],
+        status_to=status,
+    )
+    code, outcome, err = term.finish()
+    check_outcome(code, outcome, err)
+    assert ignored_signals(status) & (1 << (signal.SIGTERM - 1))
+
+
+def test_an_interactive_claude_that_cannot_be_executed_ends_the_run_not_started(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """G3: the exec fails only at the gate's release (a bad interpreter): the run goes back
+    to the launch phase and ends not-started, launch_interrupted, with no child recorded."""
+    claude = script(tmp_path / "badbin" / "claude", "#!/nonexistent/interp\n")
+    term = start_terminal(tmp_path, state, work, [], claude=claude)
+    code, outcome, err = term.finish()
+    outcome = check_outcome(code, outcome, err)
+    assert code == 12
+    assert (outcome["phase"], outcome["outcome"], outcome["end_reason"]) == (
+        "launch",
+        "not-started",
+        "launch_interrupted",
+    )
+    assert "claude could not be started" in outcome["message"]
+    row = run_row_of(state)
+    assert row["ended_at"] is not None
+    assert (row["phase"], row["child_pid"], row["started_at"]) == ("launch", None, None)
+
+
 def test_sighup_to_the_whole_group_ends_the_run_forwarded_hup(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
@@ -765,6 +809,80 @@ def test_a_sigint_during_the_interactive_spawn_is_dropped(
     assert run_row_of(state)["pending_cause"] is None
     assert fake_signals(term) == []
     assert signals_sent(term) == [] and signals_not_sent(term) == []
+
+
+def test_an_interactive_exec_killed_before_recording_its_child_never_runs_claude(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    # The wrapper dies inside the store write that records the child (after waiting up to 2s
+    # for an ungated child to start claude): the gated child exits without running claude.
+    pidfile, ran = tmp_path / "childpid", tmp_path / "ran"
+    patch = (
+        "import os, signal, time\n"
+        "from claude_session import store\n"
+        "_orig = store.Store.update_run\n"
+        "def _upd(self, *a, **k):\n"
+        "    if 'child_pid' in k:\n"
+        f"        open({str(pidfile)!r}, 'w').write(str(k['child_pid']))\n"
+        "        end = time.monotonic() + 2\n"
+        f"        while not os.path.exists({str(ran)!r}) and time.monotonic() < end:\n"
+        "            time.sleep(0.02)\n"
+        "        os.kill(os.getpid(), signal.SIGKILL)\n"
+        "    return _orig(self, *a, **k)\n"
+        "store.Store.update_run = _upd\n"
+    )
+    term = start_terminal(tmp_path, state, work, [touch(ran), START, HANG], patch=patch)
+    code, _, err = term.finish()
+    assert code == -signal.SIGKILL, err
+    child = int(pidfile.read_text())
+    token = start_time(child)
+    try:
+        deadline = time.monotonic() + 10
+        while start_time(child) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not start_time(child), "the unrecorded child is still alive"
+    finally:  # only the exact child this test's exec started, while it is still that one
+        if token and start_time(child) == token:
+            os.kill(child, signal.SIGKILL)
+    assert not ran.exists(), "claude ran"
+
+
+def test_an_exec_killed_after_recording_its_child_before_the_release_is_salvaged_lost(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """G4 (documented window, interface.md Liveness): the wrapper dies after recording its
+    child, before releasing it. The child exits at its gate without running claude, and the
+    recorded run is salvaged by the wrapper-lost rules (lost), not launch_interrupted."""
+    ran = tmp_path / "ran"
+    patch = (
+        "import os, signal\n"
+        "from claude_session import gateway\n"
+        "def _release(self):\n"
+        "    os.kill(os.getpid(), signal.SIGKILL)\n"
+        "gateway._PopenChild.release = _release\n"
+    )
+    term = start_terminal(tmp_path, state, work, [touch(ran), START, HANG], patch=patch)
+    code, _, err = term.finish()
+    assert code == -signal.SIGKILL, err
+    row = run_row_of(state)
+    child, token = int(row["child_pid"]), row["child_start"]
+    assert row["phase"] == "session" and row["ended_at"] is None
+    try:
+        deadline = time.monotonic() + 10
+        while start_time(child) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not start_time(child), "the unreleased child is still alive"
+    finally:  # only the exact child this test's exec started, while it is still that one
+        if token and start_time(child) == token:
+            os.kill(child, signal.SIGKILL)
+    assert not ran.exists(), "claude ran"
+    from claude_session import liveness
+    from claude_session.store import Store
+
+    with Store.open(str(state / "state.db")) as st:
+        liveness.check_session(st, None, row["csession_id"])
+    final = run_row_of(state)
+    assert (final["outcome"], final["end_reason"]) == ("lost", "lost")
 
 
 # Interactive resume (#17 with #29)

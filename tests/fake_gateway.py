@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 
 from claude_session.gateway import (
     DEVNULL,
+    GATE_EXEC_FAILED,
     Child,
     Gateway,
     GatewayTimeout,
@@ -60,19 +61,23 @@ class Call:
     executable: str | None = None  # the program run when argv[0] is only its name
     output_limit: int | None = None  # run only
     discard_output: bool = False  # run only
+    gated: bool = False  # spawn only
 
 
 @dataclass(frozen=True)
 class Response:
     """One scripted answer. ``timeout``: ``run`` raises ``GatewayTimeout`` (only for a call
     given a ``timeout``: otherwise the fake fails, as the real call could not time out), a
-    spawned child keeps running. ``error``: the call raises it."""
+    spawned child keeps running. ``error``: the call raises it. ``release_error``: a gated
+    spawn's ``release`` raises it, as the real one does when the exec fails (the child then
+    exits ``GATE_EXEC_FAILED``)."""
 
     returncode: int = 0
     stdout: str = ""
     stderr: str = ""
     timeout: bool = False
     error: OSError | None = None
+    release_error: OSError | None = None
 
 
 @dataclass
@@ -93,21 +98,31 @@ class FakeChild:
     at once when built with one); signals to a running child are recorded, never sent, and
     signals after it exited are dropped (the real child ignores them once reaped). With a
     ``clock``, waiting on a running child advances it by the timeout, as a real wait would take
-    that long; ``wait()`` with no timeout on a running child fails (it would never return)."""
+    that long; ``wait()`` with no timeout on a running child fails (it would never return).
+
+    A ``gated`` child is running until ``release`` (as the real one waits at its gate): its
+    scripted exit is reported only once released. With ``release_error``, ``release`` raises
+    it and the child exits ``GATE_EXEC_FAILED``, as a real gated child whose exec failed."""
 
     pid: int
     returncode: int | None = None
     signals: list[int] = field(default_factory=list)
     clock: FakeClock | None = None
+    released: bool = False  # a gated child: whether ``release`` let it run its program
+    gated: bool = False
+    release_error: OSError | None = None
 
     def exit(self, returncode: int) -> None:
         self.returncode = returncode
 
+    def _exited(self) -> int | None:
+        return None if self.gated and not self.released else self.returncode
+
     def poll(self) -> int | None:
-        return self.returncode
+        return self._exited()
 
     def wait(self, timeout: float | None = None) -> int | None:
-        if self.returncode is None:
+        if self._exited() is None:
             if timeout is None:
                 raise AssertionError(
                     f"FakeChild {self.pid}: wait() with no timeout on a running child would "
@@ -115,11 +130,19 @@ class FakeChild:
                 )
             if self.clock is not None:
                 self.clock.advance(timeout)
-        return self.returncode
+        return self._exited()
 
     def send_signal(self, sig: int) -> None:
-        if self.returncode is None:
+        if self._exited() is None:
             self.signals.append(sig)
+
+    def release(self) -> None:
+        if self.released:  # idempotent, as the real one
+            return
+        self.released = True
+        if self.release_error is not None:  # the exec failed: the program never ran
+            self.returncode = GATE_EXEC_FAILED
+            raise self.release_error
 
 
 class FakeGateway:
@@ -141,12 +164,13 @@ class FakeGateway:
         stderr: str = "",
         timeout: bool = False,
         error: OSError | None = None,
+        release_error: OSError | None = None,
         responses: Sequence[Response] | None = None,
     ) -> None:
         """Answer commands whose argv starts with ``prefix``, with one response (the keyword
         arguments) or ``responses`` in order (the last repeats). The most recent matching rule
         wins, so a test can override a fixture's default."""
-        single = Response(returncode, stdout, stderr, timeout, error)
+        single = Response(returncode, stdout, stderr, timeout, error, release_error)
         if responses is None:
             scripted = [single]
         elif single != Response():
@@ -242,6 +266,7 @@ class FakeGateway:
         new_process_group: bool = False,
         die_with_parent: bool = False,
         executable: str | None = None,
+        gated: bool = False,
     ) -> Child:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_spawn_stdin(stdin)
@@ -259,6 +284,7 @@ class FakeGateway:
                 stdout=stdout,
                 stderr=stderr,
                 executable=executable,
+                gated=gated,
             )
         )
         if self._spawn_via is not None:
@@ -273,11 +299,17 @@ class FakeGateway:
                 new_process_group=new_process_group,
                 die_with_parent=die_with_parent,
                 executable=executable,
+                gated=gated,
             )
         response = self._answer(args)
         if response.error is not None:
             raise response.error
-        child = FakeChild(FAKE_PID_BASE + len(self.children), clock=self._clock)
+        child = FakeChild(
+            FAKE_PID_BASE + len(self.children),
+            clock=self._clock,
+            gated=gated,
+            release_error=response.release_error if gated else None,
+        )
         if not response.timeout:
             child.exit(response.returncode)
         self.children.append(child)

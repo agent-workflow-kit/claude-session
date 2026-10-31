@@ -53,7 +53,10 @@ handlers on entry to a Python function). Residuals: signals to the forking threa
 child has exec'd (or failed to); a handler (for a signal another thread took) that raises inside
 ``Popen`` after the fork, before ``spawn`` holds the ``Popen``, leaves that child running. ``run``
 (Linux) starts its child the same way, without the death signal, so a handler that raises in
-``exec``'s launch phase does so only once ``run`` holds the ``Popen`` and ends its child.
+``exec``'s launch phase does so only once ``run`` holds the ``Popen`` and ends its child. A
+``gated`` spawn forks the same way on every platform, and its child restores the caller's mask
+there too; SIGTERM is reset only with ``die_with_parent`` (``run`` and an interactive gated
+child keep an inherited ignored or blocked SIGTERM).
 
 ``run(..., discard_output=True)`` connects stdout and stderr to ``/dev/null`` (no pipes): it
 then waits only for the child itself to exit, never for descendants that keep the output open
@@ -106,7 +109,8 @@ class Inherit(enum.Enum):
 # Pass as a ``spawn`` stream to share this process's descriptor (interactive ``claude``).
 INHERIT: Final = Inherit.INHERIT
 
-# Exit code of a ``die_with_parent`` child whose parent died before the death signal was set.
+# Exit code of a ``die_with_parent`` child whose parent died before the death signal was set,
+# and of a ``gated`` child whose gate closed without a release (its parent died or gave up).
 PARENT_GONE_EXIT: Final = 128 + signal.SIGTERM
 
 # PATH when sanitizing leaves no entry: an empty PATH makes some programs search the cwd.
@@ -126,7 +130,11 @@ _READ_SIZE = 32768
 MAX_WAIT: Final = 86400.0
 # How often ``canceled`` is polled while waiting.
 _CANCEL_POLL = 0.05
-_PIPE_BUF = getattr(select, "PIPE_BUF", 512)  # a write this small never blocks once writable
+_PIPE_BUF = getattr(select, "PIPE_BUF", 512)
+try:
+    _MAX_FD = max(os.sysconf("SC_OPEN_MAX"), 256)
+except (ValueError, OSError):
+    _MAX_FD = 256  # a write this small never blocks once writable
 
 
 @dataclass(frozen=True)
@@ -189,6 +197,11 @@ class Child(Protocol):
         """Signal this child; a no-op once it has been reaped (its PID may be reused)."""
         ...
 
+    def release(self) -> None:
+        """Let a ``gated`` child exec its program (idempotent; a no-op for an ungated child or
+        one that has already exited)."""
+        ...
+
 
 @runtime_checkable
 class Gateway(Protocol):
@@ -249,6 +262,7 @@ class Gateway(Protocol):
         new_process_group: bool = False,
         die_with_parent: bool = False,
         executable: str | None = None,
+        gated: bool = False,
     ) -> Child:
         """Start without waiting. Streams are file descriptors, ``DEVNULL`` or ``INHERIT``;
         ``stdin`` defaults to ``DEVNULL`` (``None`` raises ``TypeError``: pass ``INHERIT``),
@@ -265,7 +279,23 @@ class Gateway(Protocol):
         SIGTERM, so the death signal works even when this process ignores or blocks SIGTERM;
         the rest of the signal mask, and any other ignored (``SIG_IGN``) signal, is inherited
         across exec, so callers install no-op handlers instead of ``SIG_IGN``. Raises
-        ``OSError`` when the program cannot be started (including a failed ``prctl``)."""
+        ``OSError`` when the program cannot be started (including a failed ``prctl``).
+
+        ``gated``: the child is forked but does not exec the program until ``Child.release``.
+        Between fork and exec it blocks reading a close-on-exec gate pipe whose only write end
+        this process holds; one byte lets it exec, end of file (this process died, or dropped
+        the gate because the child exited or was abandoned) makes it ``_exit`` with
+        ``PARENT_GONE_EXIT`` without running the program. So a caller that records the
+        child's PID and start time before releasing it knows an unrecorded child never ran
+        the program (interface.md, Liveness). Its PID and start time are the program's: exec
+        keeps both. The program is checked (exists, executable) here, raising as an ungated
+        spawn would; an exec that fails anyway (a bad interpreter, a race) makes ``release``
+        raise that ``OSError``, and the child exits ``GATE_EXEC_FAILED``. Gated children are
+        started like ``die_with_parent`` ones on every platform (every signal blocked around
+        the fork; before it waits at the gate the child resets the signals with a Python
+        handler here to their default action and restores the caller's mask). Only with
+        ``die_with_parent`` is SIGTERM also reset and unblocked; without it an inherited
+        ignored or blocked SIGTERM stays so, as for an ungated child."""
         ...
 
 
@@ -348,7 +378,7 @@ def _stream(value: int | Inherit | None) -> int | None:
 
 @dataclass(frozen=True)
 class _Libc:
-    prctl: Callable[..., int]
+    prctl: Callable[..., int] | None  # Linux only
     signal: Callable[..., object]
     get_errno: Callable[[], int]
 
@@ -373,7 +403,8 @@ def _libc() -> _Libc:
     libc_signal = ctypes.CDLL(None).signal
     libc_signal.restype = ctypes.c_void_p
     libc_signal.argtypes = (ctypes.c_int, ctypes.c_void_p)
-    return _Libc(_prctl(), libc_signal, ctypes.get_errno)
+    prctl = _prctl() if sys.platform.startswith("linux") else None
+    return _Libc(prctl, libc_signal, ctypes.get_errno)
 
 
 # Pidfds
@@ -461,21 +492,25 @@ def pidfd_send_signal(fd: int, sig: int) -> None:
 
 def _pdeathsig_preexec(
     child_mask: set[int], parent: int | None = None, *, death_signal: bool = True
-) -> Callable[[], None] | None:
-    """A ``preexec_fn`` setting ``PR_SET_PDEATHSIG(SIGTERM)``, or ``None`` off Linux.
+) -> Callable[[], None]:
+    """A ``preexec_fn`` for a fork made with every signal blocked (``_start_blocked``).
 
-    The fork happens with every signal blocked (``spawn``, ``run``); the child resets
-    the signals that have a Python handler here, and SIGTERM, to their default action, then
-    sets ``child_mask`` (the caller's mask) without SIGTERM. ``parent`` is the PID the child
-    must see as its parent (default: this process). Without ``death_signal`` (``run``) only
-    the handlers and the mask are reset."""
-    if not sys.platform.startswith("linux"):
-        return None
+    On every platform the child resets the signals that have a Python handler here to their
+    default action and then sets ``child_mask`` (the caller's mask). With ``death_signal``
+    SIGTERM is also reset to its default and dropped from the mask, and on Linux the child
+    sets ``PR_SET_PDEATHSIG(SIGTERM)``; ``parent`` is the PID the child must then see as its
+    parent (default: this process). Without ``death_signal`` (``run``, an interactive gated
+    spawn) an inherited ignored or blocked SIGTERM stays as it was."""
     libc = _libc()  # resolved before the fork
     expected = os.getpid() if parent is None else parent
-    handled = [s for s in signal.valid_signals() if callable(signal.getsignal(s))]
-    reset = sorted({*handled, signal.SIGTERM})
-    mask = child_mask - {signal.SIGTERM}
+    handled = {s for s in signal.valid_signals() if callable(signal.getsignal(s))}
+    if death_signal:
+        reset = sorted({*handled, signal.SIGTERM})
+        mask = child_mask - {signal.SIGTERM}
+    else:
+        reset = sorted(handled)
+        mask = set(child_mask)
+    prctl = libc.prctl if death_signal else None
 
     def preexec() -> None:
         # A Python handler would run here, in the forked child, if its signal arrived; an
@@ -483,12 +518,62 @@ def _pdeathsig_preexec(
         for sig in reset:
             libc.signal(sig, _SIG_DFL)
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        if not death_signal:
+        if prctl is None:  # no death signal asked for, or not Linux
             return
-        if libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+        if prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
             raise OSError(libc.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
         if os.getppid() != expected:  # the parent died before the flag was set
             os._exit(PARENT_GONE_EXIT)
+
+    return preexec
+
+
+# Exit code of a released ``gated`` child whose program could not be executed.
+GATE_EXEC_FAILED: Final = 127
+
+
+def _gate_preexec(
+    inner: Callable[[], None] | None,
+    gate_fd: int,
+    error_fd: int,
+    program: str,
+    argv: tuple[str, ...],
+    env: dict[str, str],
+) -> Callable[[], None]:
+    """``inner`` (the signal reset), then wait at the gate and exec the program here.
+
+    ``subprocess.Popen`` returns only once its child has exec'd (it waits for its
+    close-on-exec error pipe), so the child closes every descriptor above stderr but the
+    gate's read end and its own error pipe's write end (``Popen``'s error pipe and the gate's
+    write end included) before it waits: what ``close_fds`` does right after this function
+    anyway. ``Popen`` then returns at once, and the child execs the program itself on a byte
+    from the gate, or ``_exit(PARENT_GONE_EXIT)`` on end of file. A failing exec writes its
+    errno to the error pipe (close-on-exec: end of file means the exec succeeded) and exits
+    ``GATE_EXEC_FAILED``."""
+    low, high = sorted((gate_fd, error_fd))
+
+    def preexec() -> None:
+        if inner is not None:
+            inner()
+        os.closerange(3, low)
+        os.closerange(low + 1, high)
+        os.closerange(high + 1, _MAX_FD)
+        while True:
+            try:
+                data = os.read(gate_fd, 1)
+            except InterruptedError:
+                continue
+            break
+        if not data:  # the parent died or dropped the gate: never run the program
+            os._exit(PARENT_GONE_EXIT)
+        os.close(gate_fd)
+        try:
+            os.execve(program, argv, env)
+        except OSError as exc:
+            try:
+                os.write(error_fd, str(exc.errno or 0).encode())
+            finally:
+                os._exit(GATE_EXEC_FAILED)
 
     return preexec
 
@@ -788,24 +873,79 @@ def _start_blocked(
 
 
 class _PopenChild:
-    def __init__(self, popen: subprocess.Popen[bytes]) -> None:
+    def __init__(
+        self, popen: subprocess.Popen[bytes], gate: tuple[int, int, str] | None = None
+    ) -> None:
         self._popen = popen
+        # A gated child waiting at its gate: (gate write end, error pipe read end, program).
+        self._gate = gate
 
     @property
     def pid(self) -> int:
         return self._popen.pid
 
     def poll(self) -> int | None:
-        return self._popen.poll()
+        return self._exited(self._popen.poll())
 
     def wait(self, timeout: float | None = None) -> int | None:
         try:
-            return self._popen.wait(timeout)
+            return self._exited(self._popen.wait(timeout))
         except subprocess.TimeoutExpired:
             return None
 
     def send_signal(self, sig: int) -> None:
         self._popen.send_signal(sig)  # Popen skips the signal once the child is reaped
+
+    def release(self) -> None:
+        """Let the child exec; raises ``OSError`` (the child then exits ``GATE_EXEC_FAILED``)
+        when the exec fails, as ``Popen`` raises for an ungated child. A child that already
+        exited is not an error."""
+        gate, self._gate = self._gate, None
+        if gate is None:
+            return
+        gate_fd, error_fd, program = gate
+        try:
+            try:
+                os.write(gate_fd, b"\x01")
+            except BrokenPipeError:  # the child already exited: nothing to release
+                return
+            finally:
+                os.close(gate_fd)
+            report = b""
+            while chunk := _read_retrying(error_fd):  # end of file: the exec succeeded
+                report += chunk
+        finally:
+            os.close(error_fd)
+        if report:
+            code = int(report) if report.isdigit() else errno.ENOEXEC
+            raise OSError(code, os.strerror(code), program)
+
+    def _exited(self, returncode: int | None) -> int | None:
+        if returncode is not None:  # never released: drop the gate
+            self._drop_gate()
+        return returncode
+
+    def _drop_gate(self) -> None:
+        gate, self._gate = self._gate, None
+        if gate is not None:
+            os.close(gate[0])
+            os.close(gate[1])
+
+    def __del__(self) -> None:
+        # An abandoned gate is closed, so a child never released exits instead of waiting.
+        try:
+            if getattr(self, "_gate", None) is not None:
+                self._drop_gate()
+        except Exception:  # interpreter shutdown: the descriptors close with the process
+            pass
+
+
+def _read_retrying(fd: int) -> bytes:
+    while True:
+        try:
+            return os.read(fd, 64)
+        except InterruptedError:
+            continue
 
 
 class SystemGateway:
@@ -901,6 +1041,7 @@ class SystemGateway:
         new_process_group: bool = False,
         die_with_parent: bool = False,
         executable: str | None = None,
+        gated: bool = False,
     ) -> Child:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_spawn_stdin(stdin)
@@ -921,6 +1062,58 @@ class SystemGateway:
             except subprocess.SubprocessError as exc:  # preexec_fn failed in the child
                 raise OSError(f"could not start {argv[0]!r}: {exc}") from exc
 
+        if gated:
+            program = argv[0] if executable is None else executable
+            _check_program(program)
+            return _spawn_gated(
+                start,
+                program=program,
+                argv=tuple(argv),
+                env=_child_env(env, extra_env),
+                die_with_parent=die_with_parent,
+            )
         if not (die_with_parent and sys.platform.startswith("linux")):
             return _PopenChild(start(None))
         return _PopenChild(_start_blocked(start, _pdeathsig_preexec))
+
+
+def _check_program(program: str) -> None:
+    """Raise as ``Popen`` would for a program that cannot be executed, so the common failures
+    come from ``spawn`` itself (``release`` raises for the rest, such as a bad interpreter)."""
+    if not os.path.isfile(program):
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), program)
+    if not os.access(program, os.X_OK):
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), program)
+
+
+def _spawn_gated(
+    start: Callable[[Callable[[], None] | None], subprocess.Popen[bytes]],
+    *,
+    program: str,
+    argv: tuple[str, ...],
+    env: dict[str, str],
+    die_with_parent: bool,
+) -> _PopenChild:
+    """``start`` a child that waits at a gate pipe until ``release`` (see ``spawn``)."""
+    gate_read, gate_write = os.pipe()  # all four ends close-on-exec (PEP 446)
+    try:
+        error_read, error_write = os.pipe()
+    except BaseException:
+        os.close(gate_read)
+        os.close(gate_write)
+        raise
+    try:
+
+        def preexec(mask: set[int]) -> Callable[[], None]:
+            inner = _pdeathsig_preexec(mask, death_signal=die_with_parent)
+            return _gate_preexec(inner, gate_read, error_write, program, argv, env)
+
+        popen = _start_blocked(start, preexec)
+    except BaseException:
+        os.close(gate_write)
+        os.close(error_read)
+        raise
+    finally:
+        os.close(gate_read)
+        os.close(error_write)
+    return _PopenChild(popen, (gate_write, error_read, program))

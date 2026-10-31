@@ -1273,3 +1273,197 @@ def test_kill_group_on_exit_ends_descendants_left_by_a_leader_that_exited(
 def test_kill_group_on_exit_needs_a_process_group(gw: SystemGateway) -> None:
     with pytest.raises(ValueError, match="kill_group_on_exit needs new_process_group"):
         gw.run(["/bin/true"], kill_group_on_exit=True)
+
+
+# --- gated spawn (the child execs only once released) -------------------------------------
+
+# An intermediate process spawns a gated child that would create a marker, prints its PID and
+# SIGKILLs itself without releasing it: the child must exit without running the program.
+GATED_INTERMEDIATE = """
+import os, signal, sys
+from claude_session.gateway import DEVNULL, SystemGateway
+child = SystemGateway().spawn(
+    ["/bin/sh", "-c", "echo ran > " + sys.argv[1]],
+    stdout=DEVNULL,
+    stderr=DEVNULL,
+    die_with_parent=sys.argv[2] == "1",
+    gated=True,
+)
+print(child.pid, flush=True)
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+
+@pytest.mark.parametrize("die_with_parent", [False, True])
+def test_a_gated_child_whose_parent_is_killed_never_runs_the_program(
+    gw: SystemGateway,
+    tmp_path: Path,
+    grandchildren: list[tuple[int, bytes | None]],
+    die_with_parent: bool,
+) -> None:
+    marker = tmp_path / "ran"
+    proc = subprocess.run(
+        [PY, "-c", GATED_INTERMEDIATE, str(marker), "1" if die_with_parent else "0"],
+        env={**os.environ, "PYTHONPATH": str(Path(gateway.__file__).parents[1])},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == -signal.SIGKILL, proc.stderr
+    pid = int(proc.stdout)
+    grandchildren.append((pid, _start_token(pid)))
+    assert _wait_dead(pid, 10)
+    assert not marker.exists()
+
+
+def test_a_gated_child_runs_the_program_only_once_released(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    marker = tmp_path / "ran"
+    child = gw.spawn(["/bin/sh", "-c", f"echo ran > {marker}"], gated=True)
+    try:
+        assert child.wait(timeout=0.3) is None
+        assert not marker.exists()
+    finally:
+        child.release()
+    assert child.wait(timeout=30) == 0
+    assert marker.read_text() == "ran\n"
+    child.release()  # idempotent
+
+
+@linux_only
+def test_a_gated_child_keeps_its_pid_and_start_time_across_the_release(
+    gw: SystemGateway,
+) -> None:
+    child = gw.spawn(["/bin/sleep", "30"], gated=True)
+    try:
+        before = _start_token(child.pid)
+        child.release()
+        assert _start_token(child.pid) == before
+        with open(f"/proc/{child.pid}/cmdline", "rb") as fh:  # the program now runs
+            assert fh.read().split(b"\0")[:2] == [b"/bin/sleep", b"30"]
+    finally:
+        child.send_signal(signal.SIGKILL)
+        child.wait(timeout=30)
+
+
+def test_a_gated_child_whose_gate_is_dropped_exits_without_running(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    marker = tmp_path / "ran"
+    child = gw.spawn(["/bin/sh", "-c", f"echo ran > {marker}"], gated=True)
+    child._drop_gate()  # pyright: ignore[reportAttributeAccessIssue]  # an abandoned gate
+    assert child.wait(timeout=30) == PARENT_GONE_EXIT
+    assert not marker.exists()
+
+
+def test_a_gated_child_that_cannot_exec_raises_from_release(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    script = tmp_path / "bad"
+    script.write_text("#!/nonexistent/interp\n")
+    script.chmod(0o755)
+    child = gw.spawn([str(script)], gated=True)
+    with pytest.raises(FileNotFoundError):
+        child.release()
+    assert child.wait(timeout=30) == gateway.GATE_EXEC_FAILED
+
+
+def test_a_gated_spawn_of_a_missing_program_raises_at_once(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    with pytest.raises(FileNotFoundError):
+        gw.spawn([str(tmp_path / "missing")], gated=True)
+
+
+def test_releasing_a_gated_child_that_already_died_is_not_an_error(gw: SystemGateway) -> None:
+    child = gw.spawn(["/bin/true"], gated=True)
+    child.send_signal(signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while not _reaped_or_zombie(child.pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    child.release()
+    assert child.wait(timeout=30) == -signal.SIGKILL
+
+
+def _reaped_or_zombie(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            return fh.read().rpartition(b")")[2].split()[0] == b"Z"
+    except FileNotFoundError:
+        return True
+
+
+# --- a gated child's signal state (every platform) ----------------------------------------
+
+
+def _gated_status(gw: SystemGateway, tmp_path: Path, *, die_with_parent: bool) -> dict[str, int]:
+    """The signal masks (``SigBlk``, ``SigIgn``) of the program a gated spawn runs."""
+    out = tmp_path / "status"
+    with open(out, "wb") as fh:
+        child = gw.spawn(
+            ["/bin/cat", "/proc/self/status"],
+            stdout=fh.fileno(),
+            die_with_parent=die_with_parent,
+            gated=True,
+        )
+        child.release()
+        assert child.wait(timeout=30) == 0
+    fields = dict(line.split(":", 1) for line in out.read_text().splitlines() if ":" in line)
+    return {name: int(fields[name].strip(), 16) for name in ("SigBlk", "SigIgn")}
+
+
+def _bits(signals: Iterable[int]) -> int:
+    return sum(1 << (int(sig) - 1) for sig in set(signals))
+
+
+def _no_prctl() -> Callable[..., int]:
+    raise AssertionError("prctl resolved off Linux")
+
+
+@linux_only  # reads /proc; the non-Linux branch is forced
+@pytest.mark.parametrize("die_with_parent", [False, True])
+def test_a_gated_child_off_linux_restores_the_callers_mask(
+    gw: SystemGateway,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    usr1_blocked: None,
+    die_with_parent: bool,
+) -> None:
+    """G1: the gated fork blocks every signal on every platform; off Linux the child must
+    still restore the caller's mask (no death signal there, and no prctl)."""
+    monkeypatch.setattr(gateway, "_prctl", _no_prctl)
+    monkeypatch.setattr(gateway.sys, "platform", "darwin")
+    expected = _sigmask() - ({signal.SIGTERM} if die_with_parent else set())
+    status = _gated_status(gw, tmp_path, die_with_parent=die_with_parent)
+    monkeypatch.undo()
+    assert status["SigBlk"] == _bits(expected)
+
+
+@linux_only
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.parametrize("die_with_parent", [False, True])
+def test_only_a_gated_child_that_dies_with_its_parent_resets_an_inherited_sigterm(
+    gw: SystemGateway,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    die_with_parent: bool,
+) -> None:
+    """G2: an interactive (``die_with_parent=False``) gated child inherits an ignored or
+    blocked SIGTERM as an ungated one does; a headless one starts with it at its default."""
+    if platform != "linux":
+        monkeypatch.setattr(gateway, "_prctl", _no_prctl)
+    monkeypatch.setattr(gateway.sys, "platform", platform)
+    term = _bits([signal.SIGTERM])
+    previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    saved = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        status = _gated_status(gw, tmp_path, die_with_parent=die_with_parent)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, saved)
+        signal.signal(signal.SIGTERM, previous)
+        monkeypatch.undo()
+    assert bool(status["SigIgn"] & term) == (not die_with_parent)
+    assert bool(status["SigBlk"] & term) == (not die_with_parent)

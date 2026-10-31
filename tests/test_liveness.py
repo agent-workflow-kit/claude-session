@@ -267,7 +267,8 @@ def test_a_wrapper_dead_before_the_spawn_ends_launch_interrupted_and_cleans_up(
     tmp = Path(tmpdir.create(sid))
     checked = liveness.check_session(st, None, sid, cause="reconcile")
     assert [(c.action, c.outcome, c.end_reason) for c in checked.changes] == [
-        ("marked_not_started", "not-started", "launch_interrupted")
+        ("marked_not_started", "not-started", "launch_interrupted"),
+        ("tmpdir_removed", None, None),
     ]
     row = run_row(st, sid)
     assert row["phase"] == "launch" and row["message"] == liveness.LAUNCH_LOST_MESSAGE
@@ -557,6 +558,55 @@ def test_an_exec_that_crashed_mid_launch_is_ended_by_reconcile(tmp_path: Path, w
     ]
     with store.open_state() as st:
         assert final_events(st, sid) == [(1, "reconcile", "not-started")]
+
+
+def test_an_exec_killed_between_the_spawn_and_the_child_record_never_runs_claude(
+    tmp_path: Path, work: Path
+) -> None:
+    # The wrapper dies inside the store write that records the child: the child, waiting at
+    # its gate, must exit without running claude (this one would ignore the death signal and
+    # create a marker), so launch_interrupted is the truth.
+    pidfile = tmp_path / "childpid"
+    ran = tmp_path / "ran"
+    steps = [
+        {"do": "ignore_signals", "signals": ["TERM"]},
+        {"do": "touch", "path": str(ran)},
+        START,
+        result_step(),
+    ]
+    cfg = fake_config(tmp_path, steps)
+    patch = (
+        "from claude_session import store\n"
+        "_orig = store.Store.update_run\n"
+        "def _upd(self, *a, **k):\n"
+        "    if 'child_pid' in k:\n"
+        f"        open({str(pidfile)!r}, 'w').write(str(k['child_pid']))\n"
+        "        import time\n"  # give an ungated child the time to start running claude
+        "        end = time.monotonic() + 2\n"
+        f"        while not os.path.exists({str(ran)!r}) and time.monotonic() < end:\n"
+        "            time.sleep(0.02)\n"
+        "        _die()\n"
+        "    return _orig(self, *a, **k)\n"
+        "store.Store.update_run = _upd\n"
+    )
+    crash(tmp_path, work, ["exec", "--mode", "headless", "--config", str(cfg), *PROMPT], patch)
+    child = int(pidfile.read_text())
+    token = store.start_time(child)
+    try:
+        deadline = time.monotonic() + 10
+        while store.start_time(child) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not store.start_time(child), "the unrecorded child is still alive"
+    finally:  # only the exact child this test's exec started, while it is still that one
+        if token and store.start_time(child) == token:
+            os.kill(child, signal.SIGKILL)
+    assert not ran.exists(), "claude ran"
+    only_session()
+    out = reconcile_json(tmp_path)
+    assert [(c["action"], c["end_reason"]) for c in out["changes"]][:1] == [
+        ("marked_not_started", "launch_interrupted")
+    ]
+    assert out["orphans"] == []
 
 
 def test_a_start_that_died_before_release_is_ended_and_its_spec_deleted(
@@ -966,3 +1016,541 @@ def test_the_database_records_hook_groups_from_schema_1_2(st: Store) -> None:
     finally:
         db.close()
     assert {"pgid", "leader_start", "holder_pid", "holder_start"} <= names
+
+
+# Review round 1 (#33)
+
+
+def implicit_run(st: Store, root: str, procs: Procs, *, cap: int, text: str = "the result") -> str:
+    """A dead run whose kind has ``implicit_done``, with everything an accepted implicit done
+    needs: the secret file matching the stored digest, the run's frozen caps
+    (``hookconf.json``, ``artifact_max_bytes`` ``cap``), a secret index and a complete
+    successful ``result.json`` whose text is ``text``."""
+    from claude_session import hookevent, secretindex
+
+    sid = salvaged(st, root, procs, resolved_json=json.dumps({"profile": {"implicit_done": True}}))
+    with sessiondir.SessionDirs.open(root, sid) as dirs:
+        dirs.prepare_run(1)
+        secret = dirs.write_run_files(
+            1,
+            claude_session_path="/usr/bin/true",
+            summary_max_bytes=1000,
+            artifact_max_bytes=cap,
+            input_files=[],
+        )
+        conf = hookevent.hookconf_bytes([], summary_max_bytes=1000, artifact_max_bytes=cap)
+        dirs.write_private_run_file(1, hookevent.HOOKCONF_NAME, conf)
+        index = secretindex.build([secret.value])
+        dirs.write_private_run_file(1, secretindex.INDEX_NAME, index)
+    st.conn.execute("UPDATE runs SET secret_sha256 = ? WHERE csession_id = ?", (secret.sha256, sid))
+    result = {"type": "result", "subtype": "success", "is_error": False, "result": text}
+    write_private(root, sid, 1, "result.json", (json.dumps(result) + "\n").encode())
+    return sid
+
+
+def test_salvage_accepts_an_implicit_done_without_a_config(
+    st: Store, root: str, procs: Procs
+) -> None:
+    sid = implicit_run(st, root, procs, cap=1000)
+    (change,) = liveness.check_session(st, None, sid).changes
+    assert (change.action, change.outcome, change.end_reason) == (
+        "finalized_from_result",
+        "done",
+        "normal",
+    )
+    assert run_row(st, sid)["report_implicit"] == 1
+
+
+def test_salvage_checks_an_implicit_done_against_the_runs_frozen_cap(
+    st: Store, root: str, procs: Procs, tmp_path: Path
+) -> None:
+    small = implicit_run(st, root, procs, cap=5)  # the default config's cap is far larger
+    (change,) = liveness.check_session(st, cfg_of(tmp_path), small).changes
+    assert (change.outcome, change.end_reason) == ("exited-unreported", "result_rejected")
+    large = implicit_run(st, root, procs, cap=1000)
+    tight = cfg_of(tmp_path, "artifact_max_bytes: 5\n")  # the caller's cap is not the run's
+    (change,) = liveness.check_session(st, tight, large).changes
+    assert (change.outcome, change.end_reason) == ("done", "normal")
+
+
+def test_salvage_rejects_an_implicit_done_while_requests_stay_undrained(
+    st: Store, root: str, procs: Procs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = implicit_run(st, root, procs, cap=1000)
+    monkeypatch.setattr(liveness, "_pending_requests", lambda *a: True)
+    checked = liveness.check_session(st, None, sid)
+    (change,) = checked.changes
+    assert (change.outcome, change.end_reason) == ("exited-unreported", "result_rejected")
+    assert any("were not ingested" in w for w in checked.warnings)
+    assert any("were not ingested" in w for w in json.loads(run_row(st, sid)["warnings_json"]))
+
+
+def test_salvage_with_auto_exit_keeps_its_cause(st: Store, root: str, procs: Procs) -> None:
+    sid = salvaged(st, root, procs, report="done", pending_cause="auto_exit")
+    (change,) = liveness.check_session(st, None, sid).changes
+    assert (change.action, change.outcome, change.end_reason) == (
+        "finalized_from_cause",
+        "done",
+        "auto_exit",
+    )
+    assert final_events(st, sid) == [(1, "auto_exit", "exited")]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_an_auto_exit_cause_without_a_report_ends_by_the_wrapper_lost_rules(
+    st: Store, root: str, procs: Procs, dry_run: bool
+) -> None:
+    sid = salvaged(st, root, procs, pending_cause="auto_exit")  # exec never records this
+    checked = liveness.check_session(st, None, sid, dry_run=dry_run)
+    (change,) = checked.changes
+    assert (change.action, change.outcome, change.end_reason) == ("marked_lost", "lost", "lost")
+    assert bool(checked.warnings) is not dry_run  # the real end says why it ignored the cause
+    assert (run_row(st, sid)["ended_at"] is None) == dry_run
+
+
+def test_a_cas_lost_to_a_report_is_mapped_again_and_finalized(
+    st: Store, root: str, procs: Procs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compare-and-set loses to a report that landed meanwhile (same dead wrapper and
+    child): the run is read again and the report's outcome finalized."""
+    sid = salvaged(st, root, procs)
+    real = st.finalize_run
+    calls: list[int] = []
+
+    def report_lands_first(*args: Any, **kwargs: Any) -> bool:
+        if not calls:
+            st.conn.execute(
+                "UPDATE runs SET report_status = 'blocked', report_implicit = 0, "
+                "report_summary = 's', reported_at = '2026-01-01T00:00:00Z' "
+                "WHERE csession_id = ?",
+                (sid,),
+            )
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(st, "finalize_run", report_lands_first)
+    (change,) = liveness.check_session(st, None, sid).changes
+    assert len(calls) == 2
+    assert (change.outcome, change.end_reason) == ("blocked", "wrapper_lost")
+
+
+def test_a_cas_lost_because_the_run_changed_hands_is_never_retried(
+    st: Store, root: str, procs: Procs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compare-and-set loses because another wrapper now owns the run: the run is read
+    again, found changed, and left alone (no second attempt)."""
+    sid = salvaged(st, root, procs)
+    live = procs.live()
+    real = st.finalize_run
+    calls: list[int] = []
+
+    def adopted_meanwhile(*args: Any, **kwargs: Any) -> bool:
+        st.conn.execute(
+            "UPDATE runs SET wrapper_pid = ?, wrapper_start = ? WHERE csession_id = ?",
+            (*live, sid),
+        )
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(st, "finalize_run", adopted_meanwhile)
+    assert liveness.check_session(st, None, sid).changes == []
+    assert len(calls) == 1 and run_row(st, sid)["ended_at"] is None
+
+
+def test_a_superseded_runs_final_event_has_its_own_from_state(
+    st: Store, root: str, procs: Procs
+) -> None:
+    sid = salvaged(st, root, procs)
+    st.conn.execute(
+        "INSERT INTO events (csession_id, run_no, event_ts, from_state, to_state, from_activity,"
+        " to_activity, cause, final, labels_json) VALUES (?, 1, '2026-01-01T00:00:00Z',"
+        " 'starting', 'working', NULL, 'busy', 'SessionStart', 0, '[]')",
+        (sid,),
+    )
+    st.conn.execute(
+        "INSERT INTO runs (csession_id, run_no, created_at, run_kind, wrapper_pid, wrapper_start)"
+        " VALUES (?, 2, '2026-01-01T00:00:00Z', 'implement', ?, ?)",
+        (sid, *procs.live()),
+    )
+    st.conn.execute(
+        "UPDATE sessions SET current_run = 2, state = 'needs-input', activity = 'idle'"
+        " WHERE csession_id = ?",
+        (sid,),
+    )
+    (change,) = liveness.check_session(st, None, sid).changes
+    assert change.from_state == "working"
+    row = st.conn.execute(
+        "SELECT from_state, from_activity FROM events WHERE csession_id = ? AND final = 1",
+        (sid,),
+    ).fetchone()
+    assert row == ("working", "busy")
+
+
+def request_file(root: str, sid: str, *, run: int, secret: str) -> Path:
+    from claude_session import outbox
+
+    path = Path(sessiondir.session_dir(root, sid)) / "outbox" / f"{outbox.new_request_id()}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"v": 1, "run": run, "secret": secret, "status": "done"}))
+    return path
+
+
+def test_salvage_of_a_superseded_run_leaves_the_next_runs_requests_alone(
+    st: Store, root: str, procs: Procs
+) -> None:
+    sid = salvaged(st, root, procs, secret_sha256="0" * 64)
+    st.conn.execute(
+        "INSERT INTO runs (csession_id, run_no, created_at, run_kind, wrapper_pid, wrapper_start)"
+        " VALUES (?, 2, '2026-01-01T00:00:00Z', 'implement', ?, ?)",
+        (sid, *procs.live()),
+    )
+    st.conn.execute("UPDATE sessions SET current_run = 2 WHERE csession_id = ?", (sid,))
+    request = request_file(root, sid, run=2, secret="b" * 64)
+    checked = liveness.check_session(st, None, sid)
+    assert [c.outcome for c in checked.changes] == ["lost"]
+    assert request.exists()  # never claimed into run 1's claimed/
+    assert checked.warnings == []  # run 2's request is not run 1's undrained one
+
+
+def test_pending_requests_count_only_the_runs_own(st: Store, root: str, procs: Procs) -> None:
+    import hashlib
+
+    secret = "a" * 64
+    sid = salvaged(st, root, procs, secret_sha256=hashlib.sha256(secret.encode()).hexdigest())
+    request_file(root, sid, run=2, secret="b" * 64)
+    request_file(root, sid, run=1, secret="c" * 64)  # the run's number, another secret
+    assert not liveness._pending_requests(st, root, sid, 1)  # pyright: ignore[reportPrivateUsage]
+    request_file(root, sid, run=1, secret=secret)
+    assert liveness._pending_requests(st, root, sid, 1)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_failing_dry_run_check_writes_no_log(
+    st: Store, root: str, procs: Procs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = salvaged(st, root, procs)
+
+    def boom(*args: Any) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(liveness, "_predicted", boom)
+    log = Path(root) / "log.jsonl"
+    before = log.read_bytes() if log.exists() else None
+    checked = liveness.check_session(st, None, sid, dry_run=True)
+    assert checked.warnings and checked.changes == []
+    assert (log.read_bytes() if log.exists() else None) == before
+
+
+def test_a_zombie_with_an_empty_token_is_dead(st: Store) -> None:
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 10
+        while store.start_time(proc.pid) != "" or store.start_time(proc.pid, zombie=True) == "":
+            assert time.monotonic() < deadline, "the child never became a zombie"
+            time.sleep(0.01)
+        assert store.pid_exists(proc.pid)  # unreaped: the PID still exists
+        assert not liveness.process_alive(st, proc.pid, "")
+    finally:
+        proc.wait(timeout=30)
+
+
+def test_secret_files_survive_no_crash_after_a_salvage_compare_and_set(
+    st: Store, root: str, procs: Procs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The salvage deletes the secret index before its compare-and-set: a crash right after
+    it (here: the outcome file write raises) leaves no secret-equivalent file behind."""
+    sid = salvaged(st, root, procs)
+    index = write_private(root, sid, 1, "secret-index")
+
+    def crash(*args: Any) -> None:
+        raise RuntimeError("crashed after the compare-and-set")
+
+    monkeypatch.setattr(liveness.outcomefile, "write_run", crash)
+    liveness.check_session(st, None, sid)
+    assert run_row(st, sid)["outcome"] == "lost"
+    assert not index.exists()
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_launch_ends_delete_the_spec_and_index_before_the_outcome_file(
+    st: Store, root: str, procs: Procs, monkeypatch: pytest.MonkeyPatch, expired: bool
+) -> None:
+    if expired:
+        sid = session(st, root, wrapper=None, expires_at="2000-01-01T00:00:00Z")
+    else:
+        sid = session(st, root, wrapper=procs.dead())
+    spec = write_private(root, sid, 1, lifecycle.SPEC_NAME)
+    index = write_private(root, sid, 1, "secret-index")
+
+    def crash(*args: Any) -> None:
+        raise RuntimeError("crashed after the compare-and-set")
+
+    monkeypatch.setattr(liveness.outcomefile, "write_run", crash)
+    liveness.check_session(st, None, sid)
+    assert run_row(st, sid)["outcome"] == "not-started"
+    assert not spec.exists() and not index.exists()
+
+
+def test_reconcile_deletes_secret_files_a_finalizer_left_behind(
+    st: Store, root: str, procs: Procs, tmp_path: Path
+) -> None:
+    sid = session(st, root, wrapper=procs.live())
+    spec = write_private(root, sid, 1, lifecycle.SPEC_NAME)
+    index = write_private(root, sid, 1, "secret-index")
+    st.finalize_run(sid, 1, Final("session", "lost", "lost", 17, "lost", "exit"))  # then died
+    out = reconcile.run(st, cfg_of(tmp_path), gateway=SystemGateway(), environ=os.environ)
+    validate(out, RECONCILE_SCHEMA)
+    assert (sid, 1, "secret_files_deleted") in [
+        (c["csession_id"], c["run"], c["action"]) for c in out["changes"]
+    ]
+    assert not spec.exists() and not index.exists()
+    again = reconcile.run(st, cfg_of(tmp_path), gateway=SystemGateway(), environ=os.environ)
+    assert "secret_files_deleted" not in [c["action"] for c in again["changes"]]
+
+
+def test_reconcile_goes_on_when_the_hook_groups_cannot_be_read(
+    st: Store, root: str, procs: Procs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "o.json"
+    sid = session(st, root, wrapper=procs.live(), outcome_file=str(out))
+    st.finalize_run(sid, 1, Final("session", "lost", "lost", 17, "lost", "exit"))
+
+    def locked(*args: Any) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(st, "hook_groups", locked)
+    result = reconcile.run(st, cfg_of(tmp_path), gateway=SystemGateway(), environ=os.environ)
+    assert result["already_running"] is False
+    assert json.loads(out.read_text())["outcome"] == "lost"  # the later steps still ran
+
+
+def test_delivery_goes_on_when_a_hook_group_row_fails(
+    st: Store, root: str, procs: Procs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hooked = tmp_path / "hooked.jsonl"
+    cfg = cfg_of(tmp_path, f"hooks:\n  post-state-change:\n    - cmd: cat >> {hooked}\n")
+    sid = salvaged(st, root, procs)
+    liveness.check_session(st, None, sid)
+    st.add_hook_group(sid, 1, 2**31 - 2, "x", store.Holder(*procs.dead()))
+
+    def locked(*args: Any) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(st, "remove_hook_group", locked)
+    done = toolhooks.deliver(
+        st, cfg, sid, gateway=SystemGateway(), environ=os.environ, state_root=root
+    )
+    assert done.delivered and hooked.read_text()
+
+
+def test_reconcile_keeps_its_lease_through_a_long_delivery(
+    root: str, procs: Procs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import timedelta
+
+    monkeypatch.setattr(store, "LEASE_TTL", timedelta(seconds=1))
+    monkeypatch.setattr(toolhooks, "LEASE_TTL", 1.0)
+    monkeypatch.setattr(toolhooks, "LEASE_RENEW_INTERVAL", 0.2)
+    monkeypatch.setattr(reconcile, "RENEW_EVERY", 0.4)
+    marker = tmp_path / "hook-started"
+    cfg = cfg_of(tmp_path, f"hooks:\n  post-state-change:\n    - cmd: touch {marker}; sleep 3\n")
+    with store.open_state() as st:
+        sid = salvaged(st, root, procs)
+        liveness.check_session(st, None, sid)  # finalized, its events undelivered
+    results: list[dict[str, Any]] = []
+
+    def reconcile_pass() -> None:
+        with store.open_state() as own:
+            results.append(reconcile.run(own, cfg, gateway=SystemGateway(), environ=os.environ))
+
+    thread = threading.Thread(target=reconcile_pass)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 30
+        while not marker.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        time.sleep(1.5)  # past the (scaled) lease TTL: only renewal keeps it
+        with store.open_state() as second:
+            second_result = reconcile.run(second, cfg, gateway=SystemGateway(), environ=os.environ)
+    finally:
+        thread.join(60)
+    assert second_result["already_running"] is True
+    assert results and not any("taken over" in w for w in results[0]["warnings"])
+
+
+def outbox_requests(root: str, sid: str, count: int) -> list[str]:
+    from claude_session import outbox
+
+    path = Path(sessiondir.session_dir(root, sid)) / "outbox"
+    path.mkdir(parents=True, exist_ok=True)
+    names = []
+    for _ in range(count):
+        name = f"{outbox.new_request_id()}.json"
+        (path / name).write_text("{}")
+        names.append(name)
+    return names
+
+
+def discarded_ids(st: Store, sid: str) -> set[str]:
+    rows = st.conn.execute(
+        "SELECT request_id FROM requests WHERE csession_id = ? AND result = 'discarded'", (sid,)
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def test_reconcile_discards_a_large_outbox_in_batches_up_to_a_cap(
+    st: Store, root: str, procs: Procs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reconcile, "DISCARD_BATCH", 40)
+    monkeypatch.setattr(reconcile, "DISCARD_MAX", 100)
+    sid = session(st, root, wrapper=procs.live())
+    st.finalize_run(sid, 1, Final("session", "lost", "lost", 17, "lost", "exit"))
+    names = outbox_requests(root, sid, 130)
+    batches: list[int] = []
+    real_record = st.record_discarded
+    real_remove = sessiondir.SessionDirs.remove_discarded
+
+    def record(conn: Any, s: str, run: int, ids_: Any) -> None:
+        batches.append(len(ids_))
+        real_record(conn, s, run, ids_)
+
+    def remove(self: Any, run: int, trash: Any) -> list[str]:
+        # Between batches the write lock is free: another writer gets it at once.
+        with Store.open(st.path, holder=store.Holder(*procs.live()), busy_timeout=0) as other:
+            other.take_lease("probe")
+            other.release_lease("probe")
+        return real_remove(self, run, trash)
+
+    monkeypatch.setattr(st, "record_discarded", record)
+    monkeypatch.setattr(sessiondir.SessionDirs, "remove_discarded", remove)
+    first = reconcile.run(st, cfg_of(tmp_path), gateway=SystemGateway(), environ=os.environ)
+    assert batches == [40, 40, 20]
+    (change,) = [c for c in first["changes"] if c["action"] == "outbox_discarded"]
+    assert change["detail"] == "100 request(s); more are left for the next pass"
+    reconcile.run(st, cfg_of(tmp_path), gateway=SystemGateway(), environ=os.environ)
+    assert discarded_ids(st, sid) == {name[: -len(".json")] for name in names}
+    assert not any((Path(sessiondir.session_dir(root, sid)) / "outbox").iterdir())
+
+
+def test_a_request_swapped_for_a_directory_is_still_discarded_and_recorded(
+    st: Store, root: str, procs: Procs, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = session(st, root, wrapper=procs.live())
+    st.finalize_run(sid, 1, Final("session", "lost", "lost", 17, "lost", "exit"))
+    names = outbox_requests(root, sid, 3)
+    outbox_dir = Path(sessiondir.session_dir(root, sid)) / "outbox"
+    real_token = sessiondir.secrets.token_hex
+    swapped: list[str] = []
+
+    def swap_then_name(n: int) -> str:
+        # Called between the check and the rename: the agent swaps the second request.
+        if len(swapped) == 1 or not swapped:
+            target = names[len(swapped)]
+            if len(swapped) == 1:
+                (outbox_dir / target).unlink()
+                (outbox_dir / target).mkdir()
+                (outbox_dir / target / "inside").write_text("x")
+            swapped.append(target)
+        return real_token(n)
+
+    monkeypatch.setattr(sessiondir.secrets, "token_hex", swap_then_name)
+    out = reconcile.run(st, cfg_of(tmp_path), gateway=SystemGateway(), environ=os.environ)
+    assert not any("could not be discarded" in w for w in out["warnings"])
+    assert discarded_ids(st, sid) == {name[: -len(".json")] for name in names}
+    private_run = Path(sessiondir.private_dir(root, sid)) / "runs" / "1"
+    assert not list(private_run.glob(".*.discarded"))
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_an_outbox_symlink_is_never_followed_and_warns(
+    st: Store, root: str, procs: Procs, tmp_path: Path, dry_run: bool
+) -> None:
+    from claude_session import outbox
+
+    sid = session(st, root, wrapper=procs.live())
+    st.finalize_run(sid, 1, Final("session", "lost", "lost", 17, "lost", "exit"))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    victim = elsewhere / f"{outbox.new_request_id()}.json"
+    victim.write_text("{}")
+    session_dir = Path(sessiondir.session_dir(root, sid))
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "outbox").symlink_to(elsewhere)
+    out = reconcile.run(
+        st, cfg_of(tmp_path), gateway=SystemGateway(), environ=os.environ, dry_run=dry_run
+    )
+    assert "outbox_discarded" not in [c["action"] for c in out["changes"]]
+    assert any("outbox cannot be trusted" in w for w in out["warnings"])
+    assert victim.exists()
+
+
+def test_a_dry_run_counts_no_events_a_live_wrapper_delivers(
+    st: Store, root: str, procs: Procs, tmp_path: Path
+) -> None:
+    live = session(st, root, wrapper=procs.live())
+    st.conn.execute(
+        "INSERT INTO events (csession_id, run_no, event_ts, from_state, to_state, cause, final,"
+        " labels_json) VALUES (?, 1, '2026-01-01T00:00:00Z', 'starting', 'working',"
+        " 'SessionStart', 0, '[]')",
+        (live,),
+    )
+    dead = salvaged(st, root, procs)
+    liveness.check_session(st, None, dead)
+    out = reconcile.run(
+        st, cfg_of(tmp_path), gateway=SystemGateway(), environ=os.environ, dry_run=True
+    )
+    delivered = {
+        c["csession_id"]: c["detail"] for c in out["changes"] if c["action"] == "events_delivered"
+    }
+    assert live not in delivered
+    count = len(st.undelivered_events(dead, toolhooks.BATCH))
+    assert count and delivered[dead].startswith(f"{count} event(s)")
+
+
+def test_the_resume_liveness_check_backfills_outcome_files(
+    st: Store, root: str, procs: Procs, tmp_path: Path
+) -> None:
+    from claude_session import launch, resume
+
+    out = tmp_path / "o.json"
+    sid = session(st, root, wrapper=procs.live(), outcome_file=str(out))
+    st.finalize_run(sid, 1, Final("session", "lost", "lost", 17, "lost", "exit"))  # then died
+    resume.liveness(st, launch.Process.current(SystemGateway(), root), sid)
+    assert json.loads(out.read_text())["outcome"] == "lost"
+
+
+def test_resume_runs_the_liveness_check_once(tmp_path: Path, work: Path) -> None:
+    cfg = fake_config(tmp_path, [START, {"do": "report", "args": ["done", "--summary", "s"]}])
+    argv = ["--json", "--config", str(cfg)]
+    first = subprocess.run(
+        [*claude_session_cmd(), "exec", *argv, "--mode", "headless", *PROMPT],
+        cwd=work,
+        env={**os.environ, **private_home(tmp_path)},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    sid = json.loads(first.stdout)["csession_id"]
+    calls = tmp_path / "checks"
+    patch = (
+        "from claude_session import liveness\n"
+        "_orig = liveness.check_session\n"
+        "def _counted(*a, **k):\n"
+        f"    open({str(calls)!r}, 'a').write('check\\n')\n"
+        "    return _orig(*a, **k)\n"
+        "liveness.check_session = _counted\n"
+    )
+    proc = subprocess.run(
+        [*crashing_cmd(patch), "resume", sid, *argv],
+        cwd=work,
+        env={**os.environ, **private_home(tmp_path)},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert calls.read_text().splitlines() == ["check"]

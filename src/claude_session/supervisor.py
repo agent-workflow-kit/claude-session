@@ -10,8 +10,11 @@ terminal's foreground group, no ``setsid``), with the terminal inherited on stdi
 stderr; it gets SIGINT, SIGTSTP and SIGHUP from the terminal itself. The spawn is the last
 step of the launch phase: a signal received since the launch steps, or a spawn that fails,
 ends the run ``not-started`` (``launch_interrupted``, or ``canceled`` after a ``stop``
-request; ``launch.end_launch``). It then records the child's PID and start time and the
-``session`` phase and supervises the child until it exits (``Supervision``): every signal
+request; ``launch.end_launch``). The child is spawned ``gated``: it does not exec
+``claude`` until its PID and start time and the ``session`` phase are recorded, then it is
+released; if ``exec`` dies in between, the child exits without running ``claude``, so a run
+whose child was never recorded never ran ``claude`` (liveness: ``launch_interrupted`` is
+then correct). It then supervises the child until it exits (``Supervision``): every signal
 ``exec`` receives is handled per the signal table (``signals``; ``pending_cause`` recorded
 before the one forward to the exact child, SIGKILL to that same child after ``kill_grace``),
 and every ``poll_interval`` the auto-exit rule, the run's bound and (headless) the
@@ -131,6 +134,7 @@ def spawn(
                 stdin=INHERIT,
                 stdout=INHERIT,
                 stderr=INHERIT,
+                gated=True,
             )
         assert prepared.stdout_fd is not None and prepared.stderr_fd is not None
         return process.gateway.spawn(
@@ -143,6 +147,7 @@ def spawn(
             stderr=prepared.stderr_fd,
             new_process_group=True,
             die_with_parent=True,
+            gated=True,
         )
     finally:
         for fd in (prepared.stdout_fd, prepared.stderr_fd):
@@ -732,6 +737,21 @@ def run_session(
             child_start=store.start_time(child.pid, zombie=True),  # unreaped: still ours
             started_at=store.format_ts(st.clock()),
         )
+        # Only a recorded child runs claude: until here it waits at its gate, and exits
+        # without running claude if this process dies first (interface.md, Liveness). Dying
+        # from here to the release (or to the revert below) leaves a recorded child that
+        # never ran claude: liveness then salvages the run (wrapper-lost rules), as documented.
+        try:
+            child.release()
+        except OSError as exc:  # claude could not be executed: the child exited at once
+            child.wait()
+            # It never ran claude: back to a launch-phase run without a child.
+            st.update_run(
+                sid, run_no, phase="launch", child_pid=None, child_start=None, started_at=None
+            )
+            error = launch.interrupted(exc, _not_started(exc))
+            launch.end_launch(st, alloc, v, None, process, error, exc=exc)
+            return Ended(exit_code=EXIT_CODES["not-started"], warnings=())
         record = st.run_record(sid, run_no)
         log = launch.event_log(process, sorted(prepared.secrets))
         launch.log_best_effort(

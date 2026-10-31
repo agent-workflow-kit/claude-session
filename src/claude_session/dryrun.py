@@ -627,11 +627,13 @@ def hooks_json(
 ) -> list[dict[str, Any]]:
     """The configured and per-invocation hook entries. ``selected``: the entry's ``kinds``,
     ``exclude_kinds`` and ``labels`` selectors match this run (its run kind and the
-    session's labels after the launch); ``states`` depends on the state change and is not
-    evaluated. Per-invocation entries have no selectors.
+    session's labels after the launch), decided by the runner's own match
+    (``toolhooks.selected``, without a state); ``states`` depends on the state change and is
+    not evaluated. Per-invocation entries have no selectors.
 
-    TODO(#31, #20): share the selector match with the hook runners."""
-    have = set(labels)
+    TODO(#31): the ``pre-launch`` runner uses the same ``toolhooks.selected``."""
+    from . import toolhooks
+
     entries: list[dict[str, Any]] = []
     configured = (
         ("pre-launch", cfg.hooks.pre_launch),
@@ -639,11 +641,16 @@ def hooks_json(
     )
     for hook, items in configured:
         for item in items:
-            selected = (
-                (item.kinds is None or run_kind in item.kinds)
-                and (item.exclude_kinds is None or run_kind not in item.exclude_kinds)
-                and (item.labels is None or set(item.labels) <= have)
+            entry = toolhooks.Entry(
+                cmd=item.cmd,
+                timeout=item.timeout,
+                origin="config",
+                index=0,
+                kinds=None if item.kinds is None else tuple(item.kinds),
+                exclude_kinds=None if item.exclude_kinds is None else tuple(item.exclude_kinds),
+                labels=None if item.labels is None else tuple(item.labels),
             )
+            selected = toolhooks.selected(entry, run_kind=run_kind, labels=labels)
             entries.append(
                 {
                     "hook": hook,

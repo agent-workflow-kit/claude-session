@@ -796,6 +796,128 @@ def remove_private_run_file(state_root: str, csession_id: str, run: int, name: s
         os.close(run_fd)
 
 
+def _request_names(dir_fd: int, where: str, limit: int | None) -> tuple[list[str], bool]:
+    """Request names (``<uuidv7>.json``) of the non-directory entries of ``dir_fd`` (from the
+    directory entries, never following a symlink), sorted, at most ``limit``; and whether
+    more were left out."""
+    from . import outbox
+
+    names: list[str] = []
+    more = False
+    try:
+        with os.scandir(dir_fd) as scan:
+            for entry in scan:
+                if not outbox.is_request_name(entry.name):
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    pass
+                if limit is not None and len(names) >= limit:
+                    more = True
+                    break
+                names.append(entry.name)
+    except OSError as exc:
+        raise _failed(where, exc) from exc
+    return sorted(names), more
+
+
+def outbox_request_names(
+    state_root: str, csession_id: str, limit: int | None = None
+) -> tuple[list[str], bool]:
+    """``SessionDirs.outbox_request_names`` without opening (and so creating) the session's
+    directories: ``sessions/<id>/outbox/`` reached through the no-follow walk (``([],
+    False)`` when it or a directory on the way is missing). Raises ``SessionDirUnsafe`` when
+    it cannot be trusted (not a directory of ours, a symlink, unsearchable)."""
+    if not ids.is_session_id(csession_id):
+        raise ValueError(f"not a session id: {csession_id!r}")
+    fd, where = _inspect_tree(state_root, SESSIONS, csession_id, OUTBOX, strict=True)
+    if fd is None:
+        return [], False
+    try:
+        return _request_names(fd, where, limit)
+    finally:
+        os.close(fd)
+
+
+# Bytes of one outbox request read to tell whose it is (requests are far smaller).
+_REQUEST_READ_MAX = 1 << 20
+
+
+def any_outbox_request(
+    state_root: str, csession_id: str, match: Callable[[bytes], bool], *, limit: int
+) -> bool:
+    """Whether ``match`` is true for one of the first ``limit`` requests waiting in
+    ``sessions/<id>/outbox/`` (untrusted bytes: regular single-link files of ours, read
+    no-follow without waiting on a FIFO, at most ``_REQUEST_READ_MAX`` bytes; others are
+    skipped). Creates nothing; raises ``SessionDirUnsafe`` for an unsafe outbox."""
+    if not ids.is_session_id(csession_id):
+        raise ValueError(f"not a session id: {csession_id!r}")
+    fd, where = _inspect_tree(state_root, SESSIONS, csession_id, OUTBOX, strict=True)
+    if fd is None:
+        return False
+    try:
+        names, _ = _request_names(fd, where, limit)
+        for name in names:
+            data = _read_request(fd, name)
+            if data is not None and match(data):
+                return True
+        return False
+    finally:
+        os.close(fd)
+
+
+def _read_request(dir_fd: int, name: str) -> bytes | None:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or info.st_size > _REQUEST_READ_MAX
+        ):
+            return None
+        data = os.read(fd, _REQUEST_READ_MAX + 1)
+        return None if len(data) > _REQUEST_READ_MAX else data
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def remove_private_run_files(
+    state_root: str, csession_id: str, run: int, names: Sequence[str]
+) -> list[str]:
+    """Delete the files ``names`` of the private ``runs/<run>/`` that are there (reached
+    through the no-follow walk, creating nothing; a missing directory holds none). Returns
+    the names deleted. Raises ``SessionDirUnsafe``."""
+    for name in names:
+        if not name or "/" in name or name in (".", ".."):
+            raise ValueError(f"not a file name: {name!r}")
+    run_fd, where = _inspect_run_dir(state_root, csession_id, run)
+    if run_fd is None:
+        return []
+    deleted: list[str] = []
+    try:
+        for name in names:
+            try:
+                os.unlink(name, dir_fd=run_fd)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise _failed(os.path.join(where, name), exc) from exc
+            deleted.append(name)
+    finally:
+        os.close(run_fd)
+    return deleted
+
+
 class SessionDirs:
     """The pinned session and private directories of one session.
 
@@ -1207,20 +1329,35 @@ class SessionDirs:
     def discard_outbox(self, run: int) -> list[str]:
         """A resume, before the secret rotates: move every request (``<uuidv7>.json``, not a
         directory) out of ``outbox/`` into the private ``runs/<run>/`` and delete it there
-        (renames relative to the pinned descriptors; nothing is read). Returns the request
-        ids. Other names are left for the next drain, which removes them."""
+        (``move_outbox_requests``, then ``remove_discarded``; nothing is read). Returns the
+        request ids. Other names are left for the next drain, which removes them."""
+        moved = self.move_outbox_requests(run, self.outbox_request_names()[0])
+        self.remove_discarded(run, [trash for _, trash in moved])
+        return [request_id for request_id, _ in moved]
+
+    def outbox_request_names(self, limit: int | None = None) -> tuple[list[str], bool]:
+        """The request names (``<uuidv7>.json``, not directories) in ``outbox/``, sorted, at
+        most ``limit``; and whether more were left out."""
+        where = os.path.join(self.session_path, OUTBOX)
+        outbox_fd = _open_dir(self._sfd, OUTBOX, where)
+        try:
+            return _request_names(outbox_fd, where, limit)
+        finally:
+            os.close(outbox_fd)
+
+    def move_outbox_requests(self, run: int, names: Sequence[str]) -> list[tuple[str, str]]:
+        """Move the requests ``names`` (not directories) out of ``outbox/`` into the private
+        ``runs/<run>/`` under trash names (renames relative to the pinned descriptors;
+        nothing is read). Returns ``(request id, trash name)`` of each moved; one gone or a
+        directory is skipped. Delete them with ``remove_discarded``."""
         from . import outbox  # the request-name grammar (outbox imports only fsutil, errors)
 
         _check_run(run)
         where = os.path.join(self.session_path, OUTBOX)
         outbox_fd = _open_dir(self._sfd, OUTBOX, where)
         run_fd = self._run_private_dir(run)
-        discarded: list[str] = []
+        moved: list[tuple[str, str]] = []
         try:
-            try:
-                names = sorted(os.listdir(outbox_fd))
-            except OSError as exc:
-                raise _failed(where, exc) from exc
             for name in names:
                 if not outbox.is_request_name(name):
                     continue
@@ -1239,12 +1376,36 @@ class SessionDirs:
                     continue
                 except OSError as exc:
                     raise _failed(os.path.join(where, name), exc) from exc
-                _unlink_at(run_fd, trash, os.path.join(self.private_path, RUNS, str(run), trash))
-                discarded.append(name[: -len(".json")])
+                moved.append((name[: -len(".json")], trash))
         finally:
             os.close(run_fd)
             os.close(outbox_fd)
-        return discarded
+        return moved
+
+    def remove_discarded(self, run: int, trash: Sequence[str]) -> list[str]:
+        """Delete entries ``move_outbox_requests`` moved into the private ``runs/<run>/``,
+        each on its own: what is there now is checked again (no-follow), so a directory the
+        agent swapped in between the check and the rename is removed as a tree, never
+        followed. Returns the paths that could not be removed (the rest are gone)."""
+        _check_run(run)
+        run_fd = self._run_private_dir(run)
+        run_path = os.path.join(self.private_path, RUNS, str(run))
+        failed: list[str] = []
+        try:
+            for name in trash:
+                try:
+                    info = os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode):
+                        fsutil.remove_tree_at(run_fd, name)
+                    else:
+                        os.unlink(name, dir_fd=run_fd)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    failed.append(os.path.join(run_path, name))
+        finally:
+            os.close(run_fd)
+        return failed
 
     # Staging (start) and placement (the adopting exec)
 
