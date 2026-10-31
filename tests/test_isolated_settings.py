@@ -1576,3 +1576,20 @@ def test_hard_link_check_ignores_symlinks(tmp_path: Path) -> None:
     layout = interpreter_layout(tmp_path)
     (Path(layout["package_dir"]) / "link.py").symlink_to(tmp_path / "base")
     check(layout)
+
+
+def test_interpreter_through_a_symlink_hop_in_a_writable_path_is_refused(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / "hop").symlink_to(layout["interpreter"])
+    link = tmp_path / "python-link"
+    link.symlink_to(cwd / "hop")
+    layout["interpreter"] = str(link)
+    assert refused_reason(layout, str(cwd)) == "unsafe_path"
+
+
+def test_system_read_dirs_are_shared_with_pathrules() -> None:
+    from claude_session import pathrules
+
+    assert settings_builder.SYSTEM_READ_DIRS == pathrules.SYSTEM_READ_DIRS

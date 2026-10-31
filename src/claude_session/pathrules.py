@@ -22,20 +22,25 @@ session-writable path is a ``UsageError`` (exit 2). Messages name paths, never p
 values other than the offending path.
 
 TODO(#15): exec builds ``Host`` and ``PathRules`` at launch step 5 and calls, for isolated
-runs, ``check_host``, ``check_cwd`` (before ``permission_profiles.expand``), ``resolve_dirs``
-and ``resolve_write_dirs``, ``check_profile``, ``check_plugin_dirs``, ``check_generated``
-(every generated allowRead entry, the git directory included), ``check_claude_args``, then
-builds ``session_writable`` and passes it to ``permission_profiles.select``,
-``envbuild.build``, ``resolve_tool`` (``claude_bin``, ``bwrap``, ``socat``, ``git`` on the
-sanitized PATH) and ``settings_builder.check_interpreter``; trusted runs call
-``check_profile`` (refused paths only). #28 repeats them at adoption.
+runs, ``check_host`` first (the write checks assume a valid ``$HOME``), ``check_cwd`` (before
+``permission_profiles.expand``), ``resolve_dirs`` and ``resolve_write_dirs``, builds
+``session_writable``, then ``check_read_dirs``, ``check_write_dirs`` and ``check_profile``
+(with it), ``check_plugin_dirs``, ``check_generated`` (every generated allowRead entry, the
+git directory included), ``check_claude_args``, and passes ``session_writable`` to
+``permission_profiles.select``, ``envbuild.build``, ``resolve_tool`` (``claude_bin``,
+``bwrap``, ``socat``, ``git`` on the sanitized PATH) and
+``settings_builder.check_interpreter``; trusted runs call ``check_profile`` (refused paths
+only). #28 repeats them at adoption.
 """
 
 from __future__ import annotations
 
 import os
+import pwd
 import re
+import stat
 import sys
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -56,7 +61,19 @@ CREDENTIAL_PATHS = (
     ".netrc",
     ".git-credentials",
     ".local/state",
+    ".local/share/keyrings",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".gem/credentials",
+    ".gradle/gradle.properties",
+    ".m2/settings.xml",
+    ".m2/settings-security.xml",
 )
+# The fixed system directories every isolated run may read (settings_builder lists them in
+# allowRead); a generated entry inside one is exempt from the caller's-cwd rule.
+SYSTEM_READ_DIRS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc")
+# Symlinks followed while resolving one path before it counts as a loop (as the kernel).
+MAX_SYMLINKS = 40
 # The only claude_args isolated runs accept (exact tokens; interface.md, Path rules).
 ISOLATED_CLAUDE_ARGS = frozenset({"--verbose", "--debug"})
 # Subdirectories of the run's own $CSESSION_DIR exempt from the unsafe-write-target rules.
@@ -89,13 +106,16 @@ def tmp_parent(uid: int | None = None) -> str:
 @dataclass(frozen=True)
 class _Ref:
     """A resolved path: its realpath, the comparison key (case-folded on case-insensitive
-    platforms), its own identity (None when it does not exist) and the identities of it and
-    every existing ancestor."""
+    platforms), its own identity (None when it does not exist), the identities of it and
+    every existing ancestor, and for each existing ancestor its identity paired with the
+    name of the next component of the path (``children``: so a second name of ``$HOME``
+    still shows that the path continues with a ``.<name>`` entry, existing or not)."""
 
     real: str
     key: str
     ident: _Identity | None
     chain: frozenset[_Identity]
+    children: frozenset[tuple[_Identity, str]] = frozenset()
 
 
 def _ref(path: str) -> _Ref:
@@ -103,8 +123,10 @@ def _ref(path: str) -> _Ref:
     ``ValueError`` for a path ``realpath`` cannot take (a NUL)."""
     real = os.path.realpath(path)
     chain: set[_Identity] = set()
+    children: set[tuple[_Identity, str]] = set()
     ident: _Identity | None = None
     current = real
+    child: str | None = None
     while True:
         try:
             info = os.stat(current)
@@ -115,15 +137,36 @@ def _ref(path: str) -> _Ref:
             chain.add(identity)
             if current == real:
                 ident = identity
+            if child is not None:
+                children.add((identity, child))
         parent = os.path.dirname(current)
         if parent == current:
             break
+        child = os.path.basename(current)
         current = parent
-    return _Ref(real=real, key=_key(real), ident=ident, chain=frozenset(chain))
+    return _Ref(
+        real=real,
+        key=_key(real),
+        ident=ident,
+        chain=frozenset(chain),
+        children=frozenset(children),
+    )
 
 
 def _key(path: str) -> str:
-    return path.casefold() if CASE_INSENSITIVE else path
+    """The comparison key: on case-insensitive platforms (macOS) Unicode-decomposed (NFD,
+    as the file system stores names) and case-folded, so ``~/.Café`` in either normal form
+    or case is one name."""
+    if not CASE_INSENSITIVE:
+        return path
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", path).casefold())
+
+
+def home_join(home: str, rest: str) -> str:
+    """``$HOME`` joined with the rest of a ``~/rest`` path, normalized. Leading slashes of
+    ``rest`` are dropped, so ``~//x`` stays under ``$HOME`` (``os.path.join`` would make it
+    ``/x``)."""
+    return os.path.normpath(home.rstrip("/") + "/" + rest.lstrip("/"))
 
 
 def _under(path: str, root: str) -> bool:
@@ -147,6 +190,10 @@ def _exactly_under(inner: _Ref, outer: _Ref) -> bool:
 
 def _overlap(a: _Ref, b: _Ref) -> bool:
     return _contains(a, b) or _contains(b, a)
+
+
+def _same(a: _Ref, b: _Ref) -> bool:
+    return a.key == b.key or (a.ident is not None and a.ident == b.ident)
 
 
 def _shown(path: str) -> str:
@@ -207,6 +254,16 @@ class SessionWritable:
     def __init__(self, paths: Iterable[str]) -> None:
         self._refs = tuple(_ref(path) for path in dict.fromkeys(paths))
 
+    def encloses(self, path: str) -> bool:
+        """Whether a session-writable path is a proper ancestor of ``path`` (resolved): the
+        agent could rename the ancestor's contents and swap in a symlink. A path equal to a
+        session-writable path is not enclosed by it. Unresolvable: True (fail closed)."""
+        try:
+            ref = _ref(path)
+        except ValueError:
+            return True
+        return any(_contains(w, ref) and not _same(w, ref) for w in self._refs)
+
     @property
     def paths(self) -> tuple[str, ...]:
         """The resolved session-writable paths (for ``check_interpreter``'s
@@ -257,12 +314,35 @@ def session_writable(
 
 
 def _profile_writes(profile: Mapping[str, Any], *, cwd: str, home: str) -> list[str]:
-    targets = list(_strings(profile, "sandbox", "filesystem", "allowWrite"))
+    targets = [
+        sandbox_path(entry, home=home)
+        for entry in _strings(profile, "sandbox", "filesystem", "allowWrite")
+    ]
     for rule in _strings(profile, "permissions", "allow"):
         parsed = rule_target(rule, cwd=cwd, home=home)
         if parsed is not None and parsed[0] in WRITE_TOOLS:
             targets.append(parsed[1])
+    if _SETTINGS_RELATIVE in targets:
+        raise InvalidPermissionProfile(
+            "invalid permission profile",
+            detail="a profile write path is relative to the generated settings file, inside"
+            " the state root",
+        )
     return targets
+
+
+def sandbox_path(entry: str, *, home: str) -> str:
+    """The path a profile's sandbox ``filesystem`` entry names: ``~`` and ``~/x`` are under
+    ``$HOME`` (``home_join``), ``//x`` is ``/x``, an absolute path stays as it is, and
+    anything else (relative, ``~user``) is relative to the settings file, reported as the
+    settings-relative marker (inside the state root, so it is refused)."""
+    if entry == "~" or entry.startswith("~/"):
+        return home_join(home, entry[2:])
+    if entry.startswith("//"):
+        return "/" + entry.lstrip("/")
+    if os.path.isabs(entry):
+        return entry
+    return _SETTINGS_RELATIVE
 
 
 def rule_target(rule: str, *, cwd: str, home: str) -> tuple[str, str] | None:
@@ -270,8 +350,9 @@ def rule_target(rule: str, *, cwd: str, home: str) -> tuple[str, str] | None:
     of another tool (``Bash(...)``, ``WebFetch``, ...).
 
     The path pattern follows Claude Code's forms: ``//abs`` is absolute, ``~/x`` is under
-    ``$HOME``, ``x`` and ``./x`` are relative to the cwd; a bare tool name (or an empty
-    pattern) reaches everything (``/``). The reached directory is the literal part before
+    ``$HOME`` (``~//x`` too), ``x`` and ``./x`` are relative to the cwd; a bare tool name, an
+    empty pattern or ``*`` (Claude Code treats ``Tool()`` and ``Tool(*)`` as the bare tool
+    name) reaches everything (``/``). The reached directory is the literal part before
     the first glob or escape character, cut back to its last whole path segment, then
     normalized (``..`` applied). ``/x`` is relative to the settings file, which lives in the
     private directory under the state root: it is reported as that, so the refused-path
@@ -282,7 +363,7 @@ def rule_target(rule: str, *, cwd: str, home: str) -> tuple[str, str] | None:
     tool, pattern = match.group(1), match.group(2)
     if tool not in FILE_TOOLS:
         return None
-    if pattern is None or not pattern.strip():
+    if pattern is None or not pattern.strip() or pattern.strip() == "*":
         return tool, "/"
     if "\x00" in pattern:
         raise InvalidPermissionProfile(
@@ -295,7 +376,7 @@ def rule_target(rule: str, *, cwd: str, home: str) -> tuple[str, str] | None:
     if pattern.startswith("//"):
         base = "/" + literal[2:]
     elif pattern == "~" or pattern.startswith("~/"):
-        base = os.path.join(home, literal[2:]) if len(literal) >= 2 else home
+        base = home_join(home, literal[2:]) if len(literal) >= 2 else home
     elif pattern.startswith("/"):
         return tool, _SETTINGS_RELATIVE
     else:
@@ -332,13 +413,20 @@ class Host:
     - ``path_dirs``: the absolute entries of the caller's ``PATH`` plus
       ``env.path_prepend`` (unsafe write targets: a directory on ``PATH``).
     - ``xdg_dirs``: ``$XDG_CONFIG_HOME``, ``$XDG_DATA_HOME``, ``$XDG_STATE_HOME`` when set
-      to absolute paths (their defaults are under ``$HOME/.<name>``, refused anyway)."""
+      to absolute paths (their defaults are under ``$HOME/.<name>``, refused anyway).
+    - ``xdg_credentials``: credential paths named by XDG variables set to absolute paths:
+      ``$XDG_CONFIG_HOME``, ``$XDG_STATE_HOME`` and ``$XDG_DATA_HOME/keyrings`` (as
+      ``(label, path)``; the defaults are ``CREDENTIAL_PATHS`` entries).
+    - ``account_home``: the home directory of the user's account (``pw_dir``) when it is
+      not ``$HOME``: its credential paths and ``.<name>`` entries are protected too."""
 
     home: str
     state_root: str
     tmp_parent: str
     path_dirs: tuple[str, ...] = ()
     xdg_dirs: tuple[str, ...] = ()
+    xdg_credentials: tuple[tuple[str, str], ...] = ()
+    account_home: str | None = None
 
     @classmethod
     def from_environ(
@@ -349,18 +437,39 @@ class Host:
         uid: int | None = None,
         path_prepend: Sequence[str] = (),
     ) -> Host:
-        """The facts from an environment mapping (the caller's). Raises
-        ``LaunchValidationError`` (``unsafe_path``) for a missing or relative ``$HOME``."""
+        """The facts from an environment mapping (the caller's) and the user's account entry
+        (``pwd``; a failed lookup is ignored). Raises ``LaunchValidationError``
+        (``unsafe_path``) for a missing or relative ``$HOME``, or one that is ``/``."""
         home = environ.get("HOME", "")
         if not home or not os.path.isabs(home) or "\x00" in home:
             raise LaunchValidationError(
                 "HOME must be set to an absolute path", end_reason="unsafe_path"
             )
+        if os.path.realpath(home) == "/":
+            raise LaunchValidationError("HOME must not be /", end_reason="unsafe_path")
+        try:
+            account: str | None = pwd.getpwuid(os.getuid() if uid is None else uid).pw_dir
+        except (KeyError, OSError):
+            account = None
+        if account is not None and (
+            not os.path.isabs(account) or os.path.realpath(account) in ("/", os.path.realpath(home))
+        ):
+            account = None
         path_dirs = [entry for entry in environ.get("PATH", "").split(":") if os.path.isabs(entry)]
         xdg = [
             value
             for name in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME")
             if os.path.isabs(value := environ.get(name, ""))
+        ]
+        xdg_credentials = [
+            (label, path)
+            for name, label, sub in (
+                ("XDG_CONFIG_HOME", "$XDG_CONFIG_HOME", ""),
+                ("XDG_STATE_HOME", "$XDG_STATE_HOME", ""),
+                ("XDG_DATA_HOME", "$XDG_DATA_HOME/keyrings", "keyrings"),
+            )
+            if os.path.isabs(value := environ.get(name, ""))
+            for path in [os.path.join(value, sub) if sub else value]
         ]
         return cls(
             home=home,
@@ -368,6 +477,8 @@ class Host:
             tmp_parent=tmp_parent(uid),
             path_dirs=tuple(dict.fromkeys([*path_prepend, *path_dirs])),
             xdg_dirs=tuple(xdg),
+            xdg_credentials=tuple(xdg_credentials),
+            account_home=account,
         )
 
 
@@ -388,34 +499,36 @@ class PathRules:
         self.host = host
         self.cwd = cwd
         self._home = _ref(host.home)
+        self._homes = [(self._home, "~")]
+        if host.account_home is not None:
+            account = _ref(host.account_home)
+            self._homes.append((account, _shown(account.real)))
         self._state = _ref(host.state_root)
         self._private = _ref(os.path.join(host.state_root, sessiondir.PRIVATE))
         self._tmp_parent = _ref(host.tmp_parent)
         self._session = _ref(session_dir)
-        self._own = tuple(_ref(os.path.join(session_dir, name)) for name in OWN_WRITABLE)
-        self._tmpdir = None if tmpdir is None else _ref(tmpdir)
+        self._own = tuple(
+            ref
+            for name in OWN_WRITABLE
+            if (ref := _exception_dir(os.path.join(session_dir, name))) is not None
+        )
+        self._tmpdir = None if tmpdir is None else _exception_dir(tmpdir)
         self._cwd = _ref(cwd)
         self._caller = _ref(caller_cwd)
         self._path_dirs = tuple(_ref(path) for path in host.path_dirs)
         self._xdg = tuple(_ref(path) for path in host.xdg_dirs)
-        self._claude = _ref(os.path.join(host.home, ".claude"))
+        self._claude = tuple(_ref(os.path.join(home.real, ".claude")) for home, _ in self._homes)
         self._credentials = tuple(
-            (name, _ref(os.path.join(host.home, name))) for name in CREDENTIAL_PATHS
+            (f"{label}/{name}", _ref(os.path.join(home.real, name)))
+            for home, label in self._homes
+            for name in CREDENTIAL_PATHS
+        ) + tuple((label, _ref(path)) for label, path in host.xdg_credentials)
+        self._system = tuple(
+            dict.fromkeys(form for d in SYSTEM_READ_DIRS for form in (d, os.path.realpath(d)))
         )
-        self._hidden = self._hidden_home_dirs()
-
-    def _hidden_home_dirs(self) -> tuple[_Ref, ...]:
-        """The existing ``$HOME/.<name>`` entries, resolved, for the identity and realpath
-        checks (a bind mount, or a symlinked dot entry whose target holds the
-        configuration). An entry that resolves to ``$HOME`` or an ancestor of it (an alias
-        of the home directory, not a configuration directory) is left out: ``$HOME`` has
-        its own rule."""
-        try:
-            names = os.listdir(self._home.real)
-        except OSError:
-            return ()
-        refs = (_ref(os.path.join(self._home.real, n)) for n in names if n.startswith("."))
-        return tuple(ref for ref in refs if not _contains(ref, self._home))
+        self._hidden = tuple(
+            hidden for home, label in self._homes for hidden in _hidden_dirs(home, label)
+        )
 
     # Host
 
@@ -423,7 +536,9 @@ class PathRules:
         """``$HOME`` must not be the state root, inside it or inside ``/tmp/csession-<uid>``:
         the session's own directories would then be under ``$HOME``'s credential rules and
         the home rules would cover the state. Raises ``LaunchValidationError``
-        (``unsafe_path``)."""
+        (``unsafe_path``). The launch path must call it before the write checks
+        (``check_cwd``, ``check_write_dirs``, ``check_profile``): they assume a valid
+        ``$HOME``."""
         if _contains(self._state, self._home) or _contains(self._tmp_parent, self._home):
             raise LaunchValidationError(
                 f"HOME is inside the state root or {self.host.tmp_parent}:"
@@ -437,7 +552,8 @@ class PathRules:
         """Why ``path`` may not be made writable by an isolated run, or None
         (interface.md, Path rules: unsafe write targets, state root containment and the
         refused paths). The run's own ``work/``, ``outbox/`` and ``artifacts/`` (and their
-        subpaths) are always allowed; a path in the private tmpdir passes the tmp rules."""
+        subpaths) are always allowed while each is a real directory (not a symlink) at its
+        own path; a path in the private tmpdir (same condition) passes the tmp rules."""
         if path == _SETTINGS_RELATIVE:
             return "is relative to the generated settings file, inside the state root"
         try:
@@ -457,11 +573,9 @@ class PathRules:
         problem = self._state_problem(ref, own_session=False)
         if problem is not None:
             return problem
-        if _contains(self._claude, ref):
+        if any(_contains(claude, ref) for claude in self._claude):
             return "is or is inside ~/.claude"
-        if self._is_hidden_home(ref):
-            return "is or is inside a $HOME/.<name> directory"
-        return None
+        return self._hidden_home_problem(ref)
 
     def _state_problem(self, ref: _Ref, *, own_session: bool) -> str | None:
         """The state root and ``/tmp/csession-<uid>``: an entry may not be or contain either
@@ -480,21 +594,39 @@ class PathRules:
         own = own_session and _exactly_under(ref, self._session)
         if _contains(self._state, ref) and not own:
             return "is inside the state root (outside the session's own directory)"
-        in_tmpdir = self._tmpdir is not None and _exactly_under(ref, self._tmpdir)
-        if _contains(self._tmp_parent, ref) and not in_tmpdir:
+        if _contains(self._tmp_parent, ref) and not self._in_tmpdir(ref):
             return f"is inside {self.host.tmp_parent} (outside the run's private tmpdir)"
         return None
 
-    def _is_hidden_home(self, ref: _Ref) -> bool:
-        """Inside a ``$HOME/.<name>`` entry: lexically, by identity (a bind mount), or
-        overlapping one's realpath (``~/.config`` as a symlink to ``/data/config`` makes
-        ``/data/config`` and ``/data`` refused: writing there changes the configuration)."""
-        home = self._home.key
-        if ref.key != home and _under(ref.key, home):
-            first = ref.key[len(home.rstrip("/")) + 1 :].split("/", 1)[0]
-            if first.startswith("."):
-                return True
-        return any(_overlap(hidden, ref) for hidden in self._hidden)
+    def _in_tmpdir(self, ref: _Ref) -> bool:
+        return self._tmpdir is not None and _exactly_under(ref, self._tmpdir)
+
+    def _hidden_home_problem(self, ref: _Ref) -> str | None:
+        """Inside a ``$HOME/.<name>`` entry (of ``$HOME`` or the account's home):
+        lexically, by identity (a bind mount or another name of the home directory, also
+        for a ``.<name>`` entry that does not exist yet), or overlapping one's realpath
+        (``~/.config`` as a symlink to ``/data/config`` makes ``/data/config`` and ``/data``
+        refused: writing there changes the configuration)."""
+        message = "is or is inside a $HOME/.<name> directory"
+        for home, _label in self._homes:
+            key = home.key
+            if ref.key != key and _under(ref.key, key):
+                first = ref.key[len(key.rstrip("/")) + 1 :].split("/", 1)[0]
+                if first.startswith("."):
+                    return message
+            if home.ident is not None and any(
+                identity == home.ident and name.startswith(".") for identity, name in ref.children
+            ):
+                return message
+        for hidden in self._hidden:
+            if _overlap(hidden.ref, ref):
+                if hidden.link:
+                    return (
+                        f"is, contains or is inside {_shown(hidden.ref.real)}, the target of"
+                        f" the symlink {hidden.name}"
+                    )
+                return message
+        return None
 
     def check_cwd(self) -> None:
         """Isolated runs: the cwd is writable (``work/`` or the caller's cwd), so it must
@@ -506,26 +638,50 @@ class PathRules:
                 f"cwd {problem}: {_shown(self.cwd)!r}", end_reason="unsafe_cwd"
             )
 
-    def check_write_dirs(self, dirs: Sequence[str]) -> None:
+    def check_write_dirs(self, dirs: Sequence[str], writable: SessionWritable) -> None:
         """Isolated runs: every ``write_dirs`` entry (resolved) passes the
-        unsafe-write-target rules. Raises ``InvalidPermissionProfile``."""
+        unsafe-write-target rules and the user-entry rule (``user_entry_problem``). Raises
+        ``InvalidPermissionProfile``."""
         for entry in dirs:
-            problem = self.write_target_problem(entry)
+            problem = self.write_target_problem(entry) or self.user_entry_problem(entry, writable)
             if problem is not None:
                 raise InvalidPermissionProfile(
                     "unsafe write_dirs entry", detail=f"{_shown(entry)}: {problem}"
                 )
+
+    def user_entry_problem(self, path: str, writable: SessionWritable) -> str | None:
+        """Isolated runs: a user-supplied sandbox entry (``read_dirs``, ``write_dirs``, a
+        profile's ``allowRead``, ``allowWrite`` or ``additionalDirectories``) may not be
+        inside a session-writable path (a proper ancestor of it): the agent could rename an
+        ancestor and swap in a symlink. Entries inside the run's own ``$CSESSION_DIR`` or
+        private tmpdir are exempt."""
+        if path == _SETTINGS_RELATIVE:
+            return "is relative to the generated settings file, inside the state root"
+        try:
+            ref = _ref(path)
+        except ValueError:
+            return "cannot be resolved"
+        if _exactly_under(ref, self._session) or self._in_tmpdir(ref):
+            return None
+        if writable.encloses(path):
+            return (
+                "is inside a session-writable path (the session could replace a parent"
+                " directory with a symlink)"
+            )
+        return None
 
     # Read entries
 
     def read_entry_problem(self, path: str, *, generated: bool = False) -> str | None:
         """Why ``path`` may not be in an isolated run's sandbox ``allowRead`` list, or None:
         ``/``, ``$HOME`` or an ancestor of it; containing or inside a credential path
-        (``CREDENTIAL_PATHS``; paths inside the run's own ``$CSESSION_DIR``, readable
-        anyway, are exempt); the state-root and tmp rules (inside the private tmpdir is
-        refused too: listed in allowRead it would be mounted read-only, live E1). With
+        (``CREDENTIAL_PATHS`` under ``$HOME`` and the account's home, and the XDG
+        credential paths; paths inside the run's own ``$CSESSION_DIR``, readable anyway,
+        are exempt); the state-root and tmp rules (inside the private tmpdir is refused
+        too: listed in allowRead it would be mounted read-only, live E1). With
         ``generated`` (entries ``exec`` adds on its own): also the caller's cwd, or a
-        directory containing it, unless the caller's cwd is the run's cwd."""
+        directory containing it, unless the caller's cwd is the run's cwd or the entry is
+        a system read directory or inside one (``SYSTEM_READ_DIRS``, readable anyway)."""
         if path == _SETTINGS_RELATIVE:
             return "is relative to the generated settings file, inside the state root"
         try:
@@ -535,15 +691,26 @@ class PathRules:
         if _contains(ref, self._home):
             return "is /, $HOME or an ancestor of $HOME"
         if not _exactly_under(ref, self._session):
-            for name, credential in self._credentials:
-                if _overlap(ref, credential):
-                    return f"contains or is inside the credential path ~/{name}"
+            for label, credential in self._credentials:
+                if _contains(credential, ref):
+                    return f"contains or is inside the credential path {label}"
+                if _contains(ref, credential):
+                    return (
+                        f"contains or is inside the credential path {label} (list narrower"
+                        " directories that leave it out, for example ~/.cargo/bin and"
+                        " ~/.cargo/registry instead of ~/.cargo)"
+                    )
         problem = self._state_problem(ref, own_session=True)
         if problem is not None:
             return problem
         if self._tmpdir is not None and _contains(self._tmpdir, ref):
             return "is inside the private tmpdir, which must stay out of allowRead"
-        if generated and self._caller.real != self._cwd.real and _contains(ref, self._caller):
+        if (
+            generated
+            and self._caller.real != self._cwd.real
+            and not any(_under(ref.real, system) for system in self._system)
+            and _contains(ref, self._caller)
+        ):
             return (
                 "is or contains the caller's cwd, which is not the run's cwd (a sys.path"
                 " entry: running `python -m claude_session` from inside a directory puts"
@@ -551,11 +718,11 @@ class PathRules:
             )
         return None
 
-    def check_read_dirs(self, dirs: Sequence[str]) -> None:
-        """Isolated runs: ``read_dirs`` entries (resolved). Raises
-        ``InvalidPermissionProfile``."""
+    def check_read_dirs(self, dirs: Sequence[str], writable: SessionWritable) -> None:
+        """Isolated runs: ``read_dirs`` entries (resolved): the read-entry rules and the
+        user-entry rule (``user_entry_problem``). Raises ``InvalidPermissionProfile``."""
         for entry in dirs:
-            problem = self.read_entry_problem(entry)
+            problem = self.read_entry_problem(entry) or self.user_entry_problem(entry, writable)
             if problem is not None:
                 raise InvalidPermissionProfile(
                     "unsafe read_dirs entry", detail=f"{_shown(entry)}: {problem}"
@@ -599,14 +766,26 @@ class PathRules:
 
     # Profiles
 
-    def check_profile(self, content: Mapping[str, Any], *, isolated: bool) -> None:
-        """The expanded profile's paths. Every run: a path a rule or list grants (file-tool
-        ``allow``/``ask`` rule targets, ``additionalDirectories``, sandbox ``allowRead`` and
-        ``allowWrite``) may not be under the state root or ``/tmp/csession-<uid>``, except
-        inside the run's own ``$CSESSION_DIR`` and private tmpdir. Isolated runs: sandbox
-        ``allowRead`` entries pass the read-entry rules (credential paths included), and
-        sandbox ``allowWrite`` entries and ``Edit``/``Write`` allow targets the
-        unsafe-write-target rules. Raises ``InvalidPermissionProfile``."""
+    def check_profile(
+        self,
+        content: Mapping[str, Any],
+        *,
+        isolated: bool,
+        writable: SessionWritable | None = None,
+    ) -> None:
+        """The expanded profile's paths. Sandbox ``filesystem`` entries are mapped first
+        (``sandbox_path``: ``~/x`` under ``$HOME``, ``//x`` absolute, a relative entry
+        relative to the settings file, so refused). Every run: a path a rule or list grants
+        (file-tool ``allow``/``ask`` rule targets, ``additionalDirectories``, sandbox
+        ``allowRead`` and ``allowWrite``) may not be under the state root or
+        ``/tmp/csession-<uid>``, except inside the run's own ``$CSESSION_DIR`` and private
+        tmpdir. Isolated runs (``writable`` required): sandbox ``allowRead`` entries pass
+        the read-entry rules (credential paths included), sandbox ``allowWrite`` entries
+        and ``Edit``/``Write`` allow targets the unsafe-write-target rules, and the sandbox
+        entries and ``additionalDirectories`` the user-entry rule. Raises
+        ``InvalidPermissionProfile``."""
+        if isolated and writable is None:
+            raise ValueError("isolated runs need the session-writable paths (writable)")
         home = self.host.home
         granted: list[tuple[str, str]] = []
         writes: list[tuple[str, str]] = []
@@ -619,27 +798,28 @@ class PathRules:
                 granted.append((where, parsed[1]))
                 if key == "allow" and parsed[0] in WRITE_TOOLS:
                     writes.append((where, parsed[1]))
+        directories: list[tuple[str, str]] = []
         for index, entry in enumerate(_strings(content, "permissions", "additionalDirectories")):
             if entry == "~" or entry.startswith("~/"):
-                target = os.path.join(home, entry[2:])
+                target = home_join(home, entry[2:])
             else:
                 target = os.path.join(self.cwd, entry)  # an absolute entry stays as it is
-            granted.append((f"permissions.additionalDirectories.{index}", target))
+            directories.append((f"permissions.additionalDirectories.{index}", target))
         reads = [
-            (f"sandbox.filesystem.allowRead.{i}", v)
+            (f"sandbox.filesystem.allowRead.{i}", sandbox_path(v, home=home))
             for i, v in enumerate(_strings(content, "sandbox", "filesystem", "allowRead"))
         ]
         allow_writes = [
-            (f"sandbox.filesystem.allowWrite.{i}", v)
+            (f"sandbox.filesystem.allowWrite.{i}", sandbox_path(v, home=home))
             for i, v in enumerate(_strings(content, "sandbox", "filesystem", "allowWrite"))
         ]
-        for where, path in [*granted, *reads, *allow_writes]:
+        for where, path in [*granted, *directories, *reads, *allow_writes]:
             problem = self._refused_problem(path)
             if problem is not None:
                 raise InvalidPermissionProfile(
                     "permission profile names a refused path", detail=f"{where}: {problem}"
                 )
-        if not isolated:
+        if writable is None:
             return
         for where, path in reads:
             problem = self.read_entry_problem(path)
@@ -652,6 +832,13 @@ class PathRules:
             if problem is not None:
                 raise InvalidPermissionProfile(
                     "permission profile makes an unsafe path writable",
+                    detail=f"{where}: {problem}",
+                )
+        for where, path in [*reads, *allow_writes, *directories]:
+            problem = self.user_entry_problem(path, writable)
+            if problem is not None:
+                raise InvalidPermissionProfile(
+                    "permission profile names a path inside a session-writable path",
                     detail=f"{where}: {problem}",
                 )
 
@@ -668,10 +855,55 @@ class PathRules:
             return "cannot be resolved"
         if _contains(self._state, ref) and not _exactly_under(ref, self._session):
             return "is under the state root (outside the session's own directory)"
-        in_tmpdir = self._tmpdir is not None and _exactly_under(ref, self._tmpdir)
-        if _contains(self._tmp_parent, ref) and not in_tmpdir:
+        if _contains(self._tmp_parent, ref) and not self._in_tmpdir(ref):
             return f"is under {self.host.tmp_parent} (outside the run's private tmpdir)"
         return None
+
+
+@dataclass(frozen=True)
+class _Hidden:
+    """An existing ``.<name>`` entry of a home directory: its label (``~/.name``), its
+    resolved reference and whether it is a symlink."""
+
+    name: str
+    ref: _Ref
+    link: bool
+
+
+def _hidden_dirs(home: _Ref, label: str) -> tuple[_Hidden, ...]:
+    """The existing ``.<name>`` entries of ``home``, resolved, for the identity and
+    realpath checks (a bind mount, or a symlinked dot entry whose target holds the
+    configuration). An entry that resolves to the home directory or an ancestor of it (an
+    alias of the home directory, not a configuration directory) is left out: the home
+    directory has its own rule."""
+    try:
+        names = os.listdir(home.real)
+    except OSError:
+        return ()
+    found = []
+    for name in names:
+        if not name.startswith("."):
+            continue
+        path = os.path.join(home.real, name)
+        ref = _ref(path)
+        if _contains(ref, home):
+            continue
+        found.append(_Hidden(name=f"{label}/{name}", ref=ref, link=os.path.islink(path)))
+    return tuple(found)
+
+
+def _exception_dir(path: str) -> _Ref | None:
+    """The run's own directory ``path`` as an exception, or None: granted only while it is
+    a real directory (``lstat``: not a symlink) whose realpath is its normalized path, so
+    a ``work`` swapped for a symlink widens nothing."""
+    literal = os.path.normpath(path)
+    try:
+        info = os.lstat(literal)
+    except (OSError, ValueError):
+        return None
+    if not stat.S_ISDIR(info.st_mode) or os.path.realpath(literal) != literal:
+        return None
+    return _ref(literal)
 
 
 # read_dirs and write_dirs
@@ -691,7 +923,7 @@ def resolve_dirs(
     for index, entry in enumerate(expanded):
         where = f"{key}.{index}"
         if entry == "~" or entry.startswith("~/"):
-            entry = home + entry[1:]
+            entry = home_join(home, entry[2:])
         elif entry.startswith("~"):
             raise InvalidPermissionProfile(
                 f"invalid {key} entry", detail=f"{where}: ~user is not supported"
@@ -753,13 +985,65 @@ def sanitize_path(value: str) -> list[str]:
     return [entry for entry in value.split(":") if entry and os.path.isabs(entry)]
 
 
+def writable_hop(path: str, writable: Callable[[str], bool]) -> str | None:
+    """The first session-writable step of resolving ``path``, or None: every literal
+    normalized prefix of ``path``, every path visited while following its symlinks one
+    component at a time (``lstat``), the directory holding each symlink followed, and the
+    final realpath are checked with ``writable``. A symlink whose directory is
+    session-writable can be re-pointed by the agent, even when the final target is safe.
+    More than ``MAX_SYMLINKS`` symlinks, or a path that cannot be resolved, is returned as
+    it is (fail closed)."""
+    try:
+        literal = os.path.normpath(path)
+        steps = [literal]
+        parts = [part for part in literal.split("/") if part]
+        steps += ["/" + "/".join(parts[:end]) for end in range(1, len(parts))]
+        current = "/"
+        links = 0
+        while parts:
+            name = parts.pop(0)
+            if name in ("", "."):
+                continue
+            if name == "..":
+                current = os.path.dirname(current)
+                continue
+            candidate = os.path.join(current, name)
+            steps.append(candidate)
+            try:
+                info = os.lstat(candidate)
+            except OSError:
+                current = candidate
+                continue
+            if not stat.S_ISLNK(info.st_mode):
+                current = candidate
+                continue
+            links += 1
+            if links > MAX_SYMLINKS:
+                return path
+            steps.append(current)  # the directory holding the link
+            target = os.readlink(candidate)
+            if target.startswith("/"):
+                current = "/"
+            parts = [part for part in target.split("/") if part] + parts
+        steps.append(os.path.realpath(literal))
+    except (OSError, ValueError):
+        return path
+    for step in dict.fromkeys(steps):
+        if writable(step):
+            return step
+    return None
+
+
 def check_path_entries(entries: Sequence[str], writable: Callable[[str], bool]) -> None:
-    """No ``PATH`` entry (resolved) may be inside a session-writable path: an isolated run
-    never runs a binary from one. Raises ``LaunchValidationError`` (``unsafe_path``)."""
+    """No ``PATH`` entry may be inside a session-writable path, resolved hop by hop
+    (``writable_hop``): an isolated run never runs a binary from one. Raises
+    ``LaunchValidationError`` (``unsafe_path``)."""
     for entry in entries:
-        if writable(entry):
+        hop = writable_hop(entry, writable)
+        if hop is not None:
             raise LaunchValidationError(
-                f"PATH entry is inside a session-writable path: {_shown(entry)!r}",
+                f"PATH entry is inside a session-writable path: {_shown(entry)!r}"
+                + ("" if hop == entry else f" (through {_shown(hop)!r})"),
                 end_reason="unsafe_path",
             )
 
@@ -767,10 +1051,11 @@ def check_path_entries(entries: Sequence[str], writable: Callable[[str], bool]) 
 def resolve_tool(
     name: str, path_entries: Sequence[str], writable: Callable[[str], bool]
 ) -> str | None:
-    """The absolute path of executable ``name`` on the (sanitized) ``path_entries``, or None
+    """The realpath of executable ``name`` on the (sanitized) ``path_entries``, or None
     when it is not found. An absolute ``name`` is used as it is; a relative name with a
-    ``/`` is refused. The found file and its realpath must be outside every session-writable
-    path. Raises ``LaunchValidationError`` (``unsafe_path``)."""
+    ``/`` is refused. No step of resolving the found file (``writable_hop``: its literal
+    prefixes, every symlink hop and its realpath) may be session-writable. Raises
+    ``LaunchValidationError`` (``unsafe_path``)."""
     if not name or "\x00" in name:
         raise LaunchValidationError("empty or invalid executable name", end_reason="unsafe_path")
     if "/" in name:
@@ -785,12 +1070,12 @@ def resolve_tool(
     for candidate in candidates:
         if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
             continue
-        if writable(candidate) or writable(os.path.realpath(candidate)):
+        if writable_hop(candidate, writable) is not None:
             raise LaunchValidationError(
                 f"executable is inside a session-writable path: {_shown(candidate)!r}",
                 end_reason="unsafe_path",
             )
-        return candidate
+        return os.path.realpath(candidate)
     return None
 
 

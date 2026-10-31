@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -1312,7 +1313,8 @@ def test_isolated_path_drops_empty_and_relative_entries(
     cfg_dir: Path, kind: str, flags: dict[str, Any] | None
 ) -> None:
     env = env_of(load(cfg_dir), kind, {**CALLER, "PATH": DIRTY_PATH}, flags=flags)
-    assert path_of(env) == [EXE_DIR, "/usr/bin", "/repo/node_modules/.bin", "/bin"]
+    real_bin = os.path.realpath("/bin")  # PATH holds realpaths (usr-merged: /usr/bin)
+    assert path_of(env) == [EXE_DIR, "/usr/bin", "/repo/node_modules/.bin", real_bin]
 
 
 def test_isolated_path_keeps_exe_dir_first_after_sanitizing(cfg_dir: Path) -> None:
@@ -1350,7 +1352,9 @@ def test_isolated_path_check_sees_only_kept_entries(cfg_dir: Path) -> None:
         return False
 
     env_of(load(cfg_dir), "review", {**CALLER, "PATH": DIRTY_PATH}, session_writable=writable)
-    assert seen == ["/usr/bin", "/repo/node_modules/.bin", "/bin", EXE_DIR]
+    # Each kept entry is checked hop by hop (its literal prefixes too); dropped ones never.
+    assert {"/usr/bin", "/repo/node_modules/.bin", "/bin", EXE_DIR} <= set(seen)
+    assert not [path for path in seen if path.endswith(("/x", "/bin/bin")) or path == "bin"]
 
 
 def test_exe_dir_inside_a_session_writable_path_fails(cfg_dir: Path) -> None:
@@ -1363,3 +1367,55 @@ def test_isolated_runs_need_the_session_writable_check(cfg_dir: Path) -> None:
     with pytest.raises(ValueError, match="session_writable"):
         env_of(load(cfg_dir), "review", session_writable=None)
     env_of(load(cfg_dir), "implement", session_writable=None)  # trusted: not needed
+
+
+def writable_under(root: Path) -> Any:
+    def check(path: str) -> bool:
+        return path == str(root) or path.startswith(str(root) + "/")
+
+    return check
+
+
+def test_isolated_path_entries_are_realpaths(cfg_dir: Path, tmp_path: Path) -> None:
+    real = tmp_path.resolve() / "real-bin"
+    real.mkdir()
+    link = tmp_path.resolve() / "link-bin"
+    link.symlink_to(real)
+    env = env_of(load(cfg_dir), "review", {**CALLER, "PATH": str(link)})
+    assert path_of(env) == [EXE_DIR, str(real)]
+
+
+def test_path_entry_through_a_symlink_hop_in_a_writable_path_fails(
+    cfg_dir: Path, tmp_path: Path
+) -> None:
+    root = tmp_path.resolve()
+    (root / "real-bin").mkdir()
+    (root / "cwd").mkdir()
+    (root / "cwd" / "hop").symlink_to(root / "real-bin")
+    (root / "entry").symlink_to(root / "cwd" / "hop")
+    with pytest.raises(LaunchValidationError) as info:
+        env_of(
+            load(cfg_dir),
+            "review",
+            {**CALLER, "PATH": str(root / "entry")},
+            session_writable=writable_under(root / "cwd"),
+        )
+    assert info.value.end_reason == "unsafe_path"
+
+
+def test_exe_dir_through_a_symlink_hop_in_a_writable_path_fails(
+    cfg_dir: Path, tmp_path: Path
+) -> None:
+    root = tmp_path.resolve()
+    (root / "real-bin").mkdir()
+    (root / "cwd").mkdir()
+    (root / "cwd" / "hop").symlink_to(root / "real-bin")
+    (root / "exe").symlink_to(root / "cwd" / "hop")
+    with pytest.raises(LaunchValidationError) as info:
+        env_of(
+            load(cfg_dir),
+            "review",
+            exe_dir=str(root / "exe"),
+            session_writable=writable_under(root / "cwd"),
+        )
+    assert info.value.end_reason == "unsafe_path"

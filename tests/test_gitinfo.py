@@ -89,16 +89,19 @@ def fake(returncode: int, stdout: str = "", stderr: str = "") -> Any:
     return run
 
 
-def test_resolve_is_hardened_and_absolute() -> None:
+def test_resolve_is_hardened_and_absolute(tmp_path: Path) -> None:
+    (tmp_path / "r" / ".git").mkdir(parents=True)
+    cwd = str(tmp_path / "r")
     run = fake(0, ".git\n.git\n")
-    dirs = gitinfo.resolve("/w/r", git="/usr/bin/git", environ={"GIT_DIR": "/x"}, run=run)
-    assert dirs == GitDirs(common_dir=os.path.realpath("/w/r/.git"))
+    dirs = gitinfo.resolve(cwd, git="/usr/bin/git", environ={"GIT_DIR": "/x"}, run=run)
+    assert dirs == GitDirs(common_dir=os.path.realpath(tmp_path / "r" / ".git"))
     call = run.calls[0]
     assert call["argv"][0] == "/usr/bin/git"
     assert "core.hooksPath=/dev/null" in call["argv"] and "core.fsmonitor=" in call["argv"]
     assert "GIT_DIR" not in call["env"] and call["env"]["GIT_CONFIG_NOSYSTEM"] == "1"
     assert call["env"]["LC_ALL"] == "C"
     assert call["timeout"] == gitinfo.GIT_TIMEOUT
+    assert call["devnull_stdin"] is True
 
 
 @pytest.mark.parametrize(
@@ -125,9 +128,14 @@ def test_resolve_git_that_cannot_run() -> None:
         gitinfo.resolve("/w", git="/missing/git", environ={}, run=run)
 
 
-def test_not_a_repository_is_none() -> None:
-    run = fake(128, "", "fatal: not a git repository (or any of the parent directories): .git")
-    assert gitinfo.resolve("/w", git="/usr/bin/git", environ={}, run=run) is None
+NOT_A_REPO = "fatal: not a git repository (or any of the parent directories): .git"
+
+
+def test_not_a_repository_is_none(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    run = fake(128, "", NOT_A_REPO)
+    assert gitinfo.resolve(str(plain), git="/usr/bin/git", environ={}, run=run) is None
 
 
 # git_dir_changed and no_git_cwd
@@ -206,6 +214,23 @@ def listing(*entries: tuple[str, str, str | None]) -> str:
             ("local", f"url.https://u:{TOKEN}@host/.insteadof", "https://host/"),
             ["url.<redacted>.insteadof"],
         ),
+        (
+            ("local", f"url.https://{TOKEN}@github.com/.insteadof", "https://github.com/"),
+            ["url.<redacted>.insteadof"],
+        ),
+        (("local", "sendemail.smtppass", TOKEN), ["sendemail.smtppass"]),
+        (("local", "sendemail.work.smtppass", TOKEN), ["sendemail.work.smtppass"]),
+        (("local", "imap.pass", TOKEN), ["imap.pass"]),
+        (
+            ("local", "credential.helper", f"!f() {{ echo password={TOKEN}; }}; f"),
+            ["credential.helper"],
+        ),
+        (
+            ("local", "credential.https://host.helper", f"!echo password={TOKEN}"),
+            ["credential.https://host.helper"],
+        ),
+        (("local", "credential.helper", "store"), []),
+        (("local", "url.ssh://git@host/.insteadof", "https://host/"), []),
         (("local", "remote.origin.url", "ssh://git@host/r.git"), []),
         (("local", "remote.origin.url", "git@host:r.git"), []),
         (("local", "remote.origin.url", "https://host/r.git"), []),
@@ -249,3 +274,136 @@ def test_no_credential_warning_for_a_clean_repository(repo: Path, tmp_path: Path
 def test_credential_warning_when_git_fails() -> None:
     warnings = gitinfo.credential_warnings("/w", git="/g", environ={}, run=fake(1))
     assert warnings == ["could not read the repository git config to check it for credentials"]
+
+
+# Review round 1 (#24)
+
+
+def test_git_failure_detail_holds_the_sanitized_first_stderr_line() -> None:
+    stderr = "fatal: \x1b[31mbad\x07 thing " + "x" * 400 + "\nsecond line\n"
+    with pytest.raises(FailedError) as info:
+        gitinfo.resolve("/w", git="/usr/bin/git", environ={}, run=fake(128, "", stderr))
+    detail = info.value.detail or ""
+    assert "fatal: ?[31mbad? thing" in detail
+    assert "\x1b" not in detail and "\x07" not in detail
+    assert "second line" not in detail
+    assert len(detail) < 300
+
+
+def test_git_output_with_extra_lines_fails(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    for stdout in (".git\n.git\nextra\n", ".git\n.git", ".git\n"):
+        with pytest.raises(FailedError):
+            gitinfo.resolve(str(tmp_path), git="/g", environ={}, run=fake(0, stdout))
+
+
+def test_git_dirs_must_exist(tmp_path: Path) -> None:
+    with pytest.raises(FailedError):
+        gitinfo.resolve(str(tmp_path), git="/g", environ={}, run=fake(0, "missing\nmissing\n"))
+
+
+@needs_git
+def test_repository_path_with_a_newline_fails(tmp_path: Path) -> None:
+    assert GIT is not None
+    repo = tmp_path.resolve() / "re\npo"
+    (repo / "sub").mkdir(parents=True)
+    git(repo, "init", "-q")
+    with pytest.raises(FailedError):
+        gitinfo.resolve(str(repo / "sub"), git=GIT, environ=environ(tmp_path))
+
+
+@needs_git
+def test_linked_worktree_of_a_newline_repository_fails(tmp_path: Path) -> None:
+    assert GIT is not None
+    repo = tmp_path.resolve() / "ma\nin"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(
+        repo,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@e",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "x",
+    )
+    wt = tmp_path.resolve() / "wt"
+    git(repo, "worktree", "add", "-q", str(wt))
+    with pytest.raises(FailedError):
+        gitinfo.resolve(str(wt), git=GIT, environ=environ(tmp_path))
+
+
+@needs_git
+def test_git_file_pointing_nowhere_is_a_failure(tmp_path: Path) -> None:
+    assert GIT is not None
+    cwd = tmp_path.resolve() / "broken"
+    cwd.mkdir()
+    (cwd / ".git").write_text("gitdir: /nonexistent/gitdir\n")
+    with pytest.raises(FailedError):
+        gitinfo.resolve(str(cwd), git=GIT, environ=environ(tmp_path))
+
+
+@needs_git
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads unreadable directories")
+def test_unreadable_git_directory_is_a_failure(tmp_path: Path) -> None:
+    assert GIT is not None
+    cwd = tmp_path.resolve() / "locked"
+    cwd.mkdir()
+    git(cwd, "init", "-q")
+    (cwd / ".git").chmod(0)
+    try:
+        with pytest.raises(FailedError):
+            gitinfo.resolve(str(cwd), git=GIT, environ=environ(tmp_path))
+    finally:
+        (cwd / ".git").chmod(0o755)
+
+
+def test_not_a_repository_message_must_start_the_line(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    stderr = "fatal: cannot change to '/x/not a git repository': No such file or directory\n"
+    with pytest.raises(FailedError):
+        gitinfo.resolve(str(plain), git="/g", environ={}, run=fake(128, "", stderr))
+
+
+@needs_git
+def test_missing_cwd_named_like_the_message_is_a_failure(tmp_path: Path) -> None:
+    assert GIT is not None
+    missing = tmp_path / "fatal: not a git repository"
+    with pytest.raises(FailedError):
+        gitinfo.resolve(str(missing), git=GIT, environ=environ(tmp_path))
+
+
+def test_not_a_repository_with_a_git_entry_above_is_a_failure(tmp_path: Path) -> None:
+    (tmp_path / ".git").write_text("gitdir: /nowhere\n")
+    (tmp_path / "sub").mkdir()
+    with pytest.raises(FailedError):
+        gitinfo.resolve(str(tmp_path / "sub"), git="/g", environ={}, run=fake(128, "", NOT_A_REPO))
+
+
+def test_credential_warning_wording() -> None:
+    def run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, listing(("local", "imap.pass", TOKEN)), "")
+
+    warnings = gitinfo.credential_warnings("/w", git="/g", environ={}, run=run)
+    assert warnings == [
+        "the repository git config may hold a credential in imap.pass; the session can read it"
+        " (use a credential helper instead)"
+    ]
+
+
+def test_gateway_runs_with_stdin_from_devnull(monkeypatch: pytest.MonkeyPatch) -> None:
+    from claude_session import gateway
+
+    seen: dict[str, Any] = {}
+
+    def run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        seen.update(kw)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(gateway.subprocess, "run", run)
+    gateway.run(["true"], devnull_stdin=True)
+    assert seen["stdin"] is subprocess.DEVNULL and "input" not in seen

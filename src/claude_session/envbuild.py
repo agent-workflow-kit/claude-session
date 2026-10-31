@@ -27,11 +27,12 @@ caller's for ``exec``, the adopting process's for ``exec --session-id``); it nev
    ``env.path_prepend``, the kind's ``PATH``. Config validation already refuses invalid
    ``env.set``, ``env.allow`` and ``path_prepend`` entries; the checks here are a backstop.
 6. Isolated runs: ``PATH`` sanitized (empty and relative entries dropped; an entry inside a
-   session-writable path fails the launch, ``unsafe_path``; interface.md, Path rules), and
+   session-writable path, checked hop by hop through its symlinks, fails the launch,
+   ``unsafe_path``; interface.md, Path rules; each kept entry is replaced by its realpath), and
    the dynamic-loader variables (``LD_PRELOAD``, ``LD_LIBRARY_PATH``, ``LD_AUDIT``, every
    ``DYLD_*``) removed, also ones ``env.set`` sets: they would reach the unsandboxed hook
    interpreter. Then, for every run, the executable directory is prepended to ``PATH``
-   (after sanitizing; it is checked against the session-writable paths too).
+   (after sanitizing; it is checked against the session-writable paths too, hop by hop).
 7. Third-party-reading runs: the git variables that override config or redirect git
    (``GIT_CONFIG_PARAMETERS``, ``GIT_SSH``, ``GIT_DIR``, ...; ``GIT_ENV_DROP``) removed, then
    the ``GIT_CONFIG_COUNT``/``KEY``/``VALUE`` hardening entries appended after the existing
@@ -251,12 +252,12 @@ def build(
         assert session_writable is not None
         entries = pathrules.sanitize_path(":".join(path))
         pathrules.check_path_entries(entries, session_writable)
-        if session_writable(exe_dir):
+        if pathrules.writable_hop(exe_dir, session_writable) is not None:
             raise LaunchValidationError(
                 "the claude-session executable directory is inside a session-writable path",
                 end_reason="unsafe_path",
             )
-        path = entries
+        path = [os.path.realpath(entry) for entry in entries]
         for name in [n for n in env if n in LOADER_DROP or n.startswith(LOADER_DROP_PREFIX)]:
             del env[name]
     env["PATH"] = ":".join([exe_dir, *path])

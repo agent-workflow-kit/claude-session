@@ -17,9 +17,22 @@ def run(
     stdin: str | None = None,
     timeout: float | None = None,
     env: Mapping[str, str] | None = None,
+    devnull_stdin: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``argv`` without a shell and capture its text output. ``env`` replaces the whole
-    environment of the child (None: inherit this process's environment)."""
+    environment of the child (None: inherit this process's environment). ``stdin`` is the
+    child's input; with ``devnull_stdin`` (and no ``stdin``) its stdin is ``/dev/null``
+    instead of this process's stdin."""
+    if devnull_stdin and stdin is None:
+        return subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            env=None if env is None else dict(env),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
     return subprocess.run(
         argv,
         input=stdin,

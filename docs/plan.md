@@ -13,7 +13,7 @@ Status: planned, 2026-10-29. Implements [interface.md](interface.md) (normative)
 
 ## Module map
 
-The plan splits five modules out of design.md's module list to keep files focused: `ids` (from `cli`/`store`), `endmap` (from `supervisor`), `isolation` (from `settings_builder`), `lifecycle` (from `supervisor` and `reconcile`) and `notes` (from `hookevent`). Responsibilities are unchanged.
+The plan splits five modules out of design.md's module list to keep files focused: `ids` (from `cli`/`store`), `endmap` (from `supervisor`), `pathrules` (from `settings_builder`), `lifecycle` (from `supervisor` and `reconcile`) and `notes` (from `hookevent`). Responsibilities are unchanged.
 
 | Module | Stage | Responsibility |
 |---|---|---|
@@ -33,7 +33,7 @@ The plan splits five modules out of design.md's module list to keep files focuse
 | `endmap.py` | 1, 2 | headless and interactive outcome mapping |
 | `supervisor.py` | 1, 2 | `exec`/`resume` process supervision |
 | `toolhooks.py` | 2, 4 | `pre-launch` and `post-state-change` execution and delivery |
-| `isolation.py` | 3 | path rules, session-writable paths, PATH sanitizing, secret index |
+| `pathrules.py` | 3 | path rules, session-writable paths, PATH sanitizing, secret index |
 | `lifecycle.py` | 4 | start/adoption, resume/fork carry-over, taint, stop, forget, liveness |
 | `reconcile.py` | 4 | reconcile, retention, cron block |
 | `transcripts.py` | 5 | transcript discovery and rendering |
@@ -98,7 +98,7 @@ The plan splits five modules out of design.md's module list to keep files focuse
 
 - settings_builder (isolated): `denyRead ["/"]` + the generated `allowRead` list; TMPDIR in `allowWrite` only; protected-file denies; `.git` deny; Claude-config denies under cwd, `$CSESSION_DIR` and add-dirs; git dir read-only with `GIT_OPTIONAL_LOCKS=0`; `autoAllowBashIfSandboxed: false`; `dontAsk` forced; conservative Read denies for credential locations; `--add-dir` for `$CSESSION_DIR` and plugin dirs with write denies; `--setting-sources`, `--strict-mcp-config`; `GIT_CONFIG_COUNT` hardening env.
 - profile validation: refused keys; variable expansion; empty expansion fails; name vs file detection; file snapshot carried on resume.
-- isolation path rules: unsafe write targets (with own `work/` exception); `read_dirs`/plugin dirs/generated allowRead refusals (`unsafe_read_dir`); session-writable paths definition; PATH sanitizing and absolute tool resolution (`unsafe_path`); outcome-file path rejection; `unsafe_cwd`; `unsafe_claude_args` allowlist; `no_git_cwd`; `git_dir_changed`; credential-in-git-config warning.
+- isolation path rules: unsafe write targets (with own `work/` exception); `read_dirs` refusals (`invalid_permission_profile`), plugin dir refusals (`unsafe_plugin_dir`), generated allowRead refusals (`unsafe_read_dir`); session-writable paths definition; PATH sanitizing and absolute tool resolution (`unsafe_path`); outcome-file path rejection; `unsafe_cwd`; `unsafe_claude_args` allowlist; `no_git_cwd`; `git_dir_changed`; credential-in-git-config warning.
 - sandbox self-check: prerequisites per platform; socket path length; `tmpdir_unsafe` checks (lstat, owner, mode, no symlink).
 - contains_secret: q-gram index built without plaintext; hits in summary, reason, artifact, implicit `result.md`; 10 MiB performance budget.
 - `--reads-third-party` implications; `sandbox_lowered` audit and warning.

@@ -77,7 +77,7 @@ PROTECTED = (
 # Isolated runs: the fixed system directories of the sandbox allowRead list (missing ones are
 # skipped by system_read_dirs, which adds their realpaths too). /opt is deliberately not here
 # (design.md, Generated settings).
-SYSTEM_READ_DIRS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc")
+SYSTEM_READ_DIRS = pathrules.SYSTEM_READ_DIRS
 # Home-directory credential locations denied to the Read tool (conservative until live F1 is
 # verified); a trailing "/" marks a directory, denied with "/**".
 HOME_READ_DENIES = (
@@ -305,8 +305,10 @@ def check_interpreter(
     (``unsafe_path``).
 
     The candidates (stricter than what ``python -I`` actually loads; nothing is run): the hook
-    interpreter path and its realpath; the ``prefixes`` (default ``sys.prefix``,
-    ``sys.exec_prefix``, ``sys.base_prefix``, ``sys.base_exec_prefix``); the ``stdlib_dirs``
+    interpreter path, every step of resolving it (``pathrules.writable_hop``: literal
+    prefixes, each symlink hop and the directory holding it) and its realpath; the
+    ``prefixes`` (default ``sys.prefix``, ``sys.exec_prefix``, ``sys.base_prefix``,
+    ``sys.base_exec_prefix``); the ``stdlib_dirs``
     (default ``sysconfig``'s ``stdlib`` and ``platstdlib``); the ``claude_session`` package
     directory; every absolute ``sys_path`` entry (default this process's ``sys.path``); the
     ``site_dirs`` (default ``site.getsitepackages()`` plus the user site when enabled), every
@@ -357,6 +359,12 @@ def check_interpreter(
         *((".pth path entry", entry, True) for entry in pth_entries),
         *((".pth file (resolved)", entry, False) for entry in pth_files),
     ]
+    hop = pathrules.writable_hop(interpreter, session_writable)
+    if hop is not None:
+        raise LaunchValidationError(
+            f"hook interpreter is reached through a session-writable path: {_shown(hop)!r}",
+            end_reason="unsafe_path",
+        )
     for label, path, code_dir in candidates:
         if session_writable(path):
             raise LaunchValidationError(

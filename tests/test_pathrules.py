@@ -366,9 +366,9 @@ def test_home_inside_the_state_root_is_refused(world: World) -> None:
 
 def test_write_dirs(world: World) -> None:
     rules = world.rules()
-    rules.check_write_dirs([str(world.repo / "out"), str(world.work)])
+    rules.check_write_dirs([str(world.repo / "out"), str(world.work)], world.writable())
     with pytest.raises(InvalidPermissionProfile, match="write_dirs"):
-        rules.check_write_dirs([str(world.home / ".config" / "app")])
+        rules.check_write_dirs([str(world.home / ".config" / "app")], world.writable())
 
 
 # Read entries
@@ -439,7 +439,7 @@ def test_credential_path_reached_through_a_symlink(world: World) -> None:
 
 def test_read_dirs_raise_invalid_permission_profile(world: World) -> None:
     with pytest.raises(InvalidPermissionProfile) as info:
-        world.rules().check_read_dirs([str(world.home)])
+        world.rules().check_read_dirs([str(world.home)], world.writable())
     assert info.value.end_reason == "invalid_permission_profile"
 
 
@@ -498,7 +498,7 @@ def test_profile_allow_read_of_a_credential_path_is_refused(world: World) -> Non
         {"HOME": str(world.home)},
     )
     with pytest.raises(InvalidPermissionProfile, match="unsafe read path"):
-        world.rules().check_profile(content, isolated=True)
+        world.rules().check_profile(content, isolated=True, writable=world.writable())
     world.rules().check_profile(content, isolated=False)  # trusted: refused paths only
 
 
@@ -516,7 +516,7 @@ def test_profile_allow_read_of_a_credential_path_is_refused(world: World) -> Non
 def test_isolated_profile_write_additions(world: World, content: dict[str, Any]) -> None:
     filled = fill(content, world)
     with pytest.raises(InvalidPermissionProfile, match="unsafe path writable"):
-        world.rules().check_profile(filled, isolated=True)
+        world.rules().check_profile(filled, isolated=True, writable=world.writable())
 
 
 @pytest.mark.parametrize(
@@ -545,7 +545,7 @@ def test_profile_paths_inside_the_own_session_and_tmpdir_pass(world: World) -> N
         },
         world,
     )
-    world.rules().check_profile(content, isolated=True)
+    world.rules().check_profile(content, isolated=True, writable=world.writable())
     world.rules().check_profile(content, isolated=False)
 
 
@@ -556,8 +556,8 @@ def test_builtin_respond_profile_passes(world: World) -> None:
     variables = {"CSESSION_DIR": str(world.csdir), "CWD": str(world.repo), "HOME": str(world.home)}
     content = permission_profiles.expand(selected.content, {**variables, "GIT_DIR": None})
     rules = world.rules(cwd=world.repo)
-    rules.check_profile(content, isolated=True)
     writable = world.writable(cwd=world.repo, profile=content)
+    rules.check_profile(content, isolated=True, writable=writable)
     assert str(world.repo) in writable.paths
 
 
@@ -682,14 +682,15 @@ def test_resolve_tool_refuses_session_writable_binaries(world: World) -> None:
         ["--debug", "api"],
         ["--verbose", "--add-dir", "/"],
         ["--VERBOSE"],
-        [" --verbose"],
+        ["\t--verbose"],
+        ["--append-system-prompt=never-echoed-value"],
     ],
 )
 def test_isolated_claude_args_allowlist(args: list[str]) -> None:
     with pytest.raises(LaunchValidationError) as info:
         pathrules.check_claude_args(args, isolated=True)
     assert info.value.end_reason == "unsafe_claude_args"
-    refused = [a for a in args if a.strip() not in pathrules.ISOLATED_CLAUDE_ARGS]
+    refused = [a for a in args if a not in pathrules.ISOLATED_CLAUDE_ARGS]
     assert all(arg not in info.value.message for arg in refused)  # values are not echoed
     pathrules.check_claude_args(args, isolated=False)
 
@@ -784,3 +785,320 @@ def test_dot_alias_of_home_does_not_make_home_hidden(world: World) -> None:
     (world.home / "src" / "project").mkdir(parents=True)
     assert write_problem(world, world.home / "src" / "project") is None
     assert write_problem(world, world.repo) is None
+
+
+# Review round 1 (#24)
+
+
+@pytest.mark.parametrize("tool", ["Edit", "Write", "MultiEdit", "NotebookEdit", "Read"])
+@pytest.mark.parametrize("pattern", ["*", ""])
+def test_star_and_empty_rule_content_is_the_bare_tool(tool: str, pattern: str) -> None:
+    assert pathrules.rule_target(f"{tool}({pattern})", cwd="/c", home="/h") == (tool, "/")
+
+
+@pytest.mark.parametrize(
+    "rule", ["Edit(*)", "Write(*)", "MultiEdit(*)", "NotebookEdit(*)", "Edit()"]
+)
+def test_star_write_rules_are_refused_for_isolated_runs(world: World, rule: str) -> None:
+    content = {"permissions": {"allow": [rule]}}
+    with pytest.raises(InvalidPermissionProfile, match="unsafe path writable"):
+        world.rules().check_profile(content, isolated=True, writable=world.writable())
+
+
+@pytest.mark.parametrize(
+    ("rule", "expected"),
+    [
+        ("Edit(~//.ssh/**)", ("Edit", "/h/.ssh")),
+        ("Edit(~//.bash_profile)", ("Edit", "/h/.bash_profile")),
+        (
+            "Read(~//.local/state/claude-session/private/**)",
+            ("Read", "/h/.local/state/claude-session/private"),
+        ),
+        ("Edit(~///x)", ("Edit", "/h/x")),
+    ],
+)
+def test_double_slash_after_tilde_stays_under_home(rule: str, expected: tuple[str, str]) -> None:
+    assert pathrules.rule_target(rule, cwd="/c", home="/h") == expected
+
+
+@pytest.mark.parametrize(
+    "rule", ["Edit(~//.ssh/**)", "Edit(~//.bash_profile)", "Write(~//.config/x)"]
+)
+def test_double_slash_after_tilde_write_rules_are_refused(world: World, rule: str) -> None:
+    with pytest.raises(InvalidPermissionProfile, match="unsafe path writable"):
+        world.rules().check_profile(
+            {"permissions": {"allow": [rule]}}, isolated=True, writable=world.writable()
+        )
+
+
+def test_double_slash_after_tilde_reaches_the_state_root(world: World) -> None:
+    content = {"permissions": {"allow": ["Read(~//.local/state/claude-session/private/**)"]}}
+    with pytest.raises(InvalidPermissionProfile, match="refused path"):
+        world.rules().check_profile(content, isolated=False)
+
+
+def test_double_slash_after_tilde_in_additional_directories(world: World) -> None:
+    content = {"permissions": {"additionalDirectories": ["~//.local/state/claude-session"]}}
+    with pytest.raises(InvalidPermissionProfile, match="refused path"):
+        world.rules().check_profile(content, isolated=False)
+
+
+def test_session_writable_with_double_slash_after_tilde(world: World) -> None:
+    writable = world.writable(profile={"permissions": {"allow": ["Edit(~//.ssh/**)"]}})
+    assert writable(str(world.home / ".ssh" / "authorized_keys"))
+
+
+def test_resolve_dirs_double_slash_after_tilde(world: World) -> None:
+    resolved = pathrules.resolve_dirs(
+        ["~//.nvm"], {"HOME": str(world.home)}, home=str(world.home), key="read_dirs"
+    )
+    assert resolved == [str(world.home / ".nvm")]
+
+
+def test_path_entry_through_a_two_hop_symlink_chain_in_the_cwd_fails(world: World) -> None:
+    writable = world.writable(cwd=world.repo)
+    target = world.root / "opt" / "real-bin"
+    target.mkdir()
+    (world.repo / "hop").symlink_to(target)  # the agent can re-point this link
+    first = world.root / "opt" / "first-link"
+    first.symlink_to(world.repo / "hop")
+    assert not writable(str(first))  # the realpath alone is outside the cwd
+    with pytest.raises(LaunchValidationError) as info:
+        pathrules.check_path_entries([str(first)], writable)
+    assert info.value.end_reason == "unsafe_path"
+
+
+def test_tool_through_a_two_hop_symlink_chain_in_the_cwd_fails(world: World) -> None:
+    writable = world.writable(cwd=world.repo)
+    real = executable(world.root / "opt" / "real-tool")
+    (world.repo / "hop").symlink_to(real)
+    (world.bin / "tool").symlink_to(world.repo / "hop")
+    with pytest.raises(LaunchValidationError) as info:
+        pathrules.resolve_tool("tool", [str(world.bin)], writable)
+    assert info.value.end_reason == "unsafe_path"
+
+
+def test_resolve_tool_returns_the_realpath(world: World) -> None:
+    writable = world.writable(cwd=world.repo)
+    real = executable(world.root / "opt" / "real-tool")
+    (world.bin / "tool").symlink_to(real)
+    assert pathrules.resolve_tool("tool", [str(world.bin)], writable) == str(real)
+
+
+def test_writable_hop(world: World) -> None:
+    writable = world.writable(cwd=world.repo)
+    assert pathrules.writable_hop(str(world.bin), writable) is None
+    (world.repo / "hop").symlink_to(world.bin)
+    link = world.root / "opt" / "via"
+    link.symlink_to(world.repo / "hop")
+    assert pathrules.writable_hop(str(link / "x"), writable) is not None
+    assert pathrules.writable_hop(str(world.repo / "bin"), writable) is not None
+
+
+def test_own_work_swapped_for_a_symlink_gets_no_exception(world: World) -> None:
+    os.rmdir(world.work)
+    world.work.symlink_to(world.home / ".ssh")
+    rules = world.rules()
+    with pytest.raises(LaunchValidationError) as info:
+        rules.check_cwd()
+    assert info.value.end_reason == "unsafe_cwd"
+    assert rules.write_target_problem(str(world.home / ".ssh")) is not None
+
+
+def test_private_tmpdir_swapped_for_a_symlink_gets_no_exception(world: World) -> None:
+    os.rmdir(world.tmpdir)
+    world.tmpdir.symlink_to(world.tmp_parent / OTHER)
+    assert world.rules().write_target_problem(str(world.tmp_parent / OTHER)) is not None
+
+
+def test_profile_sandbox_paths_are_mapped(world: World) -> None:
+    (world.home / ".kube").mkdir()
+    trusted = {"sandbox": {"filesystem": {"allowRead": ["~/.kube"]}}}
+    world.rules().check_profile(trusted, isolated=False)
+    isolated = {"sandbox": {"filesystem": {"allowRead": ["~/.ssh"]}}}
+    with pytest.raises(InvalidPermissionProfile, match="unsafe read path"):
+        world.rules().check_profile(isolated, isolated=True, writable=world.writable())
+    state = {"sandbox": {"filesystem": {"allowWrite": ["~/.local/state/claude-session"]}}}
+    with pytest.raises(InvalidPermissionProfile, match="refused path"):
+        world.rules().check_profile(state, isolated=False)
+    double = {"sandbox": {"filesystem": {"allowRead": [f"/{world.state}"]}}}
+    with pytest.raises(InvalidPermissionProfile, match="refused path"):
+        world.rules().check_profile(double, isolated=False)
+
+
+@pytest.mark.parametrize("isolated", [True, False])
+def test_relative_profile_sandbox_path_is_settings_relative(world: World, isolated: bool) -> None:
+    content = {"sandbox": {"filesystem": {"allowRead": ["relative/dir"]}}}
+    with pytest.raises(InvalidPermissionProfile) as info:
+        world.rules().check_profile(content, isolated=isolated, writable=world.writable())
+    assert "settings file" in (info.value.detail or "")
+
+
+def test_session_writable_raises_for_a_settings_relative_rule(world: World) -> None:
+    with pytest.raises(InvalidPermissionProfile):
+        world.writable(profile={"permissions": {"allow": ["Edit(/x/**)"]}})
+    with pytest.raises(InvalidPermissionProfile):
+        world.writable(profile={"sandbox": {"filesystem": {"allowWrite": ["rel"]}}})
+
+
+def test_session_writable_maps_tilde_sandbox_writes(world: World) -> None:
+    writable = world.writable(profile={"sandbox": {"filesystem": {"allowWrite": ["~/out"]}}})
+    assert str(world.home / "out") in writable.paths
+
+
+def test_caller_cwd_rule_exempts_system_read_dirs(world: World) -> None:
+    rules = world.rules(caller=Path("/usr/src/app"))
+    rules.check_generated({"Python read directory": ["/usr"]})
+    with pytest.raises(LaunchValidationError):
+        world.rules(caller=world.repo / "x").check_generated({"tool directory": [str(world.repo)]})
+
+
+def test_dot_entry_reached_through_a_home_alias_is_refused(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias = world.root / "mnt" / "home-alias"
+    alias.mkdir(parents=True)
+    fake_bind_mount(monkeypatch, alias, world.home)
+    rules = world.rules()
+    assert "$HOME/.<name>" in (rules.write_target_problem(str(alias / ".bash_profile")) or "")
+    assert "$HOME/.<name>" in (rules.write_target_problem(str(alias / ".new" / "x")) or "")
+    assert rules.write_target_problem(str(alias / "visible")) is None
+
+
+def test_case_insensitive_key_is_unicode_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pathrules, "CASE_INSENSITIVE", True)
+    assert pathrules._key("/h/.Café") == pathrules._key("/h/.café")
+
+
+def test_user_entries_inside_a_session_writable_path_are_refused(world: World) -> None:
+    rules = world.rules(cwd=world.repo)
+    writable = world.writable(cwd=world.repo)
+    (world.repo / "sub").mkdir()
+    with pytest.raises(InvalidPermissionProfile, match="write_dirs"):
+        rules.check_write_dirs([str(world.repo / "sub")], writable)
+    with pytest.raises(InvalidPermissionProfile, match="read_dirs"):
+        rules.check_read_dirs([str(world.repo / "x")], writable)
+    content = {"sandbox": {"filesystem": {"allowRead": [str(world.repo / "tools")]}}}
+    with pytest.raises(InvalidPermissionProfile, match="session-writable"):
+        rules.check_profile(content, isolated=True, writable=writable)
+    # Entries equal to a session-writable path, inside the run's own directories, or
+    # elsewhere (also missing) stay allowed.
+    rules.check_write_dirs([str(world.repo), str(world.csdir / "outbox" / "x")], writable)
+    rules.check_read_dirs([str(world.csdir / "inputs"), str(world.root / "missing")], writable)
+
+
+def test_read_dir_inside_a_write_dir_is_refused(world: World) -> None:
+    out = world.root / "out"
+    out.mkdir()
+    writable = world.writable(write_dirs=[str(out)])
+    with pytest.raises(InvalidPermissionProfile) as info:
+        world.rules().check_read_dirs([str(out / "tools")], writable)
+    assert "session-writable" in (info.value.detail or "")
+
+
+def test_isolated_check_profile_needs_the_writable_paths(world: World) -> None:
+    with pytest.raises(ValueError, match="writable"):
+        world.rules().check_profile({}, isolated=True)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".cargo",
+        ".cargo/credentials.toml",
+        ".cargo/credentials",
+        ".local/share/keyrings",
+        ".gem/credentials",
+        ".gradle/gradle.properties",
+        ".m2",
+        ".m2/settings-security.xml",
+    ],
+)
+def test_toolchain_credential_files_are_refused_read_entries(world: World, name: str) -> None:
+    problem = world.rules().read_entry_problem(str(world.home / name))
+    assert problem is not None and "credential" in problem
+
+
+def test_cargo_hint_names_narrower_directories(world: World) -> None:
+    problem = world.rules().read_entry_problem(str(world.home / ".cargo"))
+    assert problem is not None and "~/.cargo/bin" in problem
+    assert world.rules().read_entry_problem(str(world.home / ".cargo" / "bin")) is None
+
+
+def test_custom_xdg_dirs_are_credential_paths(world: World) -> None:
+    host = Host.from_environ(
+        {
+            "HOME": str(world.home),
+            "XDG_CONFIG_HOME": str(world.root / "cfg"),
+            "XDG_STATE_HOME": str(world.root / "st"),
+            "XDG_DATA_HOME": str(world.root / "data"),
+        },
+        state_root=str(world.state),
+    )
+    rules = world.rules(host=host)
+    for path in (world.root / "cfg" / "gh", world.root / "st", world.root / "data" / "keyrings"):
+        problem = rules.read_entry_problem(str(path))
+        assert problem is not None and "credential" in problem, path
+    assert rules.read_entry_problem(str(world.root / "data" / "fonts")) is None
+
+
+def test_home_under_the_tmp_parent_is_refused(world: World) -> None:
+    home = world.tmp_parent / "home"
+    home.mkdir()
+    with pytest.raises(LaunchValidationError) as info:
+        world.rules(host=world.host(home=str(home))).check_host()
+    assert info.value.end_reason == "unsafe_path"
+
+
+def test_write_target_containing_an_xdg_dir_outside_home(world: World) -> None:
+    xdg = world.root / "data" / "xdg"
+    xdg.mkdir(parents=True)
+    rules = world.rules(host=world.host(xdg_dirs=(str(xdg),)))
+    assert "XDG directory" in (rules.write_target_problem(str(world.root / "data")) or "")
+
+
+def test_symlinked_dot_entry_into_the_cwd_names_the_entry(world: World) -> None:
+    config = world.repo / "config"
+    config.mkdir()
+    (world.home / ".tool").symlink_to(config)
+    with pytest.raises(LaunchValidationError) as info:
+        world.rules(cwd=world.repo).check_cwd()
+    message = info.value.message
+    assert "~/.tool" in message and str(config) in message
+    assert "is or is inside a $HOME/.<name>" not in message
+
+
+def test_credential_paths_of_the_account_home(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = world.root / "account"
+    (account / ".ssh").mkdir(parents=True)
+
+    class Entry:
+        pw_dir = str(account)
+
+    monkeypatch.setattr(pathrules.pwd, "getpwuid", lambda uid: Entry())
+    host = Host.from_environ({"HOME": str(world.home)}, state_root=str(world.state))
+    assert host.account_home == str(account)
+    rules = world.rules(host=host)
+    assert "credential" in (rules.read_entry_problem(str(account / ".ssh")) or "")
+    assert rules.write_target_problem(str(account / ".bashrc")) is not None
+    assert rules.write_target_problem(str(account / "src")) is None
+
+
+def test_account_home_lookup_failure_is_ignored(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(uid: int) -> Any:
+        raise KeyError(uid)
+
+    monkeypatch.setattr(pathrules.pwd, "getpwuid", fail)
+    host = Host.from_environ({"HOME": str(world.home)}, state_root=str(world.state))
+    assert host.account_home is None
+
+
+@pytest.mark.parametrize("home", ["/", "//", "/."])
+def test_home_root_is_refused(home: str) -> None:
+    with pytest.raises(LaunchValidationError) as info:
+        Host.from_environ({"HOME": home}, state_root="/s")
+    assert info.value.end_reason == "unsafe_path"
