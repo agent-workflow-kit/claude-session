@@ -81,33 +81,32 @@
               "allow": {
                 "type": "array",
                 "items": {
-                  "type": "string"
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\*?$"
                 },
-                "description": "Names or PREFIX_* globs. Only a kind's config env.allow naming a secret_env variable exactly passes it; per-call --env-allow cannot."
+                "description": "Names (^[A-Za-z_][A-Za-z0-9_]*$) or PREFIX* globs (a valid name start followed by one trailing *; anything else is an invalid config). Only a kind's config env.allow naming a secret_env variable exactly passes it; per-call --env-allow cannot, and --env-allowlist-only replaces env.allow, so it unlocks nothing then."
               },
               "set": {
                 "type": "object",
                 "additionalProperties": {
-                  "type": "string"
+                  "type": "string",
+                  "pattern": "^(?:[^$\\u0000]|\\$(?!\\{)|\\$\\{(?:CSESSION_DIR|CWD|HOME|GIT_DIR)\\})*$"
                 },
                 "propertyNames": {
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
                   "not": {
-                    "enum": [
-                      "CSESSION_ID",
-                      "CSESSION_DIR",
-                      "CSESSION_KIND",
-                      "CSESSION_HOOK",
-                      "CSESSION_OBJECT_TYPE"
-                    ]
+                    "pattern": "^CSESSION_"
                   }
                 },
-                "description": "Literal non-secret values; ${CSESSION_DIR} ${CWD} ${HOME} ${GIT_DIR} expanded. Reserved CSESSION_* names are not allowed."
+                "description": "Literal values, not treated as secrets (never put a credential here). Names match ^[A-Za-z_][A-Za-z0-9_]*$; no CSESSION_* name may be set. Values contain no NUL; ${CSESSION_DIR}, ${CWD}, ${HOME} and ${GIT_DIR} are expanded once and any other '${' is an invalid config ('$' and '}' alone are literal). On third-party-reading runs the token removals and GH_CONFIG_DIR/GLAB_CONFIG_DIR win over env.set."
               },
               "path_prepend": {
                 "type": "array",
                 "items": {
-                  "type": "string"
-                }
+                  "type": "string",
+                  "pattern": "^/[^:\\u0000]*$"
+                },
+                "description": "Absolute directories (no ':' or NUL), prepended to PATH as written (not expanded)."
               }
             },
             "required": [],
@@ -232,17 +231,20 @@
     "claude_auth_env": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
       },
       "default": [],
-      "description": "Added to the built-in list (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, CLAUDE_CODE_USE_BEDROCK, CLAUDE_CODE_USE_VERTEX; AWS_* only with CLAUDE_CODE_USE_BEDROCK; GOOGLE_*, CLOUD_ML_REGION, ANTHROPIC_VERTEX_PROJECT_ID only with CLAUDE_CODE_USE_VERTEX)."
+      "description": "Variable names (^[A-Za-z_][A-Za-z0-9_]*$; exact names, no globs) added to the built-in list (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, CLAUDE_CODE_USE_BEDROCK, CLAUDE_CODE_USE_VERTEX; AWS_* only when CLAUDE_CODE_USE_BEDROCK is set to a true value; GOOGLE_*, CLOUD_ML_REGION, ANTHROPIC_VERTEX_PROJECT_ID only when CLAUDE_CODE_USE_VERTEX is; a flag is true when its passed value, trimmed and lowercased, is 1, true, yes or on)."
     },
     "secret_env": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
       },
-      "default": []
+      "default": [],
+      "description": "Variable names (^[A-Za-z_][A-Za-z0-9_]*$; exact names, no globs) stripped from every kind unless the kind's config env.allow names them exactly (not with --env-allow, and not while --env-allowlist-only is in effect)."
     },
     "notes_context_cmd": {
       "type": "array",
@@ -569,33 +571,32 @@
                     "allow": {
                       "type": "array",
                       "items": {
-                        "type": "string"
+                        "type": "string",
+                        "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\*?$"
                       },
-                      "description": "Names or PREFIX_* globs. Only a kind's config env.allow naming a secret_env variable exactly passes it; per-call --env-allow cannot."
+                      "description": "Names (^[A-Za-z_][A-Za-z0-9_]*$) or PREFIX* globs (a valid name start followed by one trailing *; anything else is an invalid config). Only a kind's config env.allow naming a secret_env variable exactly passes it; per-call --env-allow cannot, and --env-allowlist-only replaces env.allow, so it unlocks nothing then."
                     },
                     "set": {
                       "type": "object",
                       "additionalProperties": {
-                        "type": "string"
+                        "type": "string",
+                        "pattern": "^(?:[^$\\u0000]|\\$(?!\\{)|\\$\\{(?:CSESSION_DIR|CWD|HOME|GIT_DIR)\\})*$"
                       },
                       "propertyNames": {
+                        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
                         "not": {
-                          "enum": [
-                            "CSESSION_ID",
-                            "CSESSION_DIR",
-                            "CSESSION_KIND",
-                            "CSESSION_HOOK",
-                            "CSESSION_OBJECT_TYPE"
-                          ]
+                          "pattern": "^CSESSION_"
                         }
                       },
-                      "description": "Literal non-secret values; ${CSESSION_DIR} ${CWD} ${HOME} ${GIT_DIR} expanded. Reserved CSESSION_* names are not allowed."
+                      "description": "Literal values, not treated as secrets (never put a credential here). Names match ^[A-Za-z_][A-Za-z0-9_]*$; no CSESSION_* name may be set. Values contain no NUL; ${CSESSION_DIR}, ${CWD}, ${HOME} and ${GIT_DIR} are expanded once and any other '${' is an invalid config ('$' and '}' alone are literal). On third-party-reading runs the token removals and GH_CONFIG_DIR/GLAB_CONFIG_DIR win over env.set."
                     },
                     "path_prepend": {
                       "type": "array",
                       "items": {
-                        "type": "string"
-                      }
+                        "type": "string",
+                        "pattern": "^/[^:\\u0000]*$"
+                      },
+                      "description": "Absolute directories (no ':' or NUL), prepended to PATH as written (not expanded)."
                     }
                   },
                   "required": [],
