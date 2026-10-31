@@ -410,6 +410,21 @@ def test_check_is_called_while_confirming_candidates() -> None:
     assert calls[0] > 2 * (samples // secretindex.CHECK_EVERY + 1)
 
 
+def test_check_is_called_while_draining_pending_windows() -> None:
+    """Candidate windows waiting for their end are revisited on every update: each one
+    counts as work, so tiny chunks after a long run of candidates still reach check."""
+    calls, check = _counting_check()
+    index = index_of("a" * 2000, RUN_SECRET)
+    scan = index.scan(check)
+    assert not scan.update(b"a" * 1000)  # about 1000 windows wait for their end
+    calls[0] = 0
+    updates = 500
+    for _ in range(updates):
+        assert not scan.update(b"a")
+    pending_work = updates * 1000
+    assert calls[0] >= updates + pending_work // secretindex.CHECK_EVERY
+
+
 def test_an_exception_from_check_ends_the_scan() -> None:
     _, check = _counting_check(limit=3)
     scan = index_of("exactly8").scan(check)

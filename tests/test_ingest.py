@@ -1154,6 +1154,34 @@ def test_a_later_request_whose_scan_outlasts_the_drain_is_deferred(
     }
 
 
+def test_a_first_request_that_started_late_in_the_drain_is_deferred(
+    run: Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cleanup before checking used up most of the budget: the first request checked did
+    not have the whole budget, so a scan that outlasts the drain defers it (its copy
+    removed) rather than rejecting it too_large; the next drain ingests it."""
+    monkeypatch.setattr(outbox, "_READ_CHUNK", 64)
+    run.write_artifact("a.md", os.urandom(1000))
+    request = run.report(artifact="a.md")
+    now = [0.0]
+    real_remove_leftovers = outbox._remove_leftovers
+
+    def slow_remove_leftovers(scan_fd: int, stop: Callable[[], bool]) -> None:
+        now[0] += outbox.DRAIN_BUDGET * 0.8
+        real_remove_leftovers(scan_fd, stop)
+
+    monkeypatch.setattr(outbox, "_remove_leftovers", slow_remove_leftovers)
+    drain = _drain_with(run, ClockedScanner(now, outbox.DRAIN_BUDGET / 4), now)
+    assert [item.deferred for item in drain.items] == [True]
+    assert results(run) == []
+    assert listing(run.claimed) == [f"{request.request_id}.json"]
+    assert listing(run.private_run / "scan") == []
+    assert listing(run.private_run / "artifact") == []
+    monkeypatch.setattr(outbox, "_remove_leftovers", real_remove_leftovers)
+    run.post_tool_use()
+    assert results(run) == ["ingested"]
+
+
 def test_a_text_scan_outlasting_the_drain_is_too_large(run: Run) -> None:
     run.report(summary="done")
     now = [0.0]

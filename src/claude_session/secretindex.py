@@ -77,8 +77,9 @@ INDEX_MAX_BYTES = _HEADER + GRAM_ENTRY * VALUES_MAX_BYTES
 # (an 8-byte value). Pathological values (self-periodic ones such as "a" * 2000) can take
 # longer on matching data; the caller's deadline (``check``) bounds every scan.
 SCAN_BUDGET = 10.0
-# Work units between two ``check`` calls: one per sampled q-gram, CONFIRM_COST per candidate
-# prefilter (plus a unit per 512 bytes of a full-window hash). About a millisecond of work.
+# Work units between two ``check`` calls: one per sampled q-gram and per waiting candidate
+# window revisited, CONFIRM_COST per candidate prefilter (plus a unit per 512 bytes of a
+# full-window hash). About a millisecond of work.
 CHECK_EVERY = 4096
 CONFIRM_COST = 8
 _GRAM_PERSON = b"cs-qgram"
@@ -334,6 +335,7 @@ class Scan:
         lengths = self._index.lengths_by_value
         waiting: list[tuple[int, int, int]] = []
         for start, number, offset in self._pending:
+            self._tick(1)  # every waiting window is revisited: one unit each
             if start + lengths[number] > end:
                 waiting.append((start, number, offset))
             elif self._confirm(buf, start - base, number, offset):

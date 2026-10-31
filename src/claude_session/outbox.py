@@ -66,6 +66,11 @@ DRAIN_MAX_REQUESTS = 16
 # Seconds a drain may spend claiming and checking: half the 60 s timeout of the hooks that
 # drain (settings_builder.HOOKS, tested equal); the rest waits for the next drain.
 DRAIN_BUDGET = 30.0
+# A scan that outlasts the drain rejects its request too_large only when the request was the
+# first one checked and its check began with at least this share of DRAIN_BUDGET left (it had
+# about the whole budget, so no later drain would finish it either); otherwise the request
+# waits for the next drain.
+FULL_BUDGET_SHARE = 0.9
 # run.json is written by exec; anything larger is not one.
 RUN_JSON_MAX_BYTES = 1024 * 1024
 SECRET_CHARS = 64
@@ -848,8 +853,9 @@ class Drain:
         drain (``DrainSetupError``: nothing is ingested without the scan). Claiming and
         checking stop ``DRAIN_BUDGET`` seconds (by ``clock``) after the start; what is left
         waits for the next drain. A scan still running at that deadline is stopped: the
-        request is rejected ``too_large`` when it was the first one checked (it had the whole
-        budget), and otherwise left for the next drain.
+        request is rejected ``too_large`` when it had the whole budget (the first one checked,
+        its check begun with ``FULL_BUDGET_SHARE`` of the budget left), and otherwise left
+        for the next drain.
 
         Raises ``OutboxDirError`` when ``outbox/`` cannot be trusted (nothing is claimed),
         ``DrainSetupError`` and ``OSError`` for an unusable private directory."""
@@ -929,22 +935,26 @@ class Drain:
             elif self._past_deadline():
                 item.deferred = True
             else:
+                whole_budget = first and (
+                    self._deadline - self._clock() >= FULL_BUDGET_SHARE * DRAIN_BUDGET
+                )
                 try:
                     self._check(item, caps, secret_sha256, artifacts_dev_ino, index)
                 except ScanTimeout:
-                    self._timed_out(item, first)
+                    self._timed_out(item, whole_budget)
                 first = False
                 winner_found = item.request is not None
 
-    def _timed_out(self, item: Item, first: bool) -> None:
-        """A scan of ``item`` outlasted the drain's budget. The first request checked had the
-        whole budget, so it never will fit: rejected ``too_large``. A later one is left in
+    def _timed_out(self, item: Item, whole_budget: bool) -> None:
+        """A scan of ``item`` outlasted the drain's budget. A request that had the whole
+        budget (the first one checked, its check begun with ``FULL_BUDGET_SHARE`` of the
+        budget left) never will fit: rejected ``too_large``. Any other is left in
         ``claimed/`` for the next drain. Either way its partial copy is removed now."""
         if item.copy_name is not None:
             _unlink_quietly(self._fds["scan"], item.copy_name)
             item.copy_name = None
         item.request = None
-        if first:
+        if whole_budget:
             item.rejection = "too_large"
         else:
             item.deferred = True
