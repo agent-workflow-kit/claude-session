@@ -140,6 +140,13 @@ file or any fake-internal error (never 1, which a real claude also uses).
 **Log records** (``"event"`` key): ``start``, ``step``, ``hook``, ``hook_skipped``,
 ``hook_error``, ``hook_output_invalid``, ``context``, ``block``, ``bash``, ``signal``,
 ``signal_ignored``, ``error``, ``exit``.
+
+**Start records.** When ``$FAKE_CLAUDE_STARTED_DIR`` is set (the test suite's
+``no_leftover_processes`` fixture sets it for every test), every call of the fake first creates
+an empty file ``<pid>.<start ticks>`` in that directory (Linux; start ticks from
+``/proc/self/stat``), so a test can find a fake it did not start itself (one started by
+``claude-session exec``) and end exactly that process. A record that cannot be written is a
+fake error (99), never a silently untracked fake.
 """
 
 from __future__ import annotations
@@ -163,6 +170,7 @@ from typing import Any
 SCENARIO_ENV = "FAKE_CLAUDE_SCENARIO"
 LOG_ENV = "FAKE_CLAUDE_LOG"
 VERSION_ENV = "FAKE_CLAUDE_VERSION"
+STARTED_ENV = "FAKE_CLAUDE_STARTED_DIR"
 DEFAULT_VERSION = "2.1.312 (Claude Code)"
 DEFAULT_REPORT_COMMAND = "claude-session report"
 DEFAULT_PERMISSION_MODE = "default"
@@ -1528,10 +1536,30 @@ def _error(message: str, code: int) -> int:
     return code
 
 
+def record_start() -> None:
+    """The start record in ``$FAKE_CLAUDE_STARTED_DIR`` (see the module docs); nothing when
+    the variable is unset or off Linux."""
+    directory = os.environ.get(STARTED_ENV)
+    if not directory or not sys.platform.startswith("linux"):
+        return
+    with open("/proc/self/stat", "rb") as fh:
+        ticks = int(fh.read().rpartition(b")")[2].split()[19])
+    fd = os.open(
+        os.path.join(directory, f"{os.getpid()}.{ticks}"),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    os.close(fd)
+
+
 def main(args: list[str]) -> int:
     # TERM/HUP/INT stay blocked until ``run`` has its handlers in place; a signal before then
     # is handled there (or dropped at exit for calls that never get that far).
     signal.pthread_sigmask(signal.SIG_BLOCK, SIGNUMS)
+    try:
+        record_start()
+    except OSError as exc:
+        return _error(f"cannot write the start record: {exc}", FAKE_ERROR)
     made: list[Fake] = []
     try:
         return _main(args, made)
