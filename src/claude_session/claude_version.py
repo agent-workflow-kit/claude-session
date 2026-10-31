@@ -217,21 +217,6 @@ def run(
     return Version(line=line, text=shown(line))
 
 
-def probe(
-    claude: ResolvedTool,
-    environ: Mapping[str, str],
-    gw: Gateway,
-    *,
-    writable: Callable[[str], bool],
-    timeout: float = PROBE_TIMEOUT,
-) -> Version | None:
-    """``run``, or None when it raises ``NotRun`` (``kinds``)."""
-    try:
-        return run(claude, environ, gw, writable=writable, timeout=timeout)
-    except NotRun:
-        return None
-
-
 def _parts(text: str) -> tuple[str, ...] | None:
     """The digit strings of the version at the very start of ``text`` (nothing stripped),
     or None."""
