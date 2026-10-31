@@ -206,6 +206,50 @@ def test_the_version_check_uses_the_configured_minimum(tmp_path: Path) -> None:
     assert info.value.end_reason == "claude_too_old"
 
 
+def dry_run_version(
+    tmp_path: Path,
+    writable: pathrules.SessionWritable,
+    known: pathrules.SessionWritable | None,
+) -> tuple[list[str], FakeGateway]:
+    claude = executable(tmp_path / "tools" / "claude")
+    cfg = load(tmp_path, f"claude_bin: {claude}\n")
+    proc = process(tmp_path)
+    assert isinstance(proc.gateway, FakeGateway)
+    proc.gateway.on(["claude", "--version"], stdout="2.1.312 (Claude Code)\n")
+    tools = launch.Tools(
+        claude=pathrules.ResolvedTool(str(claude), "claude"), git=None, bwrap=None, socat=None
+    )
+    found = launch.Effects().claude_version(
+        cfg, resolution(cfg), proc, tools, writable, lambda: known
+    )
+    return found, proc.gateway
+
+
+def test_a_dry_run_probes_a_claude_outside_every_known_path(tmp_path: Path) -> None:
+    found, gw = dry_run_version(
+        tmp_path, pathrules.SessionWritable([]), pathrules.SessionWritable([])
+    )
+    assert found == [] and len(gw.calls) == 1
+
+
+@pytest.mark.parametrize("where", ["known", "writable"])
+def test_a_dry_run_never_runs_a_claude_under_a_known_or_run_path(
+    tmp_path: Path, where: str
+) -> None:
+    under = pathrules.SessionWritable([str(tmp_path / "tools")])
+    nothing = pathrules.SessionWritable([])
+    known, writable = (under, nothing) if where == "known" else (nothing, under)
+    found, gw = dry_run_version(tmp_path, writable, known)
+    assert gw.calls == []
+    (warning,) = found
+    assert warning.startswith("claude --version not run (not probed by a dry run")
+
+
+def test_a_dry_run_with_unknown_paths_runs_no_claude(tmp_path: Path) -> None:
+    found, gw = dry_run_version(tmp_path, pathrules.SessionWritable([]), None)
+    assert gw.calls == [] and "not known" in found[0]
+
+
 def test_a_git_that_changed_once_every_writable_path_is_known_is_refused(tmp_path: Path) -> None:
     claude = executable(tmp_path / "bin" / "claude")
     cfg = load(tmp_path, f"claude_bin: {claude}\n")

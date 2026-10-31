@@ -1040,14 +1040,19 @@ class Effects:
         dry_run: Callable[[], pathrules.SessionWritable | None],
     ) -> list[str]:
         """The version check of a dry run: ``claude`` resolved again against the paths a
-        dry run never runs a binary under (``dry_run``, trusted kinds too); under one of
-        them, or when they are not known, it is not run and a warning says so (a trusted
-        kind's launch would run it). Otherwise ``check_claude_version`` as a launch makes
-        it, the probe's ``PATH`` without those paths either."""
-        guard = dry_run()
-        if guard is None:
+        dry run never runs a binary under (``dry_run``, trusted kinds too, and the run's
+        own ``writable``); under one of them, or when they are not known, it is not run and
+        a warning says so (a trusted kind's launch would run it). Otherwise
+        ``check_claude_version`` as a launch makes it, the probe's ``PATH`` without those
+        paths either."""
+        known = dry_run()
+        if known is None:
             why = "the permission profile or write_dirs are not known"
             return [VERSION_NOT_PROBED.format(why=why)]
+
+        def guard(path: str) -> bool:
+            return known(path) or writable(path)
+
         entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
         try:
             claude = pathrules.resolve_tool(cfg.claude_bin, entries, guard)
