@@ -10,7 +10,10 @@ This module covers trusted runs. Isolated runs (third-party-reading, or ``sandbo
 ``off``) are refused with ``NotImplementedError`` until the isolation rules land.
 
 TODO(#15): exec calls build() in launch step 7 and writes the settings with
-SessionDirs.write_settings before spawning claude.
+SessionDirs.write_settings before spawning claude. Before allocation, the step-5 launch
+validations call check_rule_paths() (state root and claude-session path); a
+LaunchValidationError there, or from build(), ends the run not-started with its end_reason
+(unsafe_path, invalid_permission_profile).
 TODO(#27): the dry-run serializer reports build()'s settings and argv.
 """
 
@@ -60,7 +63,25 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # Characters that would change the meaning of a path inside a permission rule (glob syntax,
 # rule parentheses, escapes). A path containing one is refused rather than escaped.
 _RULE_UNSAFE = re.compile(r"[*?\[\]{}()\\]")
+# Characters ``shlex.quote`` leaves unquoted. A claude-session path with any other character
+# (whitespace, shell metacharacters, non-ASCII) is invoked quoted, which the absolute
+# ``Bash(<path> report:*)`` rule never matches; such a path is refused.
+_SHELL_SAFE = re.compile(r"[A-Za-z0-9_@%+=:,./-]+")
+# The permission modes Claude Code accepts; any other value makes it discard the whole
+# settings file, injected hooks included.
+DEFAULT_MODES = frozenset(
+    {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
+)
 _HEADLESS_RESUME = "Continue the task. When you are finished, file your status report."
+
+
+class LaunchValidationError(FailedError):
+    """A launch validation failure: the run ends ``not-started`` with ``end_reason`` (a
+    launch-phase end reason of interface.md, Outcome mapping)."""
+
+    def __init__(self, message: str, *, end_reason: str) -> None:
+        super().__init__(message)
+        self.end_reason = end_reason
 
 
 @dataclass(frozen=True)
@@ -150,12 +171,37 @@ def current_interpreter(executable: str | None = None) -> str:
     """The interpreter the injected hooks run: ``sys.executable`` (or ``executable``) with
     its directory symlink-resolved but not its last component. A venv's ``bin/python`` is a
     symlink to the base interpreter; resolving it would lose the venv (``pyvenv.cfg`` is found
-    next to the link), and the hook could no longer import ``claude_session``."""
+    next to the link), and the hook could no longer import ``claude_session``.
+
+    TODO(#23): for isolated runs, refuse the launch (and adoption) when this path, its
+    realpath, ``sys.prefix``/``sys.exec_prefix`` or the ``claude_session`` package directory
+    is inside a session-writable path (design.md, Security notes)."""
     exe = sys.executable if executable is None else executable
     if not exe:
         raise FailedError("cannot determine the Python interpreter (sys.executable is empty)")
     exe = os.path.abspath(exe)
     return os.path.join(os.path.realpath(os.path.dirname(exe)), os.path.basename(exe))
+
+
+def check_rule_paths(state_root: str, claude_session: str) -> None:
+    """The paths the generated permission rules name must be usable there: absolute,
+    normalized, valid UTF-8, free of control characters and of characters with a meaning in
+    rules; the claude-session path also needs no shell quoting. Raises
+    ``LaunchValidationError`` with end reason ``unsafe_path``."""
+    try:
+        _check_abs("state root", state_root, rule=True)
+        _check_abs("claude-session path", claude_session, rule=True)
+    except LaunchValidationError:
+        raise
+    except FailedError as exc:
+        raise LaunchValidationError(exc.message, end_reason="unsafe_path") from exc
+    if not _SHELL_SAFE.fullmatch(claude_session):
+        shown = claude_session.encode("utf-8", "backslashreplace").decode("utf-8")
+        raise LaunchValidationError(
+            "claude-session path contains whitespace, a shell metacharacter or another "
+            f"character that needs shell quoting: {shown!r}",
+            end_reason="unsafe_path",
+        )
 
 
 def is_isolated(profile: config.Kind) -> bool:
@@ -192,15 +238,15 @@ def build_settings(
     interface asks for one, and the injected hooks.
 
     ``permission_profile`` is the expanded profile (``${...}`` variables already
-    substituted). Raises ``FailedError`` for a path that cannot be put into a rule or a hook
-    command, or a malformed profile."""
+    substituted). Raises ``LaunchValidationError`` for a state root or claude-session path
+    that cannot be put into a rule (``unsafe_path``) or a malformed profile
+    (``invalid_permission_profile``), and ``FailedError`` for an unusable interpreter."""
     profile = resolution.profile
     if is_isolated(profile):
         # TODO(#23): sandbox settings and the isolation rules of interface.md, Generated
         # settings (isolated runs and third-party-reading runs); #24 adds the path rules.
         raise NotImplementedError("generated settings for isolated runs are not implemented")
-    _check_abs("state root", paths.state_root, rule=True)
-    _check_abs("claude-session path", tools.claude_session, rule=True)
+    check_rule_paths(paths.state_root, tools.claude_session)
     _check_abs("interpreter", tools.interpreter)
 
     permissions = _profile_permissions(permission_profile)
@@ -210,8 +256,6 @@ def build_settings(
     mode = _default_mode(permission_profile, profile.setting_sources)
     if mode is not None:
         permissions["defaultMode"] = mode
-    else:
-        permissions.pop("defaultMode", None)
     # A trusted run's sandbox is off: a profile's sandbox fragment is not emitted.
     return {"permissions": permissions, "hooks": _hooks(paths, tools)}
 
@@ -250,14 +294,25 @@ def _generated_rules(paths: Paths, tools: Tools, cwd: str) -> tuple[list[str], l
 
 def _profile_permissions(profile: config.PermissionProfile) -> dict[str, Any]:
     # TODO(#22): the permission profile is resolved (name or file snapshot), validated and
-    # its ${...} variables expanded before it gets here.
+    # its ${...} variables expanded before it gets here; validation at profile load must
+    # apply the same value checks (defaultMode, string lists) as below.
     permissions = copy.deepcopy(dict(profile.permissions or {}))
-    for key in _RULE_LISTS:
+    for key in (*_RULE_LISTS, "additionalDirectories"):
         if key not in permissions:
             continue
         value = permissions[key]
-        if not isinstance(value, list) or not all(isinstance(rule, str) for rule in value):
-            raise FailedError(f"permission profile: permissions.{key} must be a list of strings")
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise LaunchValidationError(
+                f"permission profile: permissions.{key} must be a list of strings",
+                end_reason="invalid_permission_profile",
+            )
+    mode = permissions.get("defaultMode", "default")
+    if not isinstance(mode, str) or mode not in DEFAULT_MODES:
+        raise LaunchValidationError(
+            "permission profile: permissions.defaultMode must be one of "
+            + ", ".join(sorted(DEFAULT_MODES)),
+            end_reason="invalid_permission_profile",
+        )
     return permissions
 
 
@@ -266,10 +321,7 @@ def _default_mode(profile: config.PermissionProfile, setting_sources: Sequence[s
     excludes ``user`` (otherwise the user's settings decide)."""
     permissions = profile.permissions or {}
     if "defaultMode" in permissions:
-        mode = permissions["defaultMode"]
-        if not isinstance(mode, str) or not mode:
-            raise FailedError("permission profile: permissions.defaultMode must be a string")
-        return mode
+        return str(permissions["defaultMode"])
     return None if "user" in setting_sources else "default"
 
 
@@ -328,7 +380,8 @@ def _check_abs(label: str, path: str, *, rule: bool = False) -> None:
 
 
 def build_argv(resolution: Resolution, paths: Paths, tools: Tools, launch: Launch) -> Argv:
-    """The ``claude`` argv (design.md, Generated settings: argv). An interactive run ignores
+    """The ``claude`` argv (design.md, Generated settings: argv); the bootstrap prompt, if
+    any, is the last argument, after ``--``. An interactive run ignores
     an explicit ``--max-turns`` with a warning."""
     profile = resolution.profile
     _check_abs("claude", tools.claude)
@@ -383,7 +436,9 @@ def build_argv(resolution: Resolution, paths: Paths, tools: Tools, launch: Launc
         prompt_path=launch.prompt_path,
     )
     if message is not None:
-        argv.append(message)
+        # "--" ends the options: a preceding variadic or optional-value option (from
+        # claude_args, e.g. --allowedTools or --debug) would otherwise take the prompt.
+        argv += ["--", message]
     return Argv(argv=argv, warnings=tuple(warnings))
 
 

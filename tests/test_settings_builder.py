@@ -42,7 +42,6 @@ FAKE_VALUE_FLAGS = {
     "--settings",
     "--setting-sources",
     "--model",
-    "--add-dir",
     "--plugin-dir",
     "--append-system-prompt-file",
     "--system-prompt-snapshot",
@@ -51,8 +50,19 @@ FAKE_VALUE_FLAGS = {
     "--output-format",
     "--max-turns",
 }
-FAKE_REPEATABLE = {"--add-dir", "--plugin-dir"}
-FAKE_BOOL_FLAGS = {"-p", "--print", "--fork-session", "--strict-mcp-config", "--verbose", "--debug"}
+FAKE_REPEATABLE = {"--plugin-dir"}
+FAKE_BOOL_FLAGS = {"-p", "--print", "--fork-session", "--strict-mcp-config", "--verbose"}
+# As in Claude Code: an optional value is taken when the next argument is not an option, and a
+# variadic flag takes every following argument up to the next option (or "--").
+FAKE_OPTIONAL_VALUE_FLAGS = {"--debug"}
+FAKE_VARIADIC_FLAGS = {
+    "--add-dir",
+    "--allowedTools",
+    "--disallowedTools",
+    "--mcp-config",
+    "--betas",
+    "--file",
+}
 
 EVENTS = [
     "SessionStart",
@@ -114,13 +124,35 @@ def argv(resolution: kinds.Resolution, **kw: Any) -> list[str]:
 
 def parse_like_fake(args: list[str]) -> tuple[dict[str, Any], str | None]:
     """Parse argv as the fake claude does: unknown options, a missing value, a repeated
-    single-use flag and a second positional are errors."""
+    single-use flag and a second positional are errors. Optional-value and variadic flags
+    consume following arguments as Claude Code does; everything after ``--`` is positional."""
     flags: dict[str, Any] = {}
     prompt: str | None = None
     i = 0
+
+    def is_option(value: str) -> bool:
+        return value.startswith("-") and value != "-"
+
     while i < len(args):
         arg = args[i]
-        if arg in FAKE_VALUE_FLAGS:
+        if arg == "--":
+            rest = args[i + 1 :]
+            assert prompt is None and len(rest) <= 1, f"extra positionals {rest!r}"
+            return flags, (rest[0] if rest else None)
+        if arg in FAKE_VARIADIC_FLAGS:
+            values = []
+            while i + 1 < len(args) and not is_option(args[i + 1]):
+                values.append(args[i + 1])
+                i += 1
+            assert values, f"{arg} without a value"
+            flags.setdefault(arg, []).extend(values)
+        elif arg in FAKE_OPTIONAL_VALUE_FLAGS:
+            if i + 1 < len(args) and not is_option(args[i + 1]):
+                flags[arg] = args[i + 1]
+                i += 1
+            else:
+                flags[arg] = True
+        elif arg in FAKE_VALUE_FLAGS:
             assert i + 1 < len(args), f"{arg} without a value"
             value = args[i + 1]
             i += 1
@@ -462,6 +494,44 @@ def test_unsafe_claude_session_path_is_refused(cfg: config.Config, path: str) ->
         settings(resolve(cfg), tools=tools)
 
 
+RULE_UNSAFE_CHARS = list("*?[]{}()\\")
+# Characters shlex.quote would quote: a rule naming such a path never matches a quoted call.
+SHELL_UNSAFE_CHARS = [" ", "\t", "'", '"', "$", "`", ";", "&", "|", "<", ">", "!", "#", "~", "ä"]
+
+
+@pytest.mark.parametrize("char", RULE_UNSAFE_CHARS)
+def test_check_rule_paths_refuses_rule_characters_in_the_state_root(char: str) -> None:
+    with pytest.raises(settings_builder.LaunchValidationError) as info:
+        settings_builder.check_rule_paths(f"/state/a{char}b", CS_PATH)
+    assert info.value.end_reason == "unsafe_path"
+
+
+@pytest.mark.parametrize("char", RULE_UNSAFE_CHARS + SHELL_UNSAFE_CHARS)
+def test_check_rule_paths_refuses_unsafe_claude_session_paths(char: str) -> None:
+    with pytest.raises(settings_builder.LaunchValidationError) as info:
+        settings_builder.check_rule_paths(STATE, f"/opt/my{char}tools/claude-session")
+    assert info.value.end_reason == "unsafe_path"
+
+
+@pytest.mark.parametrize("path", ["claude-session", "/opt/cs\n", "/opt/../cs"])
+def test_check_rule_paths_refuses_malformed_paths(path: str) -> None:
+    with pytest.raises(settings_builder.LaunchValidationError) as info:
+        settings_builder.check_rule_paths(STATE, path)
+    assert info.value.end_reason == "unsafe_path"
+
+
+def test_check_rule_paths_accepts_normal_paths() -> None:
+    settings_builder.check_rule_paths(STATE, CS_PATH)
+    settings_builder.check_rule_paths("/home/a user/state", "/opt/cs-1.2_x+y@z/bin/claude-session")
+
+
+def test_settings_refuse_an_unsafe_claude_session_path_as_unsafe_path(cfg: config.Config) -> None:
+    tools = Tools(interpreter=PYTHON, claude_session="/opt/my tools/claude-session", claude=CLAUDE)
+    with pytest.raises(settings_builder.LaunchValidationError) as info:
+        settings(resolve(cfg), tools=tools)
+    assert info.value.end_reason == "unsafe_path"
+
+
 def test_paths_reject_bad_session_id_and_run() -> None:
     with pytest.raises(ValueError):
         Paths(state_root=STATE, csession_id="cs-../../x", run=1)
@@ -493,7 +563,9 @@ def test_default_mode_is_default_without_user_settings(cfg: config.Config, sourc
     assert settings(resolution)["permissions"]["defaultMode"] == "default"
 
 
-@pytest.mark.parametrize("mode", ["acceptEdits", "bypassPermissions", "plan", "dontAsk"])
+@pytest.mark.parametrize(
+    "mode", ["acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"]
+)
 @pytest.mark.parametrize("sources", ["", "user"])
 def test_profile_mode_wins_for_trusted_runs(cfg: config.Config, mode: str, sources: str) -> None:
     resolution = resolve(cfg, setting_sources=sources)
@@ -501,10 +573,20 @@ def test_profile_mode_wins_for_trusted_runs(cfg: config.Config, mode: str, sourc
     assert perms["defaultMode"] == mode
 
 
-@pytest.mark.parametrize("mode", ["", 3, None, ["default"]])
-def test_profile_mode_must_be_a_non_empty_string(cfg: config.Config, mode: Any) -> None:
-    with pytest.raises(FailedError):
+@pytest.mark.parametrize("mode", ["", 3, None, ["default"], "notAMode", "Default", "dontask"])
+def test_profile_mode_must_be_a_known_mode(cfg: config.Config, mode: Any) -> None:
+    with pytest.raises(settings_builder.LaunchValidationError) as info:
         settings(resolve(cfg), profile(defaultMode=mode))
+    assert info.value.end_reason == "invalid_permission_profile"
+
+
+@pytest.mark.parametrize("value", ["x", "/data", [1], ["/data", None], {"a": "/data"}])
+def test_profile_additional_directories_must_be_a_string_list(
+    cfg: config.Config, value: Any
+) -> None:
+    with pytest.raises(settings_builder.LaunchValidationError) as info:
+        settings(resolve(cfg), profile(additionalDirectories=value))
+    assert info.value.end_reason == "invalid_permission_profile"
 
 
 def test_profile_rules_are_kept_and_generated_rules_added(cfg: config.Config) -> None:
@@ -525,8 +607,9 @@ def test_profile_rules_are_kept_and_generated_rules_added(cfg: config.Config) ->
 @pytest.mark.parametrize("key", ["allow", "deny", "ask"])
 @pytest.mark.parametrize("value", ["Bash(x)", [1], [None], {"a": 1}])
 def test_profile_rule_lists_must_be_string_lists(cfg: config.Config, key: str, value: Any) -> None:
-    with pytest.raises(FailedError):
+    with pytest.raises(settings_builder.LaunchValidationError) as info:
         settings(resolve(cfg), profile(**{key: value}))
+    assert info.value.end_reason == "invalid_permission_profile"
 
 
 def test_profile_input_is_not_mutated(cfg: config.Config) -> None:
@@ -594,6 +677,7 @@ def test_headless_argv(cfg: config.Config) -> None:
         "--verbose",
         "--session-id",
         NEW_ID,
+        "--",
         f"Your claude-session directory is {CSDIR}. Read and follow {CSDIR}/prompt.md",
     ]
 
@@ -674,13 +758,42 @@ def test_plugin_dirs_trusted_runs_get_no_extra_add_dir(cfg: config.Config) -> No
 def test_claude_args_come_before_resume_and_prompt(tmp_path: Path) -> None:
     cfg = load_cfg(tmp_path, "kinds:\n  implement:\n    claude_args: ['--debug']\n")
     args = argv(resolve(cfg), resume_from=CLAUDE_ID, resume=True, prompt_path=None)
-    assert args[-4:] == [
+    assert args[-5:] == [
         "--debug",
         "--resume",
         CLAUDE_ID,
+        "--",
         f"Your claude-session directory is {CSDIR}. Continue the task. "
         "When you are finished, file your status report.",
     ]
+
+
+@pytest.mark.parametrize(
+    ("claude_args", "flag", "value"),
+    [
+        ("['--debug']", "--debug", True),
+        ("['--allowedTools', 'X']", "--allowedTools", ["X"]),
+        ("['--add-dir', '/extra']", "--add-dir", [CSDIR, "/extra"]),
+    ],
+)
+def test_claude_args_do_not_swallow_the_prompt_of_a_new_session(
+    tmp_path: Path, claude_args: str, flag: str, value: Any
+) -> None:
+    cfg = load_cfg(tmp_path, f"kinds:\n  implement:\n    claude_args: {claude_args}\n")
+    flags, prompt = parse_like_fake(argv(resolve(cfg))[1:])
+    assert flags[flag] == value
+    assert prompt == f"Your claude-session directory is {CSDIR}. Read and follow {CSDIR}/prompt.md"
+
+
+def test_prompt_follows_a_double_dash(cfg: config.Config) -> None:
+    args = argv(resolve(cfg))
+    assert args[-2] == "--"
+    assert args.count("--") == 1
+
+
+def test_no_double_dash_without_a_prompt(cfg: config.Config) -> None:
+    args = argv(resolve(cfg, mode="interactive"), mode="interactive", prompt_path=None)
+    assert "--" not in args
 
 
 def test_resume_argv(cfg: config.Config) -> None:
