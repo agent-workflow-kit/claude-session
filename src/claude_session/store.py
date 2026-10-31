@@ -233,9 +233,10 @@ def _connect(path: str, busy_timeout: float) -> sqlite3.Connection:
     )
 
 
-def _is_busy(exc: sqlite3.OperationalError) -> bool:
+def is_busy(exc: sqlite3.OperationalError) -> bool:
     """Whether ``exc`` is SQLITE_BUSY or SQLITE_LOCKED (any extended code)."""
-    return exc.sqlite_errorcode & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    code = getattr(exc, "sqlite_errorcode", None) or 0
+    return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
 # Time and process identity
@@ -542,7 +543,7 @@ def _enable_wal(conn: sqlite3.Connection, busy_timeout: float) -> None:
             (mode,) = conn.execute("PRAGMA journal_mode=WAL").fetchone()
             break
         except sqlite3.OperationalError as exc:
-            if not _is_busy(exc) or time.monotonic() >= deadline:
+            if not is_busy(exc) or time.monotonic() >= deadline:
                 raise
             time.sleep(MIGRATE_POLL)
     if mode != "wal":
@@ -790,7 +791,7 @@ class Store:
                     if self.take_lease(MIGRATE_LEASE):
                         return
                 except sqlite3.OperationalError as exc:
-                    if not _is_busy(exc):
+                    if not is_busy(exc):
                         raise
                 if time.monotonic() >= deadline:
                     raise FailedError(
@@ -832,7 +833,7 @@ class Store:
                         detail=f"{path}: migrate lease taken over",
                     )
         except sqlite3.OperationalError as exc:
-            if not _is_busy(exc):
+            if not is_busy(exc):
                 raise
             raise FailedError(
                 "state.db stayed locked while migrating", detail=f"{path}: {exc}"

@@ -23,6 +23,8 @@ from .errors import InternalError, NotFoundError
 TIMED_OUT = 22
 # The fields wait adds to the outcome object (schemas/cli/wait.json).
 WAIT_FIELDS = ("timed_out", "run_exit_code", "pending")
+# The largest SQLite INTEGER: a larger ``--run`` names no run.
+SQLITE_INTEGER_MAX = 2**63 - 1
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,9 @@ def wait_for_run(
     clock = clock or SystemClock()
     deadline = None if timeout is None else clock.monotonic() + timeout
     sid = ids.lookup_session_id(text, st.session_id_candidates)
+    if run_no is not None and run_no > SQLITE_INTEGER_MAX:
+        # No such run (a query with it would raise OverflowError).
+        raise NotFoundError(f"session {sid} has no run {run_no}")
     check_liveness(st, sid)
     row = st.waited_run(sid, run_no)
     if row is None:
@@ -71,7 +76,7 @@ def wait_for_run(
             return _final(st, sid, bound)
         now = clock.monotonic()
         if deadline is not None and now >= deadline:
-            return _timed_out(st, sid, bound, row)
+            return _timed_out(st, sid, bound)
         clock.sleep(poll_interval if deadline is None else min(poll_interval, deadline - now))
         check_liveness(st, sid)
         row = st.waited_run(sid, bound)
@@ -93,14 +98,18 @@ def _final(st: store.Store, sid: str, run_no: int) -> Waited:
     return Waited(exit_code=int(code), output=output)
 
 
-def _timed_out(st: store.Store, sid: str, run_no: int, row: dict[str, Any]) -> Waited:
-    """``--timeout`` expired: the run as ``row`` shows it, live. A run finalized since that
-    read is reported final instead."""
-    from .supervisor import outcome_object
+def _timed_out(st: store.Store, sid: str, run_no: int) -> Waited:
+    """``--timeout`` expired: the run as one fresh read shows it, live (every field from that
+    read). A run finalized since the last poll is reported final instead."""
+    from .supervisor import outcome_of_row, report_of
 
-    output = outcome_object(st, sid, run_no)
-    if output["outcome"] is not None:
+    row = st.run_record(sid, run_no)
+    if row["outcome"] is not None:
         return _final(st, sid, run_no)
+    # TODO(#33): a superseded unfinished run must be finalized by the inline liveness check
+    # before wait reports its state; until then the timeout path shows the session's current
+    # state.
+    output = outcome_of_row(row)
     pending = row["wrapper_pid"] is None
     output.update(
         outcome=None,
@@ -109,31 +118,9 @@ def _timed_out(st: store.Store, sid: str, run_no: int, row: dict[str, Any]) -> W
         # launch until claude was spawned (schemas/cli/outcome.json, phase), so always while
         # the run is pending.
         phase="launch" if pending or row["phase"] != "session" else "session",
-        report=_current_report(row),
+        report=report_of(row),
         timed_out=True,
         run_exit_code=None,
         pending=pending,
     )
     return Waited(exit_code=TIMED_OUT, output=output)
-
-
-def _current_report(row: dict[str, Any]) -> dict[str, Any] | None:
-    """The live run's latest report (the outcome object's ``report``), or None."""
-    if row["report_status"] is None:
-        return None
-    artifact = None
-    if row["artifact_name"] is not None:
-        artifact = {
-            "name": row["artifact_name"],
-            "path": row["artifact_path"],
-            "sha256": row["artifact_sha256"],
-            "size": row["artifact_size"],
-        }
-    return {
-        "status": row["report_status"],
-        "implicit": bool(row["report_implicit"]),
-        "summary": row["report_summary"],
-        "reason": row["report_reason"],
-        "artifact": artifact,
-        "reported_at": row["reported_at"],
-    }

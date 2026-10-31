@@ -526,6 +526,90 @@ def test_an_earlier_cause_stands_when_the_bound_is_reached(st: Store, tmp_path: 
     assert st.set_pending_cause(r.sid, 1, "stopped")
     r.sup.check_bound(101.0)
     assert r.child.sent == [(signal.SIGTERM, "stopped")]
+    # The log names the cause that stands, not the one the bound asked for.
+    assert [(x["event"], x["signal"], x["message"]) for x in logs_of(r)] == [
+        ("signal_sent", "SIGTERM", "stopped")
+    ]
+
+
+def busy_store(st: Store, monkeypatch: pytest.MonkeyPatch, name: str, message: str) -> list[int]:
+    """Make ``st.<name>`` always raise ``OperationalError(message)``; returns its calls."""
+    import sqlite3
+
+    calls: list[int] = []
+
+    def fail(*_args: Any) -> Any:
+        calls.append(1)
+        error = sqlite3.OperationalError(message)
+        error.sqlite_errorcode = (  # type: ignore[attr-defined]
+            sqlite3.SQLITE_BUSY if "locked" in message else sqlite3.SQLITE_FULL
+        )
+        raise error
+
+    monkeypatch.setattr(st, name, fail)
+    return calls
+
+
+def test_a_store_busy_past_the_bound_and_kill_grace_takes_the_internal_error_path(
+    st: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1-3: the timeout cause is retried while the store is busy only until bound +
+    kill_grace; then supervision fails and the internal-error path ends the child (SIGTERM,
+    SIGKILL after kill_grace), so the child never outlives the bound without limit."""
+    from types import SimpleNamespace
+
+    from claude_session.errors import InternalError
+
+    r = bounded(st, tmp_path, bound=1.0, kill_grace=3.0)
+    calls = busy_store(st, monkeypatch, "set_pending_cause", "database is locked")
+    r.sup.check_bound(101.0)
+    r.sup.check_bound(103.999)
+    assert r.child.sent == [] and len(calls) == 2  # retried within the deadline
+    with pytest.raises(InternalError, match="busy"):
+        r.sup.check_bound(104.0)
+    assert r.child.sent == []
+    assert [x["event"] for x in logs_of(r)] == ["signal_not_sent", "signal_not_sent"]
+
+    def no_run_dir(_run: int) -> int:
+        raise OSError("no run directory here")
+
+    v = SimpleNamespace(dirs=SimpleNamespace(open_run_dir=no_run_dir), tmpdir=None)
+    supervisor._internal_error(st, Cfg(kill_grace=3.0), r.sup.alloc, v, r.child)  # type: ignore[arg-type]
+    assert [s for s, _ in r.child.sent] == [signal.SIGTERM, signal.SIGKILL]
+    row = st.run_record(r.sid, 1)
+    assert (row["outcome"], row["end_reason"]) == ("killed", "internal_error")
+
+
+def test_the_loop_fails_once_the_store_stays_busy_past_the_deadline(
+    st: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_session.errors import InternalError
+
+    r = bounded(st, tmp_path, bound=2.0, kill_grace=1.0, poll_interval=0.5)
+    busy_store(st, monkeypatch, "set_pending_cause", "database is locked")
+
+    def wait(timeout: float | None = None) -> int | None:
+        r.clock.now += 0.25
+        return None
+
+    r.child.wait = wait  # type: ignore[method-assign]
+    with pytest.raises(InternalError):
+        r.sup.wait()
+    assert 103.0 <= r.clock.now <= 103.5
+    assert r.child.sent == []
+
+
+def test_a_store_error_other_than_busy_at_the_bound_fails_at_once(
+    st: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_session.errors import InternalError
+
+    r = bounded(st, tmp_path, bound=1.0, kill_grace=3.0)
+    calls = busy_store(st, monkeypatch, "set_pending_cause", "database or disk is full")
+    with pytest.raises(InternalError):
+        r.sup.check_bound(101.0)
+    assert len(calls) == 1 and r.child.sent == []
+    assert logs_of(r) == []  # not retried: no signal_not_sent
 
 
 def test_a_busy_store_at_the_bound_retries_at_the_next_poll(
@@ -540,7 +624,9 @@ def test_a_busy_store_at_the_bound_retries_at_the_next_poll(
     def busy_once(sid: str, run_no: int, cause: str) -> bool:
         calls.append(cause)
         if len(calls) == 1:
-            raise sqlite3.OperationalError("database is locked")
+            error = sqlite3.OperationalError("database is locked")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY  # type: ignore[attr-defined]
+            raise error
         return real(sid, run_no, cause)
 
     monkeypatch.setattr(st, "set_pending_cause", busy_once)
@@ -644,6 +730,32 @@ def test_a_busy_store_at_the_session_start_warning_retries_and_logs_once(
     r.sup.check_session_start(101.0)
     r.sup.check_session_start(102.0)
     r.sup.check_session_start(103.0)
+    assert len(calls) == 2
+    assert st.run_record(r.sid, 1)["warnings_json"].count("SessionStart") == 1
+    assert len([x for x in all_logs(r) if x["event"] == "session_start_missing"]) == 1
+
+
+def test_a_session_start_after_the_logged_warning_still_adds_it(
+    st: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1-10: once ``session_start_missing`` is logged, a retry only retries the add: a
+    SessionStart that lands meanwhile does not drop the warning the log announced."""
+    import sqlite3
+
+    r = bounded(st, tmp_path, session_start_timeout=1.0)
+    real = st.add_run_warnings
+    calls: list[int] = []
+
+    def busy_once(sid: str, run_no: int, warnings: Any) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        real(sid, run_no, warnings)
+
+    monkeypatch.setattr(st, "add_run_warnings", busy_once)
+    r.sup.check_session_start(101.0)
+    started(st, r.sid)  # SessionStart lands between the busy add and its retry
+    r.sup.check_session_start(102.0)
     assert len(calls) == 2
     assert st.run_record(r.sid, 1)["warnings_json"].count("SessionStart") == 1
     assert len([x for x in all_logs(r) if x["event"] == "session_start_missing"]) == 1

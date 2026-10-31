@@ -898,13 +898,19 @@ def check_schema(argv: Sequence[str]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args: argparse.Namespace | None = None
+    schema_checked = False
     try:
         check_schema(argv)
+        schema_checked = True
         args = parse(build_parser(), argv)
         check_flag_rules(args)
         return HANDLERS[args.handler](args)
     except CliError as error:
-        if isinstance(error, (UsageError, RefusedError)):
+        # `wait --outcome-file` gets any error envelope wait prints after the schema check
+        # (interface.md, Outcome file); the other commands' outcome files only usage errors
+        # and refusals.
+        is_wait = (args.handler if args else (argv[0] if argv else None)) == "wait"
+        if (is_wait and schema_checked) or isinstance(error, (UsageError, RefusedError)):
             path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
             if path:
                 _write_outcome_file(path, error)

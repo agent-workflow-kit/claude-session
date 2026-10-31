@@ -2,7 +2,10 @@
 flags ``--timeout``, exec; design.md, Supervision): ``exec`` runs the fake ``claude``
 (``tests/fakebin``), which hangs or sleeps, and ends it at the bound.
 
-Real-time waits stay short: bounds of about a second, a fast poll."""
+No assertion depends on a short real deadline being met: bounds are a few seconds (the fake
+reaches its steps long before), the fake ignores SIGTERM from its first instruction where that
+matters, and it waits for exec's own log line where order matters. The precise timing is
+covered with the injectable clock in ``test_supervision``."""
 
 from __future__ import annotations
 
@@ -12,8 +15,8 @@ from typing import Any
 
 import pytest
 
-from .fakeclaude import read_jsonl
-from .test_exec_headless import START, gone, run_exec
+from .fakeclaude import claude_bin, read_jsonl, write_json
+from .test_exec_headless import START, gone, run_exec, script
 from .test_exec_interactive import check_outcome, events, start_terminal, touch, wait_marker
 
 FAST = "poll_interval: 0.05s\nkill_grace: 2s\n"
@@ -42,7 +45,7 @@ def test_a_headless_run_past_its_timeout_ends_timeout_16(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
     began = time.monotonic()
-    run = run_exec(tmp_path, state, work, [START, HANG], args=["--timeout", "1s"], config=FAST)
+    run = run_exec(tmp_path, state, work, [START, HANG], args=["--timeout", "3s"], config=FAST)
     took = time.monotonic() - began
     assert run.code == 16, run.proc.stderr
     assert (run.outcome["outcome"], run.outcome["end_reason"], run.outcome["state"]) == (
@@ -60,13 +63,13 @@ def test_a_headless_run_past_its_timeout_ends_timeout_16(
         (row["child_pid"], "SIGTERM", "timeout")
     ]
     assert gone(row["child_pid"])
-    assert took >= 1.0
+    assert took >= 3.0
 
 
 def test_the_kinds_timeout_applies_without_the_flag(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
-    config = FAST + "kinds:\n  implement:\n    timeout: 1s\n"
+    config = FAST + "kinds:\n  implement:\n    timeout: 3s\n"
     run = run_exec(tmp_path, state, work, [START, HANG], config=config)
     assert run.code == 16, run.proc.stderr
     assert run.outcome["end_reason"] == "timeout"
@@ -85,9 +88,27 @@ def test_timeout_none_disables_the_kinds_timeout(tmp_path: Path, state: Path, wo
 def test_a_child_ignoring_sigterm_at_the_bound_is_killed_after_kill_grace(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
-    steps = [START, {"do": "ignore_signals", "signals": ["TERM"]}, HANG]
+    """The fake ignores SIGTERM from its first instruction (a shell wrapper ignores it before
+    it execs the fake, and the fake's scenario keeps it ignored), so the bound's SIGTERM can
+    never arrive before the ignore is in place."""
+    steps = [START, HANG]
+    signals = {"signals": {"TERM": "ignore"}}
+    scenario = write_json(tmp_path / "scenario.json", {"steps": steps, **signals})
+    fake = claude_bin(tmp_path / "fakebin", scenario, tmp_path / "fake.jsonl")
+    wrapper = script(
+        tmp_path / "wrapbin" / "claude", f'#!/bin/sh\ntrap \'\' TERM\nexec "{fake}" "$@"\n'
+    )
     config = "poll_interval: 0.05s\nkill_grace: 0.5s\n"
-    run = run_exec(tmp_path, state, work, steps, args=["--timeout", "0.5s"], config=config)
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        steps,
+        args=["--timeout", "2s"],
+        config=config,
+        scenario_extra=signals,
+        claude=wrapper,
+    )
     assert run.code == 16, run.proc.stderr
     row = run.run_row()
     assert (row["pending_cause"], row["end_reason"]) == ("timeout", "timeout")
@@ -103,7 +124,8 @@ def test_a_report_keeps_its_outcome_at_the_bound(tmp_path: Path, state: Path, wo
     """With a report the outcome is the report's; the end reason and the final event's cause
     are still timeout (interface.md, Outcome mapping)."""
     steps = [START, {"do": "report", "args": ["done", "--summary", "finished"]}, HANG]
-    run = run_exec(tmp_path, state, work, steps, args=["--timeout", "1s"], config=FAST)
+    # 5s: the report lands right after the start, long before the bound.
+    run = run_exec(tmp_path, state, work, steps, args=["--timeout", "5s"], config=FAST)
     assert run.code == 0, run.proc.stderr
     assert (run.outcome["outcome"], run.outcome["end_reason"], run.outcome["state"]) == (
         "done",
@@ -116,24 +138,26 @@ def test_a_report_keeps_its_outcome_at_the_bound(tmp_path: Path, state: Path, wo
 def test_no_session_start_within_the_timeout_warns_and_the_run_goes_on(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
-    config = FAST + "session_start_timeout: 0.3s\n"
-    steps = [{"do": "sleep", "seconds": 0.8}, START, {"do": "stop"}, {"do": "result"}]
+    """The fake sends its SessionStart only once exec logged the warning (order, not time)."""
+    config = FAST + "session_start_timeout: 1s\n"
+    log = state / "log.jsonl"
+    await_warning = (
+        "i=0; while ! /bin/grep -q session_start_missing "
+        f'"{log}" 2>/dev/null; do i=$((i+1)); [ "$i" -gt 1200 ] && exit 1; /bin/sleep 0.05; done'
+    )
+    steps = [
+        {"do": "bash", "command": await_warning, "post_tool_use": "never"},
+        START,
+        {"do": "stop"},
+        {"do": "result"},
+    ]
     run = run_exec(tmp_path, state, work, steps, config=config)
     assert run.code == 0, run.proc.stderr  # a warning only: the run still ends normally
     warnings = [w for w in run.outcome["warnings"] if "SessionStart" in w]
-    assert len(warnings) == 1 and "0.3s" in warnings[0]
+    assert len(warnings) == 1 and "1s" in warnings[0]
     missing = [r for r in read_jsonl(state / "log.jsonl") if r["event"] == "session_start_missing"]
     assert len(missing) == 1
     assert (missing[0]["level"], missing[0]["csession_id"]) == ("warn", run.sid)
-
-
-def test_a_session_start_in_time_gives_no_warning(tmp_path: Path, state: Path, work: Path) -> None:
-    config = FAST + "session_start_timeout: 0.5s\n"
-    steps = [START, {"do": "sleep", "seconds": 0.8}, {"do": "stop"}, {"do": "result"}]
-    run = run_exec(tmp_path, state, work, steps, config=config)
-    assert run.code == 0, run.proc.stderr
-    assert not [w for w in run.outcome["warnings"] if "SessionStart" in w]
-    assert not [r for r in read_jsonl(state / "log.jsonl") if r["event"] == "session_start_missing"]
 
 
 # Interactive: --timeout is the interactive_timeout
@@ -148,7 +172,7 @@ def test_an_interactive_run_past_its_timeout_ends_timeout(
         state,
         work,
         [START, touch(marker), HANG],
-        args=["--timeout", "1s"],
+        args=["--timeout", "3s"],
         config=FAST + "session_start_timeout: 0.1s\n",
     )
     try:
@@ -172,7 +196,7 @@ def test_the_kinds_interactive_timeout_bounds_an_interactive_run(
 ) -> None:
     """The kind's headless ``timeout`` does not apply in interactive mode; its
     ``interactive_timeout`` does."""
-    config = FAST + "kinds:\n  implement:\n    timeout: 0.2s\n    interactive_timeout: 1s\n"
+    config = FAST + "kinds:\n  implement:\n    timeout: 0.2s\n    interactive_timeout: 3s\n"
     marker = tmp_path / "running"
     began = time.monotonic()
     term = start_terminal(tmp_path, state, work, [START, touch(marker), HANG], config=config)
@@ -182,4 +206,4 @@ def test_the_kinds_interactive_timeout_bounds_an_interactive_run(
         code, outcome, err = term.finish()
     outcome = check_outcome(code, outcome, err)
     assert (code, outcome["end_reason"]) == (16, "timeout")
-    assert time.monotonic() - began >= 1.0
+    assert time.monotonic() - began >= 3.0

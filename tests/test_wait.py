@@ -231,7 +231,7 @@ def test_run_selects_another_run(st: Store, clock: Clock) -> None:
     assert clock.slept == []
 
 
-@pytest.mark.parametrize("run_no", [0, -1, 2, 9007199254740991])
+@pytest.mark.parametrize("run_no", [0, -1, 2, 9007199254740991, 2**63, 99999999999999999999])
 def test_a_run_that_does_not_exist_is_not_found(st: Store, clock: Clock, run_no: int) -> None:
     sid = session(st)
     with pytest.raises(NotFoundError, match=f"has no run {run_no}"):
@@ -356,6 +356,44 @@ def test_a_run_finalized_between_the_reads_is_reported_final(
     monkeypatch.setattr(st, "waited_run", stale)
     waited = wait(st, clock, sid, timeout=0.1)
     assert (waited.exit_code, waited.output["timed_out"]) == (15, False)
+
+
+def test_the_timeout_output_comes_from_one_read(
+    st: Store, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1-5: a report that lands after the last poll's read shows in the timeout output
+    together with the state it set, never a stale report next to a fresh state."""
+    sid = session(st)
+    real = st.waited_run
+    reads: list[int] = []
+
+    def then_report(csession_id: str, run_no: int | None) -> dict[str, Any] | None:
+        row = real(csession_id, run_no)
+        reads.append(1)
+        if len(reads) == 2:  # the last poll's read, right before the deadline check
+            report(st, sid, "done")
+        return row
+
+    monkeypatch.setattr(st, "waited_run", then_report)
+    out = wait(st, clock, sid, timeout=0.1).output
+    assert len(reads) == 2
+    assert out["state"] == "reported"
+    assert out["report"] is not None and out["report"]["status"] == "done"
+
+
+def test_the_timeout_report_has_the_final_reports_shape(st: Store, clock: Clock) -> None:
+    """One report builder for the outcome object and the timeout output."""
+    sid = session(st)
+    report(st, sid, "done")
+    st.conn.execute(
+        "UPDATE runs SET artifact_name = 'a.md', artifact_path = '/p/a.md', "
+        "artifact_sha256 = ?, artifact_size = 3 WHERE csession_id = ?",
+        ("0" * 64, sid),
+    )
+    live = wait(st, clock, sid, timeout=0.1).output["report"]
+    assert st.finalize_run(sid, 1, DONE)
+    final = wait(st, clock, sid).output["report"]
+    assert live == final
 
 
 def test_no_timeout_waits_without_a_deadline(st: Store, clock: Clock) -> None:
@@ -523,6 +561,43 @@ def test_the_command_writes_its_output_to_the_outcome_file(tmp_path: Path) -> No
     assert stat.S_IMODE(out_file.stat().st_mode) == 0o600
 
 
+def test_the_command_writes_a_not_found_envelope_to_the_outcome_file(tmp_path: Path) -> None:
+    """R1-7: wait's own output on exit 10 is the error envelope; so is its outcome file."""
+    stored_session()
+    proc = run_wait(tmp_path, "cs-zzzzzzzz", "--json", "--outcome-file", "wait.json")
+    assert proc.returncode == 10
+    written = json.loads((tmp_path / "wait.json").read_text())
+    assert written == json.loads(proc.stdout)
+    assert written["error"]["code"] == "not_found"
+
+
+def test_a_session_forgotten_mid_wait_writes_the_not_found_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from claude_session import cli
+
+    sid = stored_session()
+
+    class Forgetting(Clock):
+        def sleep(self, seconds: float) -> None:
+            super().sleep(seconds)
+            with store.open_state() as other:
+                forget(other, sid)
+
+    monkeypatch.setattr(waiter, "SystemClock", Forgetting)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("poll_interval: 0.05s\n", encoding="utf-8")
+    out_file = tmp_path / "wait.json"
+    code = cli.main(
+        ["wait", sid, "--config", str(cfg), "--timeout", "30s", "--outcome-file", str(out_file)]
+    )
+    assert code == 10
+    assert "forgotten" in capsys.readouterr().err
+    written = json.loads(out_file.read_text())
+    assert written["error"]["code"] == "not_found"
+    assert stat.S_IMODE(out_file.stat().st_mode) == 0o600
+
+
 def test_an_outcome_file_failure_is_a_warning(tmp_path: Path, state: Path) -> None:
     sid = stored_session(KILLED)
     proc = run_wait(tmp_path, sid, "--json", "--outcome-file", str(tmp_path / "no" / "x.json"))
@@ -547,7 +622,7 @@ def test_the_command_returns_when_an_exec_run_ends_at_its_bound(
     marker = tmp_path / "hanging"
     steps = [START, {"do": "touch", "path": str(marker)}, {"do": "hang"}]
     proc = start_hanging(
-        tmp_path, work, steps, marker, config="kinds:\n  implement:\n    timeout: 1.5s\n"
+        tmp_path, work, steps, marker, config="kinds:\n  implement:\n    timeout: 4s\n"
     )
     try:
         db = sqlite3.connect(f"file:{state / 'state.db'}?mode=ro", uri=True)
