@@ -230,6 +230,35 @@ def test_an_older_store_is_migrated_by_a_command(
         assert s.schema_version() == (1, 1)
 
 
-# TODO(#13): add a CLI-level test that hook-event works with a newer additive schema (and
-# never migrates) once hook-event opens the store; the store level is covered in
-# test_store.py (test_open_without_migrate_accepts_a_newer_minor_schema).
+def test_hook_event_works_with_a_newer_additive_schema_and_never_migrates(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    newer = make_newer()
+    now = "2026-10-30T00:00:00.000000Z"
+    conn = sqlite3.connect(db())
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN added_later TEXT")
+        conn.execute(
+            "INSERT INTO sessions (csession_id, created_at, launch_kind, current_run, state, "
+            "activity, updated_at) VALUES ('cs-abcdefgh', ?, 'k', 1, 'idle', 'idle', ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO runs (csession_id, run_no, created_at, run_kind, mode, "
+            "session_started_at, wrapper_pid) VALUES ('cs-abcdefgh', 1, ?, 'k', "
+            "'interactive', ?, 1)",
+            (now, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setenv("CSESSION_ID", "cs-abcdefgh")
+    monkeypatch.setattr("sys.stdin", io.TextIOWrapper(io.BytesIO(b"{}")))
+    state_root = store.state_dir()
+    assert entry.main(["hook-event", "--state-dir", state_root, "UserPromptSubmit"]) == 0
+    assert capsys.readouterr() == ("", "")
+    with store.open_state(migrate=False) as s:
+        assert store.format_version(s.schema_version()) == newer
+        row = s.conn.execute("SELECT state, activity FROM sessions").fetchone()
+    assert row == ("working", "working")
+    assert not Path(state_root, "log.jsonl").exists()  # no hook_event_failed
