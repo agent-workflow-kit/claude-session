@@ -234,3 +234,27 @@ def test_entry_module_does_not_import_re() -> None:
     if preloaded == "1":
         pytest.skip("the interpreter loads re at startup")
     assert loaded == "0"
+
+
+def test_notes_does_not_import_secrets() -> None:
+    """``notes`` is imported on every hook: its nonce comes from ``os.urandom``, since
+    importing ``secrets`` costs milliseconds. (``outbox``, also on the hook path, still
+    imports it.)"""
+    script = (
+        "import sys\n"
+        "preloaded = 'secrets' in sys.modules\n"
+        "import claude_session.notes\n"
+        "print(int(preloaded), int('secrets' in sys.modules))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    preloaded, loaded = proc.stdout.split()
+    if preloaded == "1":
+        pytest.skip("the interpreter loads secrets at startup")
+    assert loaded == "0"

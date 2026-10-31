@@ -190,3 +190,61 @@ def test_an_isolated_run_never_runs_a_notes_command_it_could_have_planted(
     assert record["message"].startswith("notes command refused: executable is inside")
     assert not (work / "notes-record.json").exists()
     assert json.loads((run.private_run / "hookconf.json").read_text())["notes"] is None
+
+
+def test_short_secret_env_and_auth_variables_never_reach_the_command(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """A secret_env value under the secret-value threshold is not a secret value, so the
+    variable is dropped by name (as is a claude_auth_env name)."""
+    cmd = notes_script(tmp_path)
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, STOP, result_step()],
+        config=FAST + f"notes_context_cmd: [{cmd}]\nsecret_env: [LC_PIN]\n"
+        "claude_auth_env: [LC_AUTH_HINT]\n",
+        env={"LC_PIN": "1234", "LC_AUTH_HINT": "x", "LC_PAPER": "C"},
+    )
+    assert run.code == 0, run.proc.stderr
+    env = recorded(tmp_path)["env"]
+    assert "LC_PIN" not in env and "LC_AUTH_HINT" not in env
+    assert env["LC_PAPER"] == "C"
+
+
+def test_a_label_holding_a_secret_value_is_left_out_and_logged(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    cmd = notes_script(tmp_path)
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, STOP, result_step()],
+        args=["--label", f"ticket=x-{SECRET_ENV_VALUE}", "--label", "team=core"],
+        config=FAST + f"notes_context_cmd: [{cmd}]\nsecret_env: [HOOK_TOKEN]\n",
+        env={"HOOK_TOKEN": SECRET_ENV_VALUE},
+    )
+    assert run.code == 0, run.proc.stderr
+    argv = recorded(tmp_path)["argv"]
+    assert argv == ["--label=kind=implement", "--label=team=core"]
+    conf = json.loads((run.private_run / "hookconf.json").read_text())["notes"]
+    assert not any(SECRET_ENV_VALUE in token for token in conf["argv"])
+    (record,) = notes_records(state)
+    assert record["level"] == "warn"
+    assert "'ticket'" in record["message"] and SECRET_ENV_VALUE not in json.dumps(record)
+
+
+def test_the_size_cap_is_bounded_to_one_mib(tmp_path: Path, state: Path, work: Path) -> None:
+    cmd = notes_script(tmp_path)
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, STOP, result_step()],
+        config=FAST + f"notes_context_cmd: [{cmd}]\nnotes_context_max_bytes: 9007199254740991\n",
+    )
+    assert run.code == 0, run.proc.stderr
+    conf = json.loads((run.private_run / "hookconf.json").read_text())["notes"]
+    assert conf["max_bytes"] == notes.MAX_BYTES_MAX == 1 << 20

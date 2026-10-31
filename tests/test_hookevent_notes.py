@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shlex
+import signal
 import statistics
 import subprocess
 import time
@@ -23,8 +24,12 @@ from claude_session.hookevent import HookEventError
 from claude_session.notes import NotesConf
 from claude_session.store import Store
 
+from . import test_gateway
 from .fake_gateway import FakeGateway
+from .test_gateway import _read_pid, _wait_dead, linux_only
 from .test_hookevent import CAPS, SID, Env, common, context_of
+
+grandchildren = test_gateway.grandchildren  # the fixture: PIDs to clean up, exact ones only
 
 EXE = "/opt/notes/bin/memoctl"
 
@@ -159,8 +164,76 @@ def test_the_block_follows_the_context_line(env: Env) -> None:
     assert call.executable == EXE
     assert call.cwd == str(env.root)  # the state root
     assert call.env == {"PATH": "/usr/bin:/bin", "HOME": "/home/u"}
-    assert (call.timeout, call.max_output, call.new_process_group) == (5.0, 16384, True)
+    assert (call.timeout, call.kill_over_bytes, call.new_process_group) == (5.0, 16384, True)
     assert log_records(env) == []
+
+
+def nonce_of(context: str) -> str:
+    return context.rsplit('</untrusted id="', 1)[1][:-2]
+
+
+def test_a_block_within_the_context_cap_is_unchanged(env: Env) -> None:
+    env.add()
+    write_conf(env, notes_conf())
+    gw = FakeGateway()
+    output = "y" * 9000 + "\n"
+    gw.on(["memoctl"], stdout=output)
+    context = context_of(start(env, gw))
+    block = notes.fence(output, max_bytes=16384, nonce=nonce_of(context))
+    assert context == line(env) + "\n" + str(block)
+    assert len(context) <= hookevent.CONTEXT_MAX_CHARS
+
+
+def test_a_block_over_the_context_cap_is_cut_to_fit(env: Env) -> None:
+    """Claude Code shows the model only a preview of a context over 10,000 characters: the
+    notes text is cut so the whole context fits, closing tag included."""
+    env.add()
+    write_conf(env, notes_conf())
+    gw = FakeGateway()
+    gw.on(["memoctl"], stdout="x" * 15000 + "\n")  # within max_bytes, over the context cap
+    context = context_of(start(env, gw))
+    assert notes.utf16_len(context) <= hookevent.CONTEXT_MAX_CHARS
+    assert context.split("\n", 1)[0] == line(env)  # the trusted line is never cut
+    assert context.endswith(f'\n[truncated]\n</untrusted id="{nonce_of(context)}">')
+    assert context.lower().count("</untrusted") == 1
+    assert len(context) > hookevent.CONTEXT_MAX_CHARS - 100  # cut, not dropped
+    assert log_records(env) == []
+
+
+def test_a_context_cap_counts_characters_outside_the_bmp_twice(env: Env) -> None:
+    env.add()
+    write_conf(env, notes_conf(max_bytes=65536))
+    gw = FakeGateway()
+    gw.on(["memoctl"], stdout="\U0001f600" * 4900 + "\n")  # 4901 characters, 9801 units
+    context = context_of(start(env, gw))
+    assert notes.utf16_len(context) <= hookevent.CONTEXT_MAX_CHARS
+    assert len(context) < hookevent.CONTEXT_MAX_CHARS // 2 + 1000
+    assert "[truncated]" in context
+
+
+def test_no_block_when_the_context_line_leaves_no_room(env: Env) -> None:
+    env.add()
+    # Input names that make the context line 50 characters short of the cap: too little
+    # room for even an empty truncated block.
+    length = len(line(env) + "; inputs: ")
+    names: list[str] = []
+    while (room := hookevent.CONTEXT_MAX_CHARS - 50 - length - len(", inputs/1/")) > 0:
+        names.append(f"{len(names):03d}" + "n" * min(room - 3, 120))
+        length += len(", inputs/1/") + len(names[-1]) - (2 if len(names) == 1 else 0)
+    data = hookevent.hookconf_bytes(
+        names,
+        summary_max_bytes=CAPS["summary_max_bytes"],
+        artifact_max_bytes=CAPS["artifact_max_bytes"],
+        notes=notes_conf(),
+    )
+    write_private_file(str(Path(env.private_dir) / "runs" / "1" / "hookconf.json"), data)
+    gw = FakeGateway()
+    gw.on(["memoctl"], stdout="note\n")
+    context = context_of(start(env, gw))
+    assert context == hookevent.context_line(env.csession_dir, 1, names)
+    assert hookevent.CONTEXT_MAX_CHARS - 60 < len(context) <= hookevent.CONTEXT_MAX_CHARS
+    assert "\n" not in context  # the line alone
+    assert context.endswith(names[-1])
 
 
 def test_the_state_is_stored_before_the_command_runs(env: Env) -> None:
@@ -346,3 +419,47 @@ def test_hook_latency_with_notes(env: Env, tmp_path: Path) -> None:
     median = statistics.median(samples)
     print(f"hook-event SessionStart with notes, median latency: {median * 1000:.0f} ms")
     assert median < 1.0
+
+
+@linux_only
+def test_a_terminated_hook_ends_the_notes_command(
+    env: Env, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    """SIGTERM to the hook while the command runs: its process group is ended, not left
+    behind. Only the exact PIDs this test started are signalled."""
+    leader, child = tmp_path / "leader.pid", tmp_path / "child.pid"
+    exe = script(
+        tmp_path,
+        f"echo $$ > {leader}\n/bin/sleep 30 >/dev/null 2>&1 &\necho $! > {child}\nwait\n",
+    )
+    env.add()
+    write_conf(env, notes_conf(argv=("notes-cmd",), executable=exe, timeout=14.0))
+    hook = subprocess.Popen(
+        [
+            settings_builder.current_interpreter(),
+            "-I",
+            "-m",
+            "claude_session",
+            "hook-event",
+            "--state-dir",
+            str(env.root),
+            "SessionStart",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, "CSESSION_ID": SID},
+        cwd="/",
+    )
+    try:
+        assert hook.stdin is not None
+        hook.stdin.write(json.dumps(common("SessionStart", source="startup")).encode())
+        hook.stdin.close()
+        pids = [_read_pid(leader, grandchildren), _read_pid(child, grandchildren)]
+        hook.send_signal(signal.SIGTERM)  # the hook process this test started
+        hook.wait(timeout=10)
+    finally:
+        if hook.poll() is None:
+            hook.kill()
+            hook.wait(timeout=10)
+    assert all(_wait_dead(pid, 5) for pid in pids)

@@ -340,3 +340,22 @@ def test_hookconf_drops_notes_settings_too_large_for_the_file(tmp_path: Path) ->
     assert json.loads(data)["notes"] is None
     data, problem = launch.hookconf([], cfg, dataclasses.replace(big, argv=("m",)))
     assert problem is None and json.loads(data)["notes"]["argv"] == ["m"]
+
+
+def test_hookconf_drops_invalid_notes_settings_without_calling_them_too_large(
+    tmp_path: Path,
+) -> None:
+    from claude_session import notes
+
+    cfg = load(tmp_path)
+    bad = notes.NotesConf(
+        argv=("m", "a\x00b"),
+        executable="/usr/bin/m",
+        env={"PATH": "/bin"},
+        timeout=5.0,
+        max_bytes=10,
+        sources=("startup",),
+    )
+    data, problem = launch.hookconf([], cfg, bad)
+    assert problem == "notes command settings invalid"
+    assert json.loads(data)["notes"] is None
