@@ -296,7 +296,7 @@ def test_unknown_cause_is_a_programming_error() -> None:
         headless(cause="nonsense")
 
 
-def test_auto_exit_without_a_done_report_is_a_programming_error() -> None:
+def test_auto_exit_without_a_report_is_a_programming_error() -> None:
     with pytest.raises(ValueError):
         headless(cause="auto_exit")
 
@@ -332,3 +332,44 @@ def test_wrapper_lost_rules() -> None:
         session_started=True,
         implicit_done=True,
     ) == Mapped("lost", "lost")
+
+
+def test_auto_exit_with_a_later_report_keeps_that_reports_outcome() -> None:
+    """The final drain may ingest a report the agent filed just before the auto-exit SIGTERM:
+    the report's outcome stands, the end reason stays ``auto_exit`` (a report outcome)."""
+    assert headless(cause="auto_exit", report="failed") == Mapped("failed", "auto_exit")
+
+
+# The interactive table: the cause and signal rows (#17); the other rows are #18's
+
+
+def interactive(*, cause: str | None = None, report: str | None = None, code: int = 0) -> Mapped:
+    return endmap.map_interactive(pending_cause=cause, report_status=report, returncode=code)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"cause": "stopped", "code": 143}, Mapped("killed", "stopped")),
+        ({"cause": "forwarded_term", "code": 143}, Mapped("killed", "forwarded_term")),
+        ({"cause": "forwarded_hup", "code": 129}, Mapped("killed", "forwarded_hup")),
+        ({"cause": "forwarded_int", "code": 0}, Mapped("killed", "forwarded_int")),
+        ({"cause": "internal_error", "code": -9}, Mapped("killed", "internal_error")),
+        ({"cause": "auto_exit", "report": "done", "code": 143}, Mapped("done", "auto_exit")),
+        ({"cause": "forwarded_term", "report": "blocked"}, Mapped("blocked", "forwarded_term")),
+        # killed by a signal exec did not send, also with a Ctrl-C (130)
+        ({"code": -9}, Mapped("killed", "signal_kill")),
+        ({"code": 130}, Mapped("killed", "signal_int")),
+        ({"code": 129, "report": "done"}, Mapped("done", "signal_hup")),
+        ({"code": 0}, Mapped("exited-unreported", "normal")),
+        ({"code": 3}, Mapped("exited-unreported", "exit_3")),
+        ({"code": 0, "report": "needs-input"}, Mapped("needs-input", "normal")),
+    ],
+)
+def test_interactive_rows(kwargs: dict[str, Any], expected: Mapped) -> None:
+    assert interactive(**kwargs) == expected
+
+
+def test_interactive_auto_exit_without_a_report_is_a_programming_error() -> None:
+    with pytest.raises(ValueError):
+        interactive(cause="auto_exit")

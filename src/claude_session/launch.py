@@ -67,13 +67,13 @@ from .config import Config
 from .endmap import EXIT_CODES
 from .errors import (
     FailedError,
-    InternalError,
     InvalidPermissionProfile,
     LaunchValidationError,
     UsageError,
 )
 from .gateway import Gateway
 from .sessiondir import InputFile, SessionDirs
+from .signals import STOP_SIGNALS, ExecSignals, LaunchInterrupted
 
 LOG_NAME = "log.jsonl"
 AUDIT_NAME = "audit.jsonl"
@@ -165,17 +165,33 @@ def _actor(given: str | None, cfg: Config) -> str:
     return "auto:unknown"
 
 
+TTY_HINT = "run it in a terminal, or pass --mode headless"
+
+
+def _isatty(stream: Any) -> bool:
+    try:
+        return stream is not None and stream.isatty()
+    except (OSError, ValueError):
+        return False
+
+
+def check_tty(mode: str, prompt_file: str | None) -> None:
+    """The TTY check of plain ``exec`` in interactive mode (launch step 2, exit 2): stdin and
+    stdout must be terminals, and ``--prompt-file -`` cannot read a terminal stdin."""
+    if mode != "interactive":
+        return
+    if not (_isatty(sys.stdin) and _isatty(sys.stdout)):
+        raise UsageError(f"interactive mode needs a terminal on stdin and stdout; {TTY_HINT}")
+    if prompt_file == "-":
+        raise UsageError("--prompt-file - cannot read the prompt from a terminal stdin")
+
+
 def read_request(args: argparse.Namespace, cfg: Config) -> Request:
-    """Launch step 2 for ``exec``: the flags (already checked by ``cli``'s flag rules), the
-    prompt and the input files read into memory (each at most ``input_max_bytes``; a bad file
-    is a ``UsageError``, exit 2). Only headless runs are implemented."""
+    """Launch step 2 for ``exec``: the TTY check of interactive mode, the flags (already
+    checked by ``cli``'s flag rules), the prompt and the input files read into memory (each
+    at most ``input_max_bytes``; a bad file is a ``UsageError``, exit 2)."""
     mode = args.mode or "interactive"
-    if mode != "headless":
-        # TODO(#17): interactive supervision (exec's default mode).
-        raise InternalError(
-            "interactive exec is not implemented yet; pass --mode headless",
-            detail="not_implemented",
-        )
+    check_tty(mode, args.prompt_file)
     cap = cfg.input_max_bytes
     prompt = None
     if args.prompt_file == "-":
@@ -277,7 +293,7 @@ def resolve_kind(req: Request, cfg: Config, process: Process) -> Resolved:
     resolution = kinds.resolve(
         cfg,
         req.kind,
-        mode="headless",
+        mode=req.mode,  # type: ignore[arg-type]  # argparse choices
         repo=req.repo,
         cwd=probe_cwd,
         flags=req.flags,
@@ -937,15 +953,16 @@ def audit_sandbox_lowered(
 class Prepared:
     """What step 7 wrote and the supervisor needs: the ``claude`` argv (``argv[0]`` the
     tool's name, run from ``executable``), the run's secret values (for log redaction) and
-    the run secret (refused in an implicit ``result.md``), and the descriptors for its stdout
-    and stderr (the supervisor closes them)."""
+    the run secret (refused in an implicit ``result.md``), and, for a headless run, the
+    descriptors for its stdout and stderr (the supervisor closes them; None in interactive
+    mode, where ``claude`` inherits the terminal)."""
 
     argv: list[str]
     executable: str
     secrets: frozenset[str] = field(repr=False)
     run_secret: str = field(repr=False)
-    stdout_fd: int
-    stderr_fd: int
+    stdout_fd: int | None
+    stderr_fd: int | None
     warnings: list[str]
 
 
@@ -1018,7 +1035,7 @@ def prepare(
         claude=v.claude.path,
     )
     launch = settings_builder.Launch(
-        mode="headless",
+        mode=req.mode,  # type: ignore[arg-type]  # argparse choices
         cwd=v.cwd,
         skill=req.skill,
         prompt_path=prompt_path,
@@ -1037,12 +1054,14 @@ def prepare(
         fields["backstop_used"] = 1  # the kind turns the Stop backstop off: never taken
     st.update_run(sid, run, **fields)
     warnings = [*v.warnings, *generated.warnings]
-    stdout_fd = dirs.create_run_output(run, RESULT_FILE)
-    try:
-        stderr_fd = dirs.create_run_output(run, STDERR_FILE)
-    except BaseException:
-        os.close(stdout_fd)
-        raise
+    stdout_fd = stderr_fd = None
+    if req.mode == "headless":  # interactive claude inherits the terminal
+        stdout_fd = dirs.create_run_output(run, RESULT_FILE)
+        try:
+            stderr_fd = dirs.create_run_output(run, STDERR_FILE)
+        except BaseException:
+            os.close(stdout_fd)
+            raise
     return Prepared(
         argv=[v.claude.name, *generated.argv[1:]],
         executable=v.claude.path,
@@ -1096,9 +1115,26 @@ def interrupted(exc: BaseException, message: str | None = None) -> LaunchValidat
     if message is None:
         if isinstance(exc, KeyboardInterrupt):
             message = "launch interrupted by SIGINT"
+        elif isinstance(exc, LaunchInterrupted):
+            message = f"launch interrupted by {exc.name}"
         else:
             message = f"launch interrupted by an internal error ({type(exc).__name__})"
     return LaunchValidationError(message, end_reason="launch_interrupted")
+
+
+def interrupted_by(st: store.Store, alloc: Allocated, exc: BaseException) -> LaunchValidationError:
+    """The launch-phase end for ``exc``: ``canceled`` for a SIGTERM or SIGHUP after a ``stop``
+    request (``stop_requested_at`` set), else ``launch_interrupted`` (interface.md, Signals)."""
+    if isinstance(exc, LaunchInterrupted) and exc.signum in STOP_SIGNALS:
+        try:
+            stop_requested = st.run_record(alloc.csession_id, alloc.run)["stop_requested_at"]
+        except Exception:  # unreadable: the conservative end is the interruption
+            stop_requested = None
+        if stop_requested is not None:
+            return LaunchValidationError(
+                f"launch canceled by stop ({exc.name})", end_reason="canceled"
+            )
+    return interrupted(exc)
 
 
 def end_launch(
@@ -1120,6 +1156,8 @@ def end_launch(
     finally:
         if prepared is not None:
             for fd in (prepared.stdout_fd, prepared.stderr_fd):
+                if fd is None:
+                    continue
                 try:
                     os.close(fd)
                 except OSError:
@@ -1139,7 +1177,7 @@ def end_launch(
                 log,
                 "launch_interrupted",
                 level="error",
-                reason="launch_interrupted",
+                reason=error.end_reason,
                 message=type(exc).__name__,
                 **fields,
             )
@@ -1199,18 +1237,23 @@ def run(
     process: Process,
     *,
     supervise: Callable[..., Any],
+    signals: ExecSignals,
 ) -> Any:
-    """Steps 5 and 7 of an allocated run, then ``supervise`` (``supervisor.run_headless``,
+    """Steps 5 and 7 of an allocated run, then ``supervise`` (``supervisor.run_session``,
     which spawns ``claude``). A launch validation failure (or an unsafe session directory)
     ends the run ``not-started`` and returns None (the outcome is in the store); so does any
     other error before ``claude`` is spawned (``launch_interrupted``), except a
-    ``KeyboardInterrupt`` (or another ``BaseException``), which is re-raised once the run is
-    final."""
+    ``LaunchInterrupted`` (a signal: ``launch_interrupted`` or ``canceled``), a
+    ``KeyboardInterrupt`` or another ``BaseException``, which is re-raised once the run is
+    final. ``signals`` enters the launch phase here (a signal received during allocation
+    raises now) and defers signals again before the hand-over (the supervisor checks them
+    right before the spawn)."""
     resolution = resolved.resolution
     v: Validated | None = None
     prepared: Prepared | None = None
     try:
         try:
+            signals.enter_launch()
             v = validate(st, cfg, req, resolved, alloc, process)
             secrets = sorted(envbuild.secret_values(v.session_env, process.environ))
             log_credential_warnings(process, alloc, v.credential_warnings, secrets)
@@ -1221,17 +1264,30 @@ def run(
             st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
             prepared = prepare(st, cfg, req, resolution, alloc, v, process)
             st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
+            signals.defer()  # the supervisor raises a signal from here right before the spawn
         except LaunchValidationError as error:
+            signals.defer()  # a signal during the cleanup is only recorded
             end_launch(st, alloc, v, prepared, process, error)
             return None
         except Exception as exc:
+            signals.defer()
             end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc)
             return None
         except BaseException as exc:
-            end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc)
+            signals.defer()  # a second signal during the cleanup is only recorded
+            end_launch(st, alloc, v, prepared, process, interrupted_by(st, alloc, exc), exc=exc)
             raise
         return supervise(
-            st, cfg, alloc, v, prepared, process, implicit_done=resolution.profile.implicit_done
+            st,
+            cfg,
+            alloc,
+            v,
+            prepared,
+            process,
+            mode=req.mode,
+            implicit_done=resolution.profile.implicit_done,
+            auto_exit=resolution.profile.auto_exit,
+            signals=signals,
         )
     finally:
         if v is not None:

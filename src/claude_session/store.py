@@ -1056,6 +1056,50 @@ class Store:
             if cursor.rowcount != 1:
                 raise InternalError(f"no run {run_no} of session {csession_id}")
 
+    def set_pending_cause(self, csession_id: str, run_no: int, cause: str) -> bool:
+        """Record ``exec``'s intended cause before it signals the child, unless the run is
+        final or already has one (an earlier cause, such as a ``stop`` request's, stands).
+        Returns whether this call recorded it."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET pending_cause = ? WHERE csession_id = ? AND run_no = ? "
+                "AND pending_cause IS NULL AND ended_at IS NULL",
+                (cause, csession_id, run_no),
+            )
+        return cursor.rowcount == 1
+
+    def set_auto_exit_cause(self, csession_id: str, run_no: int, event_id: int) -> bool:
+        """The auto-exit re-check and its ``pending_cause`` in one compare-and-set: recorded
+        only while the run is live with no cause, its report is ``done`` and ``event_id`` is
+        still its latest event (design.md, Supervision). Returns whether it was recorded."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET pending_cause = 'auto_exit' WHERE csession_id = ? "
+                "AND run_no = ? AND pending_cause IS NULL AND ended_at IS NULL "
+                "AND report_status = 'done' AND (SELECT MAX(id) FROM events "
+                "WHERE csession_id = ? AND run_no = ?) = ?",
+                (csession_id, run_no, csession_id, run_no, event_id),
+            )
+        return cursor.rowcount == 1
+
+    def latest_event(self, csession_id: str, run_no: int) -> dict[str, Any] | None:
+        """The run's latest event (``id``, ``cause``, ``to_state``, ``to_activity``,
+        ``final``), by id; None when it has none."""
+        row = self.conn.execute(
+            "SELECT id, cause, to_state, to_activity, final FROM events "
+            "WHERE csession_id = ? AND run_no = ? ORDER BY id DESC LIMIT 1",
+            (csession_id, run_no),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "cause": row[1],
+            "to_state": row[2],
+            "to_activity": row[3],
+            "final": bool(row[4]),
+        }
+
     def update_session(self, csession_id: str, **fields: Any) -> None:
         """Set columns of a session row (only ``SESSION_FIELDS``)."""
         unknown = sorted(set(fields) - SESSION_FIELDS)

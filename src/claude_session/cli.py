@@ -8,6 +8,7 @@ path).
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -157,53 +158,70 @@ def _report(args: argparse.Namespace) -> int:
 
 
 def _exec(args: argparse.Namespace) -> int:
-    """``exec`` of a new headless session: launch steps 2 to 7, then supervision (interface.md,
-    Launch order and exec). A launch-phase end exits 12 with the outcome object."""
+    """``exec`` of a new session: launch steps 2 to 7, then supervision (interface.md, Launch
+    order, exec and Signals). A launch-phase end exits 12 with the outcome object, also when a
+    signal interrupted the launch; a signal before allocation ends ``exec`` by that signal.
+    The signal handlers are installed before allocation and restored on the way out."""
     if args.session_id is not None:
         # TODO(#28): adoption of a pending run created by start.
         raise InternalError("exec --session-id is not implemented yet", detail="not_implemented")
     if args.dry_run:
         # TODO(#27): the dry-run plan.
         raise InternalError("exec --dry-run is not implemented yet", detail="not_implemented")
-    if args.mode != "headless":
-        # TODO(#17): interactive supervision (exec's default mode).
-        raise InternalError(
-            "interactive exec is not implemented yet; pass --mode headless",
-            detail="not_implemented",
-        )
     from . import launch, supervisor
     from .gateway import SystemGateway
+    from .signals import ExecSignals, LaunchInterrupted
 
     cfg = load_config(args)
-    # TODO(#17): install the signal handlers (interface.md, Signals) here, before allocation.
+    signals = ExecSignals()
+    signals.install()  # before allocation (interface.md, Signals)
     try:
         with store.open_state() as st:
             process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
             req = launch.read_request(args, cfg)
             resolved = launch.resolve_kind(req, cfg, process)
+            signals.defer()  # a signal during allocation acts once the run exists
             alloc = launch.allocate(st, req, resolved, process)
-            ended = launch.run(
-                st, cfg, req, resolved, alloc, process, supervise=supervisor.run_headless
-            )
+            try:
+                ended = launch.run(
+                    st,
+                    cfg,
+                    req,
+                    resolved,
+                    alloc,
+                    process,
+                    supervise=supervisor.run_session,
+                    signals=signals,
+                )
+            except LaunchInterrupted:
+                ended = None  # the run ended not-started: its outcome is in the store
             outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
-    except KeyboardInterrupt:
-        # TODO(#17): SIGINT is then forwarded and mapped forwarded_int (headless) or ignored
-        # (interactive); exec exits with the run's stored exit_code instead of dying by it.
-        _die_of_sigint()
-    _print_outcome(outcome, args.json)
+    except LaunchInterrupted as exc:  # before allocation: nothing to record
+        _die_of(exc.signum)
+    except KeyboardInterrupt:  # handlers not installed (not the main thread)
+        _die_of(signal.SIGINT)
+    finally:
+        signals.restore()
+    try:
+        _print_outcome(outcome, args.json)
+    except OSError as exc:
+        # A terminal that hung up (interactive SIGHUP) cannot take the outcome: the run is
+        # final and stored, and the exit code still carries it.
+        if exc.errno != errno.EIO:
+            raise
     return int(outcome["exit_code"]) if ended is None else ended.exit_code
 
 
-def _die_of_sigint() -> NoReturn:
-    """Exit by SIGINT (the run is already final) without a traceback: restore the default
-    action and signal this process itself."""
+def _die_of(signum: int) -> NoReturn:
+    """Exit by ``signum`` without a traceback: restore its default action and signal this
+    process itself (its exact PID)."""
     try:
         sys.stdout.flush()
     except (OSError, ValueError):
         pass
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    os.kill(os.getpid(), signal.SIGINT)
-    raise KeyboardInterrupt  # not reached: SIGINT ends the process
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+    raise KeyboardInterrupt  # not reached: the signal ends the process
 
 
 def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:

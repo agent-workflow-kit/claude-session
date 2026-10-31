@@ -184,3 +184,69 @@ def test_run_record_of_a_missing_run(st: Store) -> None:
 
 def test_start_time_of_a_missing_process_is_empty() -> None:
     assert store.start_time(2**22 + 5) == ""
+
+
+# pending_cause and the auto-exit compare-and-set (design.md, Supervision)
+
+
+def add_event(st: Store, sid: str, cause: str, to_state: str, to_activity: str | None) -> int:
+    with st.transaction() as conn:
+        cursor = conn.execute(
+            "INSERT INTO events (csession_id, run_no, event_ts, to_state, to_activity, cause) "
+            "VALUES (?, 1, '2026-01-01T00:00:00Z', ?, ?, ?)",
+            (sid, to_state, to_activity, cause),
+        )
+    assert cursor.lastrowid is not None
+    return cursor.lastrowid
+
+
+def test_set_pending_cause_keeps_an_earlier_cause(st: Store) -> None:
+    sid = st.allocate(new_run(), new_id=ids.new_session_id)
+    assert st.set_pending_cause(sid, 1, "stopped")
+    assert not st.set_pending_cause(sid, 1, "forwarded_term")
+    assert st.run_record(sid, 1)["pending_cause"] == "stopped"
+
+
+def test_set_pending_cause_leaves_a_final_run_alone(st: Store) -> None:
+    sid = st.allocate(new_run(), new_id=ids.new_session_id)
+    final = Final(
+        phase="session",
+        outcome="exited-unreported",
+        end_reason="normal",
+        exit_code=14,
+        state="exited-unreported",
+        cause="exit",
+    )
+    assert st.finalize_run(sid, 1, final)
+    assert not st.set_pending_cause(sid, 1, "forwarded_term")
+    assert st.run_record(sid, 1)["pending_cause"] is None
+
+
+def test_latest_event_is_by_id(st: Store) -> None:
+    sid = st.allocate(new_run(), new_id=ids.new_session_id)
+    first = st.latest_event(sid, 1)
+    assert first is not None and first["cause"] == "launch"
+    eid = add_event(st, sid, "Stop", "reported", "idle")
+    assert st.latest_event(sid, 1) == {
+        "id": eid,
+        "cause": "Stop",
+        "to_state": "reported",
+        "to_activity": "idle",
+        "final": False,
+    }
+    assert st.latest_event(sid, 2) is None
+
+
+def test_set_auto_exit_cause_rechecks_report_event_and_cause(st: Store) -> None:
+    sid = st.allocate(new_run(), new_id=ids.new_session_id)
+    stop = add_event(st, sid, "Stop", "reported", "idle")
+    assert not st.set_auto_exit_cause(sid, 1, stop)  # no report
+    st.conn.execute("UPDATE runs SET report_status = 'blocked' WHERE csession_id = ?", (sid,))
+    assert not st.set_auto_exit_cause(sid, 1, stop)  # not done
+    st.conn.execute("UPDATE runs SET report_status = 'done' WHERE csession_id = ?", (sid,))
+    newer = add_event(st, sid, "UserPromptSubmit", "reported", "working")
+    assert not st.set_auto_exit_cause(sid, 1, stop)  # a newer event
+    assert st.run_record(sid, 1)["pending_cause"] is None
+    assert st.set_auto_exit_cause(sid, 1, newer)
+    assert st.run_record(sid, 1)["pending_cause"] == "auto_exit"
+    assert not st.set_auto_exit_cause(sid, 1, newer)  # a cause already exists
