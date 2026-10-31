@@ -203,6 +203,7 @@ class Gateway(Protocol):
         discard_output: bool = False,
         on_started: Callable[[], None] | None = None,
         canceled: Callable[[], bool] | None = None,
+        on_spawn: Callable[[int], None] | None = None,
     ) -> Result:
         """Run to completion, capturing text output. ``output_limit`` (bytes, per stream) keeps
         only that prefix of stdout and of stderr; the rest is read and discarded, so untrusted
@@ -220,8 +221,11 @@ class Gateway(Protocol):
         ``GatewayTimeout``); one raised during the grace still gets the group SIGKILL and the
         leader reaped first. ``discard_output`` sends stdout and stderr to ``/dev/null`` (the
         result has empty output) and only the child's own exit is waited for; ``on_started``
-        and ``canceled``: see the module docs. Raises ``GatewayTimeout``, ``GatewayCanceled``,
-        and ``OSError`` when the program cannot be started."""
+        and ``canceled``: see the module docs. ``on_spawn`` is called with the child's PID
+        once it exists, before its stdin is written (with ``new_process_group``, the PID is
+        its process group ID); an exception it raises ends the child like any other. Raises
+        ``GatewayTimeout``, ``GatewayCanceled``, and ``OSError`` when the program cannot be
+        started."""
         ...
 
     def spawn(
@@ -733,6 +737,7 @@ class SystemGateway:
         discard_output: bool = False,
         on_started: Callable[[], None] | None = None,
         canceled: Callable[[], bool] | None = None,
+        on_spawn: Callable[[int], None] | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(
@@ -769,6 +774,8 @@ class SystemGateway:
         try:
             with popen:
                 try:
+                    if on_spawn is not None:
+                        on_spawn(popen.pid)
                     out, err = _exchange(
                         popen,
                         data,

@@ -51,6 +51,7 @@ DESIGN_COLUMNS = {
     ),
     "requests": "request_id csession_id run_no result ingested_at",
     "deleted_ids": "csession_id deleted_at",
+    "hook_groups": ("id csession_id event_id pgid leader_start holder_pid holder_start started_at"),
     "leases": "name holder_pid holder_start holder_token expires_at",
     "meta": "key value",
 }

@@ -40,9 +40,13 @@ hold up later entries or events: each runs on a thread of its own (its timeout a
 still apply) and the event is marked once its hook has started and received its payload (stdin
 written and closed, or the runner ended without starting it); the deliverer waits for them
 before it returns (``deliver``) or stops (``Worker.close``). A deliverer that is itself killed
-(SIGKILL, crash) leaves the hook it was running unsupervised in its own process group; the next
-deliverer redelivers that event, so the two copies can overlap: ordering holds only while no
-deliverer dies mid-hook.
+(SIGKILL, crash) leaves the hook it was running unsupervised in its own process group. Each
+hook's group is therefore recorded as it starts (``hook_groups``: the group ID, its leader's
+start-time token and the deliverer) and removed once the hook has finished; the next deliverer
+of the session (and ``reconcile``) first ends the groups of deliverers that are gone
+(``end_orphaned_groups``: only while the leader is verified by its token), so the redelivered
+event never overlaps its orphaned copy. A group whose leader exited while members it started
+still run cannot be verified and is left alone.
 
 **Cancel.** A deliverer given a ``cancel`` event (``exec`` after a SIGTERM, SIGINT or SIGHUP
 once its child was reaped) starts no further hook once it is set, ends the running hooks'
@@ -70,6 +74,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sqlite3
 import threading
 import time
@@ -274,8 +279,10 @@ def run_entry(
     kill_grace: float,
     on_started: Callable[[], None] | None = None,
     canceled: Callable[[], bool] | None = None,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> Ran:
     """Run ``entry`` once (see the module docs). Never raises for the hook's own failure.
+    ``on_spawn`` gets the hook's process group ID (``sh``'s PID) as soon as it exists;
     ``on_started`` is called once ``sh`` has started and its stdin was written and closed;
     ``canceled`` ends the hook's group early (``Ran("canceled")``)."""
     if sh is None:
@@ -293,6 +300,7 @@ def run_entry(
             discard_output=True,
             on_started=on_started,
             canceled=canceled,
+            on_spawn=on_spawn,
         )
     except GatewayTimeout:
         return Ran("timeout", f"timed out after {entry.timeout:g} s; process group ended")
@@ -471,6 +479,11 @@ class Deliverer:
                 return done
             self._expiry = asked + LEASE_TTL
             try:
+                # A deliverer that died mid-hook left that hook's group running: end it before
+                # its event is delivered again (``end_orphaned_groups``).
+                end_orphaned_groups(
+                    self.st, csession_id, kill_grace=self.cfg.kill_grace, log=self.log
+                )
                 self._pass(csession_id, lease, done)
             finally:
                 self.st.release_lease(lease)
@@ -668,6 +681,7 @@ class _Hook:
 
     def run(self) -> None:
         d = self.deliverer
+        group = _GroupRecord(d.st, self.sid, self.event_id, d.log)
         try:
             try:
                 ran = run_entry(
@@ -680,9 +694,12 @@ class _Hook:
                     kill_grace=d.cfg.kill_grace,
                     on_started=self.started.set,
                     canceled=None if d.cancel is None else d.cancel.is_set,
+                    on_spawn=group.record,
                 )
             except Exception as exc:  # never escapes the thread unlogged (e.g. a NUL in cmd)
                 ran = Ran("failed", f"could not run the hook ({type(exc).__name__})")
+            finally:
+                group.remove()
             message = f"{POST_STATE_CHANGE} {self.entry.name}, event {self.event_id}: {ran.detail}"
             fields: dict[str, Any] = {"csession_id": self.sid, "run": int(self.run_no)}
             if ran.result != "canceled":
@@ -692,6 +709,119 @@ class _Hook:
                 _log(d.log, failure, level="warn", message=message, **fields)
         finally:
             self.started.set()
+
+
+class _GroupRecord:
+    """A running hook's process group in ``hook_groups`` (``Store.add_hook_group``), on a
+    store connection of its own (the hook thread never uses the deliverer's), removed once
+    the hook has finished. Best effort: a group that cannot be recorded is only logged (a
+    deliverer that dies then leaves it unrecorded, the documented limit)."""
+
+    def __init__(self, st: store.Store, sid: str, event_id: int, log: logs.EventLog) -> None:
+        self.path, self.liveness, self.clock = st.path, st.liveness, st.clock
+        self.holder = st.holder  # the deliverer's identity, read before the hook starts
+        self.sid, self.event_id, self.log = sid, event_id, log
+        self.own: store.Store | None = None
+        self.row: int | None = None
+
+    def record(self, pgid: int) -> None:
+        try:
+            self.own = store.Store.open(
+                self.path, migrate=False, liveness=self.liveness, clock=self.clock
+            )
+            leader = store.start_time(pgid)
+            self.row = self.own.add_hook_group(self.sid, self.event_id, pgid, leader, self.holder)
+        except Exception as exc:
+            _log(
+                self.log,
+                "hook_failed",
+                level="warn",
+                csession_id=self.sid,
+                message=f"{POST_STATE_CHANGE} event {self.event_id}: the hook's process group"
+                f" could not be recorded ({type(exc).__name__})",
+            )
+
+    def remove(self) -> None:
+        try:
+            if self.own is not None and self.row is not None:
+                self.own.remove_hook_group(self.row)
+        except Exception:
+            pass  # a leftover row is ended (verified) or dropped by the next deliverer
+        finally:
+            if self.own is not None:
+                self.own.close()
+                self.own = None
+
+
+# How often an orphaned hook group's leader is checked while it is given kill_grace.
+_GROUP_POLL = 0.05
+
+
+def end_orphaned_groups(
+    st: store.Store,
+    csession_id: str | None,
+    *,
+    kill_grace: float,
+    log: logs.EventLog | None = None,
+) -> list[int]:
+    """End the hook process groups a dead deliverer left running (of ``csession_id``, or of
+    every session): for each recorded group whose deliverer is gone, the group is signaled
+    only while its leader is verified (the recorded PID still runs with the recorded
+    start-time token and still leads its group): SIGTERM, then SIGKILL after ``kill_grace``
+    if the verified leader still runs. Groups of a live deliverer are left alone; a row
+    whose leader cannot be verified (gone, reused, token unknown) is dropped without any
+    signal (members that outlived the leader cannot be told apart from a reused group ID).
+    Returns the process group IDs signaled."""
+    ended: list[int] = []
+    for row in st.hook_groups(csession_id):
+        if st.holder_alive(int(row["holder_pid"]), str(row["holder_start"] or "")):
+            continue
+        pgid, token = int(row["pgid"]), str(row["leader_start"] or "")
+        if _verified_leader(pgid, token):
+            ended.append(pgid)
+            _end_group(pgid, token, kill_grace)
+            if log is not None:
+                _log(
+                    log,
+                    "hook_failed",
+                    level="warn",
+                    csession_id=str(row["csession_id"]),
+                    message=f"{POST_STATE_CHANGE} event {row['event_id']}: the hook its dead"
+                    f" deliverer left running was ended (process group {pgid})",
+                )
+        st.remove_hook_group(int(row["id"]))
+    return ended
+
+
+def _verified_leader(pgid: int, token: str) -> bool:
+    """Whether ``pgid`` is still the process the recorded token names, leading its group."""
+    if token == "" or not 0 < pgid < 2**31:
+        return False
+    if store.start_time(pgid) != token:
+        return False
+    try:
+        return os.getpgid(pgid) == pgid
+    except OSError:
+        return False
+
+
+def _end_group(pgid: int, token: str, kill_grace: float) -> None:
+    """SIGTERM the verified group; SIGKILL it after ``kill_grace`` while its leader is still
+    the verified process (checked again right before)."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.monotonic() + kill_grace
+    while time.monotonic() < deadline:
+        if not _verified_leader(pgid, token):
+            return
+        time.sleep(_GROUP_POLL)
+    if _verified_leader(pgid, token):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def deliver(

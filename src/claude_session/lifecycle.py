@@ -9,9 +9,9 @@ wrapper, ``validate``), then freezes the run: the prompt and input copies are st
 become pending (``Store.release_pending``: no wrapper, ``expires_at`` = now +
 ``lost_grace``), so no adopter can take it before it is frozen. A step-5 failure ends the
 run ``not-started`` (``launch.end_launch``) and ``start`` exits 12 with ``launch_failed``.
-TODO(#33): a ``start`` that dies before the run is pending leaves a launch-phase run whose
-wrapper is gone; the liveness check ends it ``launch_interrupted`` and must also delete
-``runs/<n>/launch-spec.json`` via ``discard_spec_at``.
+A ``start`` that dies before the run is pending leaves a launch-phase run whose wrapper is
+gone; the liveness check ends it ``launch_interrupted`` and deletes ``runs/<n>/launch-spec.json``
+(``discard_spec_at``).
 
 The launch spec holds what the adopting ``exec`` must not take from anywhere else: the
 fully resolved kind profile with its origins (``env.set`` values included, which

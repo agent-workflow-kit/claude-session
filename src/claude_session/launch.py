@@ -75,6 +75,7 @@ from .config import Config
 from .endmap import EXIT_CODES
 from .errors import (
     FailedError,
+    InternalError,
     InvalidPermissionProfile,
     LaunchValidationError,
     RefusedError,
@@ -477,8 +478,9 @@ def new_run(
     run carries them from another cwd); a carried snapshot's label beside the snapshot
     path."""
     resolution = resolved.resolution
-    # TODO(#33): start_time() gives "" when the token cannot be read (plain exec and start
-    # alike); the liveness check must never take an empty token as matching a live process.
+    # start_time() gives "" when the token cannot be read (plain exec and start alike): the
+    # liveness check never takes an empty token as a match; it then decides by the PID alone
+    # and keeps the run live while that PID exists (liveness.process_alive).
     wrapper_start = store.start_time(os.getpid())
     spec = {key: value for key, value in req.carried.items() if value is not None}
     spec.update({key: value for key, value in req.flags.items() if value is not None})
@@ -1632,13 +1634,21 @@ def audit_sandbox_lowered(
 
 def drain_previous(st: store.Store, alloc: Allocated, dirs: SessionDirs, process: Process) -> None:
     """A resume, before the secret rotates: the previous run's outbox requests are
-    discarded, recorded ``discarded`` under that run and logged (``outbox_discarded``). The
-    previous run is always final here: a resume of a run that is not final is refused
-    ``live`` (``Store.allocate_resume``).
+    discarded, recorded ``discarded`` under that run and logged (``outbox_discarded``).
 
-    TODO(#33): with the liveness check, a previous run still being finalized (``ended_at``
-    unset, wrapper dead) is ingested into instead (interface.md, Launch order step 7)."""
+    A previous run still being finalized (``ended_at`` unset, wrapper dead) is ingested into
+    instead (interface.md, Launch order step 7): that ingestion is its salvage, which the
+    inline liveness check runs before allocation (it drains the run's outbox with its own
+    secret index, then finalizes it), and ``Store.allocate_resume`` refuses a previous run
+    that is not final. So the previous run is final here; should it not be, its requests are
+    left alone (never discarded while that run may still be salvaged)."""
     if alloc.previous_run is None:
+        return
+    try:
+        previous = st.run_record(alloc.csession_id, alloc.previous_run)
+    except InternalError:
+        previous = None
+    if previous is not None and previous["ended_at"] is None:
         return
     discarded = dirs.discard_outbox(alloc.run)
     if not discarded:

@@ -22,7 +22,9 @@ from typing import Any
 import pytest
 
 from claude_session import cli, ids, launch, outcomefile, pathrules, store, supervisor, waiter
+from claude_session import liveness as liveness_module
 from claude_session.errors import LaunchValidationError, OutcomeFileRejected
+from claude_session.liveness import Checked
 from claude_session.signals import LaunchInterrupted
 from claude_session.store import Final, Holder, Store
 
@@ -909,7 +911,7 @@ def test_a_session_forgotten_while_waiting_never_writes_through_its_paths(
     monkeypatch.setenv("CSESSION_POLL_INTERVAL", "0.01s")
     calls: list[str] = []
 
-    def liveness(_st: Store, csession_id: str) -> None:
+    def liveness(_st: Store, _cfg: Any, csession_id: str, **_kw: Any) -> Checked:
         calls.append(csession_id)
         if len(calls) == 2:  # after the first poll: the run is bound
             with store.open_state() as other:
@@ -918,8 +920,10 @@ def test_a_session_forgotten_while_waiting_never_writes_through_its_paths(
                     "WHERE csession_id = ?",
                     (csession_id,),
                 )
+        return Checked()
 
-    monkeypatch.setattr(waiter, "check_liveness", liveness)
+    # The check wait runs at every poll (cli passes its own, with the config).
+    monkeypatch.setattr(liveness_module, "check_session", liveness)
     assert cli.main(["wait", sid, "--json", "--outcome-file", str(link / "w.json")]) == 10
     captured = capsys.readouterr()
     assert json.loads(captured.out)["error"]["code"] == "not_found"

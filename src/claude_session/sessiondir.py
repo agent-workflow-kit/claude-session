@@ -756,6 +756,31 @@ def read_private_run_file(
         os.close(run_fd)
 
 
+def open_private_run_dir(state_root: str, csession_id: str, run: int) -> int | None:
+    """A descriptor of the private ``runs/<run>/`` reached read only, as ``SessionDirs``
+    reaches it (no-follow, owner checked), without creating anything (the liveness check's
+    salvage); None when a directory on the way is missing. The caller closes it. Raises
+    ``SessionDirUnsafe``."""
+    return _inspect_run_dir(state_root, csession_id, run)[0]
+
+
+def read_session_file(state_root: str, csession_id: str, name: str, cap: int) -> bytes | None:
+    """``<state>/sessions/<id>/<name>`` read through the same no-follow walk (a regular file
+    of ours with one link, at most ``cap`` bytes), without creating anything; None when it
+    or a directory on the way is missing. Its content is untrusted (the session directory is
+    agent-writable). Raises ``SessionDirUnsafe``."""
+    if not ids.is_session_id(csession_id):
+        raise ValueError(f"not a session id: {csession_id!r}")
+    if not name or "/" in name or name in (".", ".."):
+        raise ValueError(f"not a file name: {name!r}")
+    fd, where = _inspect_tree(state_root, SESSIONS, csession_id)
+    try:
+        return _read_optional_at(fd, name, os.path.join(where, name), cap)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def remove_private_run_file(state_root: str, csession_id: str, run: int, name: str) -> None:
     """``SessionDirs.remove_private_run_file`` without opening (and so creating) the
     session's directories: nothing to do when a directory on the way is missing. Raises

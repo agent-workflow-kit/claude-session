@@ -50,7 +50,10 @@ class Clock(FakeClock):
 
 @pytest.fixture
 def st(tmp_path: Path) -> Any:
-    with Store.open(str(tmp_path / "state.db"), holder=Holder(pid=1, start="1")) as s:
+    # The runs' wrappers (made-up PIDs) count as alive: the liveness check leaves them alone.
+    with Store.open(
+        str(tmp_path / "state.db"), holder=Holder(pid=1, start="1"), liveness=lambda _p, _s: True
+    ) as s:
         yield s
 
 
@@ -133,9 +136,10 @@ def second_run(st: Store, sid: str, *, pending: bool = False) -> None:
         conn.execute(
             "UPDATE runs SET ended_at = NULL, outcome = NULL, end_reason = NULL, "
             "exit_code = NULL, report_status = NULL, pending_cause = NULL, phase = 'launch', "
-            "wrapper_pid = CASE WHEN ? THEN NULL ELSE wrapper_pid END "
+            "wrapper_pid = CASE WHEN ? THEN NULL ELSE wrapper_pid END, "
+            "expires_at = CASE WHEN ? THEN '2999-01-01T00:00:00.000000Z' END "
             "WHERE csession_id = ? AND run_no = 2",
-            (pending, sid),
+            (pending, pending, sid),
         )
         conn.execute(
             "UPDATE sessions SET current_run = 2, state = 'starting', activity = NULL "
@@ -414,7 +418,8 @@ def test_the_liveness_check_runs_at_every_poll(
     checked: list[str] = []
     monkeypatch.setattr(waiter, "check_liveness", lambda _st, s: checked.append(s))
     wait(st, clock, sid, timeout=3.0)
-    assert checked == [sid] * 4  # at invocation and after each of the 3 sleeps
+    # At invocation, after each of the 3 sleeps, and once more before the timeout report.
+    assert checked == [sid] * 5
 
 
 def test_wait_holds_no_write_lock_between_polls(st: Store, clock: Clock, tmp_path: Path) -> None:
@@ -518,8 +523,11 @@ TRUSTED = {"kind": "implement", "profile": {"sandbox": "off", "reads_third_party
 
 
 def stored_session(final: Final | None = None) -> str:
+    """A session whose run is wrapped by this test process (alive: the liveness check of the
+    ``wait`` command leaves it alone)."""
     with store.open_state() as st:
-        sid = session(st, resolved=TRUSTED)
+        me = os.getpid()
+        sid = session(st, resolved=TRUSTED, wrapper_pid=me, wrapper_start=store.start_time(me))
         if final is not None:
             assert st.finalize_run(sid, 1, final)
     return sid

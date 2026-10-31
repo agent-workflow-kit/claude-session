@@ -6,8 +6,8 @@ Resume and fork).
 7 with a new session (``launch``); this module builds what differs:
 
 - the **source** (``load_source``): the session's current run, read in one transaction (a
-  pending run past its deadline counts as final: the inline liveness check, ``liveness``,
-  finalizes it just before allocation);
+  run the inline liveness check will finalize counts as final: a pending run past its
+  deadline, a run whose wrapper died; ``liveness`` finalizes it just before allocation);
 - the **request** (``prepare``, launch step 2): the kind and mode default to the previous
   run's; the explicit flags the previous run stored (``spec_json``) are carried by the
   carry-over table (``carry``: nothing but repo, cwd and mode when the kind changes; no
@@ -30,11 +30,10 @@ Resume and fork).
   session (``forked_from``, the source's taint), whose step 5 copies the source's
   ``inputs/`` (``SessionDirs.copy_inputs``).
 
-TODO(#33): the inline liveness check proper (wrapper-lost runs finalized and salvaged before
-the refusal checks). Until it exists, a resume of a run that is not final is refused ``live``,
-also when its wrapper died after allocation (that run then blocks every resume until #33
-finalizes it; ``--fork`` still works); only a pending run past its deadline is finalized
-here.
+The inline liveness check (``liveness``) runs right before allocation: a run whose wrapper
+died is finalized (and salvaged) there, so only a run that is still live (or pending) refuses a
+resume ``live``. The source is read earlier, at step 2: a run the check will finalize already
+counts as final there (``liveness.classify``), and as ``not-started`` when it never spawned.
 TODO(#30): ``--allow-tainted`` (human-only, audited ``resume_tainted``); until then a tainted
 session is refused for a run that is not third-party-reading whatever the flags.
 TODO(#31): ``--override-escalation`` (human-only; only after a run that ended ``escalated``;
@@ -53,6 +52,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import dryrun, gitinfo, ids, kinds, launch, sessiondir, store
+from . import liveness as check_liveness
 from .config import Config
 from .errors import InternalError, LaunchValidationError, NotFoundError, UsageError
 
@@ -139,23 +139,22 @@ def lookup(st: store.Store, given: str) -> str:
     return ids.lookup_session_id(given, st.session_id_candidates)
 
 
+# How long the liveness check waits for another process salvaging the previous run.
+SALVAGE_PATIENCE = 10.0
+
+
 def liveness(
     st: store.Store, process: launch.Process, csession_id: str, cfg: Config | None = None
 ) -> None:
-    """The part of the inline liveness check this branch has, run just before allocation
-    (after every step-2 check, so a usage error finalizes nothing): a current run still
-    pending at or past its ``expires_at`` is finalized ``not-started`` (``never_adopted``,
-    cause ``liveness``), its launch spec deleted, its outcome file written and (with
-    ``cfg``) its events delivered. TODO(#33): the wrapper-lost rules (a run whose wrapper
-    died stays live until then, and is refused ``live``)."""
-    from . import lifecycle, outcomefile, toolhooks
+    """The inline liveness check (``liveness.check_session``, cause ``liveness``), run just
+    before allocation (after every step-2 check, so a usage error finalizes nothing): a
+    pending run past its deadline ends ``never_adopted``, a run whose wrapper died is
+    finalized (salvaged, or ``launch_interrupted`` before its spawn), each with its outcome
+    file written and its launch spec deleted; then, with ``cfg``, what it changed is
+    delivered. A run still live afterwards refuses the resume ``live`` at allocation."""
+    from . import toolhooks
 
-    record = st.current_run(csession_id)
-    if record is None or record["ended_at"] is not None or record["wrapper_pid"] is not None:
-        return
-    if st.expire_pending(csession_id, record["run_no"], cause="liveness"):
-        lifecycle.discard_spec_at(process.state_root, csession_id, record["run_no"])
-        outcomefile.write_run(st, csession_id, record["run_no"])
+    if check_liveness.check_session(st, cfg, csession_id, patience=SALVAGE_PATIENCE).finalized:
         if cfg is not None:
             toolhooks.deliver_best_effort(
                 st,
@@ -173,14 +172,18 @@ def load_source(st: store.Store, csession_id: str, state_root: str) -> Source:
     record = st.resume_source(csession_id)
     if record is None or record["session_forgotten_at"] is not None:
         raise NotFoundError(f"unknown session: {csession_id}")
-    pending_expired = (
-        record["ended_at"] is None
-        and record["wrapper_pid"] is None
-        and st.past_deadline(record["expires_at"])
+    # What the inline liveness check will make of a run that is not final (it runs just
+    # before allocation): an expired pending run, or one whose wrapper died before its spawn,
+    # ends not-started; a salvaged one ends in the session phase.
+    verdict = None if record["ended_at"] is not None else check_liveness.classify(st, record)
+    final = record["ended_at"] is not None or verdict in (
+        check_liveness.EXPIRED,
+        check_liveness.LAUNCH_LOST,
+        check_liveness.SALVAGE,
     )
-    final = record["ended_at"] is not None or pending_expired
-    not_started = (record["ended_at"] is not None and record["phase"] == "launch") or (
-        pending_expired
+    not_started = (record["ended_at"] is not None and record["phase"] == "launch") or verdict in (
+        check_liveness.EXPIRED,
+        check_liveness.LAUNCH_LOST,
     )
     try:
         spec = json.loads(record["spec_json"] or "{}")

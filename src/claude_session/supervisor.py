@@ -428,7 +428,7 @@ def end_child(child: Child, *, kill_grace: float) -> None:
 # Implicit done
 
 
-def _accept_result_md(
+def accept_result_md(
     text: object, *, run_fd: int, secret: str | None, artifact_max_bytes: int
 ) -> bytes | None:
     """The ``result.md`` bytes when the final result's text passes the ingestion checks
@@ -624,7 +624,7 @@ def _implicit(
     """The implicit done (``result.md`` frozen and stored), ``result_rejected``, or None
     when a report was recorded since the end was mapped."""
     assert parsed.final is not None
-    data = _accept_result_md(
+    data = accept_result_md(
         parsed.final.get("result"),
         run_fd=run_fd,
         secret=secret,

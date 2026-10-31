@@ -310,8 +310,8 @@ def map_wrapper_lost(
     claude's exit status); else the report's outcome with ``wrapper_lost``; else ``lost``.
     ``headless_result`` is None for interactive runs.
 
-    TODO(#33): the liveness check and reconcile call this after draining the run's outbox
-    and ``claimed/`` (``finalized_from_cause`` / ``finalized_from_result``)."""
+    The liveness check (``liveness``, also from ``reconcile``) calls this after draining the
+    run's outbox and ``claimed/`` (``finalized_from_cause`` / ``finalized_from_result``)."""
     if pending_cause is not None:
         return _cause(pending_cause, report_status)
     if headless_result is not None and headless_result.complete:

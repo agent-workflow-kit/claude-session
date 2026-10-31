@@ -707,7 +707,7 @@ def apply_hook(
             # A new run began after the drain was prepared: leave its requests. They stay in
             # the old run's claimed/, which that run's final drain (``final_drain``: every
             # Drain.prepare picks up its run's claimed/ first) or its salvage processes.
-            # TODO(#33): salvage of a run whose wrapper is lost calls final_drain for it.
+            # (A run whose wrapper is lost: its salvage, liveness, calls final_drain.)
             drain = None
         if hook.claude_session_id is not None:
             assert hook.source is not None

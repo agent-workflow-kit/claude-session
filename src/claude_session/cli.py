@@ -268,14 +268,56 @@ def _exec(args: argparse.Namespace) -> int:
     return _supervised(args, begin)
 
 
+def _reconcile(args: argparse.Namespace) -> int:
+    """``reconcile [--dry-run]`` (interface.md, reconcile): one repair pass; exit 0 (also
+    when another reconcile holds the lease: ``already_running``)."""
+    from . import reconcile
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    with store.open_state() as st:
+        result = reconcile.run(
+            st, cfg, gateway=SystemGateway(), environ=os.environ, dry_run=args.dry_run
+        )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+        return 0
+    if result["already_running"]:
+        print("reconcile is already running")
+    for change in result["changes"]:
+        line = f"{change['csession_id']}"
+        if change["run"] is not None:
+            line += f" run {change['run']}"
+        line += f": {change['action']}"
+        if change["outcome"] is not None:
+            line += f" -> {change['outcome']} ({change['end_reason']})"
+        if change["detail"]:
+            line += f"; {change['detail']}"
+        print(sanitize(line))
+    for orphan in result["orphans"]:
+        print(
+            sanitize(
+                f"{orphan['csession_id']} run {orphan['run']}: orphaned child"
+                f" {orphan['child_pid']} (wrapper gone; end it with stop)"
+            )
+        )
+    for warning in result["warnings"]:
+        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+    if not (result["changes"] or result["orphans"] or result["already_running"]):
+        print("nothing to repair")
+    return 0
+
+
 def _wait(args: argparse.Namespace) -> int:
     """``wait <id> [--run n] [--timeout d] [--outcome-file p]`` (interface.md, wait): the
     run's outcome code, or 22 when ``--timeout`` expired first. Ctrl-C ends it by the signal,
     printing nothing."""
-    from . import waiter
+    from . import liveness, toolhooks, waiter
+    from .gateway import SystemGateway
 
     cfg = load_config(args)
     timeout = durations.parse_bound(args.timeout)
+    changed: set[str] = set()
     try:
         with store.open_state() as st:
             state_root = os.path.dirname(st.path)
@@ -284,14 +326,33 @@ def _wait(args: argparse.Namespace) -> int:
                 # Once bound, an error envelope is checked against the waited run's paths.
                 args.outcome_file_writable = outcomefile.run_writable(row, state_root)
 
-            waited = waiter.wait_for_run(
-                st,
-                args.id,
-                run_no=args.run,
-                timeout=timeout,
-                poll_interval=cfg.poll_interval,
-                on_row=bound,
-            )
+            def check(st: store.Store, sid: str) -> None:
+                if liveness.check_session(st, cfg, sid).finalized:
+                    changed.add(sid)
+                outcomefile.backfill(st, sid)
+
+            try:
+                waited = waiter.wait_for_run(
+                    st,
+                    args.id,
+                    run_no=args.run,
+                    timeout=timeout,
+                    poll_interval=cfg.poll_interval,
+                    on_row=bound,
+                    check=check,
+                )
+            finally:
+                # What the liveness check finalized is delivered before wait exits (a run
+                # with no live wrapper: nobody else delivers it now).
+                for sid in sorted(changed):
+                    toolhooks.deliver_best_effort(
+                        st,
+                        cfg,
+                        sid,
+                        gateway=SystemGateway(),
+                        environ=os.environ,
+                        state_root=state_root,
+                    )
     except KeyboardInterrupt:
         _die_of(signal.SIGINT)
     output = waited.output
@@ -589,7 +650,7 @@ HANDLERS: dict[str, Handler] = {
     "label remove": _not_implemented,
     "transcript": _not_implemented,
     "forget": _not_implemented,
-    "reconcile": _not_implemented,
+    "reconcile": _reconcile,
     "export": _not_implemented,
     "cron install": _not_implemented,
     "cron uninstall": _not_implemented,

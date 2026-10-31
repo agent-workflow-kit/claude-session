@@ -35,6 +35,9 @@ from .fake_clock import FakeClock
 
 # Above the largest Linux pid_max (2**22), so a fake PID can never name a real process.
 FAKE_PID_BASE = 2**22 + 1
+# The PID ``run`` reports to ``on_spawn``: above any Linux pid_max (2**22), so no real process
+# ever has it (a recorded hook group is then never verified, never signaled).
+UNREAL_PID = 2**31 - 2
 
 
 @dataclass(frozen=True)
@@ -177,6 +180,7 @@ class FakeGateway:
         discard_output: bool = False,
         on_started: Callable[[], None] | None = None,
         canceled: Callable[[], bool] | None = None,
+        on_spawn: Callable[[int], None] | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(
@@ -204,6 +208,8 @@ class FakeGateway:
         response = self._answer(args)
         if response.error is not None:
             raise response.error
+        if on_spawn is not None:  # as the real gateway: a PID once the child exists
+            on_spawn(UNREAL_PID)
         if on_started is not None:  # as the real gateway: the child got its stdin
             on_started()
         if response.timeout:
