@@ -53,6 +53,7 @@ INPUTS = "inputs"
 OUTBOX = "outbox"
 ARTIFACTS = "artifacts"
 WORK = "work"
+SETTINGS = "settings.json"
 
 SECRET_BYTES = 32
 _READ_CHUNK = 1 << 16
@@ -72,7 +73,7 @@ CSESSION_ID. Your session directory is given at session start and in $CSESSION_D
     claude-session report blocked --reason-file "$CSESSION_DIR/artifacts/reason.md"
     claude-session report failed --reason-file "$CSESSION_DIR/artifacts/reason.md"
     claude-session report needs-input --reason-file "$CSESSION_DIR/artifacts/reason.md"
-  For done, a one-line summary also works: claude-session report done --summary "<one line>".
+  For done, a one-line summary also works: claude-session report done --summary="<one line>".
   Text can also come from a heredoc:
     claude-session report done --summary-file - <<'EOF'
     <summary text>
@@ -529,6 +530,20 @@ class SessionDirs:
         self.write_instructions(render_instructions(claude_session_path, respond=respond))
         self.write_run_json(data)
         return self.rotate_secret()
+
+    def write_settings(self, run: int, data: bytes) -> str:
+        """Write the generated ``--settings`` file to the private ``runs/<run>/settings.json``
+        (0600, no-follow, temporary file in the private directory), after
+        ``prepare_run(run)``. Returns its absolute path."""
+        if run not in self._layouts:
+            raise ValueError(f"prepare_run({run}) must come first")
+        run_fd = self._run_private_dir(run)
+        where = os.path.join(self.private_path, RUNS, str(run))
+        try:
+            self._write(run_fd, SETTINGS, data, where)
+        finally:
+            os.close(run_fd)
+        return os.path.join(where, SETTINGS)
 
     # Prompts and inputs, copied directly (plain exec and resume)
 

@@ -346,7 +346,7 @@ Run by the agent inside its session. Requires `CSESSION_ID` and `CSESSION_DIR` (
 - `done` requires a non-empty summary; `blocked`, `failed` and `needs-input` require a reason (a summary is optional for them). A `--summary` text that begins with `-` must be given as `--summary=<text>`.
 - **Command forms.** Only a bare `claude-session report …` command matches the generated `Bash(claude-session report:*)` rule; the generated rules also allow `Bash(<absolute claude-session path> report:*)` (the install path is per machine, so the instructions may name it). A command prefixed with `cd … &&` or containing `$(…)` is denied (live test). The standard instructions show exactly these forms:
   - write the text with the Write tool to `$CSESSION_DIR/artifacts/summary.md` (or `reason.md`), then `claude-session report done --summary-file <path>`;
-  - `claude-session report done --summary "<one line>"`;
+  - `claude-session report done --summary="<one line>"`;
   - a heredoc: `claude-session report done --summary-file - <<'EOF'` … `EOF`;
   - the absolute path of `claude-session` in place of the bare name, as a fallback when `PATH` does not resolve it.
   The permissions for this are generated for every run ([Generated settings](#generated-settings)), so it works under `dontAsk`. `--summary` text is equally untrusted.

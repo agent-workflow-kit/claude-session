@@ -704,6 +704,13 @@ def test_instructions_match_the_design_text() -> None:
     assert sessiondir.render_instructions(CS_PATH, respond=True) == expected + respond
 
 
+def test_instructions_use_the_equals_form_for_a_one_line_summary() -> None:
+    # A summary beginning with "-" would otherwise be parsed as a flag (#46).
+    text = sessiondir.render_instructions(CS_PATH)
+    assert 'report done --summary="<one line>"' in text
+    assert "--summary " not in text
+
+
 def test_instructions_contain_no_per_run_values(root: Path) -> None:
     contents = []
     for sid, run in ((SID, 1), (OTHER_SID, 7)):
