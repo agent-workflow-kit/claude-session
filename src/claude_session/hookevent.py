@@ -3,8 +3,8 @@
 See design.md (Hook-event fast path, State machine) and interface.md (State transitions,
 Internal commands). ``__main__`` dispatches here before importing ``cli``, so this module and
 everything it imports stay standard library only, plus ``store``, ``outbox`` and
-``secretindex`` (both stdlib only) and, once it is needed, ``gateway``: never ``config``,
-Pydantic, YAML or argparse.
+``secretindex`` (both stdlib only), ``notes`` (stdlib only) and, once the notes command runs,
+``gateway``: never ``config``, Pydantic, YAML or argparse.
 
 ``PostToolUse`` and ``Stop`` drain the run's outbox: requests are claimed and pre-checked
 before the transaction (``prepare_drain``), recorded inside it after the hook's own row, and
@@ -26,10 +26,15 @@ import stat
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO
 
+from . import notes as notes_command  # "notes" is hookconf_bytes's keyword
 from . import outbox, secretindex
+from .notes import NotesConf
 from .store import BUSY_TIMEOUT, HookRun, Store, db_path
+
+if TYPE_CHECKING:
+    from .gateway import Gateway
 
 # The events the injected hooks pass (interface.md, Internal commands). Kept equal to
 # ``__main__.HOOK_EVENTS`` (tested): ``__main__`` must not import this module to log.
@@ -356,11 +361,13 @@ def _session_start(payload: dict[str, Any]) -> Hook:
 
 @dataclass(frozen=True)
 class HookConf:
-    """``hookconf.json``: the run's input names and the report caps ingestion applies."""
+    """``hookconf.json``: the run's input names, the report caps ingestion applies and the
+    notes command (None: no notes for this run)."""
 
     input_files: list[str]
     summary_max_bytes: int
     artifact_max_bytes: int
+    notes: NotesConf | None = None
 
     @property
     def limits(self) -> outbox.Limits:
@@ -371,26 +378,38 @@ class HookConf:
 
 
 HOOKCONF_KEYS = frozenset({"v", "input_files", "summary_max_bytes", "artifact_max_bytes"})
+# Optional keys of v1: a run launched before they existed has none, and its hooks keep
+# working after an upgrade. ``notes`` absent or null: no notes command.
+HOOKCONF_OPTIONAL_KEYS = frozenset({"notes"})
 
 
 def hookconf_bytes(
-    input_files: list[str], *, summary_max_bytes: int, artifact_max_bytes: int
+    input_files: list[str],
+    *,
+    summary_max_bytes: int,
+    artifact_max_bytes: int,
+    notes: NotesConf | None = None,
 ) -> bytes:
     """The content of ``private/<id>/runs/<n>/hookconf.json`` for a run whose inputs are
-    ``input_files`` (basenames, in order) and whose report caps are the given ones (outbox
-    ingestion reads them here, never from config or an agent-writable file).
+    ``input_files`` (basenames, in order), whose report caps are the given ones (outbox
+    ingestion reads them here, never from config or an agent-writable file) and whose notes
+    command is ``notes`` (``launch.notes_conf``; written as null when there is none).
+    ``HookEventError`` when the result is invalid or over ``HOOKCONF_MAX_BYTES``.
 
     ``exec`` writes it at launch step 7 (``SessionDirs.write_private_run_file``).
-    TODO(#38): add the notes command settings (``notes_context_cmd`` and its limits).
     """
     conf = {
         "v": 1,
         "input_files": list(input_files),
         "summary_max_bytes": summary_max_bytes,
         "artifact_max_bytes": artifact_max_bytes,
+        "notes": None if notes is None else notes.to_json(),
     }
     _check_hookconf(conf)
-    return json.dumps(conf, ensure_ascii=False).encode("utf-8")
+    data = json.dumps(conf, ensure_ascii=False).encode("utf-8")
+    if len(data) > HOOKCONF_MAX_BYTES:
+        raise HookEventError("hookconf.json would be too large")
+    return data
 
 
 def _cap(value: object) -> bool:
@@ -399,7 +418,11 @@ def _cap(value: object) -> bool:
 
 def _check_hookconf(conf: object) -> HookConf:
     """Validate a hookconf object."""
-    if not isinstance(conf, dict) or set(conf) != HOOKCONF_KEYS or conf["v"] != 1:
+    if (
+        not isinstance(conf, dict)
+        or set(conf) - HOOKCONF_OPTIONAL_KEYS != HOOKCONF_KEYS
+        or conf["v"] != 1
+    ):
         raise HookEventError("hookconf.json has an unknown shape")
     names = conf["input_files"]
     if not isinstance(names, list) or len(names) > HOOKCONF_MAX_INPUTS:
@@ -411,10 +434,17 @@ def _check_hookconf(conf: object) -> HookConf:
         raise HookEventError("hookconf.json has duplicate input names")
     if not _cap(conf["summary_max_bytes"]) or not _cap(conf["artifact_max_bytes"]):
         raise HookEventError("hookconf.json has an invalid size cap")
+    notes_conf = None
+    if conf.get("notes") is not None:
+        try:
+            notes_conf = NotesConf.from_json(conf["notes"])
+        except ValueError as exc:
+            raise HookEventError("hookconf.json has an invalid notes command") from exc
     return HookConf(
         input_files=names,
         summary_max_bytes=conf["summary_max_bytes"],
         artifact_max_bytes=conf["artifact_max_bytes"],
+        notes=notes_conf,
     )
 
 
@@ -504,13 +534,17 @@ def backstop_output() -> dict[str, Any]:
     return {"decision": "block", "reason": BACKSTOP_REASON}
 
 
-def session_start_output(csession_dir: str, run_no: int, inputs: list[str]) -> dict[str, Any]:
+def session_start_output(
+    csession_dir: str, run_no: int, inputs: list[str], notes_block: str | None = None
+) -> dict[str, Any]:
     """The context line (interface.md, Launch order): input paths are relative to the session
-    directory, and the inputs part is omitted when the run has none."""
+    directory, and the inputs part is omitted when the run has none. The fenced notes block
+    (``notes.fence``), when there is one, follows on the next line."""
     context = f"claude-session directory: {csession_dir}; run {run_no}"
     if inputs:
         context += "; inputs: " + ", ".join(f"inputs/{run_no}/{name}" for name in inputs)
-    # TODO(#38): append "\n<notes block>" when a notes command is configured.
+    if notes_block is not None:
+        context += "\n" + notes_block
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
 
 
@@ -847,13 +881,40 @@ def log_drain(log: _Log, drain: outbox.Drain) -> None:
             log.write("report_rejected", "warn", sid, run_no, reason=item.result, message=request)
 
 
+def notes_block(
+    gw: Gateway | None,
+    conf: NotesConf,
+    *,
+    state_dir: str,
+    log: _Log,
+    csession_id: str,
+    run_no: int,
+) -> str | None:
+    """Run the notes command with cwd = the state root and return its fenced block. Never
+    raises an ``Exception``: a failure is logged as ``notes_failed`` at ``warn`` (a fixed
+    phrase, or the exception type only) and the session starts without notes."""
+    try:
+        if gw is None:
+            from .gateway import SystemGateway  # lazy: only hooks that run notes load it
+
+            gw = SystemGateway()
+        return notes_command.run(gw, conf, cwd=state_dir)
+    except notes_command.NotesFailure as exc:
+        log.write("notes_failed", "warn", csession_id, run_no, message=str(exc))
+    except Exception as exc:
+        log.write("notes_failed", "warn", csession_id, run_no, message=type(exc).__name__)
+    return None
+
+
 def main(
     argv: list[str],
     *,
     stdin: BinaryIO | None = None,
     environ: Mapping[str, str] | None = None,
+    gw: Gateway | None = None,
 ) -> int:
-    """Handle one injected hook event (``hook-event --state-dir <abs> <Event>``)."""
+    """Handle one injected hook event (``hook-event --state-dir <abs> <Event>``). ``gw`` runs
+    the notes command (default: the real gateway, imported only then)."""
     data = read_payload(stdin)  # first: stdin is read to its end even for a rejected argv
     state_dir, cause = parse_argv(argv)
     csession_id = session_id_from(os.environ if environ is None else environ)
@@ -901,7 +962,18 @@ def main(
         if run.csession_dir is None or run.private_dir is None:
             raise HookEventError("session has no directories")
         conf = read_hookconf(run.private_dir, run.run_no)
-        output = session_start_output(run.csession_dir, run.run_no, conf.input_files)
+        block = None
+        if conf.notes is not None and hook.source in conf.notes.sources:
+            # After the transaction: the write lock is never held while the command runs.
+            block = notes_block(
+                gw,
+                conf.notes,
+                state_dir=state_dir,
+                log=log,
+                csession_id=csession_id,
+                run_no=run.run_no,
+            )
+        output = session_start_output(run.csession_dir, run.run_no, conf.input_files, block)
     if output is not None:
         sys.stdout.write(json.dumps(output) + "\n")
     return 0

@@ -22,11 +22,13 @@ from claude_session.gateway import (
     DEVNULL,
     Child,
     Gateway,
+    GatewayOutputLimit,
     GatewayTimeout,
     Inherit,
     Result,
     check_argv,
     check_kill_grace,
+    check_max_output,
     check_spawn_stdin,
 )
 
@@ -53,6 +55,7 @@ class Call:
     stderr: int | Inherit | None = None  # spawn only
     kill_grace: float | None = None  # run only
     executable: str | None = None  # the program run when argv[0] is only its name
+    max_output: int | None = None  # run only
 
 
 @dataclass(frozen=True)
@@ -168,9 +171,11 @@ class FakeGateway:
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        max_output: int | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(kill_grace, new_process_group=new_process_group)
+        check_max_output(max_output)
         args = tuple(argv)
         self.calls.append(
             Call(
@@ -184,6 +189,7 @@ class FakeGateway:
                 new_process_group=new_process_group,
                 kill_grace=kill_grace,
                 executable=executable,
+                max_output=max_output,
             )
         )
         response = self._answer(args)
@@ -198,7 +204,12 @@ class FakeGateway:
             if self._clock is not None:
                 self._clock.advance(timeout + (kill_grace or 0))
             raise GatewayTimeout(args, timeout)
-        return Result(args, response.returncode, response.stdout, response.stderr)
+        if max_output is not None and len(response.stdout.encode()) > max_output:
+            raise GatewayOutputLimit(args, max_output)
+        stderr = response.stderr
+        if max_output is not None:
+            stderr = stderr.encode()[:max_output].decode(errors="ignore")
+        return Result(args, response.returncode, response.stdout, stderr)
 
     def spawn(
         self,

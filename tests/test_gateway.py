@@ -1058,3 +1058,67 @@ def test_prctl_failure_surfaces_as_oserror(
     with pytest.raises(OSError):
         gw.spawn(py(f"open({str(marker)!r}, 'w').close()"), die_with_parent=True)
     assert not marker.exists()
+
+
+# --- output limit (the notes command: design.md, Hook-event fast path) ------------------
+
+
+def test_run_within_max_output_returns_the_output(gw: SystemGateway) -> None:
+    result = gw.run(py("import sys; sys.stdout.write('x' * 100)"), max_output=100, timeout=60)
+    assert (result.returncode, result.stdout) == (0, "x" * 100)
+
+
+def test_run_over_max_output_raises_and_reaps_the_child(gw: SystemGateway) -> None:
+    start = time.monotonic()
+    with pytest.raises(gateway.GatewayOutputLimit) as info:
+        gw.run(
+            py("import sys, time\nsys.stdout.write('x' * 101)\nsys.stdout.flush()\ntime.sleep(30)"),
+            max_output=100,
+            timeout=60,
+            new_process_group=True,
+        )
+    assert time.monotonic() - start < 10  # ended at once, not at the timeout
+    assert info.value.argv[0] == PY
+    assert info.value.limit == 100
+
+
+def test_run_endless_output_is_cut_off_at_the_limit(gw: SystemGateway) -> None:
+    """An endless writer never fills memory: it is ended once it passes the limit."""
+    with pytest.raises(gateway.GatewayOutputLimit):
+        gw.run(["/usr/bin/yes"], max_output=4096, timeout=60, new_process_group=True)
+
+
+def test_run_max_output_zero_refuses_any_output(gw: SystemGateway) -> None:
+    assert gw.run(py("pass"), max_output=0, timeout=60).stdout == ""
+    with pytest.raises(gateway.GatewayOutputLimit):
+        gw.run(py("print('x')"), max_output=0, timeout=60)
+
+
+def test_run_max_output_keeps_only_that_much_stderr(gw: SystemGateway) -> None:
+    result = gw.run(py("import sys; sys.stderr.write('e' * 100000)"), max_output=10, timeout=60)
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "e" * 10)
+
+
+def test_negative_max_output_is_refused(gw: SystemGateway) -> None:
+    with pytest.raises(ValueError):
+        gw.run([PY], max_output=-1)
+
+
+@linux_only
+def test_over_max_output_with_a_process_group_kills_grandchildren(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    pidfile = tmp_path / "pid"
+    with pytest.raises(gateway.GatewayOutputLimit):
+        gw.run(
+            [
+                "/bin/sh",
+                "-c",
+                f"/bin/sleep 30 >/dev/null 2>&1 & echo $! > {pidfile}; echo 0123456789; wait",
+            ],
+            new_process_group=True,
+            max_output=5,
+            timeout=60,
+        )
+    pid = _read_pid(pidfile, grandchildren)
+    assert _wait_dead(pid, 5)

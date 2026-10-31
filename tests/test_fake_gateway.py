@@ -201,3 +201,16 @@ def test_a_scripted_timeout_without_a_timeout_fails() -> None:
     fake.on(["/bin/sh"], timeout=True)
     with pytest.raises(AssertionError):
         fake.run(["/bin/sh", "-c", "hook"], new_process_group=True)
+
+
+def test_max_output_matches_the_real_gateway() -> None:
+    from claude_session.gateway import GatewayOutputLimit
+
+    fake = FakeGateway()
+    fake.on(["/bin/sh"], stdout="x" * 5, stderr="e" * 9)
+    assert fake.run(["/bin/sh"], max_output=5).stderr == "e" * 5
+    assert fake.calls[0].max_output == 5
+    with pytest.raises(GatewayOutputLimit):
+        fake.run(["/bin/sh"], max_output=4)
+    with pytest.raises(ValueError):
+        fake.run(["/bin/sh"], max_output=-1)

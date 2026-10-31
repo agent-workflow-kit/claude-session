@@ -54,6 +54,7 @@ from . import (
     ids,
     kinds,
     logs,
+    notes,
     pathrules,
     permission_profiles,
     secretindex,
@@ -72,7 +73,8 @@ from .errors import (
     LaunchValidationError,
     UsageError,
 )
-from .gateway import Gateway
+from .gateway import Gateway, sanitize_path
+from .hookevent import HookEventError
 from .sessiondir import InputFile, SessionDirs
 
 LOG_NAME = "log.jsonl"
@@ -399,6 +401,8 @@ class Validated:
     tmpdir: str | None
     warnings: list[str] = field(default_factory=list)
     credential_warnings: tuple[str, ...] = ()
+    notes_tool: pathrules.ResolvedTool | None = None
+    notes_problem: str | None = None  # why a kind with notes_context gets none (logged)
 
 
 def open_dirs(
@@ -692,6 +696,29 @@ def check_tools(
     return Tools(claude=claude, git=git, bwrap=bwrap, socat=socat)
 
 
+def resolve_notes(
+    cfg: Config,
+    resolution: kinds.Resolution,
+    process: Process,
+    writable: Callable[[str], bool],
+) -> tuple[pathrules.ResolvedTool | None, str | None]:
+    """The notes command's program, for a kind with ``notes_context``: resolved like the
+    other tools (the sanitized PATH, outside every session-writable path, run from its
+    realpath). A missing or unsafe program never fails the launch: the run gets no notes and
+    the second value says why (``prepare`` logs it as ``notes_failed``)."""
+    if not resolution.profile.notes_context:
+        return None, None
+    name = cfg.notes_context_cmd[0]
+    entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
+    try:
+        tool = pathrules.resolve_tool(name, entries, writable)
+    except LaunchValidationError as exc:
+        return None, f"notes command refused: {exc.message}"
+    if tool is None:
+        return None, f"notes command not found: {name!r}"
+    return tool, None
+
+
 def build_env(
     resolution: kinds.Resolution,
     cfg: Config,
@@ -831,6 +858,7 @@ def validate(
         check_hook_interpreter(process, writable)
         check_tmpdir(resolution, alloc)
         tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool)
+        notes_tool, notes_problem = resolve_notes(cfg, resolution, process, writable or NO_SANDBOX)
         session_env = build_env(resolution, cfg, process, alloc, cwd, git_dirs, tmp, writable)
         generated = generated_entries(resolution, tools, git_dirs, process)
         if isolated:
@@ -878,6 +906,8 @@ def validate(
         tmpdir=check.tmpdir,
         warnings=list(dict.fromkeys(warnings)),
         credential_warnings=tuple(credential),
+        notes_tool=notes_tool,
+        notes_problem=notes_problem,
     )
 
 
@@ -965,6 +995,66 @@ def secret_index(values: frozenset[str]) -> bytes:
         ) from exc
 
 
+def notes_conf(
+    st: store.Store,
+    cfg: Config,
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    v: Validated,
+    process: Process,
+    secrets: frozenset[str],
+) -> notes.NotesConf | None:
+    """The run's notes command for ``hookconf.json`` (None: no notes): the resolved program,
+    ``--repo`` and the session's labels as argv tokens, a minimal environment holding none of
+    the run's secret values, with the session's ``PATH`` sanitized, the timeout bounded by the
+    hook's budget (``notes.TIMEOUT_MAX``), the size cap and the sources (duplicates dropped).
+
+    TODO(#28): ``start`` freezes ``notes_context_cmd``, ``notes_context_max_bytes`` and
+    ``notes_context_sources`` with the launch spec (``lifecycle.FROZEN_CONFIG``), and
+    adoption takes them from there: interface.md (start) lists only the notes timeout among
+    the values adoption reads from the current config. The kind's ``notes_context`` is
+    already part of the resolved profile."""
+    if v.notes_tool is None:
+        return None
+    argv = notes.command_argv(
+        v.notes_tool.name,
+        cfg.notes_context_cmd,
+        repo=resolution.repo,
+        labels=st.session_labels(alloc.csession_id),
+    )
+    path = sanitize_path(v.session_env.env.get("PATH", ""))
+    return notes.NotesConf(
+        argv=argv,
+        executable=v.notes_tool.path,
+        env=notes.command_env(process.environ, path=path, secrets=secrets),
+        timeout=min(float(cfg.notes_context_timeout), notes.TIMEOUT_MAX),
+        max_bytes=cfg.notes_context_max_bytes,
+        sources=tuple(dict.fromkeys(cfg.notes_context_sources)),
+    )
+
+
+def hookconf(
+    names: list[str], cfg: Config, conf: notes.NotesConf | None
+) -> tuple[bytes, str | None]:
+    """``hookconf.json`` with the notes command; without it (and the reason, for the log)
+    when that would make the file too large (a very long command or many labels)."""
+
+    def build(notes_conf: notes.NotesConf | None) -> bytes:
+        return hookevent.hookconf_bytes(
+            names,
+            summary_max_bytes=cfg.summary_max_bytes,
+            artifact_max_bytes=cfg.artifact_max_bytes,
+            notes=notes_conf,
+        )
+
+    if conf is not None:
+        try:
+            return build(conf), None
+        except HookEventError:
+            return build(None), "notes command settings too large"
+    return build(None), None
+
+
 def prepare(
     st: store.Store,
     cfg: Config,
@@ -999,15 +1089,19 @@ def prepare(
     )
     values = envbuild.secret_values(v.session_env, process.environ, run_secret=secret.value)
     dirs.write_private_run_file(run, secretindex.INDEX_NAME, secret_index(values))
-    dirs.write_private_run_file(
-        run,
-        hookevent.HOOKCONF_NAME,
-        hookevent.hookconf_bytes(
-            names,
-            summary_max_bytes=cfg.summary_max_bytes,
-            artifact_max_bytes=cfg.artifact_max_bytes,
-        ),
-    )
+    conf = notes_conf(st, cfg, resolution, alloc, v, process, values)
+    data, notes_problem = hookconf(names, cfg, conf)
+    dirs.write_private_run_file(run, hookevent.HOOKCONF_NAME, data)
+    for problem in (v.notes_problem, notes_problem):
+        if problem is not None:  # never blocks the launch (design.md, Failure modes)
+            log_best_effort(
+                event_log(process, tuple(values)),
+                "notes_failed",
+                level="warn",
+                csession_id=sid,
+                run=run,
+                message=problem,
+            )
     snapshot = None
     if v.profile.is_file:
         snapshot = dirs.write_private_run_file(run, PROFILE_SNAPSHOT, v.profile.snapshot_bytes())
