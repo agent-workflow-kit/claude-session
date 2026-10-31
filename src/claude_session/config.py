@@ -15,6 +15,7 @@ Never imported by the hook path (design.md, Hook-event fast path): it needs Pyda
 from __future__ import annotations
 
 import copy
+import math
 import os
 import re
 import stat
@@ -732,8 +733,9 @@ def _read_bytes(path: Path, *, required: bool) -> bytes | None:
 
 def check_tree(data: dict[str, Any], path: Path) -> None:
     """Refuse (``UsageError``) trees over ``MAX_NODES`` nodes (aliases expanded) or
-    ``MAX_DEPTH`` levels, and non-string mapping keys. Shared (aliased) nodes are walked once
-    (memoized by identity). Also applied to JSON permission-profile files."""
+    ``MAX_DEPTH`` levels, non-string mapping keys and non-finite numbers (``.inf``, ``.nan``,
+    ``1e400``: not JSON). Shared (aliased) nodes are walked once (memoized by identity). Also
+    applied to JSON permission-profile files."""
     seen: dict[int, tuple[int, int]] = {}  # id -> (nodes, height)
 
     def too_deep() -> UsageError:
@@ -744,6 +746,9 @@ def check_tree(data: dict[str, Any], path: Path) -> None:
         if depth > MAX_DEPTH:
             raise too_deep()
         if not isinstance(node, (dict, list)):
+            if isinstance(node, float) and not math.isfinite(node):
+                detail = f"{where or 'top level'}: not a finite number (in {path})"
+                raise UsageError("invalid config", detail=detail)
             if node is None or isinstance(node, (str, int, float)):  # bool is an int
                 return 1, 0
             if isinstance(node, _Unsupported):

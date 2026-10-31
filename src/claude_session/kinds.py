@@ -144,6 +144,9 @@ class Resolution:
     # variable; only profile.env.allow (the kind's config env.allow) can.
     env_allow: tuple[str, ...] = ()
     env_allowlist_only: tuple[str, ...] | None = None
+    # TODO(#29): resume stores the snapshot path as the --permission-profile flag value (the
+    # docstring above relies on it) and passes the stored permission_profile label as
+    # expected_label when re-reading a carried snapshot (permission_profiles.select).
     permission_profile_file: str | None = None
 
     def isolated(self) -> bool:
@@ -421,6 +424,8 @@ def _check_profile_name(
             "permission_profile: names no built-in or configured permission profile"
             f" (in --permission-profile, {_LAYER_NAMES[origin]})"
         )
+        if origin == "previous_run":  # removed from config since: say how to recover
+            detail += "; use --reset permission-profile or give --permission-profile"
         raise UsageError("invalid flag value", detail=detail)
 
 

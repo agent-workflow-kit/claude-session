@@ -27,6 +27,9 @@ VARS = {
     "GIT_DIR": "/work/repo/.git",
 }
 # The label pattern shared by the dry-run, status and pre-launch schemas.
+# The session-writable path check of a run where nothing matches.
+NEVER = lambda path: False  # noqa: E731
+
 LABEL_PATTERNS = [
     json.loads((ROOT / "schemas" / rel).read_text(encoding="utf-8"))
     for rel in ("cli/exec-dry-run.json", "hooks/pre-launch.json")
@@ -57,8 +60,11 @@ def resolve(cfg: config.Config, kind: str, **kw: Any) -> kinds.Resolution:
 
 
 def select(cfg: config.Config, kind: str, **kw: Any) -> pp.Profile:
-    writable = kw.pop("session_writable", None)
-    return pp.select(cfg, resolve(cfg, kind, **kw), session_writable=writable)
+    writable = kw.pop("session_writable", NEVER)
+    expected = kw.pop("expected_label", None)
+    return pp.select(
+        cfg, resolve(cfg, kind, **kw), session_writable=writable, expected_label=expected
+    )
 
 
 def refused(call: Any, *args: Any, **kw: Any) -> InvalidPermissionProfile:
@@ -131,7 +137,7 @@ def test_unknown_name_in_a_resolution_is_refused(cfg_dir: Path) -> None:
     resolution = resolve(cfg, "implement")
     profile = resolution.profile.model_copy(update={"permission_profile": "missing"})
     broken = kinds.Resolution(**{**resolution.__dict__, "profile": profile})
-    assert "missing" in text_of(refused(pp.select, cfg, broken))
+    assert "missing" in text_of(refused(pp.select, cfg, broken, session_writable=NEVER))
 
 
 def test_unknown_flag_name_is_a_usage_error_before_selection(cfg_dir: Path) -> None:
@@ -439,7 +445,7 @@ def test_file_replaces_the_kind_profile_entirely(tmp_path: Path, cfg_dir: Path) 
 def test_invalid_files_fail(tmp_path: Path, raw: bytes, name: str, problem: str) -> None:
     path = tmp_path / name
     path.write_bytes(raw)
-    error = refused(pp.read_file, str(path), isolated=True)
+    error = refused(pp.read_file, str(path), isolated=True, session_writable=NEVER)
     assert problem in text_of(error)
     assert str(path) in text_of(error)
 
@@ -447,39 +453,47 @@ def test_invalid_files_fail(tmp_path: Path, raw: bytes, name: str, problem: str)
 def test_file_content_is_never_echoed(tmp_path: Path) -> None:
     path = tmp_path / "p.json"
     path.write_text('{"permissions": {"allow": "' + SECRET + '"}} trailing ' + SECRET)
-    assert SECRET not in text_of(refused(pp.read_file, str(path), isolated=True))
+    assert SECRET not in text_of(
+        refused(pp.read_file, str(path), isolated=True, session_writable=NEVER)
+    )
     path.write_text('{"permissions": {"allow": "' + SECRET + '"}}')
-    assert SECRET not in text_of(refused(pp.read_file, str(path), isolated=True))
+    assert SECRET not in text_of(
+        refused(pp.read_file, str(path), isolated=True, session_writable=NEVER)
+    )
 
 
 def test_file_larger_than_the_limit_fails(tmp_path: Path) -> None:
     path = tmp_path / "p.json"
     filler = " " * (pp.MAX_FILE_BYTES - 1)
     path.write_text("{}" + filler)
-    assert "larger than" in text_of(refused(pp.read_file, str(path), isolated=False))
+    assert "larger than" in text_of(
+        refused(pp.read_file, str(path), isolated=False, session_writable=None)
+    )
     path.write_text("{}" + filler[:-1])
-    assert pp.read_file(str(path), isolated=False).content == {}
+    assert pp.read_file(str(path), isolated=False, session_writable=None).content == {}
 
 
 def test_missing_file_fails(tmp_path: Path) -> None:
-    error = refused(pp.read_file, str(tmp_path / "missing.json"), isolated=False)
+    error = refused(
+        pp.read_file, str(tmp_path / "missing.json"), isolated=False, session_writable=None
+    )
     assert "cannot read" in text_of(error)
 
 
 def test_directory_fails(tmp_path: Path) -> None:
     (tmp_path / "d.json").mkdir()
-    refused(pp.read_file, str(tmp_path / "d.json"), isolated=False)
+    refused(pp.read_file, str(tmp_path / "d.json"), isolated=False, session_writable=None)
 
 
 def test_fifo_fails_without_blocking(tmp_path: Path) -> None:
     os.mkfifo(tmp_path / "p.json")
     assert "not a regular file" in text_of(
-        refused(pp.read_file, str(tmp_path / "p.json"), isolated=False)
+        refused(pp.read_file, str(tmp_path / "p.json"), isolated=False, session_writable=None)
     )
 
 
 def test_nul_in_the_path_fails(tmp_path: Path) -> None:
-    refused(pp.read_file, str(tmp_path) + "/p\x00.json", isolated=False)
+    refused(pp.read_file, str(tmp_path) + "/p\x00.json", isolated=False, session_writable=None)
 
 
 def test_unreadable_file_fails(tmp_path: Path) -> None:
@@ -487,7 +501,9 @@ def test_unreadable_file_fails(tmp_path: Path) -> None:
         pytest.skip("root reads anything")
     path = profile_file(tmp_path, {})
     path.chmod(0)
-    assert "cannot read" in text_of(refused(pp.read_file, str(path), isolated=False))
+    assert "cannot read" in text_of(
+        refused(pp.read_file, str(path), isolated=False, session_writable=None)
+    )
 
 
 def test_symlink_is_followed_and_checked_at_its_target(tmp_path: Path) -> None:
@@ -536,7 +552,9 @@ def test_refused_keys_apply_to_files(tmp_path: Path, cfg_dir: Path) -> None:
 
 def test_label_is_a_sha256_prefix_of_the_snapshot(tmp_path: Path) -> None:
     profile = pp.read_file(
-        str(profile_file(tmp_path, {"permissions": {"allow": ["Read"]}})), isolated=False
+        str(profile_file(tmp_path, {"permissions": {"allow": ["Read"]}})),
+        isolated=False,
+        session_writable=None,
     )
     snapshot = profile.snapshot_bytes()
     digest = hashlib.sha256(snapshot).hexdigest()
@@ -553,21 +571,21 @@ def test_snapshot_is_canonical_json(tmp_path: Path) -> None:
     a.write_text("sandbox: {}\npermissions:\n  allow: [Read, Grep]\n")
     b = tmp_path / "b.json"
     b.write_text('{ "permissions" : { "allow" : [ "Read", "Grep" ] }, "sandbox": {} }\n')
-    first = pp.read_file(str(a), isolated=False)
-    second = pp.read_file(str(b), isolated=False)
+    first = pp.read_file(str(a), isolated=False, session_writable=None)
+    second = pp.read_file(str(b), isolated=False, session_writable=None)
     assert first.snapshot_bytes() == second.snapshot_bytes()
     assert first.sha256 == second.sha256
 
 
 def test_snapshot_keeps_variables_unexpanded_and_unicode(tmp_path: Path) -> None:
     path = profile_file(tmp_path, {"permissions": {"allow": ["Edit(/${CWD}/é/**)"]}})
-    snapshot = pp.read_file(str(path), isolated=False).snapshot_bytes()
+    snapshot = pp.read_file(str(path), isolated=False, session_writable=None).snapshot_bytes()
     assert "${CWD}" in snapshot.decode("utf-8")
     assert "é" in snapshot.decode("utf-8")
 
 
 def test_write_snapshot_uses_the_injected_writer(tmp_path: Path) -> None:
-    profile = pp.read_file(str(profile_file(tmp_path, {})), isolated=False)
+    profile = pp.read_file(str(profile_file(tmp_path, {})), isolated=False, session_writable=None)
     written: list[tuple[str, bytes]] = []
     pp.write_snapshot(
         profile,
@@ -578,7 +596,7 @@ def test_write_snapshot_uses_the_injected_writer(tmp_path: Path) -> None:
 
 
 def test_write_snapshot_defaults_to_a_private_no_follow_write(tmp_path: Path) -> None:
-    profile = pp.read_file(str(profile_file(tmp_path, {})), isolated=False)
+    profile = pp.read_file(str(profile_file(tmp_path, {})), isolated=False, session_writable=None)
     dest = tmp_path / "private" / "runs" / "1" / pp.SNAPSHOT_NAME
     dest.parent.mkdir(parents=True)
     pp.write_snapshot(profile, str(dest))
@@ -610,7 +628,7 @@ def test_snapshot_is_carried_on_resume_and_the_file_is_never_re_read(
     previous = kinds.Previous(repo=None, flags={"permission_profile": str(snap1)})
     resolution = resolve(cfg, "review", previous=previous)
     assert resolution.origins["permission_profile_file"] == "previous_run"
-    run2 = pp.select(cfg, resolution)
+    run2 = pp.select(cfg, resolution, session_writable=NEVER, expected_label=run1.label)
     assert run2.content == run1.content
     assert run2.label == run1.label
     snap2 = tmp_path / "private" / "runs" / "2" / pp.SNAPSHOT_NAME
@@ -640,3 +658,174 @@ def test_carried_snapshot_is_checked_for_session_writable_paths(
 def test_fsutil_is_the_default_writer() -> None:
     defaults_ = pp.write_snapshot.__kwdefaults__
     assert defaults_ is not None and defaults_["write"] is fsutil.write_private_file
+
+
+# Review round 1: values a snapshot cannot hold, snapshot integrity, more refused keys
+
+
+@pytest.mark.parametrize(
+    ("raw", "name"),
+    [
+        (b'{"permissions": {"x": 1e400}}', "p.json"),
+        (b'{"permissions": {"x": [-1e400]}}', "p.json"),
+        (b"permissions: {x: .inf}\n", "p.yaml"),
+        (b"permissions: {x: -.inf}\n", "p.yaml"),
+        (b"permissions: {x: .nan}\n", "p.yaml"),
+        (b"permissions: {x: 1.0e+400}\n", "p.yaml"),
+    ],
+)
+def test_non_finite_numbers_in_a_file_fail(tmp_path: Path, raw: bytes, name: str) -> None:
+    path = tmp_path / name
+    path.write_bytes(raw)
+    error = refused(pp.read_file, str(path), isolated=False, session_writable=None)
+    assert "permissions.x" in text_of(error)
+    assert "not a finite number" in text_of(error)
+
+
+@pytest.mark.parametrize("number", [float("inf"), float("-inf"), float("nan")])
+def test_validate_refuses_non_finite_numbers(number: float) -> None:
+    error = refused(pp.validate, {"sandbox": {"network": {"x": [1, number]}}}, isolated=False)
+    assert "sandbox.network.x.1: not a finite number" in text_of(error)
+
+
+def test_canonical_json_refuses_non_finite_numbers() -> None:
+    with pytest.raises(ValueError):
+        pp._canonical({"x": float("inf")})
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {},
+        {"permissions": {"allow": ["Read", "Edit(/${CWD}/é/**)"], "x": [1, 2.5, -0.0, None]}},
+        {"sandbox": {"network": {"allowedDomains": []}, "y": {"z": True, "n": 10**30}}},
+    ],
+)
+@pytest.mark.parametrize("name", ["p.json", "p.yaml"])
+def test_every_accepted_snapshot_re_reads_to_the_same_label(
+    tmp_path: Path, content: Any, name: str
+) -> None:
+    first = pp.read_file(
+        str(profile_file(tmp_path, content, name)), isolated=False, session_writable=None
+    )
+    snapshot = tmp_path / pp.SNAPSHOT_NAME
+    pp.write_snapshot(first, str(snapshot))
+    again = pp.read_file(
+        str(snapshot), isolated=False, session_writable=None, expected_label=first.label
+    )
+    assert again.label == first.label
+    assert again.snapshot_bytes() == first.snapshot_bytes()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b'{"permissions": {"allow": ["\\ud800"]}}', b'{"permissions": {"\\udfff": []}}'],
+    ids=["value", "key"],
+)
+def test_lone_surrogates_in_json_fail(tmp_path: Path, raw: bytes) -> None:
+    path = tmp_path / "p.json"
+    path.write_bytes(raw)
+    error = refused(pp.read_file, str(path), isolated=False, session_writable=None)
+    assert error.detail == f"{path}: invalid string"
+
+
+def test_snapshot_bytes_are_frozen_at_read_time(tmp_path: Path) -> None:
+    path = profile_file(tmp_path, {"permissions": {"allow": ["Read"]}})
+    profile = pp.read_file(str(path), isolated=False, session_writable=None)
+    label = profile.label
+    profile.content["permissions"]["allow"].append("Bash")
+    snapshot = profile.snapshot_bytes()
+    assert "file:" + hashlib.sha256(snapshot).hexdigest()[: pp.HASH_PREFIX] == label
+    assert json.loads(snapshot) == {"permissions": {"allow": ["Read"]}}
+
+
+def test_snapshot_matching_its_recorded_label_is_accepted(tmp_path: Path, cfg_dir: Path) -> None:
+    profile = pp.read_file(
+        str(profile_file(tmp_path, {"permissions": {"allow": ["Read"]}})),
+        isolated=True,
+        session_writable=NEVER,
+    )
+    snapshot = tmp_path / pp.SNAPSHOT_NAME
+    pp.write_snapshot(profile, str(snapshot))
+    previous = kinds.Previous(repo=None, flags={"permission_profile": str(snapshot)})
+    carried = select(load(cfg_dir), "review", previous=previous, expected_label=profile.label)
+    assert carried.label == profile.label
+
+
+def test_edited_snapshot_is_refused(tmp_path: Path, cfg_dir: Path) -> None:
+    profile = pp.read_file(
+        str(profile_file(tmp_path, {"permissions": {"allow": ["Read"]}})),
+        isolated=True,
+        session_writable=NEVER,
+    )
+    snapshot = tmp_path / pp.SNAPSHOT_NAME
+    pp.write_snapshot(profile, str(snapshot))
+    snapshot.write_text('{"permissions":{"allow":["Bash","Read"]}}')
+    previous = kinds.Previous(repo=None, flags={"permission_profile": str(snapshot)})
+    error = refused(
+        select, load(cfg_dir), "review", previous=previous, expected_label=profile.label
+    )
+    assert error.detail == f"{snapshot}: snapshot does not match its recorded hash"
+
+
+NEW_REFUSED = [
+    (("sandbox", "enableWeakerNestedSandbox"), True),
+    (("sandbox", "ignoreViolations"), {"*": ["/"]}),
+    (("sandbox", "network", "allowUnixSockets"), ["/var/run/docker.sock"]),
+    (("sandbox", "network", "allowAllUnixSockets"), True),
+    (("sandbox", "network", "allowLocalBinding"), True),
+    (("sandbox", "network", "httpProxyPort"), 8080),
+    (("sandbox", "network", "socksProxyPort"), 1080),
+]
+
+
+def nested(loc: tuple[str, ...], value: Any) -> dict[str, Any]:
+    for part in reversed(loc):
+        value = {part: value}
+    return value
+
+
+@pytest.mark.parametrize(("loc", "value"), NEW_REFUSED)
+def test_sandbox_escape_keys_fail_isolated_runs(loc: tuple[str, ...], value: Any) -> None:
+    error = refused(pp.validate, nested(loc, value), isolated=True)
+    assert f"{'.'.join(loc)}: not allowed for isolated runs" in text_of(error)
+
+
+@pytest.mark.parametrize(("loc", "value"), NEW_REFUSED)
+def test_sandbox_escape_keys_are_allowed_for_trusted_runs(loc: tuple[str, ...], value: Any) -> None:
+    pp.validate(nested(loc, value), isolated=False)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["/home/u/../..", "/home/u/", "/home/u//.ssh", "//home/u", "/home/./u", "/home/u/."],
+)
+def test_non_normalized_variable_values_fail(value: str) -> None:
+    content = {"permissions": {"allow": ["Read(/${HOME}/.ssh/**)"]}}
+    error = refused(pp.expand, content, {**VARS, "HOME": value})
+    assert "HOME" in text_of(error)
+    assert value not in text_of(error)
+
+
+def test_root_is_a_normalized_variable_value() -> None:
+    expanded = pp.expand({"permissions": {"allow": ["Read(/${HOME}**)"]}}, {**VARS, "HOME": "/"})
+    assert expanded == {"permissions": {"allow": ["Read(//**)"]}}
+
+
+@pytest.mark.parametrize("call", ["select", "read_file"])
+def test_isolated_runs_require_the_session_writable_check(
+    tmp_path: Path, cfg_dir: Path, call: str
+) -> None:
+    path = profile_file(tmp_path, {})
+    with pytest.raises(ValueError, match="session_writable"):
+        if call == "read_file":
+            pp.read_file(str(path), isolated=True, session_writable=None)
+        else:
+            cfg = load(cfg_dir)
+            pp.select(cfg, resolve(cfg, "review"), session_writable=None)
+
+
+def test_session_writable_is_a_required_keyword() -> None:
+    for function in (pp.select, pp.read_file):
+        kwdefaults = function.__kwdefaults__ or {}
+        assert "session_writable" not in kwdefaults

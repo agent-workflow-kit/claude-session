@@ -1062,3 +1062,18 @@ def test_cli_load_config_requires_the_named_file(tmp_path: Path) -> None:
     with pytest.raises(UsageError) as info:
         cli.load_config(args)
     assert info.value.exit_code == 2
+
+
+def test_carried_profile_name_missing_from_config_hints_at_recovery(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"permission_profile": "gone"})
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", previous=previous)
+    detail = str(info.value.detail)
+    assert "previous run" in detail
+    assert "use --reset permission-profile or give --permission-profile" in detail
+
+
+def test_unknown_profile_name_given_now_has_no_reset_hint(cfg_dir: Path) -> None:
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", flags={"permission_profile": "gone"})
+    assert "--reset" not in str(info.value.detail)

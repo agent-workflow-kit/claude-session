@@ -1386,3 +1386,14 @@ def test_schema_defaults_equal_the_example_file() -> None:
 def test_positive_duration_that_underflows_to_zero_is_refused(cfg_dir: Path) -> None:
     write(cfg_dir / "config.yaml", "lost_grace: 0." + "0" * 400 + "1s\n")
     assert "lost_grace" in str(invalid(cfg_dir).detail)
+
+
+@pytest.mark.parametrize("number", [".inf", "-.inf", ".nan", "1.0e+400"])
+def test_non_finite_numbers_are_invalid(cfg_dir: Path, number: str) -> None:
+    write(
+        cfg_dir / "config.yaml",
+        f"permission_profiles: {{mine: {{sandbox: {{network: {{x: {number}}}}}}}}}\n",
+    )
+    detail = str(invalid(cfg_dir).detail)
+    assert "permission_profiles.mine.sandbox.network.x: not a finite number" in detail
+    assert number not in detail

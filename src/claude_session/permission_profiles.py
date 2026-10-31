@@ -13,6 +13,8 @@ launch path uses this module in this order:
    ``private/<id>/runs/<n>/permission-profile.json``. The run stores ``Profile.label``
    (``file:<sha256 prefix>``) and the snapshot path; a later run carries the snapshot path as
    its ``--permission-profile`` value, never the original path, so the file is never re-read.
+   A carried snapshot is read with ``expected_label`` (the stored label): an edited snapshot
+   fails.
 
 Every failure raises ``InvalidPermissionProfile`` (end reason ``invalid_permission_profile``).
 Messages name key paths and file paths, never values from the profile.
@@ -28,6 +30,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -44,12 +47,21 @@ SNAPSHOT_NAME = "permission-profile.json"
 HASH_PREFIX = 16  # hex characters of the sha256 in ``file:<prefix>`` (the schemas allow 12-64)
 MAX_FILE_BYTES = config.MAX_FILE_BYTES
 SECTIONS = ("permissions", "sandbox")
-# Keys an isolated run's profile may not set at all (interface.md, Permission profiles).
+# Keys an isolated run's profile may not set at all (interface.md, Permission profiles): the
+# generated isolation keys, and sandbox escapes (host sockets, local listeners, proxies, a
+# weaker sandbox, ignored violations).
 REFUSED_ISOLATED = (
     ("sandbox", "enabled"),
     ("sandbox", "failIfUnavailable"),
     ("sandbox", "allowUnsandboxedCommands"),
     ("sandbox", "excludedCommands"),
+    ("sandbox", "enableWeakerNestedSandbox"),
+    ("sandbox", "ignoreViolations"),
+    ("sandbox", "network", "allowUnixSockets"),
+    ("sandbox", "network", "allowAllUnixSockets"),
+    ("sandbox", "network", "allowLocalBinding"),
+    ("sandbox", "network", "httpProxyPort"),
+    ("sandbox", "network", "socksProxyPort"),
     ("permissions", "additionalDirectories"),
 )
 # ... and this one only as anything but false (the generated value is false).
@@ -72,8 +84,8 @@ STRINGS = (("permissions", "defaultMode"),)
 
 # Every `${`: a well-formed reference is `${NAME}`; anything else fails.
 _REFERENCE = re.compile(r"\$\{([^}]*)\}")
-# Variable values are absolute paths; glob and escape characters would change the meaning of
-# the rules they are put into, so they fail (as do control characters).
+# Variable values are normalized absolute paths; glob and escape characters would change the
+# meaning of the rules they are put into, so they fail (as do control characters).
 _UNSAFE_VALUE = re.compile(r"[*?\[\]{}\\\x00-\x1f\x7f-\x9f]")
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
@@ -81,47 +93,59 @@ _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 @dataclass(frozen=True)
 class Profile:
     """A selected permission profile. ``content`` is unexpanded; ``name`` is the config name
-    (None for a file); ``sha256`` is the hash of the snapshot (file profiles only)."""
+    (None for a file); ``snapshot`` is the canonical JSON of a file profile, fixed when the
+    file is read, so the snapshot, ``sha256`` and ``label`` agree even if ``content`` is
+    changed later."""
 
     name: str | None
     content: dict[str, Any]
-    sha256: str | None = None
+    snapshot: bytes | None = None
 
     @property
     def is_file(self) -> bool:
-        return self.sha256 is not None
+        return self.snapshot is not None
+
+    @property
+    def sha256(self) -> str | None:
+        """The hash of the snapshot (file profiles only)."""
+        return None if self.snapshot is None else hashlib.sha256(self.snapshot).hexdigest()
 
     @property
     def label(self) -> str:
         """The name, or ``file:<sha256 prefix>`` (status, dry run, pre-launch payloads)."""
-        if self.sha256 is None:
+        digest = self.sha256
+        if digest is None:
             assert self.name is not None
             return self.name
-        return "file:" + self.sha256[:HASH_PREFIX]
+        return "file:" + digest[:HASH_PREFIX]
 
     def snapshot_bytes(self) -> bytes:
-        """The snapshot of a file profile: canonical JSON of the unexpanded content."""
-        if self.sha256 is None:
+        """The snapshot of a file profile: canonical JSON of the unexpanded content, as read."""
+        if self.snapshot is None:
             raise ValueError("only file profiles are snapshotted")
-        return _canonical(self.content)
+        return self.snapshot
 
 
 def select(
     cfg: config.Config,
     resolution: kinds.Resolution,
     *,
-    session_writable: Callable[[str], bool] | None = None,
+    session_writable: Callable[[str], bool] | None,
+    expected_label: str | None = None,
 ) -> Profile:
     """The run's profile for ``resolution``: the file in
     ``permission_profile_file`` when set (a flag given now, or the previous run's snapshot),
     else the config profile ``profile.permission_profile``. Validated for the run's isolation.
-    ``session_writable`` is the session-writable path check (see ``read_file``)."""
+    ``session_writable`` and ``expected_label`` are passed to ``read_file`` (required for
+    isolated runs; None only for trusted ones)."""
     isolated = resolution.isolated()
+    _require_check(isolated, session_writable)
     if resolution.permission_profile_file is not None:
         return read_file(
             resolution.permission_profile_file,
             isolated=isolated,
             session_writable=session_writable,
+            expected_label=expected_label,
         )
     name = resolution.profile.permission_profile
     configured = cfg.permission_profiles.get(name)
@@ -144,15 +168,19 @@ def read_file(
     value: str,
     *,
     isolated: bool,
-    session_writable: Callable[[str], bool] | None = None,
+    session_writable: Callable[[str], bool] | None,
+    expected_label: str | None = None,
 ) -> Profile:
     """Read, parse and validate the profile file ``value`` (relative to the current directory).
 
     ``.json`` files are strict JSON; anything else is YAML with the config-file rules. For
     isolated runs, a file whose real path ``session_writable`` accepts is refused before it is
-    read; the file is then opened at that real path without following symlinks, so a swap
-    after the check fails. At most ``MAX_FILE_BYTES``; regular files only."""
+    read (the check is required for them: None raises ``ValueError``); the file is then
+    opened at that real path without following symlinks, so a swap after the check fails. At
+    most ``MAX_FILE_BYTES``; regular files only. With ``expected_label`` (a carried snapshot's
+    recorded ``file:<prefix>``), a file whose label differs fails."""
     # TODO(#24): the launch path passes the session-writable path check here.
+    _require_check(isolated, session_writable)
     problem: str | None = None
     try:
         path = os.path.realpath(value)
@@ -168,15 +196,28 @@ def read_file(
     raw = _read_bytes(path)
     data = _parse(raw, path, json_file=value.endswith(".json"))
     validate(data, isolated=isolated, source=path)
-    return Profile(name=None, content=data, sha256=hashlib.sha256(_canonical(data)).hexdigest())
+    profile = Profile(name=None, content=data, snapshot=_canonical(data))
+    if expected_label is not None and profile.label != expected_label:
+        raise InvalidPermissionProfile(
+            "invalid permission profile",
+            detail=f"{path}: snapshot does not match its recorded hash",
+        )
+    return profile
+
+
+def _require_check(isolated: bool, session_writable: Callable[[str], bool] | None) -> None:
+    if isolated and session_writable is None:
+        raise ValueError("isolated runs need the session_writable path check")
 
 
 def validate(content: Any, *, isolated: bool, source: str = "permission profile") -> None:
     """Check ``content``: a mapping of ``permissions`` and ``sandbox`` mappings whose known
-    rule lists are lists of strings. For isolated runs, also the refused keys. Raises
-    ``InvalidPermissionProfile`` listing every problem (key paths only)."""
+    rule lists are lists of strings and whose numbers are finite. For isolated runs, also the
+    refused keys. Raises ``InvalidPermissionProfile`` listing every problem (key paths only)."""
     # TODO(#24): refused paths (state root, /tmp/csession-<uid>, unsafe write targets) are
-    # checked on the expanded profile, for trusted and isolated runs.
+    # checked on the expanded profile, for trusted and isolated runs; for isolated runs also
+    # sandbox.filesystem.allowRead against the read_dirs credential paths (interface.md, Path
+    # rules), which this module does not check.
     problems = _shape(content)
     if not problems and isolated:
         problems = _refused(content)
@@ -214,7 +255,10 @@ def write_snapshot(
     ``private/<id>/runs/<n>/permission-profile.json``) with ``write`` (default: atomic, mode
     0600, no-follow)."""
     # TODO(#15): the launch path passes the run's private directory from the session-directory
-    # helpers (#11) and records the label and snapshot path in the run row.
+    # helpers (#11) and records the label and snapshot path in the run row. It reads and
+    # snapshots the file at `start` (a relative path resolves against the caller's cwd there,
+    # never at a later `exec`) and rewrites the stored --permission-profile flag value to the
+    # snapshot path.
     write(path, profile.snapshot_bytes())
 
 
@@ -291,6 +335,8 @@ def _parse(raw: bytes, path: str, *, json_file: bool) -> Any:
         raise invalid(problem)
     if not isinstance(data, dict):
         raise invalid(f"top level: expected a mapping (in {path})")
+    if not _encodable(data):  # a lone surrogate (\ud800) is valid JSON but not UTF-8
+        raise invalid(f"{path}: invalid string")
     try:
         config.check_tree(data, Path(path))  # the config node and depth limits
     except UsageError as exc:
@@ -317,8 +363,25 @@ def _no_constant(name: str) -> Any:
     raise ValueError("NaN and Infinity are not JSON")
 
 
+def _encodable(node: Any) -> bool:
+    """Whether every string (key or value) in ``node`` encodes as UTF-8."""
+    if isinstance(node, str):
+        try:
+            node.encode("utf-8")
+        except UnicodeEncodeError:
+            return False
+        return True
+    if isinstance(node, dict):
+        return all(_encodable(key) and _encodable(value) for key, value in node.items())
+    if isinstance(node, list):
+        return all(_encodable(value) for value in node)
+    return True
+
+
 def _canonical(content: Mapping[str, Any]) -> bytes:
-    text = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    text = json.dumps(
+        content, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
     return text.encode("utf-8")
 
 
@@ -336,6 +399,7 @@ def _shape(content: Any) -> list[str]:
             problems.append(f"{key}: expected a mapping")
     if problems:
         return problems
+    problems.extend(_non_finite(content, ""))
     for loc in MAPPINGS:
         found, value = _get(content, loc)
         if found and not isinstance(value, dict):
@@ -358,6 +422,18 @@ def _shape(content: Any) -> list[str]:
             if not isinstance(item, str)
         )
     return problems
+
+
+def _non_finite(node: Any, where: str) -> list[str]:
+    if isinstance(node, float) and not math.isfinite(node):
+        return [f"{where}: not a finite number"]
+    if isinstance(node, dict):
+        return [p for key, value in node.items() for p in _non_finite(value, _join(where, key))]
+    if isinstance(node, list):
+        return [
+            p for index, value in enumerate(node) for p in _non_finite(value, f"{where}.{index}")
+        ]
+    return []
 
 
 def _refused(content: dict[str, Any]) -> list[str]:
@@ -408,8 +484,15 @@ def _expand_string(text: str, where: str, variables: Mapping[str, str | None]) -
         value = variables.get(name)
         if not value:
             raise fail(f"${{{name}}} expands empty")
-        if not os.path.isabs(value) or _UNSAFE_VALUE.search(value):
+        if not _normalized_absolute(value) or _UNSAFE_VALUE.search(value):
             raise fail(
-                f"${{{name}}} is not an absolute path free of glob, escape and control characters"
+                f"${{{name}}} is not a normalized absolute path free of glob, escape and"
+                " control characters"
             )
     return _REFERENCE.sub(lambda m: str(variables[m.group(1)]), text)
+
+
+def _normalized_absolute(value: str) -> bool:
+    """An absolute path with no ``.`` or ``..`` segment, no ``//`` and no trailing ``/``
+    (``/`` itself is allowed here; whether it is a safe rule target is a path rule)."""
+    return os.path.isabs(value) and os.path.normpath(value) == value and not value.startswith("//")
