@@ -625,11 +625,11 @@ def test_a_launch_spec_edited_to_change_the_actor_or_decision_ids_is_refused_at_
     assert len(starts(env)) == 1
 
 
-def test_a_launch_spec_cannot_turn_the_flag_on(env: Env) -> None:
+def pending_trusted_run_tainted_after_start(env: Env) -> str:
     # A trusted pending run of a session that was untainted at start (so the row records no
     # --allow-tainted) and is tainted before adoption.
     sid = exec_session(env)["csession_id"]
-    proc, out = run_cs(env, ["start", "--json", "--resume", sid, *TRUSTED])
+    proc, _out = run_cs(env, ["start", "--json", "--resume", sid, *TRUSTED])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert store.ALLOW_TAINTED not in json.loads(env.run_row(sid, 2)["invocation_json"])
     env.write_db(
@@ -637,16 +637,31 @@ def test_a_launch_spec_cannot_turn_the_flag_on(env: Env) -> None:
         " WHERE csession_id = ?",
         (sid,),
     )
+    return sid
+
+
+def test_a_launch_spec_has_no_key_that_turns_the_flag_on(env: Env) -> None:
+    sid = pending_trusted_run_tainted_after_start(env)
     spec = env.private_run(sid, 2) / "launch-spec.json"
     data = json.loads(spec.read_text())
     data["request"]["allow_tainted"] = {"tty": True}
     data["allow_tainted"] = {"tty": True}
     spec.write_text(json.dumps(data))
     proc, out = env.adopt(sid)
-    assert proc.returncode in (12, 20), out
-    assert out.get("end_reason") in ("session_dir_unsafe", "launch_interrupted") or (
-        out["error"]["reason"] == "tainted"
-    ), out
+    assert proc.returncode == 12, out
+    assert (out["outcome"], out["end_reason"]) == ("not-started", "session_dir_unsafe")
+    assert tainted_records(env) == []
+    assert len(starts(env)) == 1
+    assert is_tainted(env, sid)
+
+
+def test_an_untouched_launch_spec_of_a_run_tainted_after_start_is_refused_as_tainted(
+    env: Env,
+) -> None:
+    sid = pending_trusted_run_tainted_after_start(env)
+    proc, out = env.adopt(sid)
+    assert proc.returncode == 20, out
+    assert out["error"]["reason"] == "tainted"
     assert tainted_records(env) == []
     assert len(starts(env)) == 1
     assert is_tainted(env, sid)
