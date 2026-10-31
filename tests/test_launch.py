@@ -164,6 +164,48 @@ def test_claude_resolves_to_its_realpath_with_its_name(tmp_path: Path) -> None:
     assert tools.bwrap is None and tools.socat is None  # sandbox off: never looked up
 
 
+# The claude --version check
+
+
+def test_the_version_probe_path_is_the_tool_lookup_path_without_writable_entries(
+    tmp_path: Path,
+) -> None:
+    """``claude`` was looked up on ``env.path_prepend`` then the caller's ``PATH``; its
+    ``#!/usr/bin/env node`` line finds ``node`` there too, never under a writable path."""
+    prepend, unsafe = tmp_path / "prepend", tmp_path / "cwd" / "bin"
+    prepend.mkdir()
+    unsafe.mkdir(parents=True)
+    cfg = load(tmp_path, f"kinds:\n  implement:\n    env:\n      path_prepend: [{prepend}]\n")
+    proc = process(tmp_path, PATH=f"{unsafe}:rel:/usr/bin:/bin", ANTHROPIC_API_KEY="sk-secret")
+    gw = proc.gateway
+    assert isinstance(gw, FakeGateway)
+    gw.on(["claude", "--version"], stdout="2.1.312 (Claude Code)\n")
+    claude = pathrules.ResolvedTool("/opt/claude/claude", "claude")
+    writable = pathrules.SessionWritable([str(tmp_path / "cwd")])
+    text = launch.check_claude_version(cfg, resolution(cfg), proc, claude, writable)
+    assert text == "2.1.312 (Claude Code)"
+    (call,) = gw.calls
+    assert call.env is not None
+    assert call.env["PATH"] == f"{prepend}:/usr/bin:/bin"
+    assert "ANTHROPIC_API_KEY" not in call.env
+    assert (call.executable, call.argv, call.cwd) == (
+        "/opt/claude/claude",
+        ("claude", "--version"),
+        "/",
+    )
+
+
+def test_the_version_check_uses_the_configured_minimum(tmp_path: Path) -> None:
+    cfg = load(tmp_path, "min_claude_version: '3'\n")
+    proc = process(tmp_path)
+    assert isinstance(proc.gateway, FakeGateway)
+    proc.gateway.on(["claude", "--version"], stdout="2.9.999 (Claude Code)\n")
+    claude = pathrules.ResolvedTool("/opt/claude/claude", "claude")
+    with pytest.raises(LaunchValidationError) as info:
+        launch.check_claude_version(cfg, resolution(cfg), proc, claude, launch.NO_SANDBOX)
+    assert info.value.end_reason == "claude_too_old"
+
+
 def test_a_git_that_changed_once_every_writable_path_is_known_is_refused(tmp_path: Path) -> None:
     claude = executable(tmp_path / "bin" / "claude")
     cfg = load(tmp_path, f"claude_bin: {claude}\n")

@@ -31,8 +31,6 @@ TODO(#28): ``start`` stores the request and the resolved spec; adoption reruns `
 and ``prepare`` for the pending run.
 TODO(#29): resume and fork build their request from the previous run (carry-over).
 TODO(#31): launch step 6, the ``pre-launch`` hooks, between ``validate`` and ``prepare``.
-TODO(#40): ``claude --version`` against ``min_claude_version`` (``claude_too_old``) in
-``validate``, after ``claude_bin`` is resolved.
 """
 
 from __future__ import annotations
@@ -48,6 +46,7 @@ from typing import Any
 
 from . import (
     audit,
+    claude_version,
     envbuild,
     gitinfo,
     hookevent,
@@ -849,6 +848,46 @@ def check_tools(
     return Tools(claude=claude, git=git, bwrap=bwrap, socat=socat)
 
 
+def check_claude_version(
+    cfg: Config,
+    resolution: kinds.Resolution,
+    process: Process,
+    claude: pathrules.ResolvedTool,
+    writable: Callable[[str], bool],
+) -> str:
+    """``claude --version`` against ``min_claude_version`` (``claude_too_old``;
+    ``claude_not_found`` when it cannot run), with ``claude_version.require``: in ``/``, a
+    minimal environment and its own process group. Its ``PATH`` is the one the tools were
+    looked up on (``env.path_prepend``, then the caller's) without any entry under
+    ``writable``. Returns the version text."""
+    entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
+    environ = {**process.environ, "PATH": ":".join(entries)}
+    return claude_version.require(
+        claude, environ, process.gateway, cfg.min_claude_version, writable=writable
+    )
+
+
+def dry_run_writable(
+    resolution: kinds.Resolution,
+    profile: permission_profiles.Profile,
+    process: Process,
+    caller_cwd: str | None,
+    git_dirs: gitinfo.GitDirs | None,
+) -> pathrules.SessionWritable | None:
+    """The paths a dry run never runs a binary under, for trusted and isolated kinds alike:
+    the step-2 set (``step2_writable``) and the kind's paths known without a session
+    (``known_write_paths``, the git directory known). None when they are not known."""
+    known = known_write_paths(
+        resolution, profile, process, caller_cwd=caller_cwd, git_dirs=git_dirs, git_known=True
+    )
+    if known is None:
+        return None
+    return pathrules.SessionWritable([*step2_writable(process, caller_cwd).paths, *known.paths])
+
+
+VERSION_NOT_PROBED = "claude --version not run (not probed by a dry run: {why})"
+
+
 def build_env(
     resolution: kinds.Resolution,
     cfg: Config,
@@ -959,6 +998,8 @@ class Effects:
       also when a later check fails).
     - ``warn``: each warning as ``checks`` finds it, in order (a dry run keeps them when a
       later check fails); ``Checked.warnings`` holds the same list either way.
+    - ``claude_version``: the version check; a dry run never runs a ``claude`` under the
+      paths it knows a session could write, also for trusted kinds (``dry_run_writable``).
     """
 
     planned = True
@@ -988,6 +1029,38 @@ class Effects:
         self, resolution: kinds.Resolution, alloc: Allocated, tools: Tools, process: Process
     ) -> selfcheck.SelfCheck:
         return check_sandbox(resolution, alloc, tools, process, create=False)
+
+    def claude_version(
+        self,
+        cfg: Config,
+        resolution: kinds.Resolution,
+        process: Process,
+        tools: Tools,
+        writable: Callable[[str], bool],
+        dry_run: Callable[[], pathrules.SessionWritable | None],
+    ) -> list[str]:
+        """The version check of a dry run: ``claude`` resolved again against the paths a
+        dry run never runs a binary under (``dry_run``, trusted kinds too); under one of
+        them, or when they are not known, it is not run and a warning says so (a trusted
+        kind's launch would run it). Otherwise ``check_claude_version`` as a launch makes
+        it, the probe's ``PATH`` without those paths either."""
+        guard = dry_run()
+        if guard is None:
+            why = "the permission profile or write_dirs are not known"
+            return [VERSION_NOT_PROBED.format(why=why)]
+        entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
+        try:
+            claude = pathrules.resolve_tool(cfg.claude_bin, entries, guard)
+        except LaunchValidationError as error:
+            return [VERSION_NOT_PROBED.format(why=error.message)]
+        if claude is None:  # check_tools found it; it has gone since
+            raise LaunchValidationError(
+                f"claude not found: {cfg.claude_bin!r}",
+                end_reason="claude_not_found",
+                hint=HINTS["claude_not_found"],
+            )
+        check_claude_version(cfg, resolution, process, claude, guard)
+        return []
 
 
 class Recording(Effects):
@@ -1022,6 +1095,20 @@ class Recording(Effects):
             self.st.update_session(alloc.csession_id, tmp_dir=check.tmpdir)
         return check
 
+    def claude_version(
+        self,
+        cfg: Config,
+        resolution: kinds.Resolution,
+        process: Process,
+        tools: Tools,
+        writable: Callable[[str], bool],
+        dry_run: Callable[[], pathrules.SessionWritable | None],
+    ) -> list[str]:
+        """The launch's version check: the ``claude`` ``check_tools`` accepted, its probe's
+        ``PATH`` without the run's session-writable paths (``writable``)."""
+        check_claude_version(cfg, resolution, process, tools.claude, writable)
+        return []
+
 
 def checks(
     cfg: Config,
@@ -1036,7 +1123,8 @@ def checks(
     write entries and ``write_dirs`` without ``${GIT_DIR}`` expanded), git and the git
     directory, the profile expanded, ``read_dirs``/``write_dirs``, the profile file against
     the full set, the profile's paths, plugin directories, the hook interpreter, the tmpdir,
-    the tools (``claude_bin``, ``git``, ``bwrap``, ``socat``), the session environment
+    the tools (``claude_bin``, ``git``, ``bwrap``, ``socat``), ``claude --version`` against
+    ``min_claude_version`` (``effects.claude_version``), the session environment
     (``PATH``), the generated read entries, ``claude_args``, setting sources and the sandbox
     self-check, which creates the private tmpdir last. What a launch records and creates in
     between goes through ``effects``. Raises ``LaunchValidationError``; the first failure
@@ -1072,6 +1160,16 @@ def checks(
     check_hook_interpreter(process, writable)
     check_tmpdir(resolution, alloc)
     tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool)
+    version_warnings = effects.claude_version(
+        cfg,
+        resolution,
+        process,
+        tools,
+        writable or NO_SANDBOX,
+        lambda: dry_run_writable(resolution, profile, process, resolved.caller_cwd, git_dirs),
+    )
+    warnings += version_warnings
+    effects.warn(version_warnings)
     session_env = build_env(resolution, cfg, process, alloc, cwd, git_dirs, tmp, writable)
     generated = generated_entries(resolution, tools, git_dirs, process)
     if isolated:

@@ -174,6 +174,7 @@ class Gateway(Protocol):
         kill_grace: float | None = None,
         executable: str | None = None,
         kill_group_on_exit: bool = False,
+        max_output: int | None = None,
     ) -> Result:
         """Run to completion, capturing text output. ``new_process_group`` puts the child in
         its own process group, which a timeout ends as a whole; ``kill_grace`` (only with a
@@ -186,8 +187,10 @@ class Gateway(Protocol):
         while waiting (a signal handler raising, ``KeyboardInterrupt`` included) ends the child
         the same way, then propagates (on Linux; best effort without ``os.waitid``, see
         ``GatewayTimeout``); one raised during the grace still gets the group SIGKILL and the
-        leader reaped first. Raises ``GatewayTimeout``, and ``OSError`` when the
-        program cannot be started."""
+        leader reaped first. ``max_output`` (positive) keeps at most that many bytes of each
+        stream; the rest is read and dropped, so a program that floods its output costs no
+        more memory. Raises ``GatewayTimeout``, and ``OSError`` when the program cannot be
+        started."""
         ...
 
     def spawn(
@@ -273,6 +276,12 @@ def check_kill_grace(
         raise ValueError("kill_grace needs new_process_group (it applies to the group)")
     if kill_grace < 0:
         raise ValueError(f"kill_grace must not be negative, got {kill_grace}")
+
+
+def check_max_output(max_output: int | None) -> None:
+    """``run``'s ``max_output`` contract, shared with the fakes."""
+    if max_output is not None and max_output <= 0:
+        raise ValueError(f"max_output must be positive, got {max_output}")
 
 
 def _child_env(
@@ -507,15 +516,18 @@ def _exchange(
     timeout: float | None,
     *,
     kill_group: bool = False,
+    max_output: int | None = None,
 ) -> tuple[bytes, bytes]:
     """Like ``Popen.communicate``: write ``data`` to stdin, read stdout and stderr to EOF,
     wait for the exit; ``subprocess.TimeoutExpired`` after ``timeout`` seconds. Unlike it, the
-    child is never reaped before it has exited, even when interrupted (see the module docs)."""
+    child is never reaped before it has exited, even when interrupted (see the module docs).
+    With ``max_output``, at most that many bytes of each stream are kept."""
     deadline = None if timeout is None else time.monotonic() + timeout
     assert popen.stdout is not None and popen.stderr is not None
     out_fd, err_fd = popen.stdout.fileno(), popen.stderr.fileno()
     readers = {out_fd: popen.stdout, err_fd: popen.stderr}
     output: dict[int, list[bytes]] = {fd: [] for fd in readers}
+    kept = dict.fromkeys(readers, 0)
     pending = memoryview(data or b"")
     with selectors.DefaultSelector() as selector:
         for fd in readers:
@@ -545,10 +557,14 @@ def _exchange(
                     continue
                 chunk = os.read(key.fd, _READ_SIZE)
                 if chunk:
-                    output[key.fd].append(chunk)
-                else:
-                    selector.unregister(key.fd)
-                    readers[key.fd].close()
+                    if max_output is not None:
+                        chunk = chunk[: max(0, max_output - kept[key.fd])]
+                        kept[key.fd] += len(chunk)
+                    if chunk:
+                        output[key.fd].append(chunk)
+                    continue
+                selector.unregister(key.fd)
+                readers[key.fd].close()
     _wait_exited(popen, deadline, timeout, kill_group=kill_group)
     return b"".join(output[out_fd]), b"".join(output[err_fd])
 
@@ -602,11 +618,13 @@ class SystemGateway:
         kill_grace: float | None = None,
         executable: str | None = None,
         kill_group_on_exit: bool = False,
+        max_output: int | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(
             kill_grace, new_process_group=new_process_group, kill_group_on_exit=kill_group_on_exit
         )
+        check_max_output(max_output)
         args = tuple(argv)
         data = None if stdin is None else stdin.encode("utf-8", "replace")
         with subprocess.Popen(
@@ -620,7 +638,9 @@ class SystemGateway:
             process_group=0 if new_process_group else None,
         ) as popen:
             try:
-                out, err = _exchange(popen, data, timeout, kill_group=kill_group_on_exit)
+                out, err = _exchange(
+                    popen, data, timeout, kill_group=kill_group_on_exit, max_output=max_output
+                )
             except subprocess.TimeoutExpired:
                 _end(popen, group=new_process_group, kill_grace=kill_grace)
                 raise GatewayTimeout(args, timeout) from None

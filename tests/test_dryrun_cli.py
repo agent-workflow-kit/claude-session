@@ -1454,3 +1454,121 @@ def test_a_trusted_kinds_git_dir_write_entry_probes_nothing(
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)["claude_bin_resolved"] is None
     assert not log.exists()
+
+
+# The claude --version check (interface.md, Launch order step 5: claude_too_old)
+
+
+def old_claude(tmp_path: Path, version: str = "2.0.1 (Claude Code)") -> None:
+    # The probe gets a minimal environment, so the fake's version comes from its scenario.
+    write_json(tmp_path / "scenario.json", {"steps": [], "version": version})
+
+
+@pytest.mark.parametrize("kind", ["implement", "review"])
+def test_an_old_claude_would_fail_claude_too_old(
+    kind: str, tmp_path: Path, tools: Path, work: Path
+) -> None:
+    old_claude(tmp_path)
+    git_repo(work)
+    proc, plan = dry_run(kind, cwd=work, tools=tools, tmp_path=tmp_path)
+    assert proc.returncode == 12
+    assert plan["would_fail"] == "claude_too_old"
+    assert plan["claude_argv"] == [] and plan["settings"] == {}
+    (failure,) = [w for w in plan["warnings"] if w.startswith("a launch would fail")]
+    assert "claude_too_old" in failure and "2.0.1 (Claude Code)" in failure
+    assert "2.1.312" in failure and "upgrade Claude Code" in failure
+
+
+@pytest.mark.parametrize(
+    ("config", "env"),
+    [("min_claude_version: '2.0'\n", {}), ("", {"CSESSION_MIN_CLAUDE_VERSION": "2.0.1"})],
+)
+def test_min_claude_version_comes_from_the_config_and_environment(
+    config: str, env: dict[str, str], tmp_path: Path, tools: Path, work: Path
+) -> None:
+    old_claude(tmp_path)
+    proc, plan = dry_run(
+        "implement", cwd=work, tools=tools, tmp_path=tmp_path, config=config, env=env
+    )
+    assert proc.returncode == 0, plan["warnings"]
+    assert plan["would_fail"] is None
+
+
+def test_a_newer_minimum_fails_a_current_claude(tmp_path: Path, tools: Path, work: Path) -> None:
+    proc, plan = dry_run(
+        "implement", cwd=work, tools=tools, tmp_path=tmp_path, config="min_claude_version: '99'\n"
+    )
+    assert proc.returncode == 12 and plan["would_fail"] == "claude_too_old"
+
+
+def test_the_version_is_checked_before_path(tmp_path: Path, tools: Path, work: Path) -> None:
+    """Launch order: ``claude_bin``, then ``claude --version``, then ``PATH``. A ``PATH``
+    entry inside the cwd fails an isolated run (``unsafe_path``), but only after the
+    version check; the probe's own ``PATH`` drops that entry."""
+    old_claude(tmp_path)
+    marker = tmp_path / "ran"
+    plant_git(work / "bin", marker)  # never run: git is resolved before the cwd is known
+    git_repo(work)
+    _, plan = dry_run(
+        "respond",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        env={"PATH": f"{tools}:/usr/bin:/bin:{work / 'bin'}"},
+    )
+    assert plan["would_fail"] == "claude_too_old"
+    old_claude(tmp_path, "2.1.312 (Claude Code)")
+    _, plan = dry_run(
+        "respond",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        env={"PATH": f"{tools}:/usr/bin:/bin:{work / 'bin'}"},
+    )
+    assert plan["would_fail"] == "unsafe_path"
+
+
+def test_a_trusted_dry_run_never_runs_a_claude_under_the_cwd(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """A trusted kind's launch would run it (it checks no session-writable path); a dry
+    run's probes never run a binary a session could have planted: not probed, a warning."""
+    marker = tmp_path / "ran"
+    plant(work / "bin", marker)
+    proc, plan = dry_run(
+        "implement",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        env={"PATH": f"{work / 'bin'}:{tools}:/usr/bin:/bin"},
+    )
+    assert not marker.exists(), marker.read_text()
+    assert proc.returncode == 0 and plan["would_fail"] is None
+    assert any(
+        w.startswith("claude --version not run (not probed by a dry run") for w in plan["warnings"]
+    )
+
+
+def test_a_dry_run_version_probe_never_runs_an_interpreter_from_a_write_dir(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """S5 for the launch check: a ``#!/usr/bin/env node`` claude never finds a ``node``
+    planted in a trusted kind's ``write_dirs``; with no other ``node`` it cannot run."""
+    marker = tmp_path / "ran"
+    planted = home() / "wd" / "bin"
+    planted.mkdir(parents=True)
+    node = planted / "node"
+    node.write_text(f"#!/bin/sh\necho node >> {marker}\necho '9.9.9'\n", encoding="utf-8")
+    node.chmod(0o755)
+    (tools / "claude").write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    proc, plan = dry_run(
+        "implement",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config="kinds:\n  implement:\n    write_dirs: ['~/wd']\n",
+        env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
+    )
+    assert not marker.exists()
+    if not any(os.access(os.path.join(d, "node"), os.X_OK) for d in ("/usr/bin", "/bin")):
+        assert proc.returncode == 12 and plan["would_fail"] == "claude_not_found"

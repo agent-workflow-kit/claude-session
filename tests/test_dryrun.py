@@ -54,6 +54,7 @@ SECRET = "do-not-print-this-value-0123456789"
 # The probe's session-writable paths: none (unit tests of the probe itself).
 NOTHING = pathrules.SessionWritable([])
 PATH_ONLY = {"PATH": "/usr/bin"}
+CURRENT_VERSION = "2.1.312 (Claude Code)"
 
 
 @pytest.fixture(scope="module")
@@ -98,6 +99,8 @@ class GitGateway(FakeGateway):
     def __init__(self, git_dirs: tuple[str, str] | None) -> None:
         super().__init__()
         self.git_dirs = git_dirs
+        # The launch's version check (a test can override it with a later rule).
+        self.on(["claude", "--version"], stdout=f"{CURRENT_VERSION}\n")
 
     def _answer(self, argv: tuple[str, ...]) -> Response:
         if argv[0] != "git":

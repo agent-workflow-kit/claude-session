@@ -265,6 +265,37 @@ def test_run_handles_large_output_on_both_streams_with_input(gw: SystemGateway) 
     assert proc.stderr == "e" * size
 
 
+def test_run_max_output_keeps_only_the_first_bytes_of_each_stream(gw: SystemGateway) -> None:
+    """A program that floods its output cannot grow our memory past ``max_output`` per
+    stream; the rest is read and dropped, so the program is not blocked on a full pipe."""
+    size = 3 * 1024 * 1024
+    proc = gw.run(
+        py(
+            f"""
+            import sys
+            sys.stdout.write("first\\n" + "o" * {size})
+            sys.stderr.write("e" * {size})
+            """
+        ),
+        timeout=60,
+        max_output=10,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout == "first\noooo"
+    assert proc.stderr == "e" * 10
+
+
+def test_run_max_output_does_not_split_a_short_output(gw: SystemGateway) -> None:
+    proc = gw.run(py("print('2.1.312 (Claude Code)')"), max_output=4096)
+    assert proc.stdout == "2.1.312 (Claude Code)\n"
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_max_output_must_be_positive(gw: SystemGateway, bad: int) -> None:
+    with pytest.raises(ValueError, match="max_output"):
+        gw.run([PY, "-c", "pass"], max_output=bad)
+
+
 def test_run_timeout_raises_gateway_timeout_and_reaps_the_child(
     gw: SystemGateway, tmp_path: Path
 ) -> None:

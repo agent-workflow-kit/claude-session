@@ -800,10 +800,90 @@ def launch_records(state: Path) -> list[dict[str, Any]]:
 
 
 @pytest.mark.parametrize("isolated", [False, True])
+def test_a_claude_older_than_the_minimum_ends_claude_too_old(
+    tmp_path: Path, state: Path, work: Path, isolated: bool
+) -> None:
+    """interface.md, Launch order step 5: ``claude --version`` below ``min_claude_version``
+    fails the launch; ``claude`` is never started for the session."""
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, result_step()],
+        args=["--reads-third-party", "--sandbox", "preferred"] if isolated else [],
+        config=FAST,
+        env={"PATH": "/usr/bin:/bin"},
+        scenario_extra={"version": "2.1.311 (Claude Code)"},
+    )
+    assert run.code == 12, run.proc.stderr
+    assert (run.outcome["phase"], run.outcome["outcome"], run.outcome["end_reason"]) == (
+        "launch",
+        "not-started",
+        "claude_too_old",
+    )
+    message = run.outcome["message"]
+    assert "2.1.311 (Claude Code)" in message and "2.1.312" in message
+    assert "upgrade Claude Code" in message
+    assert run.fake_log() == []  # only --version ran, which logs nothing
+    assert run.run_row()["child_pid"] is None
+    assert not (run.private_run / "secret-index").exists()
+    assert not csession_tmpdir(run.sid).exists()
+    assert [r["reason"] for r in launch_records(state)] == ["claude_too_old"]
+
+
+def test_the_configured_minimum_admits_an_older_claude(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, STOP, result_step()],
+        config=FAST + "min_claude_version: '2.1'\n",
+        scenario_extra={"version": "2.1.0 (Claude Code)"},
+    )
+    assert run.code == 0, run.outcome
+    assert (run.outcome["outcome"], run.outcome["end_reason"]) == ("done", "normal")
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_a_claude_that_cannot_run_fails_the_version_check(
+    tmp_path: Path, state: Path, work: Path, isolated: bool
+) -> None:
+    """An executable that is not a working program is caught by ``claude --version`` in the
+    launch validations (``claude_not_found``), before anything of step 7 exists."""
+    claude = script(tmp_path / "badbin" / "claude", "#!/nonexistent/interp\n")
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [],
+        args=["--reads-third-party", "--sandbox", "preferred"] if isolated else [],
+        config=FAST,
+        env={"PATH": "/usr/bin:/bin"},
+        claude=claude,
+    )
+    assert run.code == 12, run.proc.stderr
+    assert (run.outcome["phase"], run.outcome["outcome"], run.outcome["end_reason"]) == (
+        "launch",
+        "not-started",
+        "claude_not_found",
+    )
+    assert "--version" in run.outcome["message"]
+    assert run.run_row()["child_pid"] is None
+    assert not (run.private_run / "secret-index").exists()
+    assert not csession_tmpdir(run.sid).exists()
+
+
+@pytest.mark.parametrize("isolated", [False, True])
 def test_a_claude_that_cannot_be_started_ends_the_run_not_started(
     tmp_path: Path, state: Path, work: Path, isolated: bool
 ) -> None:
-    claude = script(tmp_path / "badbin" / "claude", "#!/nonexistent/interp\n")
+    """``claude --version`` works, then the program can no longer be executed at spawn."""
+    claude = script(
+        tmp_path / "badbin" / "claude",
+        '#!/bin/sh\nchmod a-x "$0"\necho "2.1.312 (Claude Code)"\n',
+    )
     run = run_exec(
         tmp_path,
         state,

@@ -113,6 +113,17 @@ def test_kill_grace_contract_matches_the_real_gateway() -> None:
         fake.run(["/bin/sh"], new_process_group=True, kill_grace=-1)
 
 
+def test_max_output_is_recorded_and_applied_like_the_real_gateway() -> None:
+    fake = FakeGateway()
+    fake.on(["/bin/sh"], stdout="abcdef", stderr="é" * 4)
+    result = fake.run(["/bin/sh"], max_output=3)
+    assert fake.calls[0].max_output == 3
+    # Bytes, as the real gateway counts them: a split character is replaced.
+    assert (result.stdout, result.stderr) == ("abc", "é\ufffd")
+    with pytest.raises(ValueError, match="max_output"):
+        fake.run(["/bin/sh"], max_output=0)
+
+
 def test_a_response_list_is_consumed_in_order_and_the_last_repeats() -> None:
     fake = FakeGateway()
     ps = ["/bin/ps", "-p", "42"]

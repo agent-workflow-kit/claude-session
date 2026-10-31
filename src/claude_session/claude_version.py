@@ -1,8 +1,17 @@
 """``claude --version`` and the ``min_claude_version`` comparison (interface.md, kinds and
 Launch order step 5; design.md, Platform notes).
 
-``kinds`` reports the version and ``claude_version_ok``. TODO(#40): the launch check
-(``claude_too_old``) at the version slot of step 5 reuses ``probe`` and ``at_least``.
+``kinds`` reports the version and ``claude_version_ok``; the launch (``launch.checks``, right
+after the tools are resolved, so a dry run makes the same check) calls ``require``:
+``claude_too_old`` below ``min_claude_version`` or when the output holds no version, and
+``claude_not_found`` when ``claude --version`` cannot run. One probe per launch, bounded in
+time (``PROBE_TIMEOUT`` plus ``KILL_GRACE``) and in memory (``MAX_OUTPUT``); nothing is
+cached: the version is read again at every launch, so an upgraded or downgraded ``claude``
+is seen at once.
+
+Versions are compared part by part as numbers of any length (leading zeros ignored, missing
+trailing parts count as 0) without converting them to ``int``, so no output can make the
+comparison fail. Only ASCII digits form a version.
 """
 
 from __future__ import annotations
@@ -11,6 +20,7 @@ import re
 from collections.abc import Callable, Mapping
 
 from . import pathrules
+from .errors import LaunchValidationError
 from .gateway import Gateway, GatewayTimeout
 from .pathrules import ResolvedTool
 
@@ -21,6 +31,9 @@ KILL_GRACE = 2.0
 PROBE_NAMES = ("PATH", "HOME", "LANG", "LANGUAGE")
 # The longest version text kept (the first line of the output).
 MAX_TEXT = 200
+# The most output read into memory, per stream (the rest is read and dropped).
+MAX_OUTPUT = 64 * 1024
+TOO_OLD_HINT = "upgrade Claude Code (claude update), or set min_claude_version in the config"
 # A version at the start of the output: ``2.1.312 (Claude Code)``.
 _LEADING = re.compile(r"([0-9]+(?:\.[0-9]+)*)(?:\s|$)")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -78,6 +91,7 @@ def probe(
             kill_grace=KILL_GRACE,
             kill_group_on_exit=True,
             executable=claude.path,
+            max_output=MAX_OUTPUT,
         )
     except (OSError, ValueError, GatewayTimeout):
         return None
@@ -90,23 +104,88 @@ def probe(
     return text or None
 
 
-def parse(text: str) -> tuple[int, ...] | None:
-    """The version at the start of ``text`` (``2.1.312 (Claude Code)`` -> ``(2, 1, 312)``),
-    or None when it does not start with one."""
+def _parts(text: str) -> tuple[str, ...] | None:
+    """The digit strings of the version at the start of ``text``, or None."""
     match = _LEADING.match(text.strip())
     if match is None:
         return None
-    return tuple(int(part) for part in match.group(1).split("."))
+    return tuple(match.group(1).split("."))
+
+
+def parse(text: str) -> tuple[int, ...] | None:
+    """The version at the start of ``text`` (``2.1.312 (Claude Code)`` -> ``(2, 1, 312)``),
+    or None when it does not start with one (or a part is too long for ``int``)."""
+    parts = _parts(text)
+    if parts is None:
+        return None
+    try:
+        return tuple(int(part) for part in parts)
+    except ValueError:  # more digits than int() converts
+        return None
+
+
+def _key(parts: tuple[str, ...], width: int) -> tuple[tuple[int, str], ...]:
+    """A sort key comparing each part as a number of any length: (digit count without
+    leading zeros, those digits); padded with zero parts to ``width``."""
+    keys = []
+    for part in parts + ("0",) * (width - len(parts)):
+        digits = part.lstrip("0")
+        keys.append((len(digits), digits))
+    return tuple(keys)
 
 
 def at_least(text: str | None, minimum: str) -> bool | None:
     """Whether the version in ``text`` is ``minimum`` or newer (missing trailing parts count
-    as 0); None when ``text`` is None or holds no version."""
+    as 0); None when ``text`` is None or either holds no version."""
     if text is None:
         return None
-    version = parse(text)
-    required = parse(minimum)
+    version = _parts(text)
+    required = _parts(minimum)
     if version is None or required is None:
         return None
     width = max(len(version), len(required))
-    return version + (0,) * (width - len(version)) >= required + (0,) * (width - len(required))
+    return _key(version, width) >= _key(required, width)
+
+
+def require(
+    claude: ResolvedTool,
+    environ: Mapping[str, str],
+    gw: Gateway,
+    minimum: str,
+    *,
+    writable: Callable[[str], bool],
+) -> str:
+    """The launch's version check: ``probe`` (``writable``: the run's session-writable
+    paths, which no ``PATH`` entry of the probe may be under), then ``at_least``. Returns the
+    version text. Raises ``LaunchValidationError``: ``claude_not_found`` when
+    ``claude --version`` cannot run (it fails to start, exits non-zero, prints nothing, times
+    out, or no ``PATH`` entry is left to run it with), ``claude_too_old`` when the version
+    is older than ``minimum`` or the output holds no version (fail closed: it is not known
+    to be new enough)."""
+    if not probe_path(environ, writable):
+        raise LaunchValidationError(
+            f"could not run {claude.path!r} --version: no PATH entry outside the "
+            "session-writable paths",
+            end_reason="claude_not_found",
+        )
+    text = probe(claude, environ, gw, writable=writable)
+    if text is None:
+        raise LaunchValidationError(
+            f"could not run {claude.path!r} --version (it failed, printed nothing or timed out)",
+            end_reason="claude_not_found",
+        )
+    ok = at_least(text, minimum)
+    if ok is None:
+        raise LaunchValidationError(
+            f"{claude.path!r} --version printed no version: {text!r}; "
+            f"min_claude_version is {minimum}",
+            end_reason="claude_too_old",
+            hint=TOO_OLD_HINT,
+        )
+    if not ok:
+        raise LaunchValidationError(
+            f"Claude Code {text!r} ({claude.path!r}) is older than min_claude_version {minimum}",
+            end_reason="claude_too_old",
+            hint=TOO_OLD_HINT,
+        )
+    return text

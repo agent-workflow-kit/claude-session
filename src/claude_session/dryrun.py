@@ -8,7 +8,9 @@ and ``resolve_kind`` (step 2), then the step-5 checks in their documented order
 nothing: ``tmpdir.check`` and ``self_check(create=False)``), then ``launch.generate`` (the
 settings and argv step 7 would write). It never allocates, opens no session directory, runs
 no hook and writes no audit or log record. The processes it starts are the read-only probes
-of a launch: ``git`` (repo id and git directory) and the sandbox prerequisite probes. When
+of a launch: ``git`` (repo id and git directory), ``claude --version`` (the launch's version
+check, never of a ``claude`` under the paths a session could write, also for trusted kinds:
+``launch.Effects.claude_version``) and the sandbox prerequisite probes. When
 the checks pass, the sandbox state comes from them (no second probe); when one fails, the
 prerequisites are probed with ``bwrap`` and ``socat`` resolved against the session-writable
 paths known without a session (``unchecked_writable``: with the permission profile's write
