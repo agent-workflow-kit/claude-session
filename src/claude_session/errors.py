@@ -136,7 +136,10 @@ class LaunchValidationError(FailedError):
     ``LaunchFailedError``). ``end_reason`` is a class-level default that subclasses set
     (``InvalidPermissionProfile``) and the ``end_reason=`` keyword overrides; the base class
     has none, so raising it needs the keyword. ``message`` and ``detail`` never hold values
-    from profile content; they may name file paths, profile names and key paths."""
+    from profile content; they may name file paths, profile names and key paths. ``hint`` is
+    the launch failure's hint (interface.md, Launch order: for example the install command
+    for bubblewrap and socat); the launch path reports it with the run, never in the
+    ``failed`` envelope."""
 
     # TODO(#15): the launch path maps LaunchValidationError to a not-started run (end_reason,
     # exit 12; start: LaunchFailedError) instead of the plain `failed` envelope.
@@ -144,9 +147,15 @@ class LaunchValidationError(FailedError):
     end_reason: str
 
     def __init__(
-        self, message: str, *, detail: str | None = None, end_reason: str | None = None
+        self,
+        message: str,
+        *,
+        detail: str | None = None,
+        end_reason: str | None = None,
+        hint: str | None = None,
     ) -> None:
         super().__init__(message, detail=detail)
+        self.hint = hint
         if end_reason is not None:
             self.end_reason = end_reason
         elif not isinstance(getattr(type(self), "end_reason", None), str):

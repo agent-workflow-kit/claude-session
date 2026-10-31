@@ -18,8 +18,9 @@ session-writable paths) are #24's.
 TODO(#24): before build(), the launch validations refuse unsafe cwd, read_dirs, write_dirs,
 plugin directories and generated read entries (Isolation fields), and pass the
 session_writable check and the session-writable paths to check_interpreter().
-TODO(#25): exec creates the private tmpdir (Isolation.tmpdir) and runs the sandbox
-self-check; a `preferred` run without a working sandbox adds its warning there.
+TODO(#15): exec runs selfcheck.self_check() in launch step 5 (and at adoption): it creates
+the private tmpdir (tmpdir.create) that becomes Isolation.tmpdir, gives sandbox_active, and
+returns the warning of a `preferred` run without a working sandbox.
 
 TODO(#15): exec calls build() in launch step 7 and writes the settings with
 SessionDirs.write_settings before spawning claude. Before allocation, the step-5 launch
@@ -965,7 +966,7 @@ def isolation_warnings(resolution: Resolution) -> tuple[str, ...]:
     sandbox baseline, ``sandbox_lowered`` and, for ``off``, that it runs without a sandbox;
     for another isolated run with setting sources, that their list keys merge with the
     generated ones. (A ``preferred`` run whose sandbox turns out unavailable gets its warning
-    from the self-check, #25.)"""
+    from ``selfcheck.self_check``.)"""
     profile = resolution.profile
     warnings: list[str] = []
     if is_isolated(profile) and not profile.reads_third_party and profile.setting_sources:
