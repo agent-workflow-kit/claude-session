@@ -25,6 +25,11 @@ SID = "cs-abcdefgh"
 CLAUDE_ID = "0b6f7a52-3c1d-4e5f-9a8b-7c6d5e4f3a21"
 OTHER_CLAUDE_ID = "1c7e8b63-4d2e-4f60-8b9c-8d7e6f5a4b32"
 T0 = "2026-10-30T00:00:00.000000Z"
+CAPS = {"summary_max_bytes": 65536, "artifact_max_bytes": 10485760}
+
+
+def hookconf(inputs: list[str]) -> bytes:
+    return hookevent.hookconf_bytes(inputs, **CAPS)
 
 
 class Env:
@@ -115,7 +120,7 @@ class Env:
     def write_hookconf(self, run_no: int, inputs: list[str]) -> None:
         run_dir = Path(self.private_dir) / "runs" / str(run_no)
         run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        write_private_file(str(run_dir / "hookconf.json"), hookevent.hookconf_bytes(inputs))
+        write_private_file(str(run_dir / "hookconf.json"), hookconf(inputs))
 
     def session(self) -> dict[str, Any]:
         return self._row("SELECT * FROM sessions WHERE csession_id = ?", (SID,))
@@ -321,7 +326,7 @@ def test_a_symlinked_hookconf_is_refused(env: Env, tmp_path: Path) -> None:
     env.add()
     target = Path(env.private_dir) / "runs" / "1" / "hookconf.json"
     decoy = tmp_path / "decoy.json"
-    decoy.write_bytes(hookevent.hookconf_bytes(["evil"]))
+    decoy.write_bytes(hookconf(["evil"]))
     target.unlink()
     target.symlink_to(decoy)
     with pytest.raises(OSError):
@@ -358,15 +363,19 @@ def test_a_hard_linked_hookconf_is_refused(env: Env, tmp_path: Path) -> None:
     [
         b"not json",
         b"[]",
-        b'{"v": 2, "input_files": []}',
+        b'{"v": 2, "input_files": [], "summary_max_bytes": 1, "artifact_max_bytes": 1}',
         b'{"v": 1}',
-        b'{"v": 1, "input_files": [], "extra": 1}',
-        b'{"v": 1, "input_files": ["../x"]}',
-        b'{"v": 1, "input_files": [".."]}',
-        b'{"v": 1, "input_files": ["a; run 9"]}',
-        b'{"v": 1, "input_files": ["a\\nb"]}',
-        b'{"v": 1, "input_files": ["a", "a"]}',
-        b'{"v": 1, "input_files": [1]}',
+        b'{"v": 1, "input_files": []}',
+        b'{"v": 1, "input_files": [], "summary_max_bytes": 1, "artifact_max_bytes": 1, "x": 1}',
+        b'{"v": 1, "input_files": [], "summary_max_bytes": 0, "artifact_max_bytes": 1}',
+        b'{"v": 1, "input_files": [], "summary_max_bytes": 1, "artifact_max_bytes": true}',
+        b'{"v": 1, "input_files": [], "summary_max_bytes": "1", "artifact_max_bytes": 1}',
+        b'{"v": 1, "input_files": ["../x"], "summary_max_bytes": 1, "artifact_max_bytes": 1}',
+        b'{"v": 1, "input_files": [".."], "summary_max_bytes": 1, "artifact_max_bytes": 1}',
+        b'{"v": 1, "input_files": ["a; run 9"], "summary_max_bytes": 1, "artifact_max_bytes": 1}',
+        b'{"v": 1, "input_files": ["a\\nb"], "summary_max_bytes": 1, "artifact_max_bytes": 1}',
+        b'{"v": 1, "input_files": ["a", "a"], "summary_max_bytes": 1, "artifact_max_bytes": 1}',
+        b'{"v": 1, "input_files": [1], "summary_max_bytes": 1, "artifact_max_bytes": 1}',
         b"\xff\xfe",
     ],
 )
@@ -394,7 +403,7 @@ def test_an_oversized_hookconf_is_refused(env: Env) -> None:
 
 def test_hookconf_bytes_refuses_invalid_names() -> None:
     with pytest.raises(HookEventError):
-        hookevent.hookconf_bytes(["a/b"])
+        hookconf(["a/b"])
 
 
 # Stop and the backstop

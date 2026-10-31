@@ -142,12 +142,22 @@ def test_every_level_is_written(log_path: Path) -> None:
         {"event": "adopt", "message": 3},
         {"event": "launch", "decision_ids": "d1"},
         {"event": "launch", "decision_ids": [1]},
+        {"event": "report_rejected", "count": 0},
+        {"event": "report_rejected", "count": "2"},
+        {"event": "report_rejected", "count": True},
     ],
 )
 def test_values_the_schema_rejects_are_rejected(kwargs: dict[str, Any], log_path: Path) -> None:
     with pytest.raises(ValueError):
         logs.EventLog(str(log_path)).write(**kwargs)
     assert not log_path.exists()
+
+
+def test_the_aggregate_malformed_record_carries_a_count(log_path: Path) -> None:
+    logs.EventLog(str(log_path)).write("report_rejected", reason="malformed", count=3)
+    (record,) = records(log_path)
+    validate(record, LOG_SCHEMA)
+    assert record["count"] == 3
 
 
 def test_records_append_one_line_each(log_path: Path) -> None:

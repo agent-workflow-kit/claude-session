@@ -368,6 +368,7 @@ class EventLog:
         decision_ids: Iterable[str] | None = None,
         reason: str | None = None,
         message: str | None = None,
+        count: int | None = None,
         now: datetime | None = None,
     ) -> None:
         """Append one record. Unset (``None``) fields are omitted.
@@ -384,9 +385,11 @@ class EventLog:
             raise ValueError("unknown log reason")
         if csession_id is not None and not is_csession_id(csession_id):
             raise ValueError("malformed csession_id")
-        for name, number in (("run", run), ("pid", pid)):
+        for name, number in (("run", run), ("pid", pid), ("count", count)):
             if number is not None and not is_int(number):
                 raise ValueError(f"{name} must be an integer")
+        if count is not None and count < 1:
+            raise ValueError("count must be at least 1")
         if signal is not None and not isinstance(signal, str):
             raise ValueError("signal must be a string")
         if message is not None and not isinstance(message, str):
@@ -400,6 +403,7 @@ class EventLog:
             "signal": None if signal is None else redact_text(signal, self.secrets),
             "decision_ids": None if ids is None else [redact_text(i, self.secrets) for i in ids],
             "reason": reason,
+            "count": count,
         }
         record.update((key, value) for key, value in optional.items() if value is not None)
         if message is not None:

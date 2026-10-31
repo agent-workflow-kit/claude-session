@@ -40,9 +40,12 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .errors import FailedError, InternalError, SchemaNewerError
+
+if TYPE_CHECKING:
+    from .outbox import Frozen
 
 DB_NAME = "state.db"
 BUSY_TIMEOUT = 5.0  # seconds (design.md, Data model: Concurrency)
@@ -630,6 +633,25 @@ class Store:
                     self.conn.execute("ROLLBACK")
             raise
 
+    @contextmanager
+    def savepoint(self, name: str) -> Iterator[None]:
+        """A ``SAVEPOINT`` inside the current transaction: released on success, rolled back
+        to (and released) on error, which is re-raised. When SQLite already rolled the whole
+        transaction back, the error is re-raised as is and the caller must not continue in it
+        (``conn.in_transaction`` is then false). ``name`` is a fixed identifier."""
+        if not name.isidentifier():
+            raise ValueError("savepoint names are identifiers")
+        self.conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+        except BaseException:
+            if self.conn.in_transaction:
+                with suppress(sqlite3.Error):
+                    self.conn.execute(f"ROLLBACK TO {name}")
+                    self.conn.execute(f"RELEASE {name}")
+            raise
+        self.conn.execute(f"RELEASE {name}")
+
     # Schema version
 
     def schema_version(self) -> Version:
@@ -897,7 +919,7 @@ class Store:
             "SELECT s.csession_id, r.run_no, s.state, s.activity, s.needs_input_reason, "
             "r.mode, r.session_started_at, r.report_status, r.backstop_used, "
             "r.ended_at IS NULL AND r.wrapper_pid IS NOT NULL, s.csession_dir, s.private_dir, "
-            "s.forgotten_at IS NOT NULL "
+            "s.forgotten_at IS NOT NULL, r.secret_sha256, r.outbox_dev_ino, r.artifacts_dev_ino "
             "FROM sessions s JOIN runs r "
             "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
             "WHERE s.csession_id = ?",
@@ -919,6 +941,9 @@ class Store:
             csession_dir=row[10],
             private_dir=row[11],
             forgotten=bool(row[12]),
+            secret_sha256=row[13],
+            outbox_dev_ino=row[14],
+            artifacts_dev_ino=row[15],
         )
 
     def prompt_submitted_after_report(self, run: HookRun) -> bool:
@@ -978,18 +1003,20 @@ class Store:
         activity: str | None,
         needs_input_reason: str | None,
         cause: str,
+        always: bool = False,
     ) -> int | None:
         """Store the run's new state. When ``state``, ``activity`` or ``needs_input_reason``
-        changed, also bump ``updated_at`` (and ``state_since`` for a new state) and append an
-        ``events`` row carrying the session's labels; returns its id, else None.
+        changed, or with ``always``, also bump ``updated_at`` (and ``state_since`` for a new
+        state) and append an ``events`` row carrying the session's labels; returns its id,
+        else None.
 
-        TODO(#14): report ingestion must write a ``report``-caused event row whenever the
-        run's report status or ``reported_at`` changes, even when state, activity and reason
-        are unchanged (interface.md, State transitions); the escalation check
+        Report ingestion passes ``always``: its ``report`` event is written whenever the
+        report status or ``reported_at`` changes (every ingestion), even when state, activity
+        and reason do not (interface.md, State transitions); the escalation check
         (``prompt_submitted_after_report``) and post-state-change rely on it.
         """
         before = (run.state, run.activity, run.needs_input_reason)
-        if (state, activity, needs_input_reason) == before:
+        if (state, activity, needs_input_reason) == before and not always:
             return None
         now = format_ts(self.clock())
         self.conn.execute(
@@ -1024,6 +1051,71 @@ class Store:
         )
         return cursor.lastrowid
 
+    def record_request(self, csession_id: str, run_no: int, request_id: str, result: str) -> bool:
+        """Record a claimed outbox request and its result (``ingested``, a rejection code or
+        ``discarded``). Returns False when ``request_id`` is already recorded: a request is
+        processed at most once (design.md, Claim)."""
+        cursor = self.conn.execute(
+            "INSERT INTO requests (request_id, csession_id, run_no, result, ingested_at) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (request_id) DO NOTHING",
+            (request_id, csession_id, run_no, result, format_ts(self.clock())),
+        )
+        return cursor.rowcount == 1
+
+    def ingested_count(self, csession_id: str, run_no: int) -> int:
+        """How many requests of the run were ingested (the latest one's ``<ingest_seq>``)."""
+        (count,) = self.conn.execute(
+            "SELECT COUNT(*) FROM requests WHERE csession_id = ? AND run_no = ? "
+            "AND result = 'ingested'",
+            (csession_id, run_no),
+        ).fetchone()
+        return int(count)
+
+    def latest_ingested(self, csession_id: str, run_no: int) -> str | None:
+        """The newest (largest UUIDv7) ``request_id`` of the run that was ingested, or None:
+        an older request never replaces a newer report."""
+        (latest,) = self.conn.execute(
+            "SELECT MAX(request_id) FROM requests WHERE csession_id = ? AND run_no = ? "
+            "AND result = 'ingested'",
+            (csession_id, run_no),
+        ).fetchone()
+        return latest
+
+    def set_report(
+        self,
+        csession_id: str,
+        run_no: int,
+        *,
+        status: str,
+        summary: str | None,
+        reason: str | None,
+        artifact: Frozen | None,
+    ) -> None:
+        """Store an ingested report as the run's report (the latest one wins); the run's
+        artifact becomes this report's, or null. ``reported_at`` is now."""
+        now = format_ts(self.clock())
+        cursor = self.conn.execute(
+            "UPDATE runs SET report_status = ?, report_implicit = 0, report_summary = ?, "
+            "report_reason = ?, artifact_name = ?, artifact_path = ?, artifact_sha256 = ?, "
+            "artifact_size = ?, artifact_ingest_seq = ?, reported_at = ? "
+            "WHERE csession_id = ? AND run_no = ?",
+            (
+                status,
+                summary,
+                reason,
+                None if artifact is None else artifact.name,
+                None if artifact is None else artifact.path,
+                None if artifact is None else artifact.sha256,
+                None if artifact is None else artifact.size,
+                None if artifact is None else artifact.ingest_seq,
+                now,
+                csession_id,
+                run_no,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise InternalError(f"no run {run_no} of session {csession_id}")
+
     def take_backstop(self, run: HookRun) -> bool:
         """Mark the run's Stop backstop used, once per run, while it has no report. Returns
         whether this call took it."""
@@ -1053,6 +1145,10 @@ class HookRun:
     csession_dir: str | None
     private_dir: str | None
     forgotten: bool
+    # What outbox ingestion checks requests against (NULL until exec records them).
+    secret_sha256: str | None = None
+    outbox_dev_ino: str | None = None
+    artifacts_dev_ino: str | None = None
 
 
 def open_state(**kwargs: Any) -> Store:

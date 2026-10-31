@@ -17,7 +17,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NoReturn
 
-from . import durations, fsutil, ids, store
+from . import durations, fsutil, ids, outbox, store
 from .defaults import MAX_INTEGER
 from .errors import CliError, InternalError, RefusedError, UsageError
 
@@ -137,6 +137,24 @@ def _list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _report(args: argparse.Namespace) -> int:
+    """``report`` (interface.md): validate, queue in the outbox; never opens state.db."""
+    queued = outbox.file_report(
+        status=args.status,
+        summary=args.summary,
+        summary_file=args.summary_file,
+        reason_file=args.reason_file,
+        artifact=args.artifact,
+        environ=os.environ,
+        stdin=sys.stdin.buffer,
+    )
+    if args.json:
+        print(json.dumps(queued.as_json()))
+    else:
+        print("report queued")
+    return 0
+
+
 # Command name (as typed, nested commands joined by a space) -> handler.
 HANDLERS: dict[str, Handler] = {
     "exec": _not_implemented,
@@ -144,7 +162,7 @@ HANDLERS: dict[str, Handler] = {
     "resume": _not_implemented,
     "stop": _not_implemented,
     "wait": _not_implemented,
-    "report": _not_implemented,
+    "report": _report,
     "status": _not_implemented,
     "list": _list,
     "kinds": _not_implemented,

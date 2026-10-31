@@ -1219,6 +1219,20 @@ def test_a_failed_transaction_rolls_back(db: str) -> None:
     assert counter(db) == 0
 
 
+def test_a_failed_savepoint_rolls_back_only_its_own_changes(db: str) -> None:
+    make_counter(db)
+    with open_as(db, ME) as s:
+        with s.transaction() as conn:
+            conn.execute("UPDATE counter SET n = 1")
+            with pytest.raises(RuntimeError):
+                with s.savepoint("inner"):
+                    conn.execute("UPDATE counter SET n = 5")
+                    raise RuntimeError("boom")
+            with s.savepoint("kept"):
+                conn.execute("UPDATE counter SET n = n + 1")
+    assert counter(db) == 2
+
+
 def test_an_auto_rolled_back_error_surfaces_unmasked(db: str) -> None:
     make_counter(db)
     with open_as(db, ME) as s:
