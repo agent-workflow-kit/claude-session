@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_session import sessiondir
+from claude_session import fsutil, sessiondir
 from claude_session.errors import FailedError, UsageError
 from claude_session.sessiondir import DirId, InputFile, SessionDirs
 
@@ -971,3 +971,209 @@ def test_a_non_utf8_state_root_fails(tmp_path: Path) -> None:
                 input_files=[],
             )
         assert not (sdir(state) / "run.json").exists()
+
+
+# gh-empty/ and empty-gitconfig (isolated runs)
+
+
+def test_isolated_prepare_creates_empty_gh_dir_and_gitconfig(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1, isolated=True)
+    gh = sdir(root) / "gh-empty"
+    gitconfig = sdir(root) / "empty-gitconfig"
+    assert gh.is_dir() and not gh.is_symlink() and list(gh.iterdir()) == []
+    assert mode(gh) == 0o700
+    assert gitconfig.is_file() and not gitconfig.is_symlink()
+    assert gitconfig.read_bytes() == b""
+    assert mode(gitconfig) == 0o600
+
+
+def test_trusted_prepare_creates_neither(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1)
+    assert not (sdir(root) / "gh-empty").exists()
+    assert not (sdir(root) / "empty-gitconfig").exists()
+
+
+def test_isolated_prepare_empties_what_an_earlier_run_left(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1, isolated=True)
+    gh = sdir(root) / "gh-empty"
+    (gh / "hosts.yml").write_text("oauth_token: planted\n")
+    (gh / "nested" / "deeper").mkdir(parents=True)
+    (gh / "nested" / "deeper" / "f").write_text("x")
+    (gh / "nested" / "d000").mkdir(mode=0o000)
+    (sdir(root) / "empty-gitconfig").write_text("[core]\n\tfsmonitor = /planted\n")
+    old = gh.stat().st_ino
+    dirs.prepare_run(2, isolated=True)
+    assert list(gh.iterdir()) == []
+    assert gh.stat().st_ino != old
+    assert (sdir(root) / "empty-gitconfig").read_bytes() == b""
+
+
+def test_isolated_prepare_leaves_no_trash_in_the_private_dir(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1, isolated=True)
+    (sdir(root) / "gh-empty" / "x").write_text("x")
+    dirs.prepare_run(2, isolated=True)
+    assert sorted(p.name for p in pdir(root).iterdir()) == ["runs"]
+
+
+def test_isolated_prepare_replaces_a_symlink_without_following_it(
+    tmp_path: Path, root: Path, dirs: SessionDirs
+) -> None:
+    target = tmp_path / "victim"
+    target.mkdir()
+    (target / "keep").write_text("keep")
+    victim_file = tmp_path / "victim-file"
+    victim_file.write_text("keep")
+    session = sdir(root)
+    dirs.prepare_run(1)
+    (session / "gh-empty").symlink_to(target)
+    (session / "empty-gitconfig").symlink_to(victim_file)
+    dirs.prepare_run(2, isolated=True)
+    assert (target / "keep").read_text() == "keep"
+    assert victim_file.read_text() == "keep"
+    assert (session / "gh-empty").is_dir() and not (session / "gh-empty").is_symlink()
+    assert not (session / "empty-gitconfig").is_symlink()
+    assert (session / "empty-gitconfig").read_bytes() == b""
+
+
+def test_isolated_prepare_replaces_a_file_planted_as_gh_empty(
+    root: Path, dirs: SessionDirs
+) -> None:
+    dirs.prepare_run(1)
+    (sdir(root) / "gh-empty").write_text("not a dir")
+    dirs.prepare_run(2, isolated=True)
+    gh = sdir(root) / "gh-empty"
+    assert gh.is_dir() and list(gh.iterdir()) == []
+
+
+def test_isolated_prepare_replaces_a_dir_planted_as_empty_gitconfig(
+    root: Path, dirs: SessionDirs
+) -> None:
+    dirs.prepare_run(1)
+    planted = sdir(root) / "empty-gitconfig"
+    planted.mkdir()
+    (planted / "config").write_text("x")
+    dirs.prepare_run(2, isolated=True)
+    assert planted.is_file() and planted.read_bytes() == b""
+
+
+def test_isolated_prepare_is_repeatable(root: Path, dirs: SessionDirs) -> None:
+    for run in (1, 2, 3):
+        dirs.prepare_run(run, isolated=True)
+    assert list((sdir(root) / "gh-empty").iterdir()) == []
+
+
+def test_isolated_prepare_warns_on_a_leftover_it_cannot_remove_and_sweeps_it_later(
+    root: Path, dirs: SessionDirs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dirs.prepare_run(1, isolated=True)
+    session = sdir(root)
+    (session / "gh-empty" / "a" / "b" / "c" / "d").mkdir(parents=True)
+    (session / "empty-gitconfig").unlink()
+    (session / "empty-gitconfig" / "x" / "y" / "z").mkdir(parents=True)
+    monkeypatch.setattr(fsutil, "MAX_TREE_DEPTH", 2)
+    layout = dirs.prepare_run(2, isolated=True)
+    # Both leftovers were attempted (both too deep), the launch preparation still succeeded.
+    assert len(layout.warnings) == 2
+    assert all("cannot remove leftover" in warning for warning in layout.warnings)
+    assert list((session / "gh-empty").iterdir()) == []
+    assert (session / "empty-gitconfig").read_bytes() == b""
+    trash = sorted(p.name for p in pdir(root).iterdir() if p.name.endswith(".trash"))
+    assert len(trash) == 2
+    monkeypatch.setattr(fsutil, "MAX_TREE_DEPTH", 256)
+    assert dirs.prepare_run(3, isolated=True).warnings == ()
+    assert sorted(p.name for p in pdir(root).iterdir()) == ["runs"]
+
+
+def test_leftover_warnings_never_name_entries_inside_the_tree(
+    root: Path, dirs: SessionDirs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dirs.prepare_run(1, isolated=True)
+    (sdir(root) / "gh-empty" / "planted\x1bname" / "deeper").mkdir(parents=True)
+    monkeypatch.setattr(fsutil, "MAX_TREE_DEPTH", 1)
+    warnings = dirs.prepare_run(2, isolated=True).warnings
+    assert warnings and not any("planted" in warning for warning in warnings)
+
+
+def test_trusted_prepare_has_no_warnings(dirs: SessionDirs) -> None:
+    assert dirs.prepare_run(1).warnings == ()
+
+
+# Launch helpers (#15)
+
+
+def test_an_unsafe_entry_is_a_session_dir_unsafe_launch_error(root: Path) -> None:
+    from claude_session.sessiondir import SessionDirUnsafe
+
+    elsewhere = root.parent / "elsewhere"
+    elsewhere.mkdir()
+    (root / "sessions").symlink_to(elsewhere)
+    with pytest.raises(SessionDirUnsafe) as info:
+        SessionDirs.open(str(root), SID)
+    assert info.value.end_reason == "session_dir_unsafe"
+    assert info.value.exit_code == 12
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_write_private_run_file(root: Path, dirs: SessionDirs) -> None:
+    with pytest.raises(ValueError):
+        dirs.write_private_run_file(1, "hookconf.json", b"{}")  # prepare_run first
+    dirs.prepare_run(1)
+    path = Path(dirs.write_private_run_file(1, "hookconf.json", b"{}"))
+    assert path == pdir(root) / "runs" / "1" / "hookconf.json"
+    assert path.read_bytes() == b"{}" and mode(path) == 0o600
+    for bad in ("", "a/b", ".", ".."):
+        with pytest.raises(ValueError):
+            dirs.write_private_run_file(1, bad, b"")
+
+
+def test_a_planted_symlink_is_replaced_never_written_through(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1)
+    victim = root.parent / "victim"
+    victim.write_text("keep")
+    (pdir(root) / "runs" / "1" / "secret-index").symlink_to(victim)
+    dirs.write_private_run_file(1, "secret-index", b"new")
+    assert victim.read_text() == "keep"
+    assert not (pdir(root) / "runs" / "1" / "secret-index").is_symlink()
+
+
+def test_create_run_output_is_exclusive_and_private(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1)
+    old = os.umask(0)
+    try:
+        fd = dirs.create_run_output(1, "result.json")
+    finally:
+        os.umask(old)
+    os.write(fd, b"x")
+    os.close(fd)
+    path = pdir(root) / "runs" / "1" / "result.json"
+    assert path.read_bytes() == b"x" and mode(path) == 0o600
+    from claude_session.sessiondir import SessionDirUnsafe
+
+    with pytest.raises(SessionDirUnsafe):
+        dirs.create_run_output(1, "result.json")  # never reused
+    (pdir(root) / "runs" / "1" / "stderr.log").symlink_to(root.parent / "elsewhere-log")
+    with pytest.raises(SessionDirUnsafe):
+        dirs.create_run_output(1, "stderr.log")
+    assert not (root.parent / "elsewhere-log").exists()
+
+
+def test_ensure_session_subdir(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1)
+    target = sdir(root) / "work" / "a" / "b"
+    dirs.ensure_session_subdir(str(target))
+    assert target.is_dir() and mode(target) == 0o700
+    for bad in (sdir(root) / "inputs" / "x", sdir(root) / "work" / ".." / "secret", root):
+        with pytest.raises(ValueError):
+            dirs.ensure_session_subdir(str(bad))
+
+
+def test_ensure_session_subdir_refuses_a_symlinked_component(root: Path, dirs: SessionDirs) -> None:
+    from claude_session.sessiondir import SessionDirUnsafe
+
+    dirs.prepare_run(1)
+    outside = root.parent / "outside"
+    outside.mkdir()
+    (sdir(root) / "work" / "lnk").symlink_to(outside)
+    with pytest.raises(SessionDirUnsafe):
+        dirs.ensure_session_subdir(str(sdir(root) / "work" / "lnk" / "deeper"))
+    assert list(outside.iterdir()) == []

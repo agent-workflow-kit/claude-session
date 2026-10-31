@@ -17,13 +17,15 @@ Never imported by the hook path: it needs ``config`` (Pydantic and PyYAML).
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import cache
 from typing import Any, Literal
 
-from . import config, defaults, gateway, ids
+from . import config, defaults, ids
 from .errors import UsageError
+from .gateway import Gateway, GatewayTimeout, SystemGateway, sanitize_path
 
 Origin = Literal["builtin", "config", "repo", "previous_run", "flag", "flag-implied", "derived"]
 Mode = Literal["interactive", "headless"]
@@ -63,8 +65,6 @@ _IMPLIED: tuple[tuple[str, Any, str | None], ...] = (
     ("env.inherit", False, "env_allowlist_only"),
     ("mcp", "none", None),
 )
-# `--permission-profile` values naming a file (interface.md, Launch flags).
-_PROFILE_FILE_SUFFIXES = (".json", ".yaml", ".yml")
 # Variables that would point git at another repository or config than the one at ``cwd``.
 _GIT_ENV_DROP = frozenset(
     {
@@ -124,8 +124,11 @@ class Resolution:
       for ``--env-allowlist-only ''``. When set it replaces ``profile.env.allow`` in the
       effective allowlist (``env_allowlist()``); ``profile.env.inherit`` is then false.
     - ``permission_profile_file``: the raw ``--permission-profile`` value when it names a file
-      (contains ``/`` or ends in ``.json``, ``.yaml`` or ``.yml``); None otherwise.
-      ``profile.permission_profile`` then keeps the kind's profile name.
+      (contains ``/`` or ends in ``.json``, ``.yaml`` or ``.yml``); None otherwise. The file
+      replaces the named profile entirely (``permission_profiles.select``);
+      ``profile.permission_profile`` keeps the kind's profile name. With origin
+      ``previous_run`` it is the previous run's snapshot (the stored flag value is the snapshot
+      path, never the original file).
 
     So ``profile.env.allow`` only ever holds names from the built-in, config and per-repo
     layers. ``origins`` has an entry ``env_allow``, ``env_allowlist_only`` or
@@ -143,8 +146,21 @@ class Resolution:
     # (the kind's config env.allow) can (envbuild.build, step 3).
     env_allow: tuple[str, ...] = ()
     env_allowlist_only: tuple[str, ...] | None = None
-    # TODO(#22): resolve, read and snapshot the permission profile file.
+    # TODO(#29): resume stores the snapshot path as the --permission-profile flag value (the
+    # docstring above relies on it) and passes the stored permission_profile label as
+    # expected_label when re-reading a carried snapshot (permission_profiles.select).
     permission_profile_file: str | None = None
+
+    def isolated(self) -> bool:
+        """Whether the run is isolated: third-party-reading or its sandbox is not ``off``
+        (design.md, Generated settings), whether or not the sandbox actually starts."""
+        return self.profile.reads_third_party or self.profile.sandbox != "off"
+
+    def sandbox_lowered(self) -> bool:
+        """Whether a third-party-reading run's sandbox mode is below the ``required`` baseline,
+        whatever set it (built-in, config, repo override, flag or carry-over); audited
+        ``sandbox_lowered`` at adoption and warned about (interface.md, Sandbox baseline)."""
+        return self.profile.reads_third_party and self.profile.sandbox != "required"
 
     def timeout(self, mode: Mode) -> float | None:
         """The run's wall-clock bound in ``mode`` (seconds; None: no bound)."""
@@ -209,6 +225,7 @@ def resolve(
     explicit = _explicit(previous.flags if previous else {}, flags or {})
     extra: dict[str, Any] = {}
     profile = _apply_flags(profile, explicit, origins, mode, extra, warnings)
+    _check_profile_name(cfg, profile, origins)
     return Resolution(
         kind=name,
         builtin=name in BUILTIN_KINDS,
@@ -240,7 +257,7 @@ def _resolve_repo(
         return previous.repo, "previous_run" if previous.repo is not None else None
     if base.cwd == "session-dir" or cwd is None:
         return None, None
-    lookup = git_origin_url if origin_url is None else origin_url
+    lookup = _default_origin_url if origin_url is None else origin_url
     url = lookup(cwd)
     derived = ids.repo_id_from_origin(url) if url is not None else None
     return derived, "derived" if derived is not None else None
@@ -251,30 +268,43 @@ def _check_repo(value: str, where: str) -> None:
         raise UsageError(f"{where}: invalid repo id (expected host[:port]/path)")
 
 
-def git_origin_url(cwd: str) -> str | None:
+def git_origin_url(cwd: str, *, git: str, gw: Gateway, git_name: str | None = None) -> str | None:
     """The URL of the ``origin`` remote of the repository at ``cwd`` (hardened, read-only git),
-    or None when there is none or git fails. Only git's trailing newline is removed."""
-    # TODO(#15): run git through the #51 gateway: the absolute git resolved at launch and the
-    # cwd set by the gateway; the environment cleanup below (git_env) moves there too.
-    argv = ["git", *GIT_HARDENING, "-C", os.fspath(cwd), "remote", "get-url", "origin"]
+    or None when there is none or git fails. ``git`` is the absolute git resolved at launch
+    (``pathrules.resolve_tool``: its realpath, run with ``argv[0]`` = ``git_name`` when
+    given). The output is decoded by the gateway (UTF-8, invalid bytes replaced); only git's
+    trailing newline is removed."""
+    argv = [git_name or git, *GIT_HARDENING, "-C", os.fspath(cwd), "remote", "get-url", "origin"]
+    executable = git if git_name else None
     try:
-        result = gateway.run(argv, timeout=GIT_TIMEOUT, env=git_env(os.environ))
-    except (OSError, ValueError, gateway.subprocess.SubprocessError):
+        result = gw.run(argv, timeout=GIT_TIMEOUT, env=git_env(os.environ), executable=executable)
+    except (OSError, ValueError, GatewayTimeout):
         return None
     if result.returncode != 0:
         return None
     return result.stdout.removesuffix("\n")
 
 
+def _default_origin_url(cwd: str) -> str | None:
+    """``git_origin_url`` with the ``git`` found on the sanitized ``PATH`` and the real gateway
+    (callers outside the launch path, which pass the git resolved under the path rules)."""
+    git = shutil.which("git", path=sanitize_path(os.environ.get("PATH", "")))
+    if git is None:
+        return None
+    return git_origin_url(cwd, git=os.path.abspath(git), gw=SystemGateway())
+
+
 def git_env(env: Mapping[str, str]) -> dict[str, str]:
     """``env`` without the variables that select another repository or extra config
-    (``GIT_DIR``, ``GIT_CONFIG_*`` and the like), with ``GIT_CONFIG_NOSYSTEM=1``."""
+    (``GIT_DIR``, ``GIT_CONFIG_*`` and the like), with ``GIT_CONFIG_NOSYSTEM=1`` and
+    ``LC_ALL=C``."""
     clean = {
         key: value
         for key, value in env.items()
         if key not in _GIT_ENV_DROP and not key.startswith(_GIT_ENV_DROP_PREFIXES)
     }
     clean["GIT_CONFIG_NOSYSTEM"] = "1"
+    clean["LC_ALL"] = "C"  # git's output never depends on the caller's locale
     return clean
 
 
@@ -371,7 +401,7 @@ def _apply_flags(
             keep(key, tuple(_env_names(value, key, origin, allow_empty=only)), origin)
             if only:
                 put("env.inherit", False, origin)
-        elif key == "permission_profile" and _is_profile_file(value):
+        elif key == "permission_profile" and ids.is_permission_profile_file(value):
             keep("permission_profile_file", value, origin)
         else:
             put(key, value, origin)
@@ -403,9 +433,21 @@ def _apply_flags(
     return config.validate_kind(data, where)
 
 
-def _is_profile_file(value: Any) -> bool:
-    """Whether a ``--permission-profile`` value names a file rather than a config profile."""
-    return isinstance(value, str) and ("/" in value or value.endswith(_PROFILE_FILE_SUFFIXES))
+def _check_profile_name(
+    cfg: config.Config, profile: config.Kind, origins: Mapping[str, Origin]
+) -> None:
+    """A ``--permission-profile`` name (given now or carried) must name a built-in or configured
+    profile; the grammar is checked with the profile (``config.ProfileName``). Names from the
+    kind layers were checked by ``config.load``."""
+    origin = origins["permission_profile"]
+    if origin in _LAYER_NAMES and profile.permission_profile not in cfg.permission_profiles:
+        detail = (
+            "permission_profile: names no built-in or configured permission profile"
+            f" (in --permission-profile, {_LAYER_NAMES[origin]})"
+        )
+        if origin == "previous_run":  # removed from config since: say how to recover
+            detail += "; use --reset permission-profile or give --permission-profile"
+        raise UsageError("invalid flag value", detail=detail)
 
 
 def _flag_for(field_name: str) -> str | None:

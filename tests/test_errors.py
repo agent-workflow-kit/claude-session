@@ -7,7 +7,9 @@ from claude_session.errors import (
     CliError,
     FailedError,
     InternalError,
+    InvalidPermissionProfile,
     LaunchFailedError,
+    LaunchValidationError,
     NotFoundError,
     RefusedError,
     SchemaNewerError,
@@ -46,3 +48,45 @@ def test_envelope_matches_schema_and_exit_code(error: CliError, code: str, exit_
     validate(envelope, "claude-session/cli/error.json")
     assert envelope["error"]["code"] == code
     assert error.exit_code == exit_code
+
+
+def test_launch_validation_errors_carry_their_end_reason() -> None:
+    error = InvalidPermissionProfile("bad profile", detail="sandbox.enabled: refused")
+    assert isinstance(error, LaunchValidationError)
+    assert isinstance(error, FailedError)  # uncaught, it still exits 12
+    assert error.exit_code == 12
+    assert error.end_reason == "invalid_permission_profile"
+    assert (error.message, error.detail) == ("bad profile", "sandbox.enabled: refused")
+    assert str(error) == "bad profile"
+    validate(error.envelope(), "claude-session/cli/error.json")
+
+
+def test_launch_validation_error_end_reason_keyword() -> None:
+    error = LaunchValidationError("cwd contains *", end_reason="unsafe_cwd")
+    assert (error.end_reason, error.exit_code, error.detail) == ("unsafe_cwd", 12, None)
+
+
+def test_launch_validation_error_keyword_overrides_the_class_default() -> None:
+    error = InvalidPermissionProfile("bad", end_reason="unsafe_read_dir")
+    assert error.end_reason == "unsafe_read_dir"
+    assert InvalidPermissionProfile("bad").end_reason == "invalid_permission_profile"
+
+
+def test_launch_validation_error_needs_an_end_reason() -> None:
+    with pytest.raises(TypeError, match="end_reason"):
+        LaunchValidationError("no reason")
+
+
+def test_launch_validation_error_hint_defaults_to_none() -> None:
+    error = LaunchValidationError("cwd contains *", end_reason="unsafe_cwd")
+    assert error.hint is None
+
+
+def test_launch_validation_error_hint_is_kept_out_of_the_failed_envelope() -> None:
+    error = LaunchValidationError(
+        "no bwrap", end_reason="sandbox_unavailable", hint="sudo apt install bubblewrap socat"
+    )
+    assert error.hint == "sudo apt install bubblewrap socat"
+    envelope = error.envelope()
+    assert "hint" not in envelope["error"]
+    validate(envelope, "claude-session/cli/error.json")

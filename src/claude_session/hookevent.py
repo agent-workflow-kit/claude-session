@@ -380,7 +380,7 @@ def hookconf_bytes(
     ``input_files`` (basenames, in order) and whose report caps are the given ones (outbox
     ingestion reads them here, never from config or an agent-writable file).
 
-    TODO(#15): exec writes it at launch step 7, through ``SessionDirs`` (private run dir).
+    ``exec`` writes it at launch step 7 (``SessionDirs.write_private_run_file``).
     TODO(#38): add the notes command settings (``notes_context_cmd`` and its limits).
     """
     conf = {
@@ -682,9 +682,10 @@ def apply_hook(
         if not run.adopted_and_open or run.state not in LIVE_STATES:
             return Applied(None)
         if drain is not None and drain.run_no != run.run_no:
-            # A new run began after the drain was prepared: leave its requests.
-            # TODO(#15): requests claimed into the old run's claimed/ are processed by that
-            # run's final drain or salvage, which also reads runs/<n>/claimed/.
+            # A new run began after the drain was prepared: leave its requests. They stay in
+            # the old run's claimed/, which that run's final drain (``final_drain``: every
+            # Drain.prepare picks up its run's claimed/ first) or its salvage processes.
+            # TODO(#33): salvage of a run whose wrapper is lost calls final_drain for it.
             drain = None
         if hook.claude_session_id is not None:
             assert hook.source is not None
@@ -726,6 +727,43 @@ def apply_hook(
             drained = drain is not None and drain.failure is None
             return Applied(run, backstop_output(), drained=drained)
     return Applied(run, drained=drain is not None and drain.failure is None)
+
+
+def final_drain(store: Store, csession_id: str, run_no: int, state_dir: str) -> bool:
+    """``exec``'s final drain of its run, after ``claude`` exited and before the end mapping
+    (interface.md, Outcome mapping: "first ingests the outbox"): claim the run's ``outbox/``
+    requests and those left in its private ``claimed/`` (by a canceled drain, or by a hook
+    whose run changed before its transaction), check them, then record them and apply an
+    ingested report through the transition table in one transaction (inside a savepoint, as
+    ``apply_hook`` does). The run must still be the session's current, open run. Logged like
+    a hook drain. Returns whether a drain was recorded; a drain that cannot run is logged
+    (``hook_event_failed`` with the exception type only) and its requests stay claimed."""
+    log = _Log(state_dir)
+    try:
+        drain = prepare_drain(store, csession_id, log)
+    except Exception as exc:
+        log.failure(csession_id, f"final drain: {type(exc).__name__}")
+        return False
+    if drain is None:
+        return False
+    recorded = False
+    try:
+        with store.transaction():
+            run = store.hook_run(csession_id)
+            if run is not None and run.run_no == drain.run_no == run_no and run.adopted_and_open:
+                _apply_report(store, csession_id, drain)
+                recorded = drain.failure is None
+    except BaseException:
+        drain.finish(committed=False)
+        raise
+    drain.finish(committed=recorded)
+    if recorded:
+        log_drain(log, drain)
+    else:
+        log_malformed(log, drain)
+    if drain.failure is not None:
+        log.failure(csession_id, f"final drain: {drain.failure}")
+    return recorded
 
 
 class _Log:

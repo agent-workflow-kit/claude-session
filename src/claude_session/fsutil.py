@@ -13,6 +13,7 @@ import fcntl
 import os
 import secrets
 import stat
+import sys
 import time
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -102,7 +103,7 @@ def _repair_dir_mode_at(dir_fd: int, name: str) -> tuple[int, int]:
     Linux: open it ``O_PATH`` (needs no read permission), check it through that descriptor
     and chmod it through ``/proc/self/fd``. Elsewhere (macOS): a no-follow ``chmod`` relative
     to ``dir_fd``, after an ``lstat`` check; without one the repair fails."""
-    o_path = getattr(os, "O_PATH", 0)
+    o_path = os.O_PATH if sys.platform.startswith("linux") else 0
     if o_path:
         flags = o_path | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         fd = os.open(name, flags, dir_fd=dir_fd)
@@ -300,3 +301,50 @@ def _lock(fd: int, path: str) -> None:
                 message = f"timed out waiting for the lock: {path}"
                 raise OSError(errno.EWOULDBLOCK, message) from None
             time.sleep(_LOCK_RETRY_INTERVAL)
+
+
+# Deeper trees are refused by ``remove_tree_at`` (bounded recursion and open descriptors).
+MAX_TREE_DEPTH = 256
+# Descriptors left free below RLIMIT_NOFILE while a tree is removed (one is open per level).
+FD_MARGIN = 64
+
+
+def tree_depth_cap() -> int:
+    """The depth ``remove_tree_at`` refuses beyond: ``MAX_TREE_DEPTH``, lowered to the soft
+    ``RLIMIT_NOFILE`` minus ``FD_MARGIN`` (at least 1), so a deep tree fails cleanly with
+    ``UnsafePathError`` instead of ``EMFILE`` partway down."""
+    import resource
+
+    soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY or soft < 0:
+        return MAX_TREE_DEPTH
+    return max(1, min(MAX_TREE_DEPTH, soft - FD_MARGIN))
+
+
+def remove_tree_at(dir_fd: int, name: str) -> None:
+    """Remove ``name`` in the directory ``dir_fd`` and everything below it, relative to
+    directory descriptors and never following a symlink: a symlink (anywhere, including
+    ``name`` itself) is unlinked, never followed. Directories must be owned by the effective
+    user; their modes are repaired (0700) so contents can be listed and removed. A tree
+    deeper than ``tree_depth_cap()`` is refused (``UnsafePathError``). Raises ``OSError``; on
+    failure part of the tree may already be gone."""
+    _check_segment(name)
+    _remove_at(dir_fd, name, 0, tree_depth_cap())
+
+
+def _remove_at(dir_fd: int, name: str, depth: int, cap: int) -> None:
+    info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        os.unlink(name, dir_fd=dir_fd)
+        return
+    if depth >= cap:
+        raise UnsafePathError(f"{name}: directory tree deeper than {cap} levels")
+    fd = open_private_dir_at(dir_fd, name)  # no-follow, ours, mode repaired to 0700
+    try:
+        if _identity(fd) != (info.st_dev, info.st_ino):
+            raise UnsafePathError(f"{name}: replaced while it was being removed")
+        for child in os.listdir(fd):
+            _remove_at(fd, child, depth + 1, cap)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=dir_fd)

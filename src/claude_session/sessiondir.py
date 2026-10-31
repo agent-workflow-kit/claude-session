@@ -16,8 +16,6 @@ design.md, Session directories; interface.md, Concepts and File handling:
 - The run secret is rotated every run; only its SHA-256 leaves this module besides the file.
 - The standard instructions contain no per-run values (design.md, Prompt delivery).
 
-TODO(#15): call prepare_run, write_prompt/write_inputs and write_run_files from exec's
-launch step 7, and record the layout and secret digest with Store.record_run_files.
 TODO(#28): start stages with stage(); the adopting exec calls place_staged().
 TODO(#29): fork copy of the source's inputs/ (fd-based; no symlinks, non-regular files or
 nlink > 1) and the carry-over of a not-started run's prompt and inputs.
@@ -38,7 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from . import fsutil, ids
-from .errors import FailedError, UsageError
+from .errors import FailedError, LaunchValidationError, UsageError
 
 SESSIONS = "sessions"
 PRIVATE = "private"
@@ -54,8 +52,12 @@ OUTBOX = "outbox"
 ARTIFACTS = "artifacts"
 WORK = "work"
 SETTINGS = "settings.json"
+GH_EMPTY = "gh-empty"
+EMPTY_GITCONFIG = "empty-gitconfig"
 
 SECRET_BYTES = 32
+# The private-directory names _recreate_empty moves replaced entries to.
+_TRASH = re.compile(r"\.[0-9a-f]{8}\.trash")
 _READ_CHUNK = 1 << 16
 # C0 and C1 controls and DEL: never inside the executable path written into the instructions.
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -132,10 +134,13 @@ class DirId:
 
 @dataclass(frozen=True)
 class RunLayout:
-    """The agent-writable directories of a run as ``exec`` prepared them."""
+    """The agent-writable directories of a run as ``exec`` prepared them, and the warnings of
+    the preparation (leftovers that could not be removed; ``exec`` adds them to the run's
+    warnings)."""
 
     outbox: DirId
     artifacts: DirId
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -359,21 +364,25 @@ def _check_run(run: int) -> None:
         raise ValueError(f"run must be a positive integer, got {run!r}")
 
 
-def _failed(path: str, exc: OSError) -> FailedError:
-    """The ``FailedError`` (exit 12) for an unsafe or unusable session-directory entry.
+class SessionDirUnsafe(LaunchValidationError):
+    """An unsafe or unusable entry of the session or private directory (a symlink, another
+    owner, a wrong type, a full disk, ...). A launch that meets one ends ``not-started`` with
+    end reason ``session_dir_unsafe`` (exit 12; interface.md, Outcome mapping); elsewhere it
+    is a ``FailedError`` (exit 12) like any operational failure."""
 
-    TODO(#15): decide and specify the launch end reason for a session-directory failure in
-    step 7 (no current launch_end_reason covers it; candidate: a new validation reason such
-    as `session_dir_unsafe`, exit 12).
-    """
-    return FailedError(f"unsafe or unusable session directory entry {path}: {exc}")
+    end_reason = "session_dir_unsafe"
+
+
+def _failed(path: str, exc: OSError) -> SessionDirUnsafe:
+    """The error for an unsafe or unusable session-directory entry."""
+    return SessionDirUnsafe(f"unsafe or unusable session directory entry {path}: {exc}")
 
 
 def _check_same_device(session_fd: int, private_fd: int, session: str, private: str) -> None:
     """Files are staged in the private directory and renamed into the session directory,
     which needs both on one file system."""
     if os.fstat(session_fd).st_dev != os.fstat(private_fd).st_dev:
-        raise FailedError(f"{session} and {private} are not on the same file system")
+        raise SessionDirUnsafe(f"{session} and {private} are not on the same file system")
 
 
 # The directories
@@ -462,10 +471,12 @@ class SessionDirs:
 
     # Run preparation
 
-    def prepare_run(self, run: int) -> RunLayout:
+    def prepare_run(self, run: int, *, isolated: bool = False) -> RunLayout:
         """Create (or verify) ``outbox/``, ``artifacts/``, ``work/`` and ``inputs/`` and the
         private ``runs/<run>/``; return the identities of ``outbox/`` and ``artifacts/`` for
-        ``run.json`` and the run row (``Store.record_run_files``)."""
+        ``run.json`` and the run row (``Store.record_run_files``). For an ``isolated`` run,
+        also recreate ``gh-empty/`` and ``empty-gitconfig`` empty, so nothing an agent left
+        there in an earlier (possibly trusted) run reaches this one."""
         _check_run(run)
         idents = {}
         for name in (OUTBOX, ARTIFACTS, WORK, INPUTS):
@@ -475,10 +486,71 @@ class SessionDirs:
             finally:
                 os.close(fd)
         os.close(self._run_private_dir(run))
-        layout = RunLayout(outbox=idents[OUTBOX], artifacts=idents[ARTIFACTS])
+        warnings = self._recreate_empty() if isolated else []
+        layout = RunLayout(
+            outbox=idents[OUTBOX], artifacts=idents[ARTIFACTS], warnings=tuple(warnings)
+        )
         self._layouts[run] = layout
-        # TODO(#23): recreate gh-empty/ and empty-gitconfig empty (fd-based) for isolated runs.
         return layout
+
+    def _recreate_empty(self) -> list[str]:
+        """Replace ``gh-empty/`` with a new empty directory and ``empty-gitconfig`` with an
+        empty file. Whatever is at either name (a directory with content, a file, a symlink)
+        is first moved into the private directory by rename, never followed, and removed
+        there once the new entry is in place. The new directory is created in the private
+        directory and renamed into place, like every file (no temporary name in the session
+        directory).
+
+        Removing the moved entries is best effort: every one is attempted and a failure
+        (for example a tree too deep to remove) is returned as a warning, not raised; the
+        leftovers (``.<hex>.trash``) are swept again at the start of the next call."""
+        warnings = self._sweep_trash()
+        trash = [self._move_to_private(name) for name in (GH_EMPTY, EMPTY_GITCONFIG)]
+        tmp = f".{secrets.token_hex(4)}.tmp"
+        try:
+            os.close(fsutil.create_private_dir_at(self._pfd, tmp))
+        except OSError as exc:
+            raise _failed(os.path.join(self.private_path, tmp), exc) from exc
+        self._move(self._pfd, tmp, self._sfd, GH_EMPTY, self.session_path)
+        self._write(self._sfd, EMPTY_GITCONFIG, b"", self.session_path)
+        for name in trash:
+            if name is not None:
+                warnings += self._remove_trash(name)
+        return warnings
+
+    def _sweep_trash(self) -> list[str]:
+        """Remove leftover ``.<hex>.trash`` entries of earlier calls (best effort)."""
+        try:
+            names = os.listdir(self._pfd)
+        except OSError as exc:
+            return [f"cannot list {self.private_path} for leftovers: {exc.strerror or exc}"]
+        warnings: list[str] = []
+        for name in sorted(names):
+            if _TRASH.fullmatch(name):
+                warnings += self._remove_trash(name)
+        return warnings
+
+    def _remove_trash(self, name: str) -> list[str]:
+        try:
+            fsutil.remove_tree_at(self._pfd, name)
+        except OSError as exc:
+            # Never the exception text: it may name an entry the agent created.
+            reason = exc.strerror or "unsafe entry or directory tree too deep"
+            path = os.path.join(self.private_path, name)
+            return [f"cannot remove leftover {path} (retried next run): {reason}"]
+        return []
+
+    def _move_to_private(self, name: str) -> str | None:
+        """Rename the session-directory entry ``name`` (any type) into the private directory
+        under a fresh name; return that name, or None when there was no entry."""
+        trash = f".{secrets.token_hex(4)}.trash"
+        try:
+            os.rename(name, trash, src_dir_fd=self._sfd, dst_dir_fd=self._pfd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise _failed(os.path.join(self.session_path, name), exc) from exc
+        return trash
 
     def _run_private_dir(self, run: int) -> int:
         runs_fd = _ensure_dir(self._pfd, RUNS, os.path.join(self.private_path, RUNS))
@@ -545,6 +617,69 @@ class SessionDirs:
             os.close(run_fd)
         return os.path.join(where, SETTINGS)
 
+    def write_private_run_file(self, run: int, name: str, data: bytes) -> str:
+        """Write ``private/<id>/runs/<run>/<name>`` (one path segment; 0600, no-follow,
+        atomic: a temporary file in the private directory renamed into place), after
+        ``prepare_run(run)``: ``hookconf.json``, ``secret-index``, the permission-profile
+        snapshot. Returns its absolute path."""
+        if run not in self._layouts:
+            raise ValueError(f"prepare_run({run}) must come first")
+        if not name or "/" in name or name in (".", ".."):
+            raise ValueError(f"not a file name: {name!r}")
+        run_fd = self._run_private_dir(run)
+        where = os.path.join(self.private_path, RUNS, str(run))
+        try:
+            self._write(run_fd, name, data, where)
+        finally:
+            os.close(run_fd)
+        return os.path.join(where, name)
+
+    def open_run_dir(self, run: int) -> int:
+        """A descriptor of the private ``runs/<run>/`` (verified ours, no-follow) that the
+        caller closes; after ``prepare_run(run)``."""
+        if run not in self._layouts:
+            raise ValueError(f"prepare_run({run}) must come first")
+        return self._run_private_dir(run)
+
+    def create_run_output(self, run: int, name: str) -> int:
+        """Create ``private/<id>/runs/<run>/<name>`` (headless ``result.json`` and
+        ``stderr.log``) empty, mode 0600, with ``O_EXCL | O_NOFOLLOW``, and return a write-only
+        descriptor for the child's stdout or stderr (the caller closes it). An existing entry
+        is refused: run numbers are never reused."""
+        run_fd = self.open_run_dir(run)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        path = os.path.join(self.private_path, RUNS, str(run), name)
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=run_fd)
+            os.fchmod(fd, 0o600)
+            return fd
+        except OSError as exc:
+            raise _failed(path, exc) from exc
+        finally:
+            os.close(run_fd)
+
+    def ensure_session_subdir(self, path: str) -> None:
+        """Create (or verify) the directory ``path``, which must lie inside ``outbox/``,
+        ``artifacts/`` or ``work/`` of the session directory: each component is created 0700
+        or opened no-follow relative to the pinned session descriptor (a ``write_dirs``
+        entry inside ``$CSESSION_DIR``, created before launch)."""
+        relative = os.path.relpath(os.path.normpath(path), self.session_path)
+        parts = relative.split("/")
+        if relative.startswith("..") or parts[0] not in (OUTBOX, ARTIFACTS, WORK):
+            raise ValueError(f"not inside outbox/, artifacts/ or work/: {path!r}")
+        if any(part in ("", ".", "..") for part in parts):
+            raise ValueError(f"not a normalized path: {path!r}")
+        fd = os.dup(self._sfd)
+        where = self.session_path
+        try:
+            for part in parts:
+                where = os.path.join(where, part)
+                next_fd = _ensure_dir(fd, part, where)
+                os.close(fd)
+                fd = next_fd
+        finally:
+            os.close(fd)
+
     # Prompts and inputs, copied directly (plain exec and resume)
 
     def write_prompt(self, run: int, data: bytes) -> str:
@@ -586,7 +721,9 @@ class SessionDirs:
             try:
                 return fsutil.create_private_dir_at(inputs_fd, str(run))
             except FileExistsError as exc:
-                raise FailedError(f"{INPUTS}/{run} already exists in {self.session_path}") from exc
+                raise SessionDirUnsafe(
+                    f"{INPUTS}/{run} already exists in {self.session_path}"
+                ) from exc
             except OSError as exc:
                 raise _failed(os.path.join(inputs, str(run)), exc) from exc
         finally:
@@ -598,9 +735,8 @@ class SessionDirs:
         """``start``: stage the prompt and inputs in ``private/<id>/runs/<run>/staged/``
         (which must not exist yet), so the caller may delete its files afterwards.
 
-        TODO(#28): decide and specify the launch end reason for a session-directory failure
-        during staging (no current launch_end_reason covers it; candidate: a new validation
-        reason such as `session_dir_unsafe`, exit 12).
+        TODO(#28): a session-directory failure during staging ends the launch
+        ``session_dir_unsafe`` (``start``: ``launch_failed``, exit 12), as in exec's step 7.
         """
         _check_run(run)
         check_input_names([item.name for item in inputs])
@@ -645,7 +781,7 @@ class SessionDirs:
             names = sorted(os.listdir(staged_fd))
             unexpected = [name for name in names if name not in (PROMPT, INPUTS)]
             if unexpected:
-                raise FailedError(f"unexpected entry {unexpected[0]!r} in {staged}")
+                raise SessionDirUnsafe(f"unexpected entry {unexpected[0]!r} in {staged}")
             has_prompt = PROMPT in names
             if has_prompt:
                 _check_staged_file(staged_fd, PROMPT, staged)
@@ -673,7 +809,7 @@ class SessionDirs:
                 except OSError as exc:
                     raise _failed(os.path.join(inputs, str(run)), exc) from exc
                 else:
-                    raise FailedError(f"{INPUTS}/{run} already exists in {self.session_path}")
+                    raise SessionDirUnsafe(f"{INPUTS}/{run} already exists in {self.session_path}")
             # Moves: the prompt first, the inputs directory last.
             prompt_path = None
             if prompt_dst is not None:
@@ -730,7 +866,7 @@ def _check_staged_inputs(staged_fd: int, src: str) -> list[str]:
         names = sorted(os.listdir(src_fd))
         for name in names:
             if not ids.is_artifact_name(name):
-                raise FailedError(f"unexpected staged input name {name!r} in {src}")
+                raise SessionDirUnsafe(f"unexpected staged input name {name!r} in {src}")
             _check_staged_file(src_fd, name, src)
     finally:
         os.close(src_fd)
@@ -744,8 +880,8 @@ def _check_staged_file(dir_fd: int, name: str, where: str) -> None:
     except OSError as exc:
         raise _failed(path, exc) from exc
     if not stat.S_ISREG(info.st_mode):
-        raise FailedError(f"staged entry {path} is not a regular file")
+        raise SessionDirUnsafe(f"staged entry {path} is not a regular file")
     if info.st_nlink != 1:
-        raise FailedError(f"staged entry {path} has {info.st_nlink} links")
+        raise SessionDirUnsafe(f"staged entry {path} has {info.st_nlink} links")
     if info.st_uid != os.geteuid():
-        raise FailedError(f"staged entry {path} is owned by uid {info.st_uid}")
+        raise SessionDirUnsafe(f"staged entry {path} is owned by uid {info.st_uid}")

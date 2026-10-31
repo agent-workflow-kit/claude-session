@@ -23,12 +23,21 @@ caller's for ``exec``, the adopting process's for ``exec --session-id``); it nev
    ``GLAB_CONFIG_DIR`` point at ``$CSESSION_DIR/gh-empty``. Re-applied after step 5, so these
    win over ``env.set`` (``env.set`` may still set a ``secret_env`` name).
 5. ``env.set`` (``${CSESSION_DIR}``, ``${CWD}``, ``${HOME}``, ``${GIT_DIR}`` expanded once,
-   before step 2 reads the provider flags; any other ``${`` is refused), then ``PATH`` = the
-   executable directory, ``env.path_prepend``, the kind's ``PATH``. Config validation
-   already refuses invalid ``env.set``, ``env.allow`` and ``path_prepend`` entries; the checks
-   here are a backstop.
-6. (#24) PATH sanitizing for isolated runs.
-7. (#23) git hardening for third-party-reading runs.
+   before step 2 reads the provider flags; any other ``${`` is refused), then ``PATH`` =
+   ``env.path_prepend``, the kind's ``PATH``. Config validation already refuses invalid
+   ``env.set``, ``env.allow`` and ``path_prepend`` entries; the checks here are a backstop.
+6. Isolated runs: ``PATH`` sanitized (empty and relative entries dropped; an entry inside a
+   session-writable path, checked hop by hop through its symlinks, fails the launch,
+   ``unsafe_path``; interface.md, Path rules; each kept entry is replaced by its realpath), and
+   the dynamic-loader variables (``LD_PRELOAD``, ``LD_LIBRARY_PATH``, ``LD_AUDIT``, every
+   ``DYLD_*``) removed, also ones ``env.set`` sets: they would reach the unsandboxed hook
+   interpreter. Then, for every run, the executable directory is prepended to ``PATH``
+   (after sanitizing; it is checked against the session-writable paths too, hop by hop).
+7. Third-party-reading runs: the git variables that override config or redirect git
+   (``GIT_CONFIG_PARAMETERS``, ``GIT_SSH``, ``GIT_DIR``, ...; ``GIT_ENV_DROP``) removed, then
+   the ``GIT_CONFIG_COUNT``/``KEY``/``VALUE`` hardening entries appended after the existing
+   ones (renumbered; a malformed existing set is replaced) and ``GIT_OPTIONAL_LOCKS=0``.
+   After step 5, so they win over ``env.set``.
 8. Every ``CSESSION_*`` removed, then ``CSESSION_ID``, ``CSESSION_DIR``, ``CSESSION_KIND`` and,
    when a private temporary directory is given, ``TMPDIR`` and ``CLAUDE_CODE_TMPDIR`` set.
 
@@ -39,11 +48,11 @@ itself be a valid variable-name start. Any other entry matches only the identica
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 
-from . import config, ids, kinds, logs
-from .errors import UsageError
+from . import config, ids, kinds, logs, pathrules
+from .errors import LaunchValidationError, UsageError
 
 # Step 1: passed in allowlist mode (design.md, Environment).
 BASE_ALLOWLIST = (
@@ -87,6 +96,41 @@ THIRD_PARTY_DROP = (
 )
 GH_EMPTY = "gh-empty"
 GH_CONFIG_ENV = ("GH_CONFIG_DIR", "GLAB_CONFIG_DIR")
+# Step 7: git config entries for the agent's own git commands (design.md, Environment), in
+# this order, after any existing entries (git takes the last value of a key).
+GIT_HARDENING = (
+    ("core.fsmonitor", ""),
+    ("core.hooksPath", "/dev/null"),
+    ("core.sshCommand", ""),
+    ("credential.helper", ""),
+    ("diff.external", ""),
+    ("core.pager", "cat"),
+)
+# Step 7: removed first; each beats the hardening entries (GIT_CONFIG_PARAMETERS is applied
+# after the GIT_CONFIG_COUNT entries) or points git at other commands or another repository.
+# Not kinds._GIT_ENV_DROP: that one also drops the GIT_CONFIG_COUNT set kept here.
+GIT_ENV_DROP = (
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_ASKPASS",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+GIT_CONFIG_COUNT = "GIT_CONFIG_COUNT"
+GIT_CONFIG_KEY = "GIT_CONFIG_KEY_"
+GIT_CONFIG_VALUE = "GIT_CONFIG_VALUE_"
+# An existing GIT_CONFIG_COUNT above this (or not plain ASCII digits) is treated as malformed.
+MAX_GIT_CONFIG_COUNT = 1000
+# Step 6: dynamic-loader variables removed for isolated runs.
+LOADER_DROP = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT")
+LOADER_DROP_PREFIX = "DYLD_"
 # Step 8.
 CSESSION_PREFIX = "CSESSION_"
 TMPDIR_ENV = ("TMPDIR", "CLAUDE_CODE_TMPDIR")
@@ -124,20 +168,29 @@ def build(
     exe_dir: str,
     git_dir: str | None = None,
     tmpdir: str | None = None,
+    session_writable: Callable[[str], bool] | None = None,
 ) -> SessionEnv:
     """Build the session environment from ``environ`` (never modified).
 
     ``exe_dir`` is the directory of the running ``claude-session`` executable, ``git_dir`` the
     cwd's git common directory (None: none), ``tmpdir`` the private temporary directory of a
-    sandboxed run (None: not sandboxed). Raises ``UsageError`` for an invalid ``env.set`` or
-    ``env.path_prepend`` entry (the message names the key, never a value) and ``ValueError``
-    for an ``exe_dir`` that is not one absolute path.
+    sandboxed run (None: not sandboxed). ``session_writable`` is the run's session-writable
+    path check (``pathrules.session_writable``); required for isolated runs (None raises
+    ``ValueError``). Raises ``UsageError`` for an invalid ``env.set`` or ``env.path_prepend``
+    entry (the message names the key, never a value), ``LaunchValidationError``
+    (``unsafe_path``) for an isolated run's ``PATH`` entry or ``exe_dir`` inside a
+    session-writable path, and ``ValueError`` for an ``exe_dir`` that is not one absolute
+    path.
     """
-    # TODO(#15): exec passes exe_dir (from the absolute argv[0]), git_dir (from gitinfo) and
-    # the private tmpdir (#25), and builds the redaction set and the contains_secret index
-    # (secretindex.write_at) from secret_values(session_env, environ, run_secret).
+    # exec (launch.build_env) passes exe_dir (from the absolute argv[0]), git_dir (from
+    # gitinfo) and the private tmpdir, and builds the log and audit redaction set and the
+    # contains_secret index (launch.prepare) from secret_values(session_env, environ,
+    # run_secret).
     _check_path_entry(exe_dir, ValueError, "the claude-session executable directory")
     profile = resolution.profile
+    isolated = resolution.isolated()
+    if isolated and session_writable is None:
+        raise ValueError("isolated runs need the session_writable path check")
 
     # 1. Base (entries execve cannot pass are dropped).
     environ = {name: value for name, value in environ.items() if _passable(name, value)}
@@ -182,23 +235,37 @@ def build(
     if profile.reads_third_party:
         _third_party(env, csession_dir)
 
-    # 5. env.set (expanded above), path_prepend, the executable directory.
+    # 5. env.set (expanded above), path_prepend (the executable directory: after step 6).
     env.update(set_values)
     for entry in profile.env.path_prepend:
         _check_path_entry(entry, UsageError, "env.path_prepend")
     kind_path = env.get("PATH", "")
-    env["PATH"] = ":".join(
-        [exe_dir, *profile.env.path_prepend, *([kind_path] if kind_path else [])]
-    )
+    path = [*profile.env.path_prepend, *([kind_path] if kind_path else [])]
     # Step 4 wins over env.set: a run can be third-party-reading by flag, so a token literal
     # in the kind's env.set must not reach it.
     if profile.reads_third_party:
         _third_party(env, csession_dir)
 
-    # 6. TODO(#24): sanitize PATH for isolated runs (drop empty and relative entries, refuse
-    #    entries inside session-writable paths with unsafe_path).
-    # 7. TODO(#23): third-party-reading runs: append the GIT_CONFIG_COUNT/KEY/VALUE hardening
-    #    entries (renumbered after existing ones) and set GIT_OPTIONAL_LOCKS=0.
+    # 6. Isolated runs: PATH sanitized and checked, loader variables removed. The executable
+    #    directory is prepended after sanitizing (interface.md, Environment at adoption).
+    if isolated:
+        assert session_writable is not None
+        entries = pathrules.sanitize_path(":".join(path))
+        pathrules.check_path_entries(entries, session_writable)
+        if pathrules.writable_hop(exe_dir, session_writable) is not None:
+            raise LaunchValidationError(
+                "the claude-session executable directory is inside a session-writable path",
+                end_reason="unsafe_path",
+            )
+        path = [os.path.realpath(entry) for entry in entries]
+        for name in [n for n in env if n in LOADER_DROP or n.startswith(LOADER_DROP_PREFIX)]:
+            del env[name]
+    env["PATH"] = ":".join([exe_dir, *path])
+    # 7. Git hardening (after step 5: it wins over env.set).
+    if profile.reads_third_party:
+        for name in GIT_ENV_DROP:
+            env.pop(name, None)
+        _git_hardening(env)
 
     # 8. CSESSION_* and the private temporary directory.
     for name in [name for name in env if name.startswith(CSESSION_PREFIX)]:
@@ -258,6 +325,50 @@ def _third_party(env: dict[str, str], csession_dir: str) -> None:
         env.pop(name, None)
     for name in GH_CONFIG_ENV:
         env[name] = os.path.join(csession_dir, GH_EMPTY)
+
+
+def _git_hardening(env: dict[str, str]) -> None:
+    """Append ``GIT_HARDENING`` after the existing ``GIT_CONFIG_*`` entries and set
+    ``GIT_OPTIONAL_LOCKS=0``. Entries git would ignore (numbered at or above the count) are
+    dropped. A malformed existing set (a count that is not 0-``MAX_GIT_CONFIG_COUNT`` in ASCII
+    digits, or a missing key or value below it) makes git refuse every command, so it is
+    dropped whole and only the hardening is passed."""
+    count = _git_config_count(env)
+    keep = count or 0
+    for name in list(env):
+        index = _git_config_index(name)
+        if name == GIT_CONFIG_COUNT or (index is not None and not 0 <= index < keep):
+            del env[name]
+    for offset, (key, value) in enumerate(GIT_HARDENING):
+        env[f"{GIT_CONFIG_KEY}{keep + offset}"] = key
+        env[f"{GIT_CONFIG_VALUE}{keep + offset}"] = value
+    env[GIT_CONFIG_COUNT] = str(keep + len(GIT_HARDENING))
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+
+
+def _git_config_count(env: Mapping[str, str]) -> int | None:
+    """The existing entry count (0 when unset), or None when the set is malformed."""
+    raw = env.get(GIT_CONFIG_COUNT)
+    if raw is None:
+        return 0
+    if not (raw.isascii() and raw.isdigit()) or len(raw) > 4 or int(raw) > MAX_GIT_CONFIG_COUNT:
+        return None
+    count = int(raw)
+    for index in range(count):
+        if f"{GIT_CONFIG_KEY}{index}" not in env or f"{GIT_CONFIG_VALUE}{index}" not in env:
+            return None
+    return count
+
+
+def _git_config_index(name: str) -> int | None:
+    """The index of a ``GIT_CONFIG_KEY_<n>``/``VALUE_<n>`` name; -1 for one git never reads
+    (a suffix that is not a canonical decimal); None for any other name."""
+    for prefix in (GIT_CONFIG_KEY, GIT_CONFIG_VALUE):
+        if name.startswith(prefix):
+            suffix = name.removeprefix(prefix)
+            canonical = suffix.isascii() and suffix.isdigit() and str(int(suffix)) == suffix
+            return int(suffix) if canonical else -1
+    return None
 
 
 def _matches(name: str, patterns: Iterable[str]) -> bool:
