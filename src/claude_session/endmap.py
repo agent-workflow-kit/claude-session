@@ -14,10 +14,14 @@ one ``result`` object and the last JSON object is one, and the file does not end
 truncated line: a non-empty tail without its newline (a writer killed mid-line) makes it
 incomplete even when the tail happens to parse.
 
-**Interactive table.** ``map_interactive`` has the cause and signal rows (#17), then ``normal``
-for exit 0 and ``exit_<code>`` otherwise.
-TODO(#18): the interactive rows ``no_session_start`` (``claude`` gone before SessionStart) and
-``user_exit`` (last process-ending SessionEnd reason ``prompt_input_exit``), before ``normal``.
+**Interactive table.** ``map_interactive``, first match: the cause and signal rows;
+``no_session_start`` when no SessionStart was recorded (``claude`` gone before it, e.g. the
+trust dialog quit, whatever its exit code); ``user_exit`` when the last process-ending
+SessionEnd reason is ``prompt_input_exit``; then ``normal`` for exit 0 and ``exit_<code>``
+otherwise. The run stores only its latest SessionEnd reason, verbatim. That is enough: a
+reason that does not end the process (``clear``) never matches, and an earlier
+``prompt_input_exit`` followed by more SessionEnds would not have ended the process either.
+The reason is compared exactly (no case folding or trimming).
 """
 
 from __future__ import annotations
@@ -278,20 +282,30 @@ def map_headless(
     return _with_report(report_status, "exited-unreported", reason)
 
 
+USER_EXIT_REASON = "prompt_input_exit"  # Claude Code's SessionEnd reason for /exit
+
+
 def map_interactive(
     *,
     pending_cause: str | None,
     report_status: str | None,
     returncode: int,
+    session_started: bool,
+    session_end_reason: str | None,
 ) -> Mapped:
     """The interactive table, first match (interface.md, Outcome mapping: Interactive). With a
-    report the outcome is the report's and only the end reason comes from the table."""
+    report the outcome is the report's and only the end reason comes from the table.
+    ``session_end_reason`` is the run's latest recorded SessionEnd reason (see the module
+    docs)."""
     if pending_cause is not None:
         return _cause(pending_cause, report_status)
     signalled = signal_end_reason(returncode)
     if signalled is not None:
         return _with_report(report_status, "killed", signalled)
-    # TODO(#18): no_session_start and user_exit come first (see the module docs).
+    if not session_started:
+        return _with_report(report_status, "exited-unreported", "no_session_start")
+    if session_end_reason == USER_EXIT_REASON:
+        return _with_report(report_status, "exited-unreported", "user_exit")
     if returncode == 0:
         return _with_report(report_status, "exited-unreported", "normal")
     return _with_report(report_status, "exited-unreported", f"exit_{returncode}")
