@@ -14,8 +14,10 @@ one ``result`` object and the last JSON object is one, and the file does not end
 truncated line: a non-empty tail without its newline (a writer killed mid-line) makes it
 incomplete even when the tail happens to parse.
 
-TODO(#18): the interactive table (``user_exit``, ``normal``, ``exit_<code>``,
-``no_session_start``).
+**Interactive table.** ``map_interactive`` has the cause and signal rows (#17), then ``normal``
+for exit 0 and ``exit_<code>`` otherwise.
+TODO(#18): the interactive rows ``no_session_start`` (``claude`` gone before SessionStart) and
+``user_exit`` (last process-ending SessionEnd reason ``prompt_input_exit``), before ``normal``.
 """
 
 from __future__ import annotations
@@ -232,9 +234,10 @@ def _cause(pending_cause: str, report_status: str | None) -> Mapped:
         raise ValueError(f"unknown pending cause {pending_cause!r}")
     outcome, end_reason = CAUSES[pending_cause]
     if outcome is None:
-        if report_status != "done":
+        # Set only after a done report; a report ingested after that (the final drain) wins.
+        if report_status is None:
             raise ValueError("auto_exit is set only after a done report")
-        return Mapped("done", end_reason)
+        return _with_report(report_status, "done", end_reason)
     return _with_report(report_status, outcome, end_reason)
 
 
@@ -273,6 +276,25 @@ def map_headless(
         return _with_report(report_status, "exited-unreported", f"exit_{returncode}")
     reason = "no_result" if session_started else "no_session_start"
     return _with_report(report_status, "exited-unreported", reason)
+
+
+def map_interactive(
+    *,
+    pending_cause: str | None,
+    report_status: str | None,
+    returncode: int,
+) -> Mapped:
+    """The interactive table, first match (interface.md, Outcome mapping: Interactive). With a
+    report the outcome is the report's and only the end reason comes from the table."""
+    if pending_cause is not None:
+        return _cause(pending_cause, report_status)
+    signalled = signal_end_reason(returncode)
+    if signalled is not None:
+        return _with_report(report_status, "killed", signalled)
+    # TODO(#18): no_session_start and user_exit come first (see the module docs).
+    if returncode == 0:
+        return _with_report(report_status, "exited-unreported", "normal")
+    return _with_report(report_status, "exited-unreported", f"exit_{returncode}")
 
 
 def map_wrapper_lost(
