@@ -54,6 +54,8 @@ OUTBOX = "outbox"
 ARTIFACTS = "artifacts"
 WORK = "work"
 SETTINGS = "settings.json"
+GH_EMPTY = "gh-empty"
+EMPTY_GITCONFIG = "empty-gitconfig"
 
 SECRET_BYTES = 32
 _READ_CHUNK = 1 << 16
@@ -462,10 +464,12 @@ class SessionDirs:
 
     # Run preparation
 
-    def prepare_run(self, run: int) -> RunLayout:
+    def prepare_run(self, run: int, *, isolated: bool = False) -> RunLayout:
         """Create (or verify) ``outbox/``, ``artifacts/``, ``work/`` and ``inputs/`` and the
         private ``runs/<run>/``; return the identities of ``outbox/`` and ``artifacts/`` for
-        ``run.json`` and the run row (``Store.record_run_files``)."""
+        ``run.json`` and the run row (``Store.record_run_files``). For an ``isolated`` run,
+        also recreate ``gh-empty/`` and ``empty-gitconfig`` empty, so nothing an agent left
+        there in an earlier (possibly trusted) run reaches this one."""
         _check_run(run)
         idents = {}
         for name in (OUTBOX, ARTIFACTS, WORK, INPUTS):
@@ -477,8 +481,43 @@ class SessionDirs:
         os.close(self._run_private_dir(run))
         layout = RunLayout(outbox=idents[OUTBOX], artifacts=idents[ARTIFACTS])
         self._layouts[run] = layout
-        # TODO(#23): recreate gh-empty/ and empty-gitconfig empty (fd-based) for isolated runs.
+        if isolated:
+            self._recreate_empty()
         return layout
+
+    def _recreate_empty(self) -> None:
+        """Replace ``gh-empty/`` with a new empty directory and ``empty-gitconfig`` with an
+        empty file. Whatever is at either name (a directory with content, a file, a symlink)
+        is first moved into the private directory by rename, never followed, and removed
+        there once the new entry is in place. The new directory is created in the private
+        directory and renamed into place, like every file (no temporary name in the session
+        directory)."""
+        trash = [self._move_to_private(name) for name in (GH_EMPTY, EMPTY_GITCONFIG)]
+        tmp = f".{secrets.token_hex(4)}.tmp"
+        try:
+            os.close(fsutil.create_private_dir_at(self._pfd, tmp))
+        except OSError as exc:
+            raise _failed(os.path.join(self.private_path, tmp), exc) from exc
+        self._move(self._pfd, tmp, self._sfd, GH_EMPTY, self.session_path)
+        self._write(self._sfd, EMPTY_GITCONFIG, b"", self.session_path)
+        for name in trash:
+            if name is not None:
+                try:
+                    fsutil.remove_tree_at(self._pfd, name)
+                except OSError as exc:
+                    raise _failed(os.path.join(self.private_path, name), exc) from exc
+
+    def _move_to_private(self, name: str) -> str | None:
+        """Rename the session-directory entry ``name`` (any type) into the private directory
+        under a fresh name; return that name, or None when there was no entry."""
+        trash = f".{secrets.token_hex(4)}.trash"
+        try:
+            os.rename(name, trash, src_dir_fd=self._sfd, dst_dir_fd=self._pfd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise _failed(os.path.join(self.session_path, name), exc) from exc
+        return trash
 
     def _run_private_dir(self, run: int) -> int:
         runs_fd = _ensure_dir(self._pfd, RUNS, os.path.join(self.private_path, RUNS))

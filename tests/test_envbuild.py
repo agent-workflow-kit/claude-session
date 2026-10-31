@@ -1052,3 +1052,159 @@ def test_repeated_builds_are_identical(cfg_dir: Path) -> None:
     cfg = load(cfg_dir, "secret_env: [WEBHOOK_URL]\n")
     environ = {**CALLER, "WEBHOOK_URL": SECRET, "ANTHROPIC_API_KEY": "k"}
     assert build(cfg, "review", environ) == build(cfg, "review", environ)
+
+
+# 7. Git hardening (third-party-reading runs)
+
+HARDENING = [
+    ("core.fsmonitor", ""),
+    ("core.hooksPath", "/dev/null"),
+    ("core.sshCommand", ""),
+    ("credential.helper", ""),
+    ("diff.external", ""),
+    ("core.pager", "cat"),
+]
+GIT_INHERIT = """
+kinds:
+  review:
+    env: {inherit: true, allow: [], set: {}, path_prepend: []}
+"""
+
+
+def git_entries(env: dict[str, str]) -> list[tuple[str, str]]:
+    count = int(env["GIT_CONFIG_COUNT"])
+    return [(env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"]) for i in range(count)]
+
+
+def git_names(env: dict[str, str]) -> set[str]:
+    return {name for name in env if name.startswith("GIT_CONFIG_") and name[11:12] in "KVC"}
+
+
+@pytest.mark.parametrize("kind", ["review", "gate-check", "respond"])
+def test_third_party_runs_get_git_hardening(cfg_dir: Path, kind: str) -> None:
+    env = env_of(load(cfg_dir), kind)
+    assert git_entries(env) == HARDENING
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+def test_reads_third_party_flag_adds_git_hardening(cfg_dir: Path) -> None:
+    env = env_of(load(cfg_dir), "implement", flags={"reads_third_party": True})
+    assert git_entries(env) == HARDENING
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+@pytest.mark.parametrize("kind", ["implement", "rank"])
+def test_runs_that_do_not_read_third_party_content_get_no_git_hardening(
+    cfg_dir: Path, kind: str
+) -> None:
+    env = env_of(load(cfg_dir), kind, {**CALLER, "GIT_OPTIONAL_LOCKS": "1"})
+    assert "GIT_CONFIG_COUNT" not in env
+    assert env.get("GIT_OPTIONAL_LOCKS", "1") == "1"
+
+
+def test_git_hardening_is_appended_after_existing_entries(cfg_dir: Path) -> None:
+    environ = {
+        **CALLER,
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "user.name",
+        "GIT_CONFIG_VALUE_0": "n",
+        "GIT_CONFIG_KEY_1": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_1": "/planted/monitor",
+    }
+    env = env_of(load(cfg_dir, GIT_INHERIT), "review", environ)
+    entries = git_entries(env)
+    assert entries[:2] == [("user.name", "n"), ("core.fsmonitor", "/planted/monitor")]
+    # Later entries win in git: the hardening comes last.
+    assert entries[2:] == HARDENING
+    assert env["GIT_CONFIG_COUNT"] == "8"
+
+
+def test_git_hardening_wins_over_env_set(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir,
+        """
+        kinds:
+          review:
+            env:
+              inherit: false
+              allow: []
+              set: {GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: core.hooksPath,
+                    GIT_CONFIG_VALUE_0: /evil, GIT_OPTIONAL_LOCKS: "1"}
+              path_prepend: []
+        """,
+    )
+    env = env_of(cfg, "review")
+    assert git_entries(env) == [("core.hooksPath", "/evil"), *HARDENING]
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+def test_git_hardening_applies_with_a_flag_on_a_kind_with_env_set(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir,
+        """
+        kinds:
+          implement:
+            env: {inherit: true, allow: [], set: {GIT_OPTIONAL_LOCKS: "1"}, path_prepend: []}
+        """,
+    )
+    env = env_of(cfg, "implement", flags={"reads_third_party": True, "env_allowlist_only": []})
+    assert git_entries(env) == HARDENING
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        {"GIT_CONFIG_COUNT": "x"},
+        {"GIT_CONFIG_COUNT": ""},
+        {"GIT_CONFIG_COUNT": "-1"},
+        {"GIT_CONFIG_COUNT": " 1"},
+        {"GIT_CONFIG_COUNT": "1\n"},
+        {"GIT_CONFIG_COUNT": "١"},  # a non-ASCII digit
+        {"GIT_CONFIG_COUNT": "99999999999999999999"},
+        {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "a.b", "GIT_CONFIG_VALUE_0": "c"},
+        {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "a.b"},
+        {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_VALUE_0": "c"},
+    ],
+)
+def test_malformed_existing_git_config_is_replaced_by_the_hardening(
+    cfg_dir: Path, existing: dict[str, str]
+) -> None:
+    environ = {
+        **CALLER,
+        **existing,
+        "GIT_CONFIG_KEY_7": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_7": "x",
+    }
+    env = env_of(load(cfg_dir, GIT_INHERIT), "review", environ)
+    assert git_entries(env) == HARDENING
+    # No leftover entry from the malformed set survives.
+    assert git_names(env) == {"GIT_CONFIG_COUNT"} | {
+        f"GIT_CONFIG_{part}_{i}" for part in ("KEY", "VALUE") for i in range(len(HARDENING))
+    }
+
+
+def test_stray_entries_beyond_the_count_are_dropped(cfg_dir: Path) -> None:
+    environ = {
+        **CALLER,
+        "GIT_CONFIG_COUNT": "0",
+        "GIT_CONFIG_KEY_9": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_9": "x",
+    }
+    env = env_of(load(cfg_dir, GIT_INHERIT), "review", environ)
+    assert git_entries(env) == HARDENING
+    assert "GIT_CONFIG_KEY_9" not in env and "GIT_CONFIG_VALUE_9" not in env
+
+
+def test_git_hardening_keeps_unrelated_git_variables(cfg_dir: Path) -> None:
+    env = env_of(load(cfg_dir), "respond")
+    assert env["GIT_CONFIG_GLOBAL"] == f"{SDIR}/empty-gitconfig"
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert git_entries(env) == HARDENING
+
+
+@pytest.mark.parametrize("name", ["GIT_CONFIG_KEY_x", "GIT_CONFIG_VALUE_01", "GIT_CONFIG_KEY_"])
+def test_git_config_names_git_never_reads_are_dropped(cfg_dir: Path, name: str) -> None:
+    env = env_of(load(cfg_dir, GIT_INHERIT), "review", {**CALLER, name: "core.fsmonitor"})
+    assert name not in env
+    assert git_entries(env) == HARDENING

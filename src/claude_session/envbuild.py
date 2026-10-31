@@ -28,7 +28,9 @@ caller's for ``exec``, the adopting process's for ``exec --session-id``); it nev
    already refuses invalid ``env.set``, ``env.allow`` and ``path_prepend`` entries; the checks
    here are a backstop.
 6. (#24) PATH sanitizing for isolated runs.
-7. (#23) git hardening for third-party-reading runs.
+7. Third-party-reading runs: the ``GIT_CONFIG_COUNT``/``KEY``/``VALUE`` hardening entries
+   appended after the existing ones (renumbered; a malformed existing set is replaced) and
+   ``GIT_OPTIONAL_LOCKS=0``. After step 5, so they win over ``env.set``.
 8. Every ``CSESSION_*`` removed, then ``CSESSION_ID``, ``CSESSION_DIR``, ``CSESSION_KIND`` and,
    when a private temporary directory is given, ``TMPDIR`` and ``CLAUDE_CODE_TMPDIR`` set.
 
@@ -87,6 +89,21 @@ THIRD_PARTY_DROP = (
 )
 GH_EMPTY = "gh-empty"
 GH_CONFIG_ENV = ("GH_CONFIG_DIR", "GLAB_CONFIG_DIR")
+# Step 7: git config entries for the agent's own git commands (design.md, Environment), in
+# this order, after any existing entries (git takes the last value of a key).
+GIT_HARDENING = (
+    ("core.fsmonitor", ""),
+    ("core.hooksPath", "/dev/null"),
+    ("core.sshCommand", ""),
+    ("credential.helper", ""),
+    ("diff.external", ""),
+    ("core.pager", "cat"),
+)
+GIT_CONFIG_COUNT = "GIT_CONFIG_COUNT"
+GIT_CONFIG_KEY = "GIT_CONFIG_KEY_"
+GIT_CONFIG_VALUE = "GIT_CONFIG_VALUE_"
+# An existing GIT_CONFIG_COUNT above this (or not plain ASCII digits) is treated as malformed.
+MAX_GIT_CONFIG_COUNT = 1000
 # Step 8.
 CSESSION_PREFIX = "CSESSION_"
 TMPDIR_ENV = ("TMPDIR", "CLAUDE_CODE_TMPDIR")
@@ -198,8 +215,9 @@ def build(
 
     # 6. TODO(#24): sanitize PATH for isolated runs (drop empty and relative entries, refuse
     #    entries inside session-writable paths with unsafe_path).
-    # 7. TODO(#23): third-party-reading runs: append the GIT_CONFIG_COUNT/KEY/VALUE hardening
-    #    entries (renumbered after existing ones) and set GIT_OPTIONAL_LOCKS=0.
+    # 7. Git hardening (after step 5: it wins over env.set).
+    if profile.reads_third_party:
+        _git_hardening(env)
 
     # 8. CSESSION_* and the private temporary directory.
     for name in [name for name in env if name.startswith(CSESSION_PREFIX)]:
@@ -244,6 +262,50 @@ def _third_party(env: dict[str, str], csession_dir: str) -> None:
         env.pop(name, None)
     for name in GH_CONFIG_ENV:
         env[name] = os.path.join(csession_dir, GH_EMPTY)
+
+
+def _git_hardening(env: dict[str, str]) -> None:
+    """Append ``GIT_HARDENING`` after the existing ``GIT_CONFIG_*`` entries and set
+    ``GIT_OPTIONAL_LOCKS=0``. Entries git would ignore (numbered at or above the count) are
+    dropped. A malformed existing set (a count that is not 0-``MAX_GIT_CONFIG_COUNT`` in ASCII
+    digits, or a missing key or value below it) makes git refuse every command, so it is
+    dropped whole and only the hardening is passed."""
+    count = _git_config_count(env)
+    keep = count or 0
+    for name in list(env):
+        index = _git_config_index(name)
+        if name == GIT_CONFIG_COUNT or (index is not None and not 0 <= index < keep):
+            del env[name]
+    for offset, (key, value) in enumerate(GIT_HARDENING):
+        env[f"{GIT_CONFIG_KEY}{keep + offset}"] = key
+        env[f"{GIT_CONFIG_VALUE}{keep + offset}"] = value
+    env[GIT_CONFIG_COUNT] = str(keep + len(GIT_HARDENING))
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+
+
+def _git_config_count(env: Mapping[str, str]) -> int | None:
+    """The existing entry count (0 when unset), or None when the set is malformed."""
+    raw = env.get(GIT_CONFIG_COUNT)
+    if raw is None:
+        return 0
+    if not (raw.isascii() and raw.isdigit()) or len(raw) > 4 or int(raw) > MAX_GIT_CONFIG_COUNT:
+        return None
+    count = int(raw)
+    for index in range(count):
+        if f"{GIT_CONFIG_KEY}{index}" not in env or f"{GIT_CONFIG_VALUE}{index}" not in env:
+            return None
+    return count
+
+
+def _git_config_index(name: str) -> int | None:
+    """The index of a ``GIT_CONFIG_KEY_<n>``/``VALUE_<n>`` name; -1 for one git never reads
+    (a suffix that is not a canonical decimal); None for any other name."""
+    for prefix in (GIT_CONFIG_KEY, GIT_CONFIG_VALUE):
+        if name.startswith(prefix):
+            suffix = name.removeprefix(prefix)
+            canonical = suffix.isascii() and suffix.isdigit() and str(int(suffix)) == suffix
+            return int(suffix) if canonical else -1
+    return None
 
 
 def _matches(name: str, patterns: Iterable[str]) -> bool:

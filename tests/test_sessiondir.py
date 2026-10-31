@@ -971,3 +971,92 @@ def test_a_non_utf8_state_root_fails(tmp_path: Path) -> None:
                 input_files=[],
             )
         assert not (sdir(state) / "run.json").exists()
+
+
+# gh-empty/ and empty-gitconfig (isolated runs)
+
+
+def test_isolated_prepare_creates_empty_gh_dir_and_gitconfig(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1, isolated=True)
+    gh = sdir(root) / "gh-empty"
+    gitconfig = sdir(root) / "empty-gitconfig"
+    assert gh.is_dir() and not gh.is_symlink() and list(gh.iterdir()) == []
+    assert mode(gh) == 0o700
+    assert gitconfig.is_file() and not gitconfig.is_symlink()
+    assert gitconfig.read_bytes() == b""
+    assert mode(gitconfig) == 0o600
+
+
+def test_trusted_prepare_creates_neither(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1)
+    assert not (sdir(root) / "gh-empty").exists()
+    assert not (sdir(root) / "empty-gitconfig").exists()
+
+
+def test_isolated_prepare_empties_what_an_earlier_run_left(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1, isolated=True)
+    gh = sdir(root) / "gh-empty"
+    (gh / "hosts.yml").write_text("oauth_token: planted\n")
+    (gh / "nested" / "deeper").mkdir(parents=True)
+    (gh / "nested" / "deeper" / "f").write_text("x")
+    (gh / "nested" / "d000").mkdir(mode=0o000)
+    (sdir(root) / "empty-gitconfig").write_text("[core]\n\tfsmonitor = /planted\n")
+    old = gh.stat().st_ino
+    dirs.prepare_run(2, isolated=True)
+    assert list(gh.iterdir()) == []
+    assert gh.stat().st_ino != old
+    assert (sdir(root) / "empty-gitconfig").read_bytes() == b""
+
+
+def test_isolated_prepare_leaves_no_trash_in_the_private_dir(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1, isolated=True)
+    (sdir(root) / "gh-empty" / "x").write_text("x")
+    dirs.prepare_run(2, isolated=True)
+    assert sorted(p.name for p in pdir(root).iterdir()) == ["runs"]
+
+
+def test_isolated_prepare_replaces_a_symlink_without_following_it(
+    tmp_path: Path, root: Path, dirs: SessionDirs
+) -> None:
+    target = tmp_path / "victim"
+    target.mkdir()
+    (target / "keep").write_text("keep")
+    victim_file = tmp_path / "victim-file"
+    victim_file.write_text("keep")
+    session = sdir(root)
+    dirs.prepare_run(1)
+    (session / "gh-empty").symlink_to(target)
+    (session / "empty-gitconfig").symlink_to(victim_file)
+    dirs.prepare_run(2, isolated=True)
+    assert (target / "keep").read_text() == "keep"
+    assert victim_file.read_text() == "keep"
+    assert (session / "gh-empty").is_dir() and not (session / "gh-empty").is_symlink()
+    assert not (session / "empty-gitconfig").is_symlink()
+    assert (session / "empty-gitconfig").read_bytes() == b""
+
+
+def test_isolated_prepare_replaces_a_file_planted_as_gh_empty(
+    root: Path, dirs: SessionDirs
+) -> None:
+    dirs.prepare_run(1)
+    (sdir(root) / "gh-empty").write_text("not a dir")
+    dirs.prepare_run(2, isolated=True)
+    gh = sdir(root) / "gh-empty"
+    assert gh.is_dir() and list(gh.iterdir()) == []
+
+
+def test_isolated_prepare_replaces_a_dir_planted_as_empty_gitconfig(
+    root: Path, dirs: SessionDirs
+) -> None:
+    dirs.prepare_run(1)
+    planted = sdir(root) / "empty-gitconfig"
+    planted.mkdir()
+    (planted / "config").write_text("x")
+    dirs.prepare_run(2, isolated=True)
+    assert planted.is_file() and planted.read_bytes() == b""
+
+
+def test_isolated_prepare_is_repeatable(root: Path, dirs: SessionDirs) -> None:
+    for run in (1, 2, 3):
+        dirs.prepare_run(run, isolated=True)
+    assert list((sdir(root) / "gh-empty").iterdir()) == []

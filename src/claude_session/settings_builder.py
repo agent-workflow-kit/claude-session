@@ -1,13 +1,25 @@
 """Generated Claude Code settings and ``claude`` argv (interface.md, Generated settings,
 Bootstrap prompt and Launch flags; design.md, Generated settings and Prompt delivery).
 
-Pure functions of the effective kind profile, the permission profile and the session paths:
-nothing here reads the file system, the environment or the clock. ``exec`` resolves the
-inputs (absolute, symlink-resolved paths) and writes the result with
-``SessionDirs.write_settings``.
+``build``, ``build_settings`` and ``build_argv`` are pure functions of the effective kind
+profile, the expanded permission profile (``permission_profiles.expand``), the session paths
+and, for isolated runs, the ``Isolation`` inputs: they never read the file system, the
+environment or the clock. ``exec`` resolves the inputs (absolute, symlink-resolved paths; the
+helpers ``system_read_dirs``, ``tool_dirs`` and ``python_read_dirs`` at the end of this module
+compute the generated read entries) and writes the result with ``SessionDirs.write_settings``.
 
-This module covers trusted runs. Isolated runs (third-party-reading, or ``sandbox`` not
-``off``) are refused with ``NotImplementedError`` until the isolation rules land.
+Isolated runs (third-party-reading, or ``sandbox`` not ``off``) get the isolation rules of
+interface.md, Generated settings, which always win over profile content. The sandbox is the
+boundary; the permission rules are defense in depth. Every path the rules or the sandbox lists
+name is checked to be absolute, normalized and free of glob and control characters here; the
+path rules that compare paths with each other (unsafe write targets, credential paths, the
+session-writable paths) are #24's.
+
+TODO(#24): before build(), the launch validations refuse unsafe cwd, read_dirs, write_dirs,
+plugin directories and generated read entries (Isolation fields), and pass the
+session_writable check to check_interpreter().
+TODO(#25): exec creates the private tmpdir (Isolation.tmpdir) and runs the sandbox
+self-check; a `preferred` run without a working sandbox adds its warning there.
 
 TODO(#15): exec calls build() in launch step 7 and writes the settings with
 SessionDirs.write_settings before spawning claude. Before allocation, the step-5 launch
@@ -26,11 +38,11 @@ import re
 import shlex
 import sys
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import config, ids, sessiondir
+from . import config, ids, permission_profiles, sessiondir
 from .errors import FailedError
 from .kinds import Mode, Resolution
 
@@ -54,9 +66,34 @@ PROTECTED = (
     sessiondir.INSTRUCTIONS,
     sessiondir.RUN_JSON,
     sessiondir.INPUTS + "/",
-    "gh-empty/",
-    "empty-gitconfig",
+    sessiondir.GH_EMPTY + "/",
+    sessiondir.EMPTY_GITCONFIG,
 )
+# Isolated runs: the fixed system directories of the sandbox allowRead list (missing ones are
+# skipped by system_read_dirs). /opt is deliberately not here (design.md, Generated settings).
+SYSTEM_READ_DIRS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc")
+# Home-directory credential locations denied to the Read tool (conservative until live F1 is
+# verified); a trailing "/" marks a directory, denied with "/**".
+HOME_READ_DENIES = (
+    ".ssh/",
+    ".aws/",
+    ".gnupg/",
+    ".kube/",
+    ".docker/",
+    ".config/",
+    ".claude/",
+    ".netrc",
+    ".git-credentials",
+    ".local/state/",
+)
+# Claude Code project configuration, write-denied under $CSESSION_DIR, every --add-dir and
+# (third-party-reading runs) the cwd; a trailing "/" marks a directory.
+CLAUDE_CONFIG = (".claude/", ".mcp.json", "CLAUDE.md", "CLAUDE.local.md")
+FILE_TOOLS = ("Edit", "Write")
+# Characters a path in a sandbox filesystem list must not contain: glob syntax (single-* globs
+# in denyWrite are silently ignored, live C2) and escapes.
+_SANDBOX_UNSAFE = re.compile(r"[*?\[\]{}\\]")
+_SANDBOX_LEVELS = {"off": 0, "preferred": 1, "required": 2}
 _RULE_LISTS = ("allow", "deny", "ask")
 # C0 and C1 controls and DEL.
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -155,6 +192,36 @@ class Launch:
 
 
 @dataclass(frozen=True)
+class Isolation:
+    """The inputs only isolated runs need. Every path is absolute, normalized and
+    symlink-resolved by the caller, and has passed #24's path rules.
+
+    - ``home``: ``$HOME`` (the Read denies of credential locations).
+    - ``tmpdir``: the private temporary directory (required when the sandbox is not ``off``);
+      it goes to ``allowWrite`` only, never ``allowRead`` (live E1).
+    - ``git_dir``: the cwd's git common directory; None when the cwd has none.
+      ``worktree_git_dir``: a linked worktree's own gitdir (needs ``git_dir``).
+    - ``read_dirs``, ``write_dirs``: the kind's (expanded, resolved; missing write_dirs
+      already skipped).
+    - ``system_dirs`` (``system_read_dirs()``), ``tool_dirs`` (``tool_dirs()`` of the resolved
+      bwrap, socat, git and claude), ``python_dirs`` (``python_read_dirs()``) and
+      ``path_prepend`` (the kind's ``env.path_prepend``, resolved): the generated read
+      entries.
+    """
+
+    home: str
+    tmpdir: str | None = None
+    git_dir: str | None = None
+    worktree_git_dir: str | None = None
+    read_dirs: tuple[str, ...] = ()
+    write_dirs: tuple[str, ...] = ()
+    system_dirs: tuple[str, ...] = ()
+    tool_dirs: tuple[str, ...] = ()
+    python_dirs: tuple[str, ...] = ()
+    path_prepend: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Argv:
     argv: list[str]
     warnings: tuple[str, ...] = ()
@@ -171,11 +238,8 @@ def current_interpreter(executable: str | None = None) -> str:
     """The interpreter the injected hooks run: ``sys.executable`` (or ``executable``) with
     its directory symlink-resolved but not its last component. A venv's ``bin/python`` is a
     symlink to the base interpreter; resolving it would lose the venv (``pyvenv.cfg`` is found
-    next to the link), and the hook could no longer import ``claude_session``.
-
-    TODO(#23): for isolated runs, refuse the launch (and adoption) when this path, its
-    realpath, ``sys.prefix``/``sys.exec_prefix`` or the ``claude_session`` package directory
-    is inside a session-writable path (design.md, Security notes)."""
+    next to the link), and the hook could no longer import ``claude_session``. Isolated runs
+    also pass it to ``check_interpreter``."""
     exe = sys.executable if executable is None else executable
     if not exe:
         raise FailedError("cannot determine the Python interpreter (sys.executable is empty)")
@@ -204,20 +268,67 @@ def check_rule_paths(state_root: str, claude_session: str) -> None:
         )
 
 
+def check_interpreter(
+    interpreter: str,
+    *,
+    session_writable: Callable[[str], bool],
+    prefixes: Sequence[str] | None = None,
+    package_dir: str | None = None,
+) -> None:
+    """Isolated runs (launch and adoption): the hook interpreter path, its realpath, the
+    ``prefixes`` (default ``sys.prefix`` and ``sys.exec_prefix``) and the ``claude_session``
+    package directory must not be inside a session-writable path, or the sandboxed agent could
+    replace the code the next hook runs outside the sandbox (design.md, Security notes).
+    ``session_writable`` is #24's check (it compares realpaths). Raises
+    ``LaunchValidationError`` (``unsafe_path``).
+
+    TODO(#15): exec calls this for isolated runs at launch, and #28 at adoption, with
+    current_interpreter()."""
+    if prefixes is None:
+        prefixes = (sys.prefix, sys.exec_prefix)
+    if package_dir is None:
+        package_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        ("hook interpreter", interpreter),
+        ("hook interpreter (resolved)", os.path.realpath(interpreter)),
+        *(("Python prefix", prefix) for prefix in prefixes),
+        ("claude_session package directory", package_dir),
+    ]
+    for label, path in candidates:
+        if session_writable(path):
+            raise LaunchValidationError(
+                f"{label} is inside a session-writable path: {_shown(path)!r}",
+                end_reason="unsafe_path",
+            )
+
+
 def is_isolated(profile: config.Kind) -> bool:
     """A run is isolated when it is third-party-reading or its sandbox is not ``off``."""
     return profile.reads_third_party or profile.sandbox != "off"
 
 
+ProfileContent = Mapping[str, Any] | config.PermissionProfile
+
+
 def build(
     resolution: Resolution,
-    permission_profile: config.PermissionProfile,
+    permission_profile: ProfileContent,
     paths: Paths,
     tools: Tools,
     launch: Launch,
+    *,
+    isolation: Isolation | None = None,
 ) -> Generated:
-    """The settings and argv of one run."""
-    settings = build_settings(resolution, permission_profile, paths, tools, cwd=launch.cwd)
+    """The settings and argv of one run (``isolation``: required for isolated runs)."""
+    settings = build_settings(
+        resolution,
+        permission_profile,
+        paths,
+        tools,
+        cwd=launch.cwd,
+        plugin_dirs=launch.plugin_dirs,
+        isolation=isolation,
+    )
     built = build_argv(resolution, paths, tools, launch)
     return Generated(settings=settings, argv=built.argv, warnings=built.warnings)
 
@@ -227,33 +338,39 @@ def build(
 
 def build_settings(
     resolution: Resolution,
-    permission_profile: config.PermissionProfile,
+    permission_profile: ProfileContent,
     paths: Paths,
     tools: Tools,
     *,
     cwd: str,
+    plugin_dirs: Sequence[str] = (),
+    isolation: Isolation | None = None,
 ) -> dict[str, Any]:
-    """The generated settings JSON of a trusted run: the permission profile's
-    ``permissions`` plus the generated rules, an explicit ``defaultMode`` where the
-    interface asks for one, and the injected hooks.
+    """The generated settings JSON of a run: the permission profile's ``permissions`` plus
+    the generated rules, ``defaultMode`` as the interface asks, and the injected hooks; for
+    isolated runs also the isolation rules and the ``sandbox`` block (``_isolated``).
 
-    ``permission_profile`` is the expanded profile (``${...}`` variables already
-    substituted). Raises ``LaunchValidationError`` for a state root or claude-session path
-    that cannot be put into a rule (``unsafe_path``) or a malformed profile
-    (``invalid_permission_profile``), and ``FailedError`` for an unusable interpreter."""
+    ``permission_profile`` is the expanded profile content (``permission_profiles.expand``;
+    a ``config.PermissionProfile`` is accepted too). Raises ``LaunchValidationError`` for a
+    path that cannot be put into a rule (``unsafe_path`` and the per-input reasons of
+    ``_isolated``) or a malformed profile (``invalid_permission_profile``; for isolated runs
+    also ``errors.InvalidPermissionProfile`` from the refused-key backstop), ``FailedError``
+    for an unusable interpreter and ``ValueError`` for an isolated run without
+    ``isolation``."""
     profile = resolution.profile
-    if is_isolated(profile):
-        # TODO(#23): sandbox settings and the isolation rules of interface.md, Generated
-        # settings (isolated runs and third-party-reading runs); #24 adds the path rules.
-        raise NotImplementedError("generated settings for isolated runs are not implemented")
+    content = _content(permission_profile)
     check_rule_paths(paths.state_root, tools.claude_session)
     _check_abs("interpreter", tools.interpreter)
+    if is_isolated(profile):
+        if isolation is None:
+            raise ValueError("isolated runs need the isolation inputs")
+        return _isolated(resolution, content, paths, tools, cwd, tuple(plugin_dirs), isolation)
 
-    permissions = _profile_permissions(permission_profile)
+    permissions = _profile_permissions(content)
     allow, deny = _generated_rules(paths, tools, cwd)
     permissions["allow"] = _merge(permissions.get("allow", []), allow)
     permissions["deny"] = _merge(permissions.get("deny", []), deny)
-    mode = _default_mode(permission_profile, profile.setting_sources)
+    mode = _default_mode(permissions, profile.setting_sources)
     if mode is not None:
         permissions["defaultMode"] = mode
     # A trusted run's sandbox is off: a profile's sandbox fragment is not emitted.
@@ -292,11 +409,27 @@ def _generated_rules(paths: Paths, tools: Tools, cwd: str) -> tuple[list[str], l
     return allow, deny
 
 
-def _profile_permissions(profile: config.PermissionProfile) -> dict[str, Any]:
-    # TODO(#22): the permission profile is resolved (name or file snapshot), validated and
-    # its ${...} variables expanded before it gets here; validation at profile load must
-    # apply the same value checks (defaultMode, string lists) as below.
-    permissions = copy.deepcopy(dict(profile.permissions or {}))
+def _content(profile: ProfileContent) -> dict[str, Any]:
+    """The profile as a plain mapping of its set sections (a deep copy)."""
+    if isinstance(profile, config.PermissionProfile):
+        return {
+            key: copy.deepcopy(value)
+            for key in permission_profiles.SECTIONS
+            if (value := getattr(profile, key)) is not None
+        }
+    return copy.deepcopy(dict(profile))
+
+
+def _profile_permissions(content: Mapping[str, Any]) -> dict[str, Any]:
+    """A copy of the profile's ``permissions`` after the value checks Claude Code needs
+    (``permission_profiles.validate`` applies them at profile load; this is the backstop)."""
+    section = content.get("permissions") or {}
+    if not isinstance(section, Mapping):
+        raise LaunchValidationError(
+            "permission profile: permissions must be a mapping",
+            end_reason="invalid_permission_profile",
+        )
+    permissions = copy.deepcopy(dict(section))
     for key in (*_RULE_LISTS, "additionalDirectories"):
         if key not in permissions:
             continue
@@ -316,18 +449,20 @@ def _profile_permissions(profile: config.PermissionProfile) -> dict[str, Any]:
     return permissions
 
 
-def _default_mode(profile: config.PermissionProfile, setting_sources: Sequence[str]) -> str | None:
+def _default_mode(permissions: Mapping[str, Any], setting_sources: Sequence[str]) -> str | None:
     """Trusted runs: the profile's mode; without one, ``default`` when ``setting_sources``
     excludes ``user`` (otherwise the user's settings decide)."""
-    permissions = profile.permissions or {}
     if "defaultMode" in permissions:
         return str(permissions["defaultMode"])
     return None if "user" in setting_sources else "default"
 
 
-def _merge(base: list[str], extra: list[str]) -> list[str]:
+def _merge(base: Sequence[str], extra: Sequence[str]) -> list[str]:
+    """``base`` then the entries of ``extra`` not seen yet (duplicates in ``extra`` too)."""
     merged = list(base)
-    merged += [rule for rule in extra if rule not in merged]
+    for item in extra:
+        if item not in merged:
+            merged.append(item)
     return merged
 
 
@@ -374,6 +509,353 @@ def _check_abs(label: str, path: str, *, rule: bool = False) -> None:
             f"{label} contains a character that cannot appear in a permission rule "
             f"(one of * ? [ ] {{ }} ( ) \\): {shown!r}"
         )
+
+
+# Isolated runs (interface.md, Generated settings: isolated and third-party-reading runs)
+
+
+def _isolated(
+    resolution: Resolution,
+    content: dict[str, Any],
+    paths: Paths,
+    tools: Tools,
+    cwd: str,
+    plugin_dirs: tuple[str, ...],
+    iso: Isolation,
+) -> dict[str, Any]:
+    """The settings of an isolated run: the expanded profile, then the generated isolation
+    keys, which always win over profile content (a deny beats any allow; the generated scalar
+    keys replace the profile's)."""
+    profile = resolution.profile
+    third_party = profile.reads_third_party
+    # Backstop: select() refused these already; a profile must never undo the isolation keys.
+    permission_profiles.validate(content, isolated=True)
+    _check_isolation_inputs(content, cwd, plugin_dirs, iso)
+    csdir = paths.session_dir
+    git_dirs = [d for d in (iso.git_dir, iso.worktree_git_dir) if d is not None]
+    dot_git = os.path.join(cwd, ".git")
+    # Claude config is denied under $CSESSION_DIR and every --add-dir; third-party: the cwd.
+    config_roots = [csdir, *plugin_dirs, *([cwd] if third_party else [])]
+
+    permissions = _profile_permissions(content)
+    allow, deny = _generated_rules(paths, tools, cwd)
+    for plugin in plugin_dirs:
+        # Live C6: the Read tool reaches plugin files only through --add-dir, which makes
+        # the directory writable: Edit/Write denies (and sandbox denyWrite) undo that.
+        allow.append(f"Read({_rule(plugin)}/**)")
+        deny += _file_denies(f"{_rule(plugin)}/**")
+    for git_dir in git_dirs:
+        deny += _file_denies(f"{_rule(git_dir)}/**")
+    deny += _file_denies(_rule(dot_git)) + _file_denies(f"{_rule(dot_git)}/**")
+    for root in config_roots:
+        for target in _claude_config_targets(root):
+            deny += _file_denies(target)
+    deny += [f"Read({target})" for target in _read_deny_targets(iso.home, paths, keep=(cwd, csdir))]
+    permissions["allow"] = _merge(permissions.get("allow", []), allow)
+    permissions["deny"] = _merge(permissions.get("deny", []), deny)
+    permissions["defaultMode"] = "dontAsk"  # a profile's mode is ignored
+    permissions["blockReadsOutsideWorkingDirectories"] = True
+
+    allow_read = [
+        cwd,
+        csdir,
+        *iso.system_dirs,
+        *iso.tool_dirs,
+        *iso.python_dirs,
+        *iso.read_dirs,
+        *plugin_dirs,
+        *iso.path_prepend,
+        *git_dirs,
+    ]
+    # work/ only when it is the cwd, like its Edit/Write allows (narrower than the
+    # session-writable paths, which always include it).
+    allow_write = [
+        cwd,
+        os.path.join(csdir, sessiondir.OUTBOX),
+        os.path.join(csdir, sessiondir.ARTIFACTS),
+        *iso.write_dirs,
+        *([iso.tmpdir] if iso.tmpdir is not None else []),
+    ]
+    deny_write = [
+        *(os.path.join(csdir, name.rstrip("/")) for name in PROTECTED),
+        paths.private_root,
+        *git_dirs,
+        dot_git,
+        *plugin_dirs,
+        *(os.path.join(csdir, name.rstrip("/")) for name in CLAUDE_CONFIG),
+        *(os.path.join(cwd, name.rstrip("/")) for name in CLAUDE_CONFIG if third_party),
+    ]
+    sandbox = _sandbox(
+        content.get("sandbox") or {},
+        profile.sandbox,
+        tmpdir=iso.tmpdir,
+        allow_read=allow_read,
+        allow_write=allow_write,
+        deny_write=deny_write,
+    )
+    return {"permissions": permissions, "sandbox": sandbox, "hooks": _hooks(paths, tools)}
+
+
+def _sandbox(
+    section: Mapping[str, Any],
+    mode: str,
+    *,
+    tmpdir: str | None,
+    allow_read: list[str],
+    allow_write: list[str],
+    deny_write: list[str],
+) -> dict[str, Any]:
+    """The ``sandbox`` block: the profile's section (validated), then the generated keys.
+    ``enabled`` and ``failIfUnavailable`` only when the mode is not ``off``; the other keys
+    always (they are inert without a sandbox and make one that user settings enable strict)."""
+    if mode != "off" and tmpdir is None:
+        raise ValueError("a sandboxed run needs its private tmpdir")
+    sandbox = copy.deepcopy(dict(section))
+    if mode != "off":
+        sandbox["enabled"] = True
+        sandbox["failIfUnavailable"] = mode == "required"
+    sandbox["allowUnsandboxedCommands"] = False
+    # Live D3: true (Claude Code's default) runs sandboxed Bash without the allow rules.
+    sandbox["autoAllowBashIfSandboxed"] = False
+    network = dict(sandbox.get("network") or {})
+    network.setdefault("allowedDomains", [])
+    sandbox["network"] = network
+    filesystem = dict(sandbox.get("filesystem") or {})
+    # Live E1: deny-root reads plus the allowRead list; the tmpdir in allowWrite only.
+    filesystem["denyRead"] = _merge(filesystem.get("denyRead", []), ["/"])
+    filesystem["allowRead"] = _merge(filesystem.get("allowRead", []), allow_read)
+    filesystem["allowWrite"] = _merge(filesystem.get("allowWrite", []), allow_write)
+    filesystem["denyWrite"] = _merge(filesystem.get("denyWrite", []), deny_write)
+    sandbox["filesystem"] = filesystem
+    return sandbox
+
+
+def _file_denies(target: str) -> list[str]:
+    return [f"{tool}({target})" for tool in FILE_TOOLS]
+
+
+def _claude_config_targets(root: str) -> list[str]:
+    """Rule targets of the Claude config under ``root``: top-level and at any depth."""
+    targets = []
+    for name in CLAUDE_CONFIG:
+        pattern = name.rstrip("/") + ("/**" if name.endswith("/") else "")
+        targets += [f"{_rule(root)}/{pattern}", f"{_rule(root)}/**/{pattern}"]
+    return targets
+
+
+def _read_deny_targets(home: str, paths: Paths, *, keep: Sequence[str]) -> list[str]:
+    """The Read-deny targets: home credential locations, the state root and the private
+    directory, except a prefix that is or contains a ``keep`` path (the cwd and
+    ``$CSESSION_DIR`` stay readable; the default state root under ``~/.local/state`` therefore
+    never gets a deny, and the private directory deny covers the rest of the state root that
+    matters)."""
+    prefixes = [
+        (os.path.join(home, name.rstrip("/")), name.endswith("/")) for name in HOME_READ_DENIES
+    ]
+    prefixes += [(paths.state_root, True), (paths.private_root, True)]
+    targets = []
+    for path, is_dir in prefixes:
+        if any(_inside(kept, path) for kept in keep):
+            continue
+        targets.append(_rule(path) + ("/**" if is_dir else ""))
+    return targets
+
+
+def _inside(path: str, root: str) -> bool:
+    """Whether ``path`` is ``root`` or below it (both normalized absolute paths)."""
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _check_isolation_inputs(
+    content: Mapping[str, Any], cwd: str, plugin_dirs: Sequence[str], iso: Isolation
+) -> None:
+    """Every path the isolation rules and sandbox lists name: absolute, normalized, valid
+    UTF-8, no control characters; no rule characters for paths in permission rules, no glob
+    characters for sandbox-only paths; and nothing re-opened for reading inside the private
+    tmpdir (live E1: it would be mounted read-only and break every Bash call)."""
+    rule_paths: list[tuple[str, str, Iterable[str]]] = [
+        ("cwd", "unsafe_cwd", [cwd]),
+        ("plugin directory", "unsafe_plugin_dir", plugin_dirs),
+        ("HOME", "unsafe_path", [iso.home]),
+        ("git directory", "unsafe_path", [p for p in (iso.git_dir, iso.worktree_git_dir) if p]),
+    ]
+    for label, reason, values in rule_paths:
+        for value in values:
+            _check_input(label, value, reason, rule=True)
+    if iso.git_dir is not None and iso.git_dir == "":
+        _check_input("git directory", "", "unsafe_path", rule=True)
+    if iso.worktree_git_dir is not None and not iso.git_dir:
+        raise ValueError("a worktree gitdir needs the git directory")
+    if iso.tmpdir is not None:
+        _check_input("private tmpdir", iso.tmpdir, "tmpdir_unsafe", rule=False)
+    sandbox_paths: list[tuple[str, str, Sequence[str]]] = [
+        ("read_dirs entry", "invalid_permission_profile", iso.read_dirs),
+        ("write_dirs entry", "invalid_permission_profile", iso.write_dirs),
+        ("system read directory", "unsafe_read_dir", iso.system_dirs),
+        ("tool directory", "unsafe_read_dir", iso.tool_dirs),
+        ("Python read directory", "unsafe_read_dir", iso.python_dirs),
+        ("env.path_prepend directory", "unsafe_read_dir", iso.path_prepend),
+    ]
+    for label, reason, values in sandbox_paths:
+        for value in values:
+            _check_input(label, value, reason, rule=False)
+    if iso.tmpdir is None:
+        return
+    filesystem = (content.get("sandbox") or {}).get("filesystem") or {}
+    profile_reads = filesystem.get("allowRead") or []
+    readable: list[tuple[str, str, Sequence[str]]] = [
+        ("read_dirs entry", "invalid_permission_profile", iso.read_dirs),
+        ("profile allowRead entry", "invalid_permission_profile", profile_reads),
+        ("system read directory", "unsafe_read_dir", iso.system_dirs),
+        ("tool directory", "unsafe_read_dir", iso.tool_dirs),
+        ("Python read directory", "unsafe_read_dir", iso.python_dirs),
+        ("env.path_prepend directory", "unsafe_read_dir", iso.path_prepend),
+    ]
+    for label, reason, values in readable:
+        for value in values:
+            if isinstance(value, str) and _inside(os.path.normpath(value), iso.tmpdir):
+                raise LaunchValidationError(
+                    f"{label} is inside the private tmpdir, which must stay out of allowRead:"
+                    f" {_shown(value)!r}",
+                    end_reason=reason,
+                )
+
+
+def _check_input(label: str, value: str, reason: str, *, rule: bool) -> None:
+    try:
+        _check_abs(label, value, rule=rule)
+        if not rule and _SANDBOX_UNSAFE.search(value):
+            raise FailedError(
+                f"{label} contains a glob or escape character (one of * ? [ ] {{ }} \\):"
+                f" {_shown(value)!r}"
+            )
+    except FailedError as exc:
+        raise LaunchValidationError(exc.message, end_reason=reason) from exc
+
+
+def _shown(path: str) -> str:
+    return path.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+# Sandbox baseline (interface.md, Generated settings: Sandbox baseline)
+
+
+def isolation_warnings(resolution: Resolution) -> tuple[str, ...]:
+    """The warnings of a third-party-reading run below the ``required`` sandbox baseline:
+    ``sandbox_lowered`` and, for ``off``, that it runs without a sandbox. (A ``preferred`` run
+    whose sandbox turns out unavailable gets its warning from the self-check, #25.)"""
+    if not resolution.sandbox_lowered():
+        return ()
+    mode = resolution.profile.sandbox
+    origin = resolution.origins.get("sandbox", "builtin")
+    warnings = [
+        f"sandbox_lowered: third-party-reading run with sandbox {mode!r} (from {origin});"
+        " the baseline is 'required'"
+    ]
+    if mode == "off":
+        warnings.append(
+            "third-party-reading run without a sandbox: only the evadable permission rules"
+            " isolate it"
+        )
+    return tuple(warnings)
+
+
+def sandbox_lowered_inputs(resolution: Resolution, *, run: int) -> dict[str, Any]:
+    """The ``inputs`` of the ``sandbox_lowered`` audit record (schemas/audit.json).
+
+    TODO(#15): exec writes the audit record (and the sandbox_lowered log event) at adoption
+    with the #7 writers, and adds isolation_warnings() to the run's warnings; #28 does the
+    same when start's pending run is adopted."""
+    if not resolution.sandbox_lowered():
+        raise ValueError("the run's sandbox is not lowered")
+    return {
+        "run_kind": resolution.kind,
+        "run": run,
+        "sandbox_from": "required",
+        "sandbox_to": resolution.profile.sandbox,
+    }
+
+
+# Generated read entries: these helpers read the file system (exec calls them).
+
+
+def system_read_dirs(candidates: Sequence[str] = SYSTEM_READ_DIRS) -> tuple[str, ...]:
+    """The fixed system directories, symlink-resolved; missing ones skipped."""
+    return _existing_unique(os.path.realpath(path) for path in candidates)
+
+
+def tool_dirs(tools: Iterable[str | None]) -> tuple[str, ...]:
+    """The directories of the resolved tools (``bwrap``, ``socat``, ``git``, ``claude``;
+    None: not resolved), each the directory of the tool's realpath."""
+    return _existing_unique(
+        os.path.dirname(os.path.realpath(tool)) for tool in tools if tool is not None
+    )
+
+
+def python_read_dirs(
+    *,
+    cwd: str,
+    executable_dir: str | None = None,
+    package_dir: str | None = None,
+    prefixes: Sequence[str] | None = None,
+    sys_path: Sequence[str] | None = None,
+    user_site: str | None | bool = True,
+) -> tuple[str, ...]:
+    """What sandboxed ``claude-session report`` needs to read (design.md, Python allowRead):
+    the directory of the ``claude-session`` executable, the package directory, ``sys.prefix``,
+    ``sys.exec_prefix``, ``sys.base_prefix`` and ``sys.base_exec_prefix`` (``prefixes``, in
+    that order; a missing base prefix falls back to
+    ``dirname(dirname(realpath(<prefix>/bin/python)))``), the ``sys.path`` entries outside
+    those, and the user site directory when it is in use. Every entry is realpath-resolved
+    and missing ones are skipped. Empty, relative and cwd-derived ``sys.path`` entries (the
+    caller's ``cwd`` or below it) are dropped first. ``user_site=True``: this interpreter's
+    user site when enabled and on ``sys.path``. The result still passes #24's generated-entry
+    checks."""
+    import site
+
+    if executable_dir is None:
+        executable_dir = os.path.dirname(os.path.abspath(sys.argv[0] or sys.executable))
+    if package_dir is None:
+        package_dir = os.path.dirname(os.path.abspath(__file__))
+    if prefixes is None:
+        prefixes = (sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix)
+    if sys_path is None:
+        sys_path = tuple(sys.path)
+    if user_site is True:
+        used = site.ENABLE_USER_SITE and site.USER_SITE in sys_path
+        user_site = site.USER_SITE if used else None
+    resolved_prefixes = []
+    for prefix in prefixes:
+        if os.path.isdir(prefix):
+            resolved_prefixes.append(os.path.realpath(prefix))
+            continue
+        python = os.path.join(prefixes[0], "bin", "python")
+        if os.path.exists(python):
+            resolved_prefixes.append(os.path.dirname(os.path.dirname(os.path.realpath(python))))
+    caller = os.path.realpath(cwd)
+    extra = []
+    for entry in sys_path:
+        if not entry or not os.path.isabs(entry):
+            continue
+        if _inside(os.path.normpath(entry), caller):
+            continue
+        real = os.path.realpath(entry)
+        if _inside(real, caller) or any(_inside(real, p) for p in resolved_prefixes):
+            continue
+        extra.append(real)
+    if user_site:
+        extra.append(os.path.realpath(user_site))
+    candidates = [
+        os.path.realpath(executable_dir),
+        os.path.realpath(package_dir),
+        *resolved_prefixes,
+        *extra,
+    ]
+    return _existing_unique(candidates)
+
+
+def _existing_unique(paths: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(path for path in paths if os.path.exists(path)))
 
 
 # argv

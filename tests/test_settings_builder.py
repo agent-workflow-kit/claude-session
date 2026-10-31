@@ -200,21 +200,23 @@ def test_builtin_trusted_kinds_are_not_isolated(cfg: config.Config, kind: str) -
 
 
 @pytest.mark.parametrize("kind", ["review", "gate-check", "respond", "rank"])
-def test_isolated_kinds_are_refused_until_isolation_lands(cfg: config.Config, kind: str) -> None:
+def test_isolated_kinds_need_isolation_inputs(cfg: config.Config, kind: str) -> None:
+    # The isolated settings themselves are tested in test_isolated_settings.py.
     resolution = resolve(cfg, kind)
     assert settings_builder.is_isolated(resolution.profile)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="isolation"):
         settings(resolution)
 
 
 def test_reads_third_party_flag_makes_a_trusted_kind_isolated(cfg: config.Config) -> None:
     resolution = resolve(cfg, "implement", reads_third_party=True)
-    with pytest.raises(NotImplementedError):
+    assert settings_builder.is_isolated(resolution.profile)
+    with pytest.raises(ValueError, match="isolation"):
         settings(resolution)
 
 
 def test_sandbox_flag_makes_a_trusted_kind_isolated(cfg: config.Config) -> None:
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="isolation"):
         settings(resolve(cfg, "implement", sandbox="preferred"))
 
 

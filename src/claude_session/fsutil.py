@@ -188,3 +188,36 @@ def write_private_file_at(
             pass  # the original error matters more than a leftover temporary file
         raise
     os.fsync(dir_fd)
+
+
+# Deeper trees are refused by ``remove_tree_at`` (bounded recursion and open descriptors).
+MAX_TREE_DEPTH = 256
+
+
+def remove_tree_at(dir_fd: int, name: str) -> None:
+    """Remove ``name`` in the directory ``dir_fd`` and everything below it, relative to
+    directory descriptors and never following a symlink: a symlink (anywhere, including
+    ``name`` itself) is unlinked, never followed. Directories must be owned by the effective
+    user; their modes are repaired (0700) so contents can be listed and removed. A tree
+    deeper than ``MAX_TREE_DEPTH`` is refused. Raises ``OSError``; on failure part of the tree
+    may already be gone."""
+    _check_segment(name)
+    _remove_at(dir_fd, name, 0)
+
+
+def _remove_at(dir_fd: int, name: str, depth: int) -> None:
+    info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        os.unlink(name, dir_fd=dir_fd)
+        return
+    if depth >= MAX_TREE_DEPTH:
+        raise UnsafePathError(f"{name}: directory tree deeper than {MAX_TREE_DEPTH} levels")
+    fd = open_private_dir_at(dir_fd, name)  # no-follow, ours, mode repaired to 0700
+    try:
+        if _identity(fd) != (info.st_dev, info.st_ino):
+            raise UnsafePathError(f"{name}: replaced while it was being removed")
+        for child in os.listdir(fd):
+            _remove_at(fd, child, depth + 1)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=dir_fd)

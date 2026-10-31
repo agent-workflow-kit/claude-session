@@ -349,3 +349,67 @@ def test_create_dir_at_under_umask_0o477_gives_0700(tmp_path: Path, dir_fd: int)
 def test_write_private_file_dot_names_are_a_directory_error(tmp_path: Path, name: str) -> None:
     with pytest.raises(IsADirectoryError):
         write_private_file(os.path.join(str(tmp_path), name), b"x")
+
+
+# remove_tree_at
+
+
+def test_remove_tree_at_removes_a_nested_tree(tmp_path: Path, dir_fd: int) -> None:
+    tree = tmp_path / "t"
+    (tree / "a" / "b").mkdir(parents=True)
+    (tree / "a" / "b" / "f").write_text("x")
+    (tree / "g").write_text("y")
+    (tree / "locked").mkdir(mode=0o000)
+    (tree / "a" / "ro").mkdir()
+    (tree / "a" / "ro" / "f").write_text("z")
+    (tree / "a" / "ro").chmod(0o500)
+    fsutil.remove_tree_at(dir_fd, "t")
+    assert not tree.exists()
+
+
+def test_remove_tree_at_unlinks_symlinks_without_following_them(
+    tmp_path: Path, dir_fd: int
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("keep")
+    tree = tmp_path / "t"
+    tree.mkdir()
+    (tree / "link").symlink_to(outside)
+    (tree / "dangling").symlink_to(tmp_path / "missing")
+    fsutil.remove_tree_at(dir_fd, "t")
+    assert not tree.exists()
+    assert (outside / "keep").read_text() == "keep"
+
+
+def test_remove_tree_at_removes_a_top_level_symlink_only(tmp_path: Path, dir_fd: int) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("keep")
+    (tmp_path / "t").symlink_to(outside)
+    fsutil.remove_tree_at(dir_fd, "t")
+    assert not os.path.lexists(tmp_path / "t")
+    assert (outside / "keep").read_text() == "keep"
+
+
+def test_remove_tree_at_removes_a_file_and_a_fifo(tmp_path: Path, dir_fd: int) -> None:
+    (tmp_path / "f").write_text("x")
+    os.mkfifo(tmp_path / "p")
+    fsutil.remove_tree_at(dir_fd, "f")
+    fsutil.remove_tree_at(dir_fd, "p")
+    assert not (tmp_path / "f").exists() and not os.path.lexists(tmp_path / "p")
+
+
+def test_remove_tree_at_refuses_a_tree_deeper_than_the_limit(
+    tmp_path: Path, dir_fd: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fsutil, "MAX_TREE_DEPTH", 3)
+    (tmp_path / "t" / "1" / "2" / "3" / "4").mkdir(parents=True)
+    with pytest.raises(OSError, match="deeper than"):
+        fsutil.remove_tree_at(dir_fd, "t")
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "a/b"])
+def test_remove_tree_at_refuses_names_that_are_not_one_segment(dir_fd: int, name: str) -> None:
+    with pytest.raises(ValueError):
+        fsutil.remove_tree_at(dir_fd, name)

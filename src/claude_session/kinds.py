@@ -154,6 +154,12 @@ class Resolution:
         (design.md, Generated settings), whether or not the sandbox actually starts."""
         return self.profile.reads_third_party or self.profile.sandbox != "off"
 
+    def sandbox_lowered(self) -> bool:
+        """Whether a third-party-reading run's sandbox mode is below the ``required`` baseline,
+        whatever set it (built-in, config, repo override, flag or carry-over); audited
+        ``sandbox_lowered`` at adoption and warned about (interface.md, Sandbox baseline)."""
+        return self.profile.reads_third_party and self.profile.sandbox != "required"
+
     def timeout(self, mode: Mode) -> float | None:
         """The run's wall-clock bound in ``mode`` (seconds; None: no bound)."""
         return self.profile.timeout if mode == "headless" else self.profile.interactive_timeout
