@@ -17,8 +17,10 @@ Everything up to and including a successful spawn of ``claude`` is the launch ph
 validation normally catches first, becomes ``config_invalid``) ends the run ``not-started``
 with its end reason (``end_launch``); any other error before the spawn (the audit record
 cannot be written, ``claude`` cannot be started) ends it ``launch_interrupted``. Either way
-the command exits 12 with the outcome object; only a ``KeyboardInterrupt`` (SIGINT) is
-re-raised once the run is final.
+the command exits 12 with the outcome object. A signal (``signals.LaunchInterrupted``: SIGINT,
+SIGTERM or SIGHUP) ends it ``launch_interrupted``, or ``canceled`` for SIGTERM and SIGHUP after
+a ``stop`` request (``interrupted_by``), and is re-raised once the run is final, as is a
+``KeyboardInterrupt``.
 
 The step-5 helpers take every input explicitly and return values; the side effects of step 5
 are confined to ``open_dirs`` (the session's directories), ``create_write_dirs`` and
