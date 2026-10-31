@@ -15,11 +15,14 @@ Never imported by the hook path (design.md, Hook-event fast path): it needs Pyda
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 import os
 import re
 import stat
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
@@ -429,27 +432,62 @@ def default_path(env: Mapping[str, str] | None = None) -> Path:
     return Path(base) / TOOL / CONFIG_FILE
 
 
+@dataclass(frozen=True)
+class Source:
+    """Where a config was loaded from, as ``start`` stores it for the adopting ``exec``
+    (interface.md, Flags at start and adoption): the absolute path of the main file, and
+    whether it was the default ``config.yaml`` (then missing is fine and its ``config.d/``
+    drop-ins are read too; a ``--config`` file is read alone and must exist)."""
+
+    path: str
+    default: bool
+
+    @classmethod
+    def of(cls, given: str | None, env: Mapping[str, str] | None = None) -> Source:
+        """The source of ``--config`` (made absolute against the current directory) or, when
+        not given, of the default path."""
+        if given is not None:
+            return cls(path=os.path.abspath(given), default=False)
+        return cls(path=str(default_path(env)), default=True)
+
+    def load(self, env: Mapping[str, str] | None = None) -> Config:
+        """Load the config from this source again (the adopting ``exec``)."""
+        return load(self.path, env=env, required=not self.default, dropins=self.default)
+
+
+def config_hash(cfg: Config) -> str:
+    """The SHA-256 of the validated config as canonical JSON (sorted keys): the effective
+    configuration, ``CSESSION_*`` overrides included, independent of formatting and
+    comments. ``start`` freezes it; the adopting ``exec`` warns when it changed."""
+    data = json.dumps(
+        cfg.model_dump(mode="json"), sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
 def load(
     path: str | os.PathLike[str] | None = None,
     *,
     env: Mapping[str, str] | None = None,
     required: bool | None = None,
+    dropins: bool | None = None,
 ) -> Config:
     """Load and validate the config. Without ``path``: ``default_path`` (missing is fine) and
     its ``config.d/`` drop-ins. With ``path`` (``--config``): only that file, which must exist
-    unless ``required`` is false.
-
-    TODO(#28): ``start`` also needs the absolute config path used and a ``config_hash``.
-    """
+    unless ``required`` is false. ``dropins`` (default: only without ``path``) also reads the
+    ``config.d/`` next to ``path``: the adopting ``exec`` reloading the default config from
+    the path ``start`` stored (``Source.load``)."""
     env = os.environ if env is None else env
     if required is None:
         required = path is not None
+    if dropins is None:
+        dropins = path is None
     main = Path(path) if path is not None else default_path(env)
     sources: list[tuple[str, dict[str, Any]]] = []
     data = _read(main, required=required)
     if data is not None:
         sources.append((str(main), data))
-    if path is None:
+    if dropins:
         for dropin in _dropins(main.parent / DROPIN_DIR):
             sources.append((str(dropin), _read(dropin, required=True) or {}))
 
