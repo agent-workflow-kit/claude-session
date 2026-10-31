@@ -289,8 +289,9 @@ def check_interpreter(
     interpreter: str,
     *,
     session_writable: Callable[[str], bool],
-    writable_paths: Sequence[str] = (),
+    writable_paths: Sequence[str],
     prefixes: Sequence[str] | None = None,
+    stdlib_dirs: Sequence[str] | None = None,
     package_dir: str | None = None,
     sys_path: Sequence[str] | None = None,
     site_dirs: Sequence[str] | None = None,
@@ -303,13 +304,19 @@ def check_interpreter(
 
     The candidates (stricter than what ``python -I`` actually loads; nothing is run): the hook
     interpreter path and its realpath; the ``prefixes`` (default ``sys.prefix``,
-    ``sys.exec_prefix``, ``sys.base_prefix``, ``sys.base_exec_prefix``); the
-    ``claude_session`` package directory; every absolute ``sys_path`` entry (default this
-    process's ``sys.path``); the ``site_dirs`` (default ``site.getsitepackages()`` plus the
-    user site when enabled) and every path line of their ``*.pth`` files (``site`` adds those
-    to ``sys.path``; ``import`` lines are code inside the checked file). A candidate is refused
-    when ``session_writable`` (#24's check, comparing realpaths) accepts it, or when one of the
-    ``writable_paths`` (the session-writable paths, realpaths) is the candidate or inside it.
+    ``sys.exec_prefix``, ``sys.base_prefix``, ``sys.base_exec_prefix``); the ``stdlib_dirs``
+    (default ``sysconfig``'s ``stdlib`` and ``platstdlib``); the ``claude_session`` package
+    directory; every absolute ``sys_path`` entry (default this process's ``sys.path``); the
+    ``site_dirs`` (default ``site.getsitepackages()`` plus the user site when enabled), every
+    path line of their ``*.pth`` files (``site`` adds those to ``sys.path``; ``import`` lines
+    are code inside the checked file) and the realpath of each symlinked ``.pth`` file. A
+    ``.pth`` file that cannot be opened is skipped, as ``site`` skips it. A candidate is
+    refused when ``session_writable`` (#24's check, comparing realpaths) accepts it. A
+    code-bearing directory (stdlib, package, ``sys_path`` entry, site dir, ``.pth`` path entry)
+    is also refused when one of the ``writable_paths`` (the session-writable paths, realpaths;
+    required, so the check is never skipped by omission) is the directory or inside it; the
+    interpreter, the prefixes and the ``.pth`` files are checked one way only, so a writable
+    ``/usr/src/app`` under the ``/usr`` prefix passes.
 
     Then every regular file under ``link_dirs`` must have a single link (``st_nlink`` 1): a
     hard link elsewhere (``uv`` links venv files to its cache by default) may be writable by
@@ -322,6 +329,8 @@ def check_interpreter(
 
     if prefixes is None:
         prefixes = (sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix)
+    if stdlib_dirs is None:
+        stdlib_dirs = _stdlib_dirs()
     if package_dir is None:
         package_dir = os.path.dirname(os.path.abspath(__file__))
     if sys_path is None:
@@ -333,22 +342,26 @@ def check_interpreter(
         if sys.prefix != sys.base_prefix:
             venv = os.path.realpath(sys.prefix)
             link_dirs += [d for d in site.getsitepackages() if _inside(os.path.realpath(d), venv)]
+    pth_entries, pth_files = _pth_entries(site_dirs)
+    # (label, path, code-bearing directory: also checked for a writable path inside it)
     candidates = [
-        ("hook interpreter", interpreter),
-        ("hook interpreter (resolved)", os.path.realpath(interpreter)),
-        *(("Python prefix", prefix) for prefix in prefixes),
-        ("claude_session package directory", package_dir),
-        *(("sys.path entry", entry) for entry in sys_path if entry and os.path.isabs(entry)),
-        *(("site-packages directory", entry) for entry in site_dirs),
-        *((".pth path entry", entry) for entry in _pth_entries(site_dirs)),
+        ("hook interpreter", interpreter, False),
+        ("hook interpreter (resolved)", os.path.realpath(interpreter), False),
+        *(("Python prefix", prefix, False) for prefix in prefixes),
+        *(("standard library directory", entry, True) for entry in stdlib_dirs),
+        ("claude_session package directory", package_dir, True),
+        *(("sys.path entry", entry, True) for entry in sys_path if entry and os.path.isabs(entry)),
+        *(("site-packages directory", entry, True) for entry in site_dirs),
+        *((".pth path entry", entry, True) for entry in pth_entries),
+        *((".pth file (resolved)", entry, False) for entry in pth_files),
     ]
-    for label, path in candidates:
+    for label, path, code_dir in candidates:
         if session_writable(path):
             raise LaunchValidationError(
                 f"{label} is inside a session-writable path: {_shown(path)!r}",
                 end_reason="unsafe_path",
             )
-        if _overlaps(path, writable_paths):
+        if code_dir and _overlaps(path, writable_paths):
             raise LaunchValidationError(
                 f"{label} contains a session-writable path: {_shown(path)!r}",
                 end_reason="unsafe_path",
@@ -386,6 +399,13 @@ def _overlaps(candidate: str, writable_paths: Sequence[str]) -> bool:
     return any(_inside(os.path.realpath(path), form) for path in writable_paths for form in forms)
 
 
+def _stdlib_dirs() -> list[str]:
+    import sysconfig
+
+    paths = sysconfig.get_paths()
+    return list(dict.fromkeys(paths[key] for key in ("stdlib", "platstdlib") if key in paths))
+
+
 def _site_dirs() -> list[str]:
     import site
 
@@ -395,12 +415,15 @@ def _site_dirs() -> list[str]:
     return dirs
 
 
-def _pth_entries(site_dirs: Sequence[str]) -> list[str]:
+def _pth_entries(site_dirs: Sequence[str]) -> tuple[list[str], list[str]]:
     """The path lines of the ``*.pth`` files in ``site_dirs`` (relative ones joined to their
-    directory), as ``site`` would add them; comment, blank and ``import`` lines skipped. An
-    unreadable or oversized ``.pth`` file is refused (``unsafe_path``): what it adds is
-    unknown."""
+    directory), as ``site`` would add them; comment, blank and ``import`` lines skipped. Also
+    the realpaths of the symlinked ``.pth`` files read (the agent could rewrite one whose
+    target it can write). A ``.pth`` file that cannot be opened (symlinks followed) is skipped,
+    as ``site.addpackage`` skips it; an oversized one is refused (``unsafe_path``): what it
+    adds is unknown."""
     entries: list[str] = []
+    linked: list[str] = []
     for directory in site_dirs:
         try:
             names = sorted(n for n in os.listdir(directory) if n.endswith(".pth"))
@@ -411,11 +434,10 @@ def _pth_entries(site_dirs: Sequence[str]) -> list[str]:
             try:
                 with open(path, "rb") as handle:
                     raw = handle.read(_MAX_PTH_BYTES + 1)
-            except OSError as exc:
-                raise LaunchValidationError(
-                    f"cannot read .pth file {_shown(path)!r}: {exc.strerror or 'error'}",
-                    end_reason="unsafe_path",
-                ) from exc
+            except OSError:
+                continue  # As site.addpackage: a .pth file it cannot open adds nothing.
+            if os.path.islink(path):
+                linked.append(os.path.realpath(path))
             if len(raw) > _MAX_PTH_BYTES:
                 raise LaunchValidationError(
                     f".pth file {_shown(path)!r} is larger than 1 MiB", end_reason="unsafe_path"
@@ -428,7 +450,7 @@ def _pth_entries(site_dirs: Sequence[str]) -> list[str]:
                     continue
                 line = line.rstrip()
                 entries.append(os.path.normpath(os.path.join(directory, line)))
-    return entries
+    return entries, linked
 
 
 def is_isolated(profile: config.Kind) -> bool:

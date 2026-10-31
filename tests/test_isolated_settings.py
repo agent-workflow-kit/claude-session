@@ -995,6 +995,7 @@ def test_interpreter_outside_writable_paths_passes(tmp_path: Path) -> None:
     settings_builder.check_interpreter(
         "/opt/venv/bin/python",
         session_writable=writable_under(str(tmp_path / "cwd")),
+        writable_paths=(str(tmp_path / "cwd"),),
         prefixes=("/opt/venv", "/usr"),
         package_dir="/opt/venv/lib/python3.12/site-packages/claude_session",
         link_dirs=(),
@@ -1028,6 +1029,7 @@ def test_interpreter_inside_a_writable_path_is_refused(tmp_path: Path, where: st
         settings_builder.check_interpreter(
             interpreter,
             session_writable=writable_under(str(cwd)),
+            writable_paths=(str(cwd),),
             prefixes=prefixes,
             package_dir=package,
             sys_path=(),
@@ -1044,7 +1046,9 @@ def test_interpreter_check_defaults_to_this_python() -> None:
         seen.append(path)
         return False
 
-    settings_builder.check_interpreter(sys.executable, session_writable=record, link_dirs=())
+    settings_builder.check_interpreter(
+        sys.executable, session_writable=record, writable_paths=(), link_dirs=()
+    )
     assert sys.prefix in seen and sys.exec_prefix in seen
     assert os.path.dirname(settings_builder.__file__) in seen
 
@@ -1349,6 +1353,7 @@ def interpreter_layout(tmp_path: Path) -> dict[str, Any]:
         "interpreter": str(python),
         "prefixes": (str(venv), str(venv), str(base), str(base)),
         "package_dir": str(package),
+        "stdlib_dirs": (str(base / "lib" / "python3.12"),),
         "sys_path": (str(base / "lib" / "python3.12"), str(site_dir)),
         "site_dirs": (str(site_dir),),
         "link_dirs": (str(package), str(site_dir)),
@@ -1418,7 +1423,7 @@ def test_writable_venv_site_packages_is_refused(tmp_path: Path) -> None:
 
 
 def test_writable_base_stdlib_dir_is_refused(tmp_path: Path) -> None:
-    # Only the reverse containment catches this one: the stdlib dir is inside base_prefix.
+    # Only the reverse containment of the stdlib dir catches this one (not in sys_path here).
     layout = interpreter_layout(tmp_path)
     stdlib = str(tmp_path / "base" / "lib" / "python3.12")
     layout["sys_path"] = ()
@@ -1433,6 +1438,106 @@ def test_writable_base_stdlib_dir_is_refused(tmp_path: Path) -> None:
     assert "contains a session-writable path" in info.value.message
 
 
+def test_writable_path_under_a_python_prefix_passes(tmp_path: Path) -> None:
+    # V1: a cwd like /usr/src/app sits under the system prefix but outside every code dir.
+    layout = interpreter_layout(tmp_path)
+    app = tmp_path / "base" / "src" / "app"
+    app.mkdir(parents=True)
+    check(layout, str(app))
+
+
+def test_writable_dir_inside_a_stdlib_dir_is_refused(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    layout["sys_path"] = ()
+    inner = tmp_path / "base" / "lib" / "python3.12" / "json"
+    inner.mkdir()
+    with pytest.raises(LaunchValidationError) as info:
+        settings_builder.check_interpreter(
+            layout.pop("interpreter"),
+            session_writable=lambda _path: False,
+            writable_paths=(str(inner),),
+            **layout,
+        )
+    assert end_reason(info) == "unsafe_path"
+
+
+def test_writable_dir_inside_a_site_dir_is_refused(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    inner = Path(layout["site_dirs"][0]) / "somepkg"
+    inner.mkdir()
+    assert refused_reason(layout, str(inner)) == "unsafe_path"
+
+
+def test_interpreter_check_requires_writable_paths() -> None:
+    # V2: no default that would silently skip the reverse check.
+    with pytest.raises(TypeError):
+        settings_builder.check_interpreter(  # pyright: ignore[reportCallIssue]
+            sys.executable, session_writable=lambda _path: False, link_dirs=()
+        )
+
+
+def test_interpreter_check_defaults_include_stdlib_dirs() -> None:
+    import sysconfig
+
+    seen: list[str] = []
+
+    def record(path: str) -> bool:
+        seen.append(path)
+        return False
+
+    settings_builder.check_interpreter(
+        sys.executable, session_writable=record, writable_paths=(), link_dirs=()
+    )
+    assert sysconfig.get_paths()["stdlib"] in seen
+
+
+def test_dangling_pth_symlink_is_skipped(tmp_path: Path) -> None:
+    # V3: site.addpackage skips a .pth file it cannot open.
+    layout = interpreter_layout(tmp_path)
+    site_dir = Path(layout["site_dirs"][0])
+    (site_dir / "gone.pth").symlink_to(tmp_path / "missing.pth")
+    check(layout)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read any file")
+def test_unreadable_pth_is_skipped(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    site_dir = Path(layout["site_dirs"][0])
+    pth = site_dir / "secret.pth"
+    pth.write_text(f"{tmp_path / 'cwd'}\n")
+    pth.chmod(0)
+    try:
+        check(layout, str(tmp_path / "cwd"))
+    finally:
+        pth.chmod(0o600)
+
+
+def test_symlinked_pth_into_a_writable_dir_is_refused(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    target = cwd / "evil.pth"
+    target.write_text("# nothing yet\n")
+    site_dir = Path(layout["site_dirs"][0])
+    (site_dir / "evil.pth").symlink_to(target)
+    with pytest.raises(LaunchValidationError) as info:
+        check(layout, str(cwd))
+    assert end_reason(info) == "unsafe_path"
+    assert ".pth" in info.value.message
+
+
+def test_symlinked_readable_pth_entries_are_still_checked(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    cwd = tmp_path / "cwd"
+    (cwd / "src").mkdir(parents=True)
+    store = tmp_path / "store"
+    store.mkdir()
+    (store / "real.pth").write_text(f"{cwd / 'src'}\n")
+    site_dir = Path(layout["site_dirs"][0])
+    (site_dir / "linked.pth").symlink_to(store / "real.pth")
+    assert refused_reason(layout, str(cwd)) == "unsafe_path"
+
+
 def test_interpreter_check_defaults_include_base_prefixes_and_sys_path() -> None:
     seen: list[str] = []
 
@@ -1440,7 +1545,9 @@ def test_interpreter_check_defaults_include_base_prefixes_and_sys_path() -> None
         seen.append(path)
         return False
 
-    settings_builder.check_interpreter(sys.executable, session_writable=record, link_dirs=())
+    settings_builder.check_interpreter(
+        sys.executable, session_writable=record, writable_paths=(), link_dirs=()
+    )
     for path in (sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix):
         assert path in seen
     assert all(entry in seen for entry in sys.path if entry and os.path.isabs(entry))
