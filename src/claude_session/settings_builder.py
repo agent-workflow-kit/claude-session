@@ -13,11 +13,13 @@ interface.md, Generated settings, which always win over profile content. The san
 boundary; the permission rules are defense in depth. Every path the rules or the sandbox lists
 name is checked to be absolute, normalized and free of glob and control characters here; the
 path rules that compare paths with each other (unsafe write targets, credential paths, the
-session-writable paths) are #24's.
+session-writable paths) are in ``pathrules``, which the launch validations apply before
+build(). ``_check_isolation_inputs`` repeats the lexical part as a backstop (``/``, ``$HOME``
+and its ancestors, credential paths, state-root containment).
 
-TODO(#24): before build(), the launch validations refuse unsafe cwd, read_dirs, write_dirs,
-plugin directories and generated read entries (Isolation fields), and pass the
-session_writable check and the session-writable paths to check_interpreter().
+TODO(#15): before build(), the launch validations call the pathrules checks (cwd, read_dirs,
+write_dirs, profile, plugin directories, generated read entries; see pathrules) and pass
+pathrules.session_writable(...) and its .paths to check_interpreter().
 TODO(#25): exec creates the private tmpdir (Isolation.tmpdir) and runs the sandbox
 self-check; a `preferred` run without a working sandbox adds its warning there.
 
@@ -45,7 +47,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import config, ids, permission_profiles, sessiondir
+from . import config, ids, pathrules, permission_profiles, sessiondir
 from .errors import FailedError, LaunchValidationError
 from .kinds import Mode, Resolution
 
@@ -202,7 +204,7 @@ class Launch:
 @dataclass(frozen=True)
 class Isolation:
     """The inputs only isolated runs need. Every path is absolute, normalized and
-    symlink-resolved by the caller, and has passed #24's path rules.
+    symlink-resolved by the caller, and has passed the ``pathrules`` checks.
 
     - ``home``: ``$HOME`` (the Read denies of credential locations).
     - ``tmpdir``: the private temporary directory (required when the sandbox is not ``off``);
@@ -311,7 +313,7 @@ def check_interpreter(
     path line of their ``*.pth`` files (``site`` adds those to ``sys.path``; ``import`` lines
     are code inside the checked file) and the realpath of each symlinked ``.pth`` file. A
     ``.pth`` file that cannot be opened is skipped, as ``site`` skips it. A candidate is
-    refused when ``session_writable`` (#24's check, comparing realpaths) accepts it. A
+    refused when ``session_writable`` (``pathrules.SessionWritable``) accepts it. A
     code-bearing directory (stdlib, package, ``sys_path`` entry, site dir, ``.pth`` path entry)
     is also refused when one of the ``writable_paths`` (the session-writable paths, realpaths;
     required, so the check is never skipped by omission) is the directory or inside it; the
@@ -324,7 +326,7 @@ def check_interpreter(
     (``sys.prefix != sys.base_prefix``), its own site-packages.
 
     TODO(#15): exec calls this for isolated runs at launch, and #28 at adoption, with
-    current_interpreter(), #24's session_writable check and the session-writable paths."""
+    current_interpreter(), pathrules.session_writable(...) and its .paths."""
     import site
 
     if prefixes is None:
@@ -392,11 +394,9 @@ def check_hard_links(dirs: Sequence[str]) -> None:
 
 def _overlaps(candidate: str, writable_paths: Sequence[str]) -> bool:
     """Whether a session-writable path is ``candidate`` (or its realpath) or inside it: the
-    other direction of the session-writable check.
-
-    TODO(#24): fold into #24's session-writable predicate."""
-    forms = {os.path.normpath(candidate), os.path.realpath(candidate)}
-    return any(_inside(os.path.realpath(path), form) for path in writable_paths for form in forms)
+    other direction of the session-writable check (``pathrules.contains_any``: resolved
+    paths, and identity, so a bind mount cannot hide it)."""
+    return pathrules.contains_any(candidate, writable_paths)
 
 
 def _stdlib_dirs() -> list[str]:
@@ -876,8 +876,9 @@ def _check_isolation_inputs(
     filesystem = (content.get("sandbox") or {}).get("filesystem") or {}
     profile_reads = [v for v in filesystem.get("allowRead") or [] if isinstance(v, str)]
     profile_writes = [v for v in filesystem.get("allowWrite") or [] if isinstance(v, str)]
-    # TODO(#24): the general path predicate (unsafe write targets, credential paths, the
-    # caller's cwd) covers these entries too; this checks only the state-root containment.
+    # pathrules applies the full rules (unsafe write targets, credential paths, the caller's
+    # cwd, by realpath and identity) before build(); this backstop compares lexically.
+    _check_lexical(paths, cwd, plugin_dirs, iso, profile_reads, profile_writes)
     roots = [paths.state_root, paths.private_root]
     if iso.tmpdir is not None:
         roots.append(os.path.dirname(iso.tmpdir))
@@ -924,6 +925,51 @@ def _check_isolation_inputs(
                     f"{label} is inside the private tmpdir, which must stay out of allowRead:"
                     f" {_shown(value)!r}",
                     end_reason=reason,
+                )
+
+
+def _check_lexical(
+    paths: Paths,
+    cwd: str,
+    plugin_dirs: Sequence[str],
+    iso: Isolation,
+    profile_reads: Sequence[str],
+    profile_writes: Sequence[str],
+) -> None:
+    """The lexical backstop of the path rules: no sandbox ``allowRead`` or ``allowWrite``
+    entry is ``/``, ``$HOME`` or an ancestor of it; no read entry outside ``$CSESSION_DIR``
+    contains or is inside a credential path."""
+    csdir = paths.session_dir
+    git_dirs = [p for p in (iso.git_dir, iso.worktree_git_dir) if p]
+    writes: list[tuple[str, str, Sequence[str]]] = [
+        ("cwd", "unsafe_cwd", [cwd]),
+        ("write_dirs entry", "invalid_permission_profile", iso.write_dirs),
+        ("profile allowWrite entry", "invalid_permission_profile", profile_writes),
+    ]
+    reads: list[tuple[str, str, Sequence[str]]] = [
+        ("plugin directory", "unsafe_plugin_dir", plugin_dirs),
+        ("read_dirs entry", "invalid_permission_profile", iso.read_dirs),
+        ("profile allowRead entry", "invalid_permission_profile", profile_reads),
+        ("tool directory", "unsafe_read_dir", iso.tool_dirs),
+        ("Python read directory", "unsafe_read_dir", iso.python_dirs),
+        ("env.path_prepend directory", "unsafe_read_dir", iso.path_prepend),
+        ("git directory", "unsafe_read_dir", git_dirs),
+    ]
+    for label, reason, values in writes:
+        for value in values:
+            problem = pathrules.lexical_root_problem(os.path.normpath(value), home=iso.home)
+            if problem is not None:
+                raise LaunchValidationError(
+                    f"{label} {problem}: {_shown(value)!r}", end_reason=reason
+                )
+    for label, reason, values in reads:
+        for value in values:
+            problem = pathrules.lexical_read_problem(
+                os.path.normpath(value), home=iso.home, session_dir=csdir
+            )
+            if problem is not None:
+                raise LaunchValidationError(
+                    f"{label} {problem}: {_shown(value)!r}", end_reason=reason
                 )
 
 
@@ -1041,7 +1087,7 @@ def python_read_dirs(
     those, and the user site directory when it is in use. Every entry is realpath-resolved
     and missing ones are skipped. Empty and relative ``sys.path`` entries are dropped first;
     absolute ones are kept even inside the caller's cwd (``check_interpreter`` refuses one
-    inside a session-writable path, and #24's generated-entry checks refuse the caller's
+    inside a session-writable path, and ``pathrules``' generated-entry checks refuse the caller's
     cwd). ``user_site=True``: this interpreter's user site when enabled and on ``sys.path``."""
     import site
 
