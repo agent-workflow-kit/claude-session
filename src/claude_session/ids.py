@@ -162,7 +162,6 @@ def is_repo_id(text: str) -> bool:
 def repo_id_from_origin(origin: str) -> str | None:
     """Normalize an ``origin`` URL to a repo id, or None when it does not yield a valid one
     (local paths, ``file://``, unknown schemes, no path)."""
-    # TODO(#9): call from the --repo derivation (git calls go through the gateway).
     if not origin.isascii() or _ORIGIN_UNSAFE.search(origin):
         return None  # a repo id is ASCII; str.lower would fold e.g. KELVIN SIGN into k
     if "://" in origin:

@@ -596,6 +596,7 @@ The launch steps, the refusals, the flags each entry point accepts and their sto
 What is carried, reset and refused on resume and fork is normative in [interface.md, Resume and fork carry-over](interface.md#resume-and-fork-carry-over). Implementation:
 
 - `kinds` computes the effective profile in the documented resolution order and records each value's origin in `resolved_json`; carried values come from the previous run's `spec_json` (explicit flags only), so a config change takes effect on the next resume. `--reset <setting>` removes a key from the carried spec before the flags given now are applied.
+- Origins of the built-in and config layers are decided by value: a field equal to the value its kind starts from (the built-in kind, or the built-in `review` kind for a kind that is only configured) is `builtin`, any other value `config`. An unknown kind uses the whole configured `review` profile without per-repo overrides; flags still apply. With `--reads-third-party`, an explicit `--sandbox`, `--setting-sources` or `--env-allowlist-only` beats the implication when it comes from the same layer (given now, or carried) or a later one.
 - `--kind` omitted on resume means the previous run's kind; the session's launch kind never changes. A kind change is detected by comparing the run kinds.
 - `env_allow` and `env_allowlist_only` are separate keys in `spec_json`, each replaced only by its own flag.
 - A carried `--plugin-dir` that no longer exists fails the launch (`plugin_dir_missing`); a profile is carried as its snapshot, never the path.

@@ -37,7 +37,7 @@ from yaml.parser import ParserError
 from yaml.reader import ReaderError
 from yaml.scanner import ScannerError
 
-from . import defaults, durations
+from . import defaults, durations, ids
 from .errors import UsageError
 
 TOOL = "claude-session"
@@ -51,11 +51,6 @@ MAX_DEPTH = 64
 MAX_INTEGER = defaults.MAX_INTEGER  # every integer key (JSON's exact-integer range)
 MAX_RETENTION_DAYS = 36500
 
-# Grammars (interface.md, Identifiers). TODO(#5): use the ids grammars.
-KIND_NAME = r"[a-z0-9][a-z0-9_-]{0,63}"
-PROFILE_NAME = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
-LABEL = r"[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}"
-REPO_ID = r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/(?!\.\.?(/|$))[A-Za-z0-9._-]+)+"
 VERSION = r"[0-9]+(\.[0-9]+)*"
 # Names that are never config keys and may not be set in env.set (interface.md).
 INVALID_REPO = "<invalid repo id>"
@@ -128,6 +123,22 @@ def _integral(value: Any) -> Any:
     return value
 
 
+def _grammar(check: Callable[[str], bool], what: str, pattern: str) -> AfterValidator:
+    """A name grammar of interface.md, Identifiers (the ``ids`` checks)."""
+
+    def validate(value: str) -> str:
+        if not check(value):
+            raise ValueError(f"{what} must match ^{pattern}$")
+        return value
+
+    return AfterValidator(validate)
+
+
+def _label(value: str) -> str:
+    ids.parse_label(value)  # its ValueError names the broken part, never the value
+    return value
+
+
 def _no_leading_dash(value: str) -> str:
     """``model`` is passed as ``claude --model <value>``: a leading ``-`` reads as an option."""
     if value.startswith("-"):
@@ -168,10 +179,17 @@ def _no_reserved(values: dict[str, str]) -> dict[str, str]:
     return values
 
 
-KindName = Annotated[str, _matching(KIND_NAME, "kind name")]
-ProfileName = Annotated[str, _matching(PROFILE_NAME, "permission-profile name")]
-RepoId = Annotated[str, _matching(REPO_ID, "repo id")]
-Label = Annotated[str, _matching(LABEL, "label")]
+KindName = Annotated[str, _grammar(ids.is_kind_name, "kind name", ids.KIND_NAME.pattern)]
+ProfileName = Annotated[
+    str,
+    _grammar(
+        ids.is_permission_profile_name,
+        "permission-profile name",
+        ids.PERMISSION_PROFILE_NAME.pattern,
+    ),
+]
+RepoId = Annotated[str, _grammar(ids.is_repo_id, "repo id", ids.REPO_ID.pattern.strip("^$"))]
+Label = Annotated[str, AfterValidator(_label)]
 Duration = Annotated[float, _duration_validator(positive=False, bound=False)]
 PositiveDuration = Annotated[float, _duration_validator(positive=True, bound=False)]
 Bound = Annotated[float | None, _duration_validator(positive=True, bound=True)]
@@ -301,8 +319,7 @@ class Config(_Model):
 
     claude_bin: Annotated[str, AfterValidator(_no_controls)]
     min_claude_version: Annotated[str, _matching(VERSION, "version")]
-    # TODO(#9): an unknown default_kind gets the unknown-kind fallback (review profile + warning).
-    default_kind: KindName
+    default_kind: KindName  # also names a built-in or configured kind (checked by ``load``)
     claude_auth_env: list[str]
     secret_env: list[str]
     notes_context_cmd: Annotated[list[str], Field(min_length=1)]
@@ -378,7 +395,6 @@ def load(
     its ``config.d/`` drop-ins. With ``path`` (``--config``): only that file, which must exist
     unless ``required`` is false.
 
-    TODO(#9): pass --config into config.load
     TODO(#28): ``start`` also needs the absolute config path used and a ``config_hash``.
     """
     env = os.environ if env is None else env
@@ -398,7 +414,12 @@ def load(
         merge(raw, layer)
     _complete_new_kinds(raw)
     from_env = _apply_env(raw, env)
-    return _validate(Config, raw, lambda loc: _source(loc, sources, from_env))
+    cfg = _validate(Config, raw, lambda loc: _source(loc, sources, from_env))
+    if cfg.default_kind not in cfg.kinds:
+        where = _source(("default_kind",), sources, from_env)
+        detail = f"default_kind: names no built-in or configured kind (in {where})"
+        raise UsageError("invalid config", detail=detail)
+    return cfg
 
 
 def merge(base: dict[str, Any], over: Mapping[str, Any], path: tuple[str, ...] = ()) -> None:
@@ -416,10 +437,8 @@ def merge(base: dict[str, Any], over: Mapping[str, Any], path: tuple[str, ...] =
 
 def kind_settings(cfg: Config, kind: str, repo: str | None = None) -> Kind:
     """The config kind ``kind`` with the per-repo override for ``repo`` on top. Raises
-    ``KeyError`` for a kind that is neither built in nor configured.
-
-    TODO(#9): origins, the unknown-kind fallback and previous-run flags belong to ``kinds``.
-    """
+    ``KeyError`` for a kind that is neither built in nor configured (``kinds.resolve`` handles
+    the unknown-kind fallback, origins and flags)."""
     settings = cfg.kinds[kind]
     override = cfg.repos[repo].kinds.get(kind) if repo in cfg.repos else None
     if override is None:
@@ -427,6 +446,13 @@ def kind_settings(cfg: Config, kind: str, repo: str | None = None) -> Kind:
     data = settings.model_dump()
     merge(data, override.model_dump(exclude_unset=True))
     return _validate(Kind, data, lambda loc: f"repos.{repo}.kinds.{kind}")
+
+
+def validate_kind(data: dict[str, Any], source: Callable[[tuple[str | int, ...]], str]) -> Kind:
+    """A ``Kind`` from ``data`` with flag values applied (durations may be bare numbers of
+    seconds). Raises ``UsageError("invalid flag value")`` whose ``detail`` names the key and
+    ``source(loc)``, never the value."""
+    return _validate(Kind, data, source, bare=True, message="invalid flag value")
 
 
 def with_flags[M: BaseModel](settings: M, /, **flags: Any) -> M:
@@ -726,7 +752,7 @@ def _unsupported(value: _Unsupported, where: str, path: Path) -> UsageError:
 def _key_path(where: str, key: str) -> str:
     """``where.key``; a repo key that is not a valid repo id is not echoed (it may hold
     credentials)."""
-    if where == "repos" and not re.fullmatch(REPO_ID, key):
+    if where == "repos" and not ids.is_repo_id(key):
         key = INVALID_REPO
     return f"{where}.{key}" if where else key
 
@@ -836,6 +862,7 @@ def _validate[M: BaseModel](
     source: Callable[[tuple[str | int, ...]], str],
     *,
     bare: bool = False,
+    message: str = "invalid config",
 ) -> M:
     try:
         return model.model_validate(data, context={"bare": bare})
@@ -843,7 +870,7 @@ def _validate[M: BaseModel](
         problems = [_describe(error, source) for error in exc.errors()]
     # Raised outside the handler: the ValidationError (it holds the input values) must not become
     # its ``__context__``.
-    raise UsageError("invalid config", detail="; ".join(problems))
+    raise UsageError(message, detail="; ".join(problems))
 
 
 def _describe(error: Any, source: Callable[[tuple[str | int, ...]], str]) -> str:

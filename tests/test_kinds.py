@@ -1,0 +1,756 @@
+"""Kind profile resolution with origins (interface.md, Launch flags, Config and Resume and fork
+carry-over)."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import textwrap
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+from claude_session import cli, config, defaults, gateway, kinds
+from claude_session.errors import UsageError
+
+ROOT = Path(__file__).resolve().parent.parent
+EXAMPLE = ROOT / "config.example.yaml"
+DRY_RUN_SCHEMA = ROOT / "schemas" / "cli" / "exec-dry-run.json"
+REPO = "example.com/group/project"
+SECRET = "s3cr3t-value-never-echoed"
+
+
+def write(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(text), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def cfg_dir(tmp_path: Path) -> Path:
+    return tmp_path / "claude-session"
+
+
+def load(cfg_dir: Path, text: str | None = None) -> config.Config:
+    if text is not None:
+        write(cfg_dir / "config.yaml", text)
+    return config.load(None, env={"XDG_CONFIG_HOME": str(cfg_dir.parent)})
+
+
+def no_origin(cwd: str) -> str | None:
+    raise AssertionError("the origin must not be looked up")
+
+
+def resolve(cfg: config.Config, kind: str | None = None, **kw: Any) -> kinds.Resolution:
+    kw.setdefault("mode", "headless")
+    kw.setdefault("origin_url", no_origin)
+    return kinds.resolve(cfg, kind, **kw)
+
+
+# Built-in kinds
+
+
+def test_builtin_kinds_are_the_single_defaults_table() -> None:
+    assert kinds.BUILTIN_KINDS is defaults.BUILTIN_KINDS
+    example = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    assert kinds.BUILTIN_KINDS == example["kinds"]
+
+
+def test_builtin_kind_names_are_the_documented_ones() -> None:
+    assert set(kinds.BUILTIN_KINDS) == {
+        "implement",
+        "draft-ticket",
+        "audit",
+        "improve",
+        "rank",
+        "review",
+        "gate-check",
+        "respond",
+    }
+
+
+@pytest.mark.parametrize("name", ["implement", "draft-ticket", "audit", "improve"])
+def test_trusted_builtin_kinds(cfg_dir: Path, name: str) -> None:
+    profile = resolve(load(cfg_dir), name).profile
+    assert profile.sandbox == "off"
+    assert profile.reads_third_party is False
+    assert profile.cwd == "caller"
+    assert profile.implicit_done is True
+    assert profile.permission_profile == "default"
+
+
+def test_rank_kind(cfg_dir: Path) -> None:
+    profile = resolve(load(cfg_dir), "rank").profile
+    assert profile.permission_profile == "readonly"
+    assert profile.sandbox == "preferred"
+    assert profile.env.inherit is False
+    assert profile.cwd == "session-dir"
+    assert profile.implicit_done is False
+
+
+@pytest.mark.parametrize(("name", "implicit_done"), [("review", True), ("gate-check", False)])
+def test_review_and_gate_check_kinds(cfg_dir: Path, name: str, implicit_done: bool) -> None:
+    profile = resolve(load(cfg_dir), name).profile
+    assert profile.reads_third_party is True
+    assert profile.sandbox == "required"
+    assert profile.cwd == "session-dir"
+    assert profile.implicit_done is implicit_done
+    assert profile.setting_sources == []
+    assert profile.mcp == "none"
+
+
+def test_respond_kind(cfg_dir: Path) -> None:
+    profile = resolve(load(cfg_dir), "respond").profile
+    assert profile.reads_third_party is True
+    assert profile.sandbox == "required"
+    assert profile.cwd == "caller"
+    assert profile.permission_profile == "respond"
+    assert profile.env.set["GIT_CONFIG_NOSYSTEM"] == "1"
+
+
+def test_builtin_permission_profiles_set_no_default_mode() -> None:
+    assert set(defaults.BUILTIN_PERMISSION_PROFILES) == {"default", "readonly", "review", "respond"}
+    for name in ("readonly", "review", "respond"):
+        permissions = defaults.BUILTIN_PERMISSION_PROFILES[name]["permissions"]
+        assert "defaultMode" not in permissions
+
+
+def test_default_kind_is_used_without_a_kind(cfg_dir: Path) -> None:
+    result = resolve(load(cfg_dir))
+    assert result.kind == "implement"
+    assert result.builtin is True
+    assert result.fallback is False
+    assert result.warnings == ()
+
+
+def test_configured_default_kind_is_used(cfg_dir: Path) -> None:
+    assert resolve(load(cfg_dir, "default_kind: review\n")).kind == "review"
+
+
+# Unknown kinds
+
+
+def test_unknown_kind_gets_the_review_profile_and_a_warning(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir)
+    result = resolve(cfg, "my-new-kind")
+    assert result.kind == "my-new-kind"
+    assert result.fallback is True
+    assert result.builtin is False
+    assert result.profile == cfg.kinds["review"]
+    assert len(result.warnings) == 1
+    assert "my-new-kind" in result.warnings[0]
+    assert "review" in result.warnings[0]
+
+
+def test_unknown_kind_uses_the_configured_review_profile(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "kinds: {review: {timeout: 5m}}\n")
+    result = resolve(cfg, "nope")
+    assert result.profile.timeout == 300.0
+    assert result.origins["timeout"] == "config"
+    assert result.origins["sandbox"] == "builtin"
+
+
+def test_unknown_kind_gets_no_per_repo_overrides(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir,
+        f"repos: {{{REPO}: {{kinds: {{review: {{sandbox: 'off'}}, nope: {{sandbox: 'off'}}}}}}}}\n",
+    )
+    result = resolve(cfg, "nope", repo=REPO)
+    assert result.profile.sandbox == "required"
+    assert result.origins["sandbox"] == "builtin"
+    assert result.repo == REPO
+
+
+def test_unknown_kind_still_takes_flags(cfg_dir: Path) -> None:
+    result = resolve(load(cfg_dir), "nope", flags={"model": "m1"})
+    assert result.profile.model == "m1"
+    assert result.origins["model"] == "flag"
+
+
+def test_configured_kind_is_not_a_fallback(cfg_dir: Path) -> None:
+    result = resolve(load(cfg_dir, "kinds: {mine: {sandbox: preferred}}\n"), "mine")
+    assert result.fallback is False
+    assert result.builtin is False
+    assert result.warnings == ()
+    assert result.profile.sandbox == "preferred"
+    assert result.origins["sandbox"] == "config"
+    assert result.origins["reads_third_party"] == "builtin"  # from the built-in review kind
+
+
+@pytest.mark.parametrize(
+    "name", ["", "Review", "-x", "_x", "a b", "a/b", "x" * 65, "reviеw", "a\n", SECRET + "!"]
+)
+def test_invalid_kind_names_are_usage_errors(cfg_dir: Path, name: str) -> None:
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), name)
+    assert info.value.exit_code == 2
+
+
+def test_unknown_default_kind_is_an_invalid_config(cfg_dir: Path) -> None:
+    with pytest.raises(UsageError) as info:
+        load(cfg_dir, "default_kind: nope\n")
+    assert "default_kind" in str(info.value.detail)
+    assert "config.yaml" in str(info.value.detail)
+    assert "nope" not in str(info.value.detail)
+
+
+def test_unknown_default_kind_from_the_environment_names_the_variable(cfg_dir: Path) -> None:
+    with pytest.raises(UsageError) as info:
+        config.load(
+            None,
+            env={"XDG_CONFIG_HOME": str(cfg_dir.parent), "CSESSION_DEFAULT_KIND": "nope"},
+        )
+    assert "CSESSION_DEFAULT_KIND" in str(info.value.detail)
+
+
+def test_default_kind_may_name_a_configured_kind(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "default_kind: mine\nkinds: {mine: {}}\n")
+    assert resolve(cfg).kind == "mine"
+
+
+# Layers and origins
+
+
+def test_origins_cover_every_field(cfg_dir: Path) -> None:
+    result = resolve(load(cfg_dir), "implement")
+    expected = set(config.Kind.model_fields) - {"env"}
+    expected |= {"env.inherit", "env.allow", "env.set", "env.path_prepend"}
+    assert set(result.origins) == expected
+    assert set(result.origins.values()) == {"builtin"}
+
+
+def test_origin_values_match_the_dry_run_schema(cfg_dir: Path) -> None:
+    schema = json.loads(DRY_RUN_SCHEMA.read_text(encoding="utf-8"))
+    allowed = set(schema["properties"]["origins"]["additionalProperties"]["enum"])
+    assert set(kinds.Origin.__args__) == allowed  # type: ignore[attr-defined]
+    cfg = load(cfg_dir, f"kinds: {{review: {{model: m}}}}\nrepos: {{{REPO}: {{}}}}\n")
+    result = resolve(cfg, "review", repo=REPO, flags={"reads_third_party": True, "max_turns": 3})
+    assert set(result.origins.values()) <= allowed
+
+
+def test_config_origin_for_changed_fields_only(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "kinds: {implement: {timeout: 30m, model: m1, sandbox: 'off'}}\n")
+    origins = resolve(cfg, "implement").origins
+    assert origins["timeout"] == "config"
+    assert origins["model"] == "config"
+    # A config value equal to the built-in one keeps origin builtin.
+    assert origins["sandbox"] == "builtin"
+    assert origins["max_turns"] == "builtin"
+
+
+def test_config_env_parts_have_their_own_origins(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "kinds: {implement: {env: {set: {A: b}}}}\n")
+    origins = resolve(cfg, "implement").origins
+    assert origins["env.set"] == "config"
+    assert origins["env.inherit"] == "builtin"
+    assert origins["env.allow"] == "builtin"
+
+
+def test_per_repo_override_applies_over_config(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir,
+        f"""\
+        kinds: {{respond: {{timeout: 30m, model: m1}}}}
+        repos: {{{REPO}: {{kinds: {{respond: {{timeout: 10m, env: {{allow: [X]}}}}}}}}}}
+        """,
+    )
+    result = resolve(cfg, "respond", repo=REPO)
+    assert result.profile.timeout == 600.0
+    assert result.profile.model == "m1"
+    assert result.profile.env.allow == ["X"]
+    assert result.origins["timeout"] == "repo"
+    assert result.origins["model"] == "config"
+    assert result.origins["env.allow"] == "repo"
+    assert result.origins["env.set"] == "builtin"
+    assert result.origins["repo"] == "flag"
+
+
+def test_per_repo_override_for_another_repo_does_not_apply(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, f"repos: {{{REPO}: {{kinds: {{respond: {{timeout: 10m}}}}}}}}\n")
+    result = resolve(cfg, "respond", repo="example.com/other")
+    assert result.profile.timeout == 3600.0
+    assert result.origins["timeout"] == "builtin"
+
+
+def test_per_repo_explicit_null_is_a_repo_value(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, f"repos: {{{REPO}: {{kinds: {{implement: {{timeout: null}}}}}}}}\n")
+    result = resolve(cfg, "implement", repo=REPO)
+    assert result.profile.timeout is None
+    assert result.origins["timeout"] == "repo"
+
+
+def test_previous_run_flags_apply_over_the_repo(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, f"repos: {{{REPO}: {{kinds: {{implement: {{model: r}}}}}}}}\n")
+    previous = kinds.Previous(repo=REPO, flags={"model": "p", "sandbox": "preferred"})
+    result = resolve(cfg, "implement", previous=previous)
+    assert result.profile.model == "p"
+    assert result.profile.sandbox == "preferred"
+    assert result.origins["model"] == "previous_run"
+    assert result.origins["sandbox"] == "previous_run"
+    assert result.repo == REPO
+    assert result.origins["repo"] == "previous_run"
+
+
+def test_flags_now_replace_previous_run_flags(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"model": "p", "max_turns": 4})
+    result = resolve(load(cfg_dir), "implement", previous=previous, flags={"model": "now"})
+    assert result.profile.model == "now"
+    assert result.origins["model"] == "flag"
+    assert result.profile.max_turns == 4
+    assert result.origins["max_turns"] == "previous_run"
+
+
+def test_full_precedence_chain(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir,
+        f"""\
+        kinds: {{implement: {{timeout: 50m, max_turns: 5, model: c, auto_exit: false}}}}
+        repos: {{{REPO}: {{kinds: {{implement: {{max_turns: 6, model: r}}}}}}}}
+        """,
+    )
+    previous = kinds.Previous(repo=REPO, flags={"model": "p", "auto_exit": True})
+    result = resolve(cfg, "implement", previous=previous, flags={"auto_exit": False})
+    profile, origins = result.profile, result.origins
+    assert (profile.backstop, origins["backstop"]) == (True, "builtin")
+    assert (profile.timeout, origins["timeout"]) == (3000.0, "config")
+    assert (profile.max_turns, origins["max_turns"]) == (6, "repo")
+    assert (profile.model, origins["model"]) == ("p", "previous_run")
+    assert (profile.auto_exit, origins["auto_exit"]) == (False, "flag")
+
+
+def test_none_flag_values_mean_not_given(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"model": "p"})
+    result = resolve(load(cfg_dir), "implement", previous=previous, flags={"model": None})
+    assert result.profile.model == "p"
+    assert result.origins["model"] == "previous_run"
+
+
+def test_unknown_flag_key_is_a_programming_error(cfg_dir: Path) -> None:
+    with pytest.raises(TypeError):
+        resolve(load(cfg_dir), "implement", flags={"cwd": "x"})
+    with pytest.raises(TypeError):
+        resolve(load(cfg_dir), "implement", previous=kinds.Previous(None, {"kind": "x"}))
+
+
+def test_resolution_does_not_mutate_config(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir)
+    before = cfg.model_dump()
+    resolve(
+        cfg,
+        "respond",
+        flags={"env_allow": ["X"], "reads_third_party": True, "setting_sources": "user"},
+    )
+    assert cfg.model_dump() == before
+
+
+# Individual flags
+
+
+@pytest.mark.parametrize(
+    ("mode", "field_name", "other"),
+    [
+        ("headless", "timeout", "interactive_timeout"),
+        ("interactive", "interactive_timeout", "timeout"),
+    ],
+)
+def test_timeout_flag_sets_the_bound_of_the_mode(
+    cfg_dir: Path, mode: kinds.Mode, field_name: str, other: str
+) -> None:
+    result = resolve(load(cfg_dir), "implement", mode=mode, flags={"timeout": "90"})
+    assert getattr(result.profile, field_name) == 90.0
+    assert result.origins[field_name] == "flag"
+    assert result.origins[other] == "builtin"
+    assert result.timeout(mode) == 90.0
+
+
+def test_timeout_none_flag_removes_the_bound(cfg_dir: Path) -> None:
+    result = resolve(load(cfg_dir), "implement", flags={"timeout": "none"})
+    assert result.profile.timeout is None
+    assert result.timeout("headless") is None
+
+
+def test_default_bounds_per_mode(cfg_dir: Path) -> None:
+    result = resolve(load(cfg_dir), "implement")
+    assert result.timeout("headless") == 3600.0
+    assert result.timeout("interactive") is None
+
+
+@pytest.mark.parametrize(
+    ("flags", "flag"),
+    [
+        ({"timeout": "0"}, "--timeout"),
+        ({"timeout": "soon"}, "--timeout"),
+        ({"timeout": "36501d"}, "--timeout"),
+        ({"max_turns": 0}, "--max-turns"),
+        ({"max_turns": 9007199254740992}, "--max-turns"),
+        ({"model": "-x"}, "--model"),
+        ({"model": "a\x1bb"}, "--model"),
+        ({"sandbox": "maybe"}, "--sandbox"),
+        ({"setting_sources": "user,bogus"}, "--setting-sources"),
+        ({"setting_sources": "user,user"}, "--setting-sources"),
+        ({"setting_sources": ","}, "--setting-sources"),
+        ({"permission_profile": "a/b"}, "--permission-profile"),
+        ({"auto_exit": "yes"}, "--[no-]auto-exit"),
+    ],
+)
+def test_invalid_flag_values_are_usage_errors_naming_the_flag(
+    cfg_dir: Path, flags: dict[str, Any], flag: str
+) -> None:
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", flags=flags)
+    assert info.value.exit_code == 2
+    assert info.value.message == "invalid flag value"
+    assert flag in str(info.value.detail)
+    assert "(in " in str(info.value.detail) and "flags" in str(info.value.detail)
+
+
+def test_invalid_previous_value_names_the_previous_run(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"sandbox": "maybe"})
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", previous=previous)
+    assert "previous run" in str(info.value.detail)
+
+
+def test_invalid_flag_value_is_not_echoed(cfg_dir: Path) -> None:
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", flags={"sandbox": SECRET})
+    assert SECRET not in str(info.value.detail)
+    assert SECRET not in info.value.message
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("", []), ("user", ["user"]), ("project,local", ["project", "local"]), (["local"], ["local"])],
+)
+def test_setting_sources_flag_forms(cfg_dir: Path, value: Any, expected: list[str]) -> None:
+    result = resolve(load(cfg_dir), "implement", flags={"setting_sources": value})
+    assert result.profile.setting_sources == expected
+    assert result.origins["setting_sources"] == "flag"
+
+
+def test_permission_profile_flag(cfg_dir: Path) -> None:
+    # TODO(#22): profile existence and files are validated by the permission-profile work.
+    result = resolve(load(cfg_dir), "implement", flags={"permission_profile": "readonly"})
+    assert result.profile.permission_profile == "readonly"
+    assert result.origins["permission_profile"] == "flag"
+
+
+# --env-allow / --env-allowlist-only
+
+
+def test_env_allow_adds_to_the_kind_allowlist(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "kinds: {implement: {env: {allow: [A]}}}\n")
+    result = resolve(cfg, "implement", flags={"env_allow": ["B", "A", "B"]})
+    assert result.profile.env.allow == ["A", "B"]
+    assert result.profile.env.inherit is True
+    assert result.origins["env.allow"] == "flag"
+    assert result.origins["env.inherit"] == "builtin"
+
+
+def test_env_allowlist_only_replaces_the_list_and_stops_inheritance(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "kinds: {implement: {env: {allow: [A]}}}\n")
+    result = resolve(cfg, "implement", flags={"env_allowlist_only": ["C"]})
+    assert result.profile.env.allow == ["C"]
+    assert result.profile.env.inherit is False
+    assert result.origins["env.allow"] == "flag"
+    assert result.origins["env.inherit"] == "flag"
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"), [([""], []), (["", "X"], ["X"]), (["X", ""], ["X"])]
+)
+def test_empty_allowlist_only_name(cfg_dir: Path, names: list[str], expected: list[str]) -> None:
+    result = resolve(load(cfg_dir), "implement", flags={"env_allowlist_only": names})
+    assert result.profile.env.allow == expected
+    assert result.profile.env.inherit is False
+
+
+def test_env_allow_adds_to_a_replaced_list(cfg_dir: Path) -> None:
+    flags = {"env_allowlist_only": ["C"], "env_allow": ["D"]}
+    result = resolve(load(cfg_dir), "implement", flags=flags)
+    assert result.profile.env.allow == ["C", "D"]
+
+
+def test_env_flags_are_carried_separately(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"env_allowlist_only": ["C"], "env_allow": ["D"]})
+    result = resolve(load(cfg_dir), "implement", previous=previous, flags={"env_allow": ["E"]})
+    assert result.profile.env.allow == ["C", "E"]  # env_allow now replaces the stored one only
+    assert result.profile.env.inherit is False  # allowlist-only mode persists
+    assert result.origins["env.allow"] == "flag"
+    assert result.origins["env.inherit"] == "previous_run"
+
+
+@pytest.mark.parametrize(
+    ("key", "names"),
+    [
+        ("env_allow", [""]),
+        ("env_allow", ["A=B"]),
+        ("env_allow", ["A\0"]),
+        ("env_allowlist_only", ["A=B"]),
+        ("env_allow", "A"),  # a string, not a list
+        ("env_allow", [1]),
+    ],
+)
+def test_invalid_env_names_are_usage_errors(cfg_dir: Path, key: str, names: Any) -> None:
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", flags={key: names})
+    assert "--" + key.replace("_", "-") in info.value.message
+
+
+# --reads-third-party
+
+
+def test_reads_third_party_implies_isolation(cfg_dir: Path) -> None:
+    result = resolve(load(cfg_dir), "implement", flags={"reads_third_party": True})
+    profile, origins = result.profile, result.origins
+    assert profile.reads_third_party is True
+    assert origins["reads_third_party"] == "flag"
+    assert (profile.sandbox, origins["sandbox"]) == ("required", "flag-implied")
+    assert (profile.setting_sources, origins["setting_sources"]) == ([], "flag-implied")
+    assert (profile.env.inherit, origins["env.inherit"]) == (False, "flag-implied")
+    assert (profile.mcp, origins["mcp"]) == ("none", "flag-implied")
+
+
+def test_explicit_flags_in_the_same_call_beat_the_implications(cfg_dir: Path) -> None:
+    flags = {"reads_third_party": True, "sandbox": "preferred", "setting_sources": "user"}
+    result = resolve(load(cfg_dir), "implement", flags=flags)
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("preferred", "flag")
+    assert result.profile.setting_sources == ["user"]
+    assert result.origins["setting_sources"] == "flag"
+    assert result.origins["mcp"] == "flag-implied"  # mcp has no flag
+    assert result.origins["env.inherit"] == "flag-implied"
+
+
+def test_reads_third_party_now_beats_a_carried_sandbox(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"sandbox": "off"})
+    result = resolve(
+        load(cfg_dir), "implement", previous=previous, flags={"reads_third_party": True}
+    )
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("required", "flag-implied")
+
+
+def test_carried_reads_third_party_keeps_its_carried_explicit_settings(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"reads_third_party": True, "sandbox": "off"})
+    result = resolve(load(cfg_dir), "implement", previous=previous)
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("off", "previous_run")
+    assert result.origins["setting_sources"] == "flag-implied"
+    assert result.origins["reads_third_party"] == "previous_run"
+
+
+def test_sandbox_given_now_beats_carried_reads_third_party(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"reads_third_party": True})
+    result = resolve(load(cfg_dir), "implement", previous=previous, flags={"sandbox": "preferred"})
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("preferred", "flag")
+
+
+def test_allowlist_only_in_the_same_call_sets_inherit(cfg_dir: Path) -> None:
+    flags = {"reads_third_party": True, "env_allowlist_only": ["A"]}
+    result = resolve(load(cfg_dir), "implement", flags=flags)
+    assert (result.profile.env.inherit, result.origins["env.inherit"]) == (False, "flag")
+
+
+# --repo
+
+
+def test_repo_is_derived_from_the_origin_for_caller_cwd_kinds(
+    cfg_dir: Path, tmp_path: Path
+) -> None:
+    calls: list[str] = []
+
+    def origin(cwd: str) -> str | None:
+        calls.append(cwd)
+        return "git@Example.COM:group/project.git"
+
+    cfg = load(cfg_dir, f"repos: {{{REPO}: {{kinds: {{implement: {{model: r}}}}}}}}\n")
+    result = resolve(cfg, "implement", cwd=str(tmp_path), origin_url=origin)
+    assert calls == [str(tmp_path)]
+    assert result.repo == REPO
+    assert result.origins["repo"] == "derived"
+    assert (result.profile.model, result.origins["model"]) == ("r", "repo")
+
+
+@pytest.mark.parametrize("kind", ["review", "gate-check", "rank", "nope"])
+def test_repo_is_never_derived_for_session_dir_kinds(cfg_dir: Path, kind: str) -> None:
+    result = resolve(load(cfg_dir), kind, cwd="/somewhere", origin_url=no_origin)
+    assert result.repo is None
+    assert "repo" not in result.origins
+
+
+def test_session_dir_kind_takes_an_explicit_repo(cfg_dir: Path) -> None:
+    result = resolve(load(cfg_dir), "review", repo=REPO, cwd="/x")
+    assert result.repo == REPO
+    assert result.origins["repo"] == "flag"
+
+
+def test_respond_derives_its_repo(cfg_dir: Path) -> None:
+    result = resolve(
+        load(cfg_dir), "respond", cwd="/x", origin_url=lambda cwd: "https://example.com/a/b"
+    )
+    assert result.repo == "example.com/a/b"
+
+
+def test_no_cwd_derives_nothing(cfg_dir: Path) -> None:
+    assert resolve(load(cfg_dir), "implement").repo is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        None,
+        "",
+        "/local/path/repo.git",
+        "file:///srv/repo.git",
+        "ftp://example.com/x",
+        "https://example.com/",
+        "https://exämple.com/a/b",
+        "https://example.com/a/b\n",  # more than git's one trailing newline
+        "https://example.com/a/b\nhttps://other.example/c",
+        "https://example.com/a/../b",
+        "https://example.com/a b",
+    ],
+)
+def test_unusable_origins_give_no_repo(cfg_dir: Path, url: str | None) -> None:
+    result = resolve(load(cfg_dir), "implement", cwd="/x", origin_url=lambda cwd: url)
+    assert result.repo is None
+    assert "repo" not in result.origins
+
+
+def test_explicit_repo_wins_and_skips_derivation(cfg_dir: Path) -> None:
+    result = resolve(load(cfg_dir), "implement", repo=REPO, cwd="/x", origin_url=no_origin)
+    assert result.repo == REPO
+    assert result.origins["repo"] == "flag"
+
+
+def test_previous_repo_is_carried_without_derivation(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None)
+    result = resolve(load(cfg_dir), "implement", previous=previous, cwd="/x")
+    assert result.repo is None
+    assert "repo" not in result.origins
+
+
+def test_repo_given_now_replaces_the_carried_repo(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo="example.com/old")
+    result = resolve(load(cfg_dir), "implement", repo=REPO, previous=previous)
+    assert result.repo == REPO
+    assert result.origins["repo"] == "flag"
+
+
+@pytest.mark.parametrize(
+    "repo", ["", "Example.com/x", "example.com", "example.com/../x", "example.com/x\n", SECRET]
+)
+def test_invalid_repo_ids_are_usage_errors(cfg_dir: Path, repo: str) -> None:
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", repo=repo)
+    assert "--repo" in info.value.message
+    assert SECRET not in info.value.message
+    with pytest.raises(UsageError):
+        resolve(load(cfg_dir), "implement", previous=kinds.Previous(repo=repo))
+
+
+# git origin lookup
+
+
+class FakeRun:
+    def __init__(self, result: subprocess.CompletedProcess[str] | Exception) -> None:
+        self.result = result
+        self.calls: list[tuple[list[str], float | None]] = []
+
+    def __call__(
+        self, argv: list[str], *, stdin: str | None = None, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append((argv, timeout))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def completed(code: int, out: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], code, stdout=out, stderr="")
+
+
+def test_git_origin_url_runs_hardened_read_only_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeRun(completed(0, "git@example.com:a/b.git\n"))
+    monkeypatch.setattr(gateway, "run", fake)
+    assert kinds.git_origin_url("/work/-dir") == "git@example.com:a/b.git"
+    ((argv, timeout),) = fake.calls
+    assert argv[0] == "git"
+    assert argv[-5:] == ["-C", "/work/-dir", "remote", "get-url", "origin"]
+    for setting in (
+        "core.fsmonitor=",
+        "core.sshCommand=",
+        "credential.helper=",
+        "core.hooksPath=/dev/null",
+        "diff.external=",
+        "core.pager=cat",
+    ):
+        assert argv[argv.index(setting) - 1] == "-c"
+    assert timeout is not None and timeout > 0
+
+
+def test_git_origin_url_trims_only_one_newline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gateway, "run", FakeRun(completed(0, "https://example.com/a\n\n")))
+    assert kinds.git_origin_url("/w") == "https://example.com/a\n"
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        completed(2, ""),
+        completed(128, "fatal: not a git repository\n"),
+        FileNotFoundError("git"),
+        subprocess.TimeoutExpired(["git"], 10),
+    ],
+)
+def test_git_origin_url_failures_give_none(
+    monkeypatch: pytest.MonkeyPatch, result: subprocess.CompletedProcess[str] | Exception
+) -> None:
+    monkeypatch.setattr(gateway, "run", FakeRun(result))
+    assert kinds.git_origin_url("/w") is None
+
+
+def test_default_lookup_derives_from_a_real_repository(cfg_dir: Path, tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    git = ["git", "-c", "core.hooksPath=/dev/null", "-C", str(work)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run(
+        [*git, "remote", "add", "origin", "ssh://git@example.com:22/group/project.git"],
+        check=True,
+    )
+    result = kinds.resolve(load(cfg_dir), "implement", mode="headless", cwd=str(work))
+    assert result.repo == REPO
+    assert result.origins["repo"] == "derived"
+
+
+def test_default_lookup_outside_a_repository_gives_no_repo(cfg_dir: Path, tmp_path: Path) -> None:
+    result = kinds.resolve(load(cfg_dir), "implement", mode="headless", cwd=str(tmp_path))
+    assert result.repo is None
+
+
+# --config
+
+
+def test_cli_load_config_reads_only_the_named_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "xdg"
+    write(home / "claude-session" / "config.yaml", "default_kind: review\n")
+    write(home / "claude-session" / "config.d" / "a.yaml", "default_kind: audit\n")
+    named_dir = tmp_path / "named"
+    write(named_dir / "c.yaml", "default_kind: rank\n")
+    write(named_dir / "config.d" / "b.yaml", "default_kind: improve\n")  # never read
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
+    monkeypatch.delenv("CSESSION_DEFAULT_KIND", raising=False)
+    parser = cli.build_parser()
+    assert cli.load_config(cli.parse(parser, ["kinds"])).default_kind == "audit"
+    named = cli.parse(parser, ["kinds", "--config", str(named_dir / "c.yaml")])
+    assert cli.load_config(named).default_kind == "rank"
+
+
+def test_cli_load_config_requires_the_named_file(tmp_path: Path) -> None:
+    args = cli.parse(cli.build_parser(), ["kinds", "--config", str(tmp_path / "missing.yaml")])
+    with pytest.raises(UsageError) as info:
+        cli.load_config(args)
+    assert info.value.exit_code == 2
