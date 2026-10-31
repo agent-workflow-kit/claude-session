@@ -1094,6 +1094,96 @@ class Store:
             if session["csession_id"] in current
         ]
 
+    # Labels (interface.md, label add / label remove)
+
+    def change_labels(
+        self,
+        csession_id: str,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        add: bool,
+        dry_run: bool = False,
+    ) -> LabelChange | None:
+        """Add (``add``) or remove ``pairs`` (already validated by ``ids.parse_label``) on a
+        session that is not forgotten, in one transaction; None when there is no such session.
+        Adding a present pair or removing an absent one is a no-op; a pair given twice counts
+        once. A change sets ``updated_at``. With ``dry_run`` nothing is written: the result is
+        what the change would be."""
+        unique = list(dict.fromkeys(pairs))
+        if dry_run:
+            with self._read_snapshot() as conn:
+                return self._label_change(conn, csession_id, unique, add=add)
+        with self.transaction() as conn:
+            change = self._label_change(conn, csession_id, unique, add=add)
+            if change is None:
+                return None
+            for key, value in change.added:
+                conn.execute(
+                    "INSERT INTO labels (csession_id, key, value) VALUES (?, ?, ?)",
+                    (csession_id, key, value),
+                )
+            for key, value in change.removed:
+                conn.execute(
+                    "DELETE FROM labels WHERE csession_id = ? AND key = ? AND value = ?",
+                    (csession_id, key, value),
+                )
+            if change.added or change.removed:
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE csession_id = ?",
+                    (format_ts(self.clock()), csession_id),
+                )
+        return change
+
+    @staticmethod
+    def _label_change(
+        conn: sqlite3.Connection,
+        csession_id: str,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        add: bool,
+    ) -> LabelChange | None:
+        row = conn.execute(
+            "SELECT 1 FROM sessions WHERE csession_id = ? AND forgotten_at IS NULL",
+            (csession_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        current = {
+            (key, value)
+            for key, value in conn.execute(
+                "SELECT key, value FROM labels WHERE csession_id = ?", (csession_id,)
+            )
+        }
+        if add:
+            added = [pair for pair in pairs if pair not in current]
+            removed: list[tuple[str, str]] = []
+            result = current | set(added)
+        else:
+            added = []
+            removed = [pair for pair in pairs if pair in current]
+            result = current - set(removed)
+        return LabelChange(labels=sorted(result), added=added, removed=removed)
+
+    # verify-secret (interface.md, Internal commands)
+
+    def secret_run(self, csession_id: str) -> SecretRun | None:
+        """The current run's stored secret digest and wrapper, only when the session is not
+        forgotten and the run is adopted (wrapper set) and has not ended; otherwise None."""
+        row = self.conn.execute(
+            "SELECT r.secret_sha256, r.wrapper_pid, r.wrapper_start "
+            "FROM sessions s JOIN runs r "
+            "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
+            "WHERE s.csession_id = ? AND s.forgotten_at IS NULL AND r.ended_at IS NULL "
+            "AND r.wrapper_pid IS NOT NULL",
+            (csession_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        digest, pid, start = row
+        if not (isinstance(digest, str) and isinstance(pid, int) and isinstance(start, str)):
+            return None
+        return SecretRun(secret_sha256=digest, wrapper_pid=pid, wrapper_start=start)
+
     # Runs
 
     def record_run_files(
@@ -1661,6 +1751,25 @@ class HookRun:
     secret_sha256: str | None = None
     outbox_dev_ino: str | None = None
     artifacts_dev_ino: str | None = None
+
+
+@dataclass(frozen=True)
+class LabelChange:
+    """``Store.change_labels``: the resulting labels (sorted) and the pairs actually added or
+    removed (in the order given)."""
+
+    labels: list[tuple[str, str]]
+    added: list[tuple[str, str]]
+    removed: list[tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class SecretRun:
+    """``Store.secret_run``: what ``verify-secret`` checks a presented secret against."""
+
+    secret_sha256: str
+    wrapper_pid: int
+    wrapper_start: str
 
 
 @dataclass(frozen=True)

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 from . import durations, fsutil, ids, outbox, store
 from .defaults import MAX_INTEGER
-from .errors import CliError, InternalError, RefusedError, UsageError
+from .errors import CliError, InternalError, NotFoundError, RefusedError, UsageError
 from .terminal import display
 
 if TYPE_CHECKING:
@@ -80,6 +80,8 @@ SESSION_ID_ARGS: dict[str, str | None] = {
     "forked_from": "--forked-from",
 }
 KIND_ARGS = ("kind", "launch_kind", "run_kind")
+# interface.md, Exit codes: a verify-secret mismatch (any reason).
+VERIFY_SECRET_MISMATCH = 11
 # argparse takes a token like this as an option value, not as an option.
 NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
 
@@ -170,6 +172,47 @@ def _list(args: argparse.Namespace) -> int:
     else:
         print("\n".join(views.list_lines(items)))
     return 0
+
+
+def _label(args: argparse.Namespace) -> int:
+    """``label add`` / ``label remove`` (interface.md, label add / label remove)."""
+    add = args.handler == "label add"
+    pairs = [ids.parse_label(text) for text in args.pairs]  # checked by the flag rules
+    with store.open_state() as st:
+        sid = ids.lookup_session_id(args.id, st.session_id_candidates)
+        change = st.change_labels(sid, pairs, add=add, dry_run=args.dry_run)
+    if change is None:  # forgotten (or deleted) since the id was resolved
+        raise NotFoundError(f"unknown session: {args.id}")
+    obj = {
+        "csession_id": sid,
+        "labels": [f"{key}={value}" for key, value in change.labels],
+        "added": [f"{key}={value}" for key, value in change.added],
+        "removed": [f"{key}={value}" for key, value in change.removed],
+        "dry_run": bool(args.dry_run),
+    }
+    if args.json:
+        print(json.dumps(obj))
+        return 0
+    action, done_key = ("add", "added") if add else ("remove", "removed")
+    changed = obj[done_key]
+    done = f"{done_key} {', '.join(changed)}" if changed else f"nothing to {action}"
+    prefix = "dry run: " if args.dry_run else ""
+    print(display(f"{sid}: {prefix}{done}"))
+    print(display(f"labels: {', '.join(obj['labels']) or '(none)'}"))
+    return 0
+
+
+def _verify_secret(args: argparse.Namespace) -> int:
+    """``verify-secret <full id>`` (interface.md, Internal commands): exit 0 on a match, 11
+    otherwise. The secret is read from stdin before the lookup, whatever the id."""
+    from . import secretcheck
+
+    presented = secretcheck.read_secret(sys.stdin.buffer)
+    with store.open_state() as st:
+        match = secretcheck.matches(st, args.id, presented)
+    if args.json:
+        print(json.dumps({"match": match}))
+    return 0 if match else VERIFY_SECRET_MISMATCH
 
 
 def _report(args: argparse.Namespace) -> int:
@@ -267,15 +310,15 @@ HANDLERS: dict[str, Handler] = {
     "status": _status,
     "list": _list,
     "kinds": _not_implemented,
-    "label add": _not_implemented,
-    "label remove": _not_implemented,
+    "label add": _label,
+    "label remove": _label,
     "transcript": _not_implemented,
     "forget": _not_implemented,
     "reconcile": _not_implemented,
     "export": _not_implemented,
     "cron install": _not_implemented,
     "cron uninstall": _not_implemented,
-    "verify-secret": _not_implemented,
+    "verify-secret": _verify_secret,
 }
 
 
