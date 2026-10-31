@@ -67,11 +67,15 @@ synchronously with ``deliver``.
 **Pre-launch** (launch step 6, ``run_pre_launch``; ``launch.pre_launch`` builds the payload
 and records the result): the same ``Entry``, ``selected`` (without ``states``), ``hook_env``
 and ``sh -c`` execution, but synchronous and reading the output (``run_captured``: pipes,
-``PRE_LAUNCH_OUTPUT_MAX`` + 1 bytes kept per stream). Exit 0 continues, exit 13 escalates
-(later entries still run), any other exit, a timeout or an entry that could not run vetoes at
-once (fail closed). Stdout is an untrusted decision protocol, read strictly
-(``parse_decision``); the decision ids of all entries are capped at
+``PRE_LAUNCH_KEEP`` raw bytes kept per stream; the group is SIGKILLed once ``sh`` exits, so
+nothing it left in the group outlives it; the group is recorded in ``hook_groups`` with
+event 0, so ``reconcile`` ends it if ``exec`` is killed meanwhile). Exit 0 continues, exit 13
+escalates (later entries still run), any other exit, a timeout or an entry that could not run
+vetoes at once (fail closed). Stdout is an untrusted decision protocol, read strictly from
+its raw bytes (``parse_decision``); the decision ids of all entries are capped at
 ``DECISION_IDS_MAX_BYTES`` escaped, so the log and audit records carrying them stay small.
+The outcome message is the hook's stderr, control characters stripped, redacted against the
+session's secret values and capped at ``MESSAGE_MAX`` UTF-8 bytes (``outcome_message``).
 Each entry that exited 13 is recorded by ``entry_hash`` (name, command, selectors), the input
 of a later ``--override-escalation``. ``dryrun.hooks_json`` selects with ``selected`` too, so
 the plan and a run never disagree.
@@ -352,11 +356,16 @@ def run_entry(
 PRE_LAUNCH = "pre-launch"
 # The exit code that escalates; 0 continues, any other code vetoes.
 ESCALATE_EXIT = 13
-# Bytes of a pre-launch hook's stdout read as its decision (one more is kept, so a longer
-# output is told apart and ignored), and of its stderr kept for the outcome message.
+# Bytes of a pre-launch hook's stdout read as its decision (a longer output is ignored).
 PRE_LAUNCH_OUTPUT_MAX = 2048
-# The outcome message: control characters stripped, then at most this many characters.
+# Raw bytes kept of each stream of a pre-launch hook: more than ``PRE_LAUNCH_OUTPUT_MAX``, so
+# a longer stdout is told apart, and room for stderr's control characters to be stripped
+# before the message is capped.
+PRE_LAUNCH_KEEP = 8 * 1024
+# The outcome message: control characters stripped, then at most this many UTF-8 bytes.
 MESSAGE_MAX = 2048
+# ``hook_groups.event_id`` of a pre-launch hook's group (events are numbered from 1).
+PRE_LAUNCH_EVENT = 0
 # All the decision ids one run's pre-launch hooks may add, measured as escaped ASCII JSON (the
 # form the log and audit records are written in, where one character can take up to 12
 # bytes). With at most ``PRE_LAUNCH_OUTPUT_MAX`` bytes of stdout per hook, this keeps a
@@ -394,22 +403,25 @@ def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return dict(pairs)
 
 
-def parse_decision(stdout: str) -> tuple[list[str], str | None]:
-    """The ``decision_id``s of a pre-launch hook's stdout, and why the output was ignored
-    (None: it was not). Read strictly, as untrusted input: empty (or whitespace-only) output
-    carries no decision and is not an error; anything else must be one JSON object of at
-    most ``PRE_LAUNCH_OUTPUT_MAX`` bytes of valid UTF-8, without duplicate keys or ``NaN``
-    and ``Infinity``, whose ``decision_id``, when present, is a string or a list of strings
-    without unpaired surrogates. Other keys are ignored. Output that breaks any rule is
-    ignored as a whole (no decision id taken from it)."""
-    if stdout.strip(_JSON_SPACE) == "":
-        return [], None
-    if len(stdout.encode("utf-8", "surrogatepass")) > PRE_LAUNCH_OUTPUT_MAX:
+def parse_decision(stdout: bytes) -> tuple[list[str], str | None]:
+    """The ``decision_id``s of a pre-launch hook's raw stdout, and why the output was ignored
+    (None: it was not). Read strictly, as untrusted input: more than
+    ``PRE_LAUNCH_OUTPUT_MAX`` bytes is ignored whatever it holds; the bytes must be valid
+    UTF-8 (decoded strictly, no newline translation); empty (or whitespace-only) output
+    carries no decision and is not an error; anything else must be one JSON object without
+    duplicate keys or ``NaN`` and ``Infinity``, whose ``decision_id``, when present, is a
+    string or a list of strings without unpaired surrogates. Other keys are ignored. Output
+    that breaks any rule is ignored as a whole (no decision id taken from it)."""
+    if len(stdout) > PRE_LAUNCH_OUTPUT_MAX:
         return [], f"longer than {PRE_LAUNCH_OUTPUT_MAX} bytes"
-    if "\ufffd" in stdout:  # the gateway's replacement for bytes that are not UTF-8
-        return [], "not valid UTF-8"
     try:
-        value = json.loads(stdout, parse_constant=_no_constant, object_pairs_hook=_unique_keys)
+        text = stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return [], "not valid UTF-8"
+    if text.strip(_JSON_SPACE) == "":
+        return [], None
+    try:
+        value = json.loads(text, parse_constant=_no_constant, object_pairs_hook=_unique_keys)
     except (ValueError, RecursionError):
         return [], "not JSON"
     if not isinstance(value, dict):
@@ -433,23 +445,26 @@ def escaped_size(value: str) -> int:
     return len(json.dumps(value, ensure_ascii=True))
 
 
-def outcome_message(stderr: str) -> str:
-    """A hook's stderr as the outcome message: control characters stripped, at most
-    ``MESSAGE_MAX`` characters."""
-    return _CONTROL.sub("", stderr)[:MESSAGE_MAX]
+def outcome_message(stderr: bytes, secrets: Collection[str] = ()) -> str:
+    """A hook's raw stderr as the outcome message: decoded (invalid UTF-8 replaced), control
+    characters stripped, redacted against ``secrets`` (``logs.redact_text``), then cut to at
+    most ``MESSAGE_MAX`` UTF-8 bytes on a character boundary."""
+    text = _CONTROL.sub("", stderr.decode("utf-8", "replace"))
+    text = logs.redact_text(text, logs.usable_secrets(secrets))
+    return text.encode("utf-8")[:MESSAGE_MAX].decode("utf-8", "ignore")
 
 
 @dataclass(frozen=True)
 class Captured:
-    """How one pre-launch entry ran: ``exited`` (with its exit code and output), ``timeout``
-    or ``failed`` (it could not be started or run); ``detail`` is fixed text and numbers,
-    never hook output."""
+    """How one pre-launch entry ran: ``exited`` (with its exit code and raw output),
+    ``timeout`` (with the stderr read before it) or ``failed`` (it could not be started or
+    run); ``detail`` is fixed text and numbers, never hook output."""
 
     result: str
     detail: str
     returncode: int | None = None
-    stdout: str = ""
-    stderr: str = ""
+    stdout: bytes = b""
+    stderr: bytes = b""
 
 
 def run_captured(
@@ -461,14 +476,17 @@ def run_captured(
     cwd: str,
     payload: str,
     kill_grace: float,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> Captured:
     """Run a pre-launch ``entry`` once, reading its output (``run_entry`` discards it):
     ``sh -c <cmd>`` in its own process group, the payload on stdin, at most
-    ``PRE_LAUNCH_OUTPUT_MAX`` + 1 bytes kept of each stream (the rest is read and dropped,
-    so the hook never blocks on a full pipe). On timeout the group gets SIGTERM, then
-    SIGKILL after ``kill_grace``. Any ``Exception`` from the runner is a ``failed`` result,
-    never raised; a ``BaseException`` (a signal ending the launch) propagates once the
-    gateway has ended the group."""
+    ``PRE_LAUNCH_KEEP`` raw bytes kept of each stream (the rest is read and dropped, so the
+    hook never blocks on a full pipe). Once ``sh`` exits its group gets SIGKILL
+    (``kill_group_on_exit``: a process it left in the group does not outlive it); on timeout
+    the group gets SIGTERM, then SIGKILL after ``kill_grace``. ``on_spawn`` gets the group
+    ID once it exists. Any ``Exception`` from the runner is a ``failed`` result, never
+    raised; a ``BaseException`` (a signal ending the launch) propagates once the gateway has
+    ended the group."""
     if sh is None:
         return Captured("failed", "sh not found on the sanitized PATH")
     try:
@@ -481,10 +499,16 @@ def run_captured(
             timeout=entry.timeout,
             new_process_group=True,
             kill_grace=kill_grace,
-            output_limit=PRE_LAUNCH_OUTPUT_MAX + 1,
+            kill_group_on_exit=True,
+            output_limit=PRE_LAUNCH_KEEP,
+            on_spawn=on_spawn,
         )
-    except GatewayTimeout:
-        return Captured("timeout", f"timed out after {entry.timeout:g} s; process group ended")
+    except GatewayTimeout as exc:
+        return Captured(
+            "timeout",
+            f"timed out after {entry.timeout:g} s; process group ended",
+            stderr=exc.stderr,
+        )
     except OSError as exc:
         return Captured("failed", f"could not start sh ({type(exc).__name__})")
     except Exception as exc:  # e.g. a NUL in a --hook command: a defined veto, no traceback
@@ -493,8 +517,8 @@ def run_captured(
         "exited",
         f"exit {result.returncode}",
         returncode=result.returncode,
-        stdout=result.stdout,
-        stderr=result.stderr,
+        stdout=result.stdout_bytes,
+        stderr=result.stderr_bytes,
     )
 
 
@@ -514,6 +538,29 @@ class Verdict:
     overridden: tuple[str, ...] = ()
 
 
+@dataclass
+class Collected:
+    """What step 6's entries have returned so far, filled by ``run_pre_launch`` as each entry
+    finishes, so a signal that ends the launch midway still leaves the decision ids and
+    escalating hashes already collected for the caller to record."""
+
+    decision_ids: list[str] = field(default_factory=list)
+    escalated: list[str] = field(default_factory=list)
+    overridden: list[str] = field(default_factory=list)
+
+    def verdict(
+        self, outcome: str = "continue", end_reason: str | None = None, message: str | None = None
+    ) -> Verdict:
+        return Verdict(
+            outcome,
+            end_reason,
+            message,
+            tuple(self.decision_ids),
+            tuple(self.escalated),
+            tuple(self.overridden),
+        )
+
+
 def run_pre_launch(
     gateway: Gateway,
     entries: Sequence[Entry],
@@ -527,6 +574,9 @@ def run_pre_launch(
     log: logs.EventLog,
     csession_id: str,
     run: int,
+    st: store.Store | None = None,
+    secrets: Collection[str] = (),
+    collected: Collected | None = None,
 ) -> Verdict:
     """Launch step 6 (interface.md, Hooks: ``pre-launch`` outcome rules): the selected
     ``entries`` run one after another, each with a fresh ``payload()``. Exit 0 continues;
@@ -534,43 +584,43 @@ def run_pre_launch(
     ``overridable`` (``--override-escalation``: the previous run's ``escalated_hooks``), when
     it continues; any other exit, a timeout, or an entry that could not run vetoes at once
     (fail closed). The first veto, or else the first escalation that was not overridden,
-    gives the outcome; its stderr is the message (a fixed description when it wrote none).
-    Each entry's stdout is read with ``parse_decision``; ids beyond
-    ``DECISION_IDS_MAX_BYTES`` in all are dropped and logged. Every veto, escalation,
-    timeout, failure and ignored output is logged, naming the entry by origin and position,
-    never by its command or output."""
+    gives the outcome; its stderr is the message (``outcome_message``, redacted against
+    ``secrets``; a fixed description when it wrote none). With ``st``, each entry's process
+    group is recorded in ``hook_groups`` (event ``PRE_LAUNCH_EVENT``, holder ``st.holder``)
+    while it runs. Each entry's stdout is read with ``parse_decision``; ids beyond
+    ``DECISION_IDS_MAX_BYTES`` in all are dropped and logged. What the entries return is
+    accumulated in ``collected`` as they finish. Every veto, escalation, timeout, failure and
+    ignored output is logged, naming the entry by origin and position, never by its command
+    or output."""
     fields: dict[str, Any] = {"csession_id": csession_id, "run": run}
-    decision_ids: list[str] = []
+    got = Collected() if collected is None else collected
     budget = DECISION_IDS_MAX_BYTES
-    escalated: list[str] = []
-    overridden: list[str] = []
-    escalation: tuple[str, str] | None = None  # the first escalation that stands: reason, text
+    escalation: str | None = None  # the message of the first escalation that stands
     for entry in entries:
         what = f"{PRE_LAUNCH} {entry.name}"
-        ran = run_captured(
-            gateway, entry, sh=sh, env=env, cwd=cwd, payload=payload(), kill_grace=kill_grace
-        )
+        group = None if st is None else _GroupRecord(st, csession_id, PRE_LAUNCH_EVENT, log)
+        try:
+            ran = run_captured(
+                gateway,
+                entry,
+                sh=sh,
+                env=env,
+                cwd=cwd,
+                payload=payload(),
+                kill_grace=kill_grace,
+                on_spawn=None if group is None else group.record,
+            )
+        finally:
+            if group is not None:
+                group.remove()
+        text = outcome_message(ran.stderr, secrets) or None
         if ran.result == "timeout":
             _log(log, "hook_timeout", level="warn", message=f"{what}: {ran.detail}", **fields)
-            return Verdict(
-                "vetoed",
-                "hook_timeout",
-                f"{what} {ran.detail}",
-                tuple(decision_ids),
-                tuple(escalated),
-                tuple(overridden),
-            )
+            return got.verdict("vetoed", "hook_timeout", text or f"{what} {ran.detail}")
         if ran.result == "failed":
             _log(log, "hook_failed", level="warn", message=f"{what}: {ran.detail}", **fields)
             _log(log, "hook_veto", level="warn", message=f"{what}: {ran.detail}", **fields)
-            return Verdict(
-                "vetoed",
-                "hook_veto",
-                f"{what} {ran.detail}",
-                tuple(decision_ids),
-                tuple(escalated),
-                tuple(overridden),
-            )
+            return got.verdict("vetoed", "hook_veto", f"{what} {ran.detail}")
         found, problem = parse_decision(ran.stdout)
         if problem is not None:
             _log(
@@ -594,15 +644,14 @@ def run_pre_launch(
                 budget = 0
                 break
             budget -= size
-            decision_ids.append(item)
-        text = outcome_message(ran.stderr) or None
+            got.decision_ids.append(item)
         if ran.returncode == 0:
             continue
         if ran.returncode == ESCALATE_EXIT:
             digest = entry_hash(entry)
-            escalated.append(digest)
+            got.escalated.append(digest)
             if digest in overridable:
-                overridden.append(digest)
+                got.overridden.append(digest)
                 _log(
                     log,
                     "hook_escalate",
@@ -612,29 +661,15 @@ def run_pre_launch(
                 continue
             _log(log, "hook_escalate", level="warn", message=f"{what}: exit 13", **fields)
             if escalation is None:
-                escalation = ("hook_escalate", text or f"{what} escalated the launch (exit 13)")
+                escalation = text or f"{what} escalated the launch (exit 13)"
             continue
         _log(log, "hook_veto", level="warn", message=f"{what}: {ran.detail}", **fields)
-        return Verdict(
-            "vetoed",
-            "hook_veto",
-            text or f"{what} vetoed the launch ({ran.detail})",
-            tuple(decision_ids),
-            tuple(escalated),
-            tuple(overridden),
+        return got.verdict(
+            "vetoed", "hook_veto", text or f"{what} vetoed the launch ({ran.detail})"
         )
     if escalation is not None:
-        return Verdict(
-            "escalated",
-            escalation[0],
-            escalation[1],
-            tuple(decision_ids),
-            tuple(escalated),
-            tuple(overridden),
-        )
-    return Verdict(
-        decision_ids=tuple(decision_ids), escalated=tuple(escalated), overridden=tuple(overridden)
-    )
+        return got.verdict("escalated", "hook_escalate", escalation)
+    return got.verdict()
 
 
 # Payload
@@ -1038,8 +1073,10 @@ class _Hook:
 class _GroupRecord:
     """A running hook's process group in ``hook_groups`` (``Store.add_hook_group``), on a
     store connection of its own (the hook thread never uses the deliverer's), removed once
-    the hook has finished. Best effort: a group that cannot be recorded is only logged (a
-    deliverer that dies then leaves it unrecorded, the documented limit)."""
+    the hook has finished. The holder is ``st``'s process: the deliverer, or the ``exec``
+    running a ``pre-launch`` hook (``event_id`` ``PRE_LAUNCH_EVENT``). Best effort: a group
+    that cannot be recorded is only logged (a holder that dies then leaves it unrecorded,
+    the documented limit)."""
 
     def __init__(self, st: store.Store, sid: str, event_id: int, log: logs.EventLog) -> None:
         self.path, self.liveness, self.clock = st.path, st.liveness, st.clock
@@ -1050,19 +1087,20 @@ class _GroupRecord:
 
     def record(self, pgid: int) -> None:
         try:
-            self.own = store.Store.open(
+            own = store.Store.open(
                 self.path, migrate=False, liveness=self.liveness, clock=self.clock
             )
+            self.own = own  # closed by remove(), even when a signal ends the hook below
             leader = store.start_time(pgid)
-            self.row = self.own.add_hook_group(self.sid, self.event_id, pgid, leader, self.holder)
+            self.row = own.add_hook_group(self.sid, self.event_id, pgid, leader, self.holder)
         except Exception as exc:
             _log(
                 self.log,
                 "hook_failed",
                 level="warn",
                 csession_id=self.sid,
-                message=f"{POST_STATE_CHANGE} event {self.event_id}: the hook's process group"
-                f" could not be recorded ({type(exc).__name__})",
+                message=f"{_group_hook(self.event_id)}: the hook's process group could not be"
+                f" recorded ({type(exc).__name__})",
             )
 
     def remove(self) -> None:
@@ -1088,8 +1126,9 @@ def end_orphaned_groups(
     kill_grace: float,
     log: logs.EventLog | None = None,
 ) -> list[int]:
-    """End the hook process groups a dead deliverer left running (of ``csession_id``, or of
-    every session): for each recorded group whose deliverer is gone, the group is signaled
+    """End the hook process groups a dead holder (a deliverer, or an ``exec`` killed during a
+    ``pre-launch`` hook) left running (of ``csession_id``, or of every session): for each
+    recorded group whose holder is gone, the group is signaled
     only while its leader is verified (the recorded PID still runs with the recorded
     start-time token and still leads its group): SIGTERM, then SIGKILL after ``kill_grace``
     if the verified leader still runs. Groups of a live deliverer are left alone; a row
@@ -1110,11 +1149,24 @@ def end_orphaned_groups(
                     "hook_failed",
                     level="warn",
                     csession_id=str(row["csession_id"]),
-                    message=f"{POST_STATE_CHANGE} event {row['event_id']}: the hook its dead"
-                    f" deliverer left running was ended (process group {pgid})",
+                    message=f"{_group_hook(int(row['event_id']))}: the hook its dead"
+                    f" {_group_holder(int(row['event_id']))} left running was ended (process"
+                    f" group {pgid})",
                 )
         st.remove_hook_group(int(row["id"]))
     return ended
+
+
+def _group_hook(event_id: int) -> str:
+    """How a recorded hook group's hook is named in the log: ``pre-launch`` (event 0) or
+    ``post-state-change event <n>``."""
+    if event_id == PRE_LAUNCH_EVENT:
+        return PRE_LAUNCH
+    return f"{POST_STATE_CHANGE} event {event_id}"
+
+
+def _group_holder(event_id: int) -> str:
+    return "exec" if event_id == PRE_LAUNCH_EVENT else "deliverer"
 
 
 def _verified_leader(pgid: int, token: str) -> bool:

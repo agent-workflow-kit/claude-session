@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
 import sys
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ import pytest
 
 from claude_session import config, dryrun, launch, logs, toolhooks
 from claude_session.gateway import SystemGateway
+from claude_session.store import Store
 from claude_session.toolhooks import Entry
 
 from .fake_gateway import FakeGateway
@@ -77,6 +79,9 @@ def run(
     overridable: frozenset[str] = frozenset(),
     payload: str = '{"hook": "pre-launch"}',
     kill_grace: float = 0.5,
+    st: Store | None = None,
+    secrets: list[str] | None = None,
+    collected: toolhooks.Collected | None = None,
 ) -> toolhooks.Verdict:
     env = toolhooks.hook_env(
         environ if environ is not None else dict(os.environ),
@@ -96,6 +101,9 @@ def run(
         log=logs.EventLog(str(root / "log.jsonl")),
         csession_id=SID,
         run=1,
+        st=st,
+        secrets=secrets or (),
+        collected=collected,
     )
 
 
@@ -142,12 +150,19 @@ def root(tmp_path: Path) -> Path:
         ('{"decision_id": "\\ud800"}', [], "decision_id holds an unpaired surrogate"),
         ('{"decision_id": "\\udc00\\ud800"}', [], "decision_id holds an unpaired surrogate"),
         ('{"decision_id": ["ok", "\\udfff"]}', [], "decision_id holds an unpaired surrogate"),
-        ('{"decision_id": "bad �"}', [], "not valid UTF-8"),
+        ('{"decision_id": "bad �"}', ["bad �"], None),  # a literal U+FFFD is valid UTF-8
         ("[" * 2000, [], "not JSON"),  # nesting deep enough to overflow the decoder
+        (b'{"decision_id": "a\xffb"}', [], "not valid UTF-8"),
+        (b'{"decision_id": "\xed\xa0\x80"}', [], "not valid UTF-8"),  # an encoded surrogate
+        (b'{"decision_id":\r\n"crlf"}\r\n', ["crlf"], None),  # CR is JSON whitespace, kept
+        ('{"decision_id":"d-1"}' + "\r\n" * 1500 + "garbage", [], "longer than 2048 bytes"),
+        (" " * 3000 + "x", [], "longer than 2048 bytes"),  # whitespace-led, still too long
+        (" " * 3000, [], "longer than 2048 bytes"),
     ],
 )
-def test_parse_decision(stdout: str, ids: list[str], problem: str | None) -> None:
-    assert toolhooks.parse_decision(stdout) == (ids, problem)
+def test_parse_decision(stdout: str | bytes, ids: list[str], problem: str | None) -> None:
+    raw = stdout.encode() if isinstance(stdout, str) else stdout
+    assert toolhooks.parse_decision(raw) == (ids, problem)
 
 
 def test_parse_decision_takes_exactly_the_cap_and_ignores_more() -> None:
@@ -155,14 +170,33 @@ def test_parse_decision_takes_exactly_the_cap_and_ignores_more() -> None:
     fill = toolhooks.PRE_LAUNCH_OUTPUT_MAX - len(head) - 2
     exact = head + "x" * fill + '"}'
     assert len(exact.encode()) == toolhooks.PRE_LAUNCH_OUTPUT_MAX
-    assert toolhooks.parse_decision(exact) == (["x" * fill], None)
+    assert toolhooks.parse_decision(exact.encode()) == (["x" * fill], None)
     # One byte more (a valid object padded with a space): ignored, as a cut output would be.
-    assert toolhooks.parse_decision(exact + " ") == ([], "longer than 2048 bytes")
+    assert toolhooks.parse_decision(exact.encode() + b" ") == ([], "longer than 2048 bytes")
 
 
-def test_outcome_message_strips_control_characters_and_caps_at_2_kib() -> None:
-    assert toolhooks.outcome_message("a\x1b[31mb\x00c\nd\x7fe\x85f") == "a[31mbcdef"
-    assert toolhooks.outcome_message("é" * 5000) == "é" * 2048
+def test_outcome_message_strips_control_characters() -> None:
+    raw = "a\x1b[31mb\x00c\r\nd\x7fe\x85f".encode()
+    assert toolhooks.outcome_message(raw) == "a[31mbcdef"
+
+
+def test_outcome_message_caps_at_2048_utf8_bytes_on_a_character_boundary() -> None:
+    assert toolhooks.outcome_message(("é" * 5000).encode()) == "é" * 1024
+    message = toolhooks.outcome_message(("x" + "é" * 5000).encode())
+    assert message == "x" + "é" * 1023 and len(message.encode()) == 2047
+
+
+def test_outcome_message_strips_control_characters_before_the_cap() -> None:
+    assert toolhooks.outcome_message(b"\x01" * 3000 + b"visible") == "visible"
+
+
+def test_outcome_message_is_redacted_against_the_secret_values() -> None:
+    secret = "s3cret-value-123"
+    message = toolhooks.outcome_message(f"denied: {secret}\n".encode(), [secret])
+    assert message == "denied: [redacted]"
+    # A secret split by a control character is still redacted once they are stripped.
+    split = f"key={secret[:5]}\x07{secret[5:]}".encode()
+    assert toolhooks.outcome_message(split, [secret]) == "key=[redacted]"
 
 
 # Entry hashes
@@ -370,6 +404,93 @@ def test_invalid_utf8_on_stdout_is_ignored(tmp_path: Path, root: Path) -> None:
     assert ignored["message"].endswith("(not valid UTF-8)")
 
 
+def test_crlf_padding_past_2_kib_is_ignored_and_logged(root: Path) -> None:
+    cmd = (
+        "printf '{\"decision_id\":\"d-1\"}'; i=0; while [ $i -lt 1500 ]; do printf '\\r\\n';"
+        " i=$((i+1)); done; printf garbage"
+    )
+    verdict = run(root, [entry(cmd)])
+    assert verdict == toolhooks.Verdict()
+    (ignored,) = [r for r in log_records(root) if r["event"] == "hook_output_ignored"]
+    assert ignored["message"].endswith("(longer than 2048 bytes)")
+
+
+def test_whitespace_led_output_past_2_kib_is_ignored_and_logged(root: Path) -> None:
+    cmd = "head -c 50000 /dev/zero | tr '\\0' ' '; printf x"
+    verdict = run(root, [entry(cmd)])
+    assert verdict == toolhooks.Verdict()
+    (ignored,) = [r for r in log_records(root) if r["event"] == "hook_output_ignored"]
+    assert ignored["message"].endswith("(longer than 2048 bytes)")
+
+
+def test_a_literal_replacement_character_on_stdout_is_accepted(tmp_path: Path, root: Path) -> None:
+    raw = tmp_path / "raw"
+    raw.write_bytes('{"decision_id": "a\ufffdb"}'.encode())
+    log = tmp_path / "hook.jsonl"
+    verdict = run(root, [entry(hook_cmd(log, "--stdout-file", str(raw)))])
+    assert verdict.decision_ids == ("a\ufffdb",)
+    assert [r for r in log_records(root) if r["event"] == "hook_output_ignored"] == []
+
+
+def test_the_message_is_the_hooks_stderr_redacted(root: Path) -> None:
+    secret = "s3cret-value-123"
+    verdict = run(root, [entry(f"echo 'token {secret}' >&2; exit 4")], secrets=[secret])
+    assert verdict.message == "token [redacted]"
+
+
+@pytest.mark.skipif(not LINUX, reason="process groups are checked through /proc")
+def test_a_timeout_carries_the_hooks_stderr_as_the_message(root: Path) -> None:
+    verdict = run(root, [entry("echo 'gate busy' >&2; sleep 30", timeout=1.0)])
+    assert (verdict.outcome, verdict.end_reason) == ("vetoed", "hook_timeout")
+    assert verdict.message == "gate busy"
+
+
+def sleep_pid(pidfile: Path) -> int:
+    """The PID a hook wrote to ``pidfile``."""
+    wait_until(lambda: pidfile.exists() and pidfile.read_text().strip() != "", 5)
+    return int(pidfile.read_text())
+
+
+def argv0(pid: int) -> bytes:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return fh.read().split(b"\0")[0]
+    except OSError:
+        return b""
+
+
+@pytest.mark.skipif(not LINUX, reason="process groups are checked through /proc")
+def test_a_background_process_left_in_the_hooks_group_is_ended_when_sh_exits(
+    tmp_path: Path, root: Path
+) -> None:
+    pidfile = tmp_path / "pid"
+    cmd = f"sleep 30 >/dev/null 2>&1 </dev/null & echo $! > {shlex.quote(str(pidfile))}; exit 0"
+    start = time.monotonic()
+    verdict = run(root, [entry(cmd)])
+    assert verdict == toolhooks.Verdict() and time.monotonic() - start < 10
+    pid = sleep_pid(pidfile)
+    try:
+        wait_until(lambda: not running(pid), 5)
+    finally:
+        if running(pid) and argv0(pid).endswith(b"sleep"):  # only the exact sleep it started
+            os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(not LINUX, reason="process groups are checked through /proc")
+def test_each_hooks_group_is_recorded_while_it_runs_and_removed_after(
+    tmp_path: Path, root: Path
+) -> None:
+    log = tmp_path / "hook.jsonl"
+    sql = "CREATE TABLE seen AS SELECT * FROM hook_groups"
+    with Store.open(str(root / "state.db")) as st:
+        verdict = run(root, [entry(hook_cmd(log, "--sql", sql))], st=st)
+        assert verdict == toolhooks.Verdict()
+        (record,) = records(log)
+        seen = st.conn.execute("SELECT event_id, pgid, holder_pid FROM seen").fetchall()
+        assert seen == [(toolhooks.PRE_LAUNCH_EVENT, record["pgid"], os.getpid())]
+        assert st.hook_groups() == []
+
+
 @pytest.mark.skipif(not LINUX, reason="process groups are checked through /proc")
 def test_a_timeout_vetoes_and_ends_the_hooks_process_group(tmp_path: Path, root: Path) -> None:
     log = tmp_path / "hook.jsonl"
@@ -419,6 +540,25 @@ def test_a_nul_in_a_flag_command_vetoes(root: Path) -> None:
 def test_a_signal_while_a_hook_runs_propagates(root: Path) -> None:
     with pytest.raises(KeyboardInterrupt):
         run(root, [entry("true")], gateway=_BrokenGateway(KeyboardInterrupt()))
+
+
+class _InterruptedSecond(FakeGateway):
+    """Answers the first hook with a decision id and exit 13, then a signal ends the run."""
+
+    def run(self, argv: Any, **kw: Any) -> Any:
+        if self.calls:
+            raise KeyboardInterrupt
+        self.on(["sh"], returncode=13, stdout='{"decision_id": "d1"}')
+        return super().run(argv, **kw)
+
+
+def test_what_finished_hooks_returned_is_collected_before_a_signal(root: Path) -> None:
+    collected = toolhooks.Collected()
+    first = entry("first", 1)
+    with pytest.raises(KeyboardInterrupt):
+        run(root, [first, entry("second", 2)], gateway=_InterruptedSecond(), collected=collected)
+    assert collected.decision_ids == ["d1"]
+    assert collected.escalated == [toolhooks.entry_hash(first)]
 
 
 def test_the_log_never_names_a_hook_by_its_command_or_output(tmp_path: Path, root: Path) -> None:
@@ -511,6 +651,7 @@ def test_each_entry_gets_a_fresh_payload(root: Path) -> None:
     )
     assert [call.stdin for call in gateway.calls] == ['{"n": 0}', '{"n": 1}']
     assert all(call.new_process_group and call.kill_grace == 0.5 for call in gateway.calls)
-    assert all(call.output_limit == 2049 for call in gateway.calls)
+    assert all(call.output_limit == toolhooks.PRE_LAUNCH_KEEP for call in gateway.calls)
+    assert all(call.kill_group_on_exit for call in gateway.calls)
     assert not any(call.discard_output for call in gateway.calls)
     assert [call.argv for call in gateway.calls] == [("sh", "-c", "a"), ("sh", "-c", "b")]

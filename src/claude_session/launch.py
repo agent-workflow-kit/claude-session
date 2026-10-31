@@ -518,6 +518,8 @@ def new_run(
         "decision_ids": list(req.decision_ids),
         "outcome_file": req.outcome_file,
         "input_files": [item.name for item in req.inputs],
+        # Cross-checked against the launch spec at adoption (lifecycle._check_request).
+        "override_escalation": req.override_escalation,
     }
     if req.conversation.fork:
         # The conversation a fork forked: a later run of a fork that never captured a
@@ -1732,17 +1734,18 @@ def pre_launch(
 ) -> OverrideAudit | None:
     """Launch step 6 (interface.md, Hooks): the selected ``pre-launch`` entries (the current
     config's, then this invocation's ``--hook pre-launch=...``; ``toolhooks.selected`` on
-    the run kind and the session's labels) run in order (``toolhooks.run_pre_launch``). Their
-    decision ids and escalating entries are recorded on the run (``Store.record_pre_launch``)
-    whatever the outcome; a veto or escalation raises ``HookEnded``.
+    the run kind and the session's labels) run in order (``toolhooks.run_pre_launch``), each
+    hook's process group recorded in ``hook_groups`` while it runs. Their decision ids and
+    escalating entries are recorded on the run (``Store.record_pre_launch``) whatever the
+    outcome, also those of the hooks that finished before a signal ended the launch; a veto
+    or escalation raises ``HookEnded``.
 
     With ``--override-escalation`` an exit 13 of an entry recorded as escalating on the
-    previous run counts as continue; the launch that then goes on is audited
-    ``launch_escalation_override`` (``result: ok``, with the hooks' and ``--decision-id``
-    decision ids and the ``overridden_hooks``) before anything else happens, and that record
-    must be written (an ``audit.append`` error propagates: the launch is interrupted). One
-    the hooks still end is audited ``result: refused`` (best effort). Returns the ``ok``
-    record's fields (None without the flag)."""
+    previous run counts as continue. One the hooks still end is audited
+    ``launch_escalation_override`` ``result: refused`` (best effort). Returns the fields of
+    the ``result: ok`` record (with the hooks' and ``--decision-id`` decision ids and the
+    ``overridden_hooks``; None without the flag), which the caller writes before anything
+    else happens (``audit_override_ok``)."""
     sid, run = alloc.csession_id, alloc.run
     record = st.pre_launch_record(sid, run)
     entries = [
@@ -1766,29 +1769,42 @@ def pre_launch(
             data = pre_launch_payload(req, resolution, alloc, v, record, now=now)
             return json.dumps(printable(data), ensure_ascii=False)
 
-        verdict = toolhooks.run_pre_launch(
-            process.gateway,
-            entries,
-            payload=payload,
-            sh=toolhooks.resolve_sh(env),
-            env=env,
-            cwd=process.state_root,
-            kill_grace=cfg.kill_grace,
-            overridable=frozenset(record["previous_escalated"])
-            if req.override_escalation
-            else frozenset(),
-            log=event_log(process, secrets),
-            csession_id=sid,
-            run=run,
-        )
-        st.record_pre_launch(
-            sid, run, decision_ids=verdict.decision_ids, escalated_hooks=verdict.escalated
-        )
+        collected = toolhooks.Collected()
+        try:
+            verdict = toolhooks.run_pre_launch(
+                process.gateway,
+                entries,
+                payload=payload,
+                sh=toolhooks.resolve_sh(env),
+                env=env,
+                cwd=process.state_root,
+                kill_grace=cfg.kill_grace,
+                overridable=frozenset(record["previous_escalated"])
+                if req.override_escalation
+                else frozenset(),
+                log=event_log(process, secrets),
+                csession_id=sid,
+                run=run,
+                st=st,
+                secrets=secrets,
+                collected=collected,
+            )
+        except BaseException:
+            # A signal (or a bug) midway: what the finished hooks returned is still stored.
+            try:
+                _record_pre_launch(st, sid, run, collected)
+            except Exception:  # best effort: the launch is ending either way
+                pass
+            raise
+        _record_pre_launch(st, sid, run, collected)
     audited: OverrideAudit | None = None
     if req.override_escalation:
         audited = OverrideAudit(
             path=os.path.join(process.state_root, AUDIT_NAME),
             actor=req.actor,
+            # TODO(#72): cap the escaped size of the argv --decision-id values (and --actor)
+            # so this record stays within the audit record limit (#68, #39); the hooks' ids
+            # are capped (toolhooks.DECISION_IDS_MAX_BYTES), these are not yet.
             decision_ids=(*req.decision_ids, *verdict.decision_ids),
             inputs={
                 "run_kind": resolution.kind,
@@ -1799,17 +1815,45 @@ def pre_launch(
         )
     if verdict.outcome != "continue":
         if audited is not None:
-            _audit_override(audited, sid, "refused", best_effort=True)
+            _audit_override(audited, sid, "refused", best_effort=True, process=process, run=run)
         assert verdict.end_reason is not None and verdict.message is not None
         raise HookEnded(verdict.message, outcome=verdict.outcome, end_reason=verdict.end_reason)
-    if audited is not None:
-        _audit_override(audited, sid, "ok", best_effort=False)
     return audited
 
 
-def _audit_override(audited: OverrideAudit, target: str, result: str, *, best_effort: bool) -> None:
+def _record_pre_launch(st: store.Store, sid: str, run: int, got: toolhooks.Collected) -> None:
+    st.record_pre_launch(sid, run, decision_ids=got.decision_ids, escalated_hooks=got.escalated)
+
+
+def audit_override_ok(st: store.Store, alloc: Allocated, audited: OverrideAudit) -> None:
+    """Write the ``launch_escalation_override`` ``result: ok`` record, which must be written
+    (an error propagates: the launch is interrupted). The run is marked first
+    (``Store.record_override_audit``, with the record's redacted fields), so a launch-phase
+    run that dies after this, before ``claude`` is spawned, still gets its ``result: error``
+    follow-up from the liveness check; a crash between the two leaves at worst a spurious
+    ``error`` record."""
+    usable = logs.usable_secrets(audited.secrets)
+    mark = {
+        "actor": logs.redact_text(audited.actor, usable),
+        "decision_ids": [logs.redact_text(item, usable) for item in audited.decision_ids],
+        "inputs": dict(audited.inputs),
+    }
+    st.record_override_audit(alloc.csession_id, alloc.run, mark)
+    _audit_override(audited, alloc.csession_id, "ok", best_effort=False)
+
+
+def _audit_override(
+    audited: OverrideAudit,
+    target: str,
+    result: str,
+    *,
+    best_effort: bool,
+    process: Process | None = None,
+    run: int | None = None,
+) -> None:
     """Write a ``launch_escalation_override`` record; with ``best_effort`` a failure is
-    swallowed (a ``refused`` or ``error`` record: the launch is not taken either way)."""
+    swallowed (a ``refused`` or ``error`` record: the launch is not taken either way) and
+    logged ``audit_failed`` (fixed text, best effort) to ``process``'s log."""
     try:
         audit.append(
             audited.path,
@@ -1824,6 +1868,15 @@ def _audit_override(audited: OverrideAudit, target: str, result: str, *, best_ef
     except Exception:
         if not best_effort:
             raise
+        if process is not None:
+            log_best_effort(
+                event_log(process),
+                "audit_failed",
+                level="warn",
+                csession_id=target,
+                run=run,
+                message=f"a launch_escalation_override {result} record could not be written",
+            )
 
 
 # Step 7: prepare
@@ -2133,7 +2186,14 @@ def end_launch(
             except Exception:  # best effort: the run is final either way
                 pass
         if alloc.override_audit is not None:
-            _audit_override(alloc.override_audit, alloc.csession_id, "error", best_effort=True)
+            _audit_override(
+                alloc.override_audit,
+                alloc.csession_id,
+                "error",
+                best_effort=True,
+                process=process,
+                run=alloc.run,
+            )
         log = event_log(process, () if prepared is None else sorted(prepared.secrets))
         fields: dict[str, Any] = {"csession_id": alloc.csession_id, "run": alloc.run}
         if exc is None:
@@ -2152,6 +2212,7 @@ def end_launch(
                 level="error",
                 reason=error.end_reason,
                 message=type(exc).__name__,
+                decision_ids=_run_decision_ids(st, alloc),
                 **fields,
             )
 
@@ -2304,7 +2365,14 @@ def run(
                 # run is still caught. --timeout does not count the hooks.
                 audited = pre_launch(st, cfg, req, resolution, alloc, v, process, secrets)
                 if audited is not None:
-                    alloc = dataclasses.replace(alloc, override_audit=audited)
+                    # No signal between the ok record and alloc's mark of it (the error
+                    # follow-up depends on the mark); one received meanwhile raises after.
+                    signals.defer()
+                    try:
+                        audit_override_ok(st, alloc, audited)
+                        alloc = dataclasses.replace(alloc, override_audit=audited)
+                    finally:
+                        signals.enter_launch()
                 recheck_fork_taint(st, alloc, resolution)
                 prepared = prepare(st, cfg, req, resolution, alloc, v, process)
                 st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)

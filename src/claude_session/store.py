@@ -1228,6 +1228,17 @@ class Store:
         relative to the session directory, e.g. ``inputs/2/b.txt``) in the run's
         ``invocation_json`` (``copied_inputs``). ``InternalError`` when the run row does not
         exist."""
+        self._merge_invocation(csession_id, run_no, "copied_inputs", list(paths))
+
+    def record_override_audit(self, csession_id: str, run_no: int, mark: Mapping[str, Any]) -> None:
+        """Mark a run whose launch is about to write its ``launch_escalation_override``
+        ``result: ok`` record: the record's redacted ``actor``, ``decision_ids`` and ``inputs``
+        in the run's ``invocation_json`` (``override_audit``), so the liveness check can write
+        the ``result: error`` follow-up when the run's launch dies (``launch_interrupted``).
+        ``InternalError`` when the run row does not exist."""
+        self._merge_invocation(csession_id, run_no, "override_audit", dict(mark))
+
+    def _merge_invocation(self, csession_id: str, run_no: int, key: str, value: Any) -> None:
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT invocation_json FROM runs WHERE csession_id = ? AND run_no = ?",
@@ -1241,7 +1252,7 @@ class Store:
                 invocation = None
             if not isinstance(invocation, dict):
                 raise InternalError(f"run {run_no} of {csession_id} has an unreadable record")
-            invocation["copied_inputs"] = list(paths)
+            invocation[key] = value
             conn.execute(
                 "UPDATE runs SET invocation_json = ? WHERE csession_id = ? AND run_no = ?",
                 (json.dumps(invocation, ensure_ascii=False), csession_id, run_no),

@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -16,12 +18,12 @@ from typing import Any
 
 import pytest
 
-from claude_session import launch, lifecycle, toolhooks
+from claude_session import audit, launch, lifecycle, toolhooks
 from claude_session.errors import LaunchValidationError
 from claude_session.toolhooks import Entry
 
 from .schemas import validate
-from .test_exec_headless import SECRET_VALUE, validate_exec
+from .test_exec_headless import SECRET_VALUE, claude_session_cmd, validate_exec
 from .test_resume import (
     STEPS,
     adopt_in_process,
@@ -349,6 +351,22 @@ def test_an_override_audit_that_cannot_be_written_interrupts_the_launch(env: Env
     assert starts(env) == [] and elsewhere.read_text() == ""
 
 
+def test_a_refused_override_record_that_cannot_be_written_is_logged(env: Env) -> None:
+    sid = escalated_session(env, hook_cmd(env, "--exit", "13"))
+    hooks(env, {"cmd": hook_cmd(env, "--exit", "13", "--stderr", "edited")})
+    elsewhere = env.tmp_path / "elsewhere"
+    elsewhere.write_text("")
+    os.symlink(elsewhere, env.state / "audit.jsonl")  # refused: never written through a link
+    proc, out = resume(env, sid, "--override-escalation", *HUMAN, "--decision-id", "ticket-9")
+    assert proc.returncode == 13 and out["outcome"] == "escalated"
+    assert elsewhere.read_text() == ""
+    (failed,) = [r for r in log_records(env) if r["event"] == "audit_failed"]
+    validate(failed, "claude-session/log.json")
+    assert failed["level"] == "warn" and failed["csession_id"] == sid
+    assert failed["message"] == "a launch_escalation_override refused record could not be written"
+    assert "ticket-9" not in json.dumps(failed)
+
+
 def test_a_launch_that_fails_after_the_override_was_audited_gets_an_error_record(
     env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -408,17 +426,136 @@ def test_start_resume_override_escalation_is_checked_at_start_and_audited_at_ado
     ]
 
 
-def test_a_spec_without_the_override_key_reads_as_no_override(env: Env) -> None:
+def edit_spec(env: Env, sid: str, run: int, edit: Any) -> None:
+    path = env.private_run(sid, run) / lifecycle.SPEC_NAME
+    data = json.loads(path.read_text())
+    edit(data["request"])
+    path.write_text(json.dumps(data))
+
+
+def test_a_spec_and_run_without_the_override_key_read_as_no_override(env: Env) -> None:
     sid = escalated_session(env, hook_cmd(env, "--exit", "13"))
     proc, _ = run_cs(env, ["start", "--json", "--resume", sid, "--override-escalation", *HUMAN])
     assert proc.returncode == 0, proc.stderr
-    path = env.private_run(sid, 2) / lifecycle.SPEC_NAME
-    data = json.loads(path.read_text())
-    assert data["request"].pop("override_escalation") is True
-    path.write_text(json.dumps(data))
+    # As a claude-session from before the flag wrote them: no key in either.
+    edit_spec(env, sid, 2, lambda request: request.pop("override_escalation"))
+    invocation = json.loads(env.run_row(sid, 2)["invocation_json"])
+    assert invocation.pop("override_escalation") is True
+    env.write_db(
+        "UPDATE runs SET invocation_json = ? WHERE csession_id = ? AND run_no = 2",
+        (json.dumps(invocation), sid),
+    )
     proc, out = env.adopt(sid)
     assert proc.returncode == 13 and out["outcome"] == "escalated"
     assert audit_records(env) == []
+
+
+def test_a_spec_that_turns_the_override_on_against_the_run_row_is_refused(env: Env) -> None:
+    sid = escalated_session(env, hook_cmd(env, "--exit", "13"))
+    proc, _ = run_cs(env, ["start", "--json", "--resume", sid, *HUMAN])
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(env.run_row(sid, 2)["invocation_json"])["override_escalation"] is False
+    edit_spec(env, sid, 2, lambda request: request.update(override_escalation=True))
+    proc, out = env.adopt(sid)
+    assert proc.returncode == 12 and out["end_reason"] == "session_dir_unsafe"
+    assert len(calls(env)) == 1  # only run 1's hook: the adoption never reached step 6
+    assert audit_records(env) == [] and len(starts(env)) == 0
+
+
+def test_a_frozen_override_needs_a_human_frozen_actor(env: Env) -> None:
+    sid = escalated_session(env, hook_cmd(env, "--exit", "13"))
+    proc, _ = run_cs(env, ["start", "--json", "--resume", sid, "--override-escalation", *HUMAN])
+    assert proc.returncode == 0, proc.stderr
+    edit_spec(env, sid, 2, lambda request: request.update(actor="auto:ci"))
+    proc, out = env.adopt(sid)
+    assert proc.returncode == 12 and out["end_reason"] == "session_dir_unsafe"
+    assert audit_records(env) == []
+
+
+def test_the_adoption_dry_run_reports_the_frozen_override(env: Env) -> None:
+    sid = escalated_session(env, hook_cmd(env, "--exit", "13"))
+    proc, _ = run_cs(env, ["start", "--json", "--resume", sid, "--override-escalation", *HUMAN])
+    assert proc.returncode == 0, proc.stderr
+    proc, out = env.adopt(sid, "--dry-run")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert out["override_escalation"] is True
+
+
+# Signals and crashes during step 6
+
+
+def test_a_signal_during_the_override_ok_record_still_gets_the_error_record(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = escalated_session(env, hook_cmd(env, "--exit", "13"))
+    real = audit.append
+
+    def append(*args: Any, **kwargs: Any) -> Any:
+        written = real(*args, **kwargs)
+        if kwargs.get("result") == "ok":
+            os.kill(os.getpid(), signal.SIGINT)  # right after the ok record is written
+        return written
+
+    monkeypatch.setattr(audit, "append", append)
+    code, out = resume_in_process(env, monkeypatch, capsys, sid, "--override-escalation", *HUMAN)
+    assert code == 12 and out["end_reason"] == "launch_interrupted"
+    assert [r["result"] for r in audit_records(env)] == ["ok", "error"]
+    assert starts(env) == []
+
+
+def test_a_signal_during_a_later_hook_keeps_the_decision_ids_already_returned(env: Env) -> None:
+    hooks(
+        env,
+        {"cmd": hook_cmd(env, "--stdout", '{"decision_id": "d1"}', name="first")},
+        {"cmd": "kill -INT $PPID; sleep 30"},  # $PPID: the exec running the hook
+    )
+    code, out = exec_out(env, "--decision-id", "argv-1")
+    assert code == 12 and out["end_reason"] == "launch_interrupted"
+    row = env.run_row(out["csession_id"])
+    assert json.loads(row["decision_ids_json"]) == ["argv-1", "d1"]
+    (logged,) = [r for r in log_records(env) if r["event"] == "launch_interrupted"]
+    assert logged["decision_ids"] == ["argv-1", "d1"]
+    assert starts(env) == []
+
+
+@pytest.mark.skipif(not LINUX, reason="process groups are checked through /proc")
+def test_reconcile_ends_a_pre_launch_hook_whose_exec_was_killed(env: Env) -> None:
+    hooks(env, {"cmd": hook_cmd(env, "--sleep", "60"), "timeout": "120s"})
+    prompt = env.tmp_path / "prompt.md"
+    prompt.write_text("Do the task.\n", encoding="utf-8")
+    argv = ["exec", "--json", "--mode", "headless", "--prompt-file", str(prompt)]
+    exec_proc = subprocess.Popen(
+        [*claude_session_cmd(), *argv, "--config", str(env.config)],
+        cwd=env.work,
+        env=env.environ(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not calls(env):
+            assert time.monotonic() < deadline, "the hook never started"
+            time.sleep(0.05)
+        (record,) = calls(env)
+        # The hook's group was recorded while it ran, held by this exec.
+        groups = env.rows("SELECT pgid, event_id, holder_pid FROM hook_groups", ())
+        assert groups == [(record["pgid"], 0, exec_proc.pid)]
+    finally:
+        exec_proc.kill()  # the exact process this test started
+        exec_proc.wait(timeout=30)
+    assert running(record["pid"])  # left behind by the killed exec
+    proc, _out = run_cs(env, ["reconcile", "--json"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    deadline = time.monotonic() + 10
+    while running(record["pid"]):
+        assert time.monotonic() < deadline, "reconcile did not end the orphaned hook"
+        time.sleep(0.02)
+    assert env.rows("SELECT COUNT(*) FROM hook_groups", ()) == [(0,)]
+    (ended,) = [r for r in log_records(env) if r["event"] == "hook_failed"]
+    assert ended["message"].startswith("pre-launch: the hook its dead exec left running")
+    sid = env.rows("SELECT csession_id FROM sessions", ())[0][0]
+    assert env.run_row(sid)["end_reason"] == "launch_interrupted"
 
 
 # Order: step 6 before the fork taint re-check

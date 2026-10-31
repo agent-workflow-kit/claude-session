@@ -957,6 +957,14 @@ def _check_request(frozen: Frozen, data: Mapping[str, Any], record: Mapping[str,
     args.hook = _texts(data["hooks"])
     args.hook_timeout = _texts(data["hook_timeouts"])
     args.override_escalation = _bool(data.get("override_escalation", False))
+    # The run row records the flag too (``launch.new_run``; absent: off): an edited spec
+    # cannot turn the human's override on, and the frozen actor must still be a human.
+    if args.override_escalation != (_invocation(record).get("override_escalation") is True):
+        raise ValueError("the launch spec's --override-escalation is not the run's")
+    if args.override_escalation:
+        from .resume import check_human_only  # resume imports this module
+
+        check_human_only("--override-escalation", args.actor, tty=False)
     args.input_file = _texts(data["input_files"])
     args.prompt_file = SPEC_NAME if data["has_prompt"] else None  # any non-stdin name
     if _mapping(data["conversation"]).get("resume") is True:
@@ -1269,6 +1277,7 @@ def adoption_plan(
         cwd=found.checked.cwd if found.checked is not None else adoption.frozen.cwd,
         csession_id=sid,
         run=record["run_no"],
+        override_escalation=req.override_escalation,
     )
     plan["would_refuse"] = would_refuse
     plan["config_hash_changed"] = adoption.config_hash_changed
