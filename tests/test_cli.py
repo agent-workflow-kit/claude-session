@@ -532,10 +532,20 @@ def test_refusal_is_written_to_outcome_file(
 def test_not_found_is_not_written_to_outcome_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    monkeypatch.setitem(cli.HANDLERS, "resume", raising(NotFoundError("unknown")))
+    out = tmp_path / "outcome.json"
+    assert main(["resume", SID, "--outcome-file", str(out)]) == 10
+    assert not out.exists()
+
+
+def test_wait_writes_any_error_envelope_to_its_outcome_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``wait --outcome-file`` is wait's own output, error envelopes included."""
     monkeypatch.setitem(cli.HANDLERS, "wait", raising(NotFoundError("unknown")))
     out = tmp_path / "outcome.json"
     assert main(["wait", SID, "--outcome-file", str(out)]) == 10
-    assert not out.exists()
+    assert read_envelope(out) == {"error": {"code": "not_found", "message": "unknown"}}
 
 
 def test_outcome_file_ignored_for_commands_without_it(

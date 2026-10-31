@@ -14,7 +14,8 @@ request; ``launch.end_launch``). It then records the child's PID and start time 
 ``session`` phase and supervises the child until it exits (``Supervision``): every signal
 ``exec`` receives is handled per the signal table (``signals``; ``pending_cause`` recorded
 before the one forward to the exact child, SIGKILL to that same child after ``kill_grace``),
-and every ``poll_interval`` the auto-exit rule is checked. Then, in this order: drains the
+and every ``poll_interval`` the auto-exit rule, the run's bound and (headless) the
+``session_start_timeout`` warning are checked. Then, in this order: drains the
 run's outbox (and ``claimed/``), maps the end (``endmap.map_headless`` or
 ``endmap.map_interactive``, from the recorded ``pending_cause``), accepts or rejects an
 implicit done (``result.md``, headless only), finalizes the run (the compare-and-set, which
@@ -33,8 +34,15 @@ spawned (SIGKILL after ``kill_grace``, also when the wait is interrupted), final
 directly (``killed``, ``internal_error``, unless a report exists; no drain, no result parsing,
 cost null), deletes the secret index and removes the tmpdir on every path, and re-raises.
 
-TODO(#19): the run's bound (``timeout``) and the ``session_start_timeout`` warning in the poll
-loop.
+The run's bound (``--timeout``, else the kind's ``timeout`` headless or ``interactive_timeout``
+interactive; None: no bound) counts from the spawn: once it is reached, ``pending_cause``
+``timeout`` is recorded and the child gets SIGTERM, then SIGKILL after ``kill_grace``; the
+final event's cause is then ``timeout``. A busy store holds the SIGTERM back (retried at each
+poll) until the bound plus ``kill_grace``; then, or at once on any other store error,
+supervision fails and the internal-error path ends the child. A headless run with no
+``SessionStart`` within ``session_start_timeout`` of the spawn gets a warning (logged
+``session_start_missing`` and added to the run's ``warnings``); the run goes on.
+
 TODO(#20): deliver ``post-state-change`` events of the run in the poll loop and at the end.
 TODO(#21): write ``--outcome-file`` right after the finalization compare-and-set.
 """
@@ -170,6 +178,9 @@ class Supervision:
         *,
         auto_exit: bool,
         monotonic: Any = time.monotonic,
+        bound: float | None = None,
+        session_start_timeout: float | None = None,
+        spawned_at: float | None = None,
     ) -> None:
         self.st, self.cfg, self.alloc, self.child = st, cfg, alloc, child
         self.signals, self.log = signals, log
@@ -179,6 +190,13 @@ class Supervision:
         self.kill_at: float | None = None
         self.candidate: int | None = None  # the auto_exit_candidate event id
         self.due = 0.0
+        # The run's bound and the session_start_timeout check (None: none), both counted from
+        # the spawn (``spawned_at`` on the ``monotonic`` clock; default: now).
+        self.bound = bound
+        self.session_start_timeout = session_start_timeout
+        self.spawned_at = self.monotonic() if spawned_at is None else spawned_at
+        self.session_start_checked = False
+        self.session_start_logged = False
 
     def wait(self) -> int:
         """Supervise until the child exits; its return code (negative: killed by that
@@ -199,7 +217,8 @@ class Supervision:
                 next_poll = now + self.cfg.poll_interval
                 if self.auto_exit and not self.ended:
                     self.check_auto_exit(now)
-                # TODO(#19): check the run's bound and the session_start_timeout warning here.
+                self.check_bound(now)
+                self.check_session_start(now)
                 # TODO(#20): deliver new events of the run (post-state-change) here.
 
     def forward(self, signum: int) -> None:
@@ -229,8 +248,10 @@ class Supervision:
         """Record ``cause`` (unless the run has one, or ``recorded``: the caller's
         compare-and-set just did), then send ``signum`` to the exact child and arm the
         SIGKILL after ``kill_grace``."""
-        if not recorded:
-            self.st.set_pending_cause(self.alloc.csession_id, self.alloc.run, cause)
+        sid, run_no = self.alloc.csession_id, self.alloc.run
+        if not recorded and not self.st.set_pending_cause(sid, run_no, cause):
+            # An earlier cause stands: log the one recorded, not the one asked for.
+            cause = self.st.run_record(sid, run_no)["pending_cause"] or cause
         self.ended = True
         self.kill_at = self.monotonic() + self.cfg.kill_grace
         self.child.send_signal(signum)
@@ -278,6 +299,65 @@ class Supervision:
             self.end(signal.SIGTERM, "auto_exit", recorded=True)
         else:
             self.candidate = None
+
+    def check_bound(self, now: float) -> None:
+        """The run's bound (design.md, Supervision): once ``bound`` seconds have passed since
+        the spawn, record ``pending_cause`` ``timeout`` (an earlier cause stands) and SIGTERM
+        the child, SIGKILL after ``kill_grace``. A busy store sends nothing (the cause must be
+        recorded first) and is retried at the next poll, up to the bound plus ``kill_grace``;
+        then, or at once on any other store error, ``InternalError``: supervision fails and the
+        internal-error path ends the child. Never after the child was signaled."""
+        if self.ended or self.bound is None or now < self.spawned_at + self.bound:
+            return
+        try:
+            self.end(signal.SIGTERM, "timeout")
+        except sqlite3.OperationalError as exc:
+            if not store.is_busy(exc):
+                raise InternalError(f"the store failed at the run's bound: {exc}") from exc
+            if now >= self.spawned_at + self.bound + self.cfg.kill_grace:
+                raise InternalError(
+                    f"the store stayed busy past the run's bound plus kill_grace: {exc}"
+                ) from exc
+            self._log_not_sent(
+                signal.SIGTERM,
+                f"timeout; not sent: the store was busy ({exc}); retried",
+                level="warn",
+            )
+
+    def check_session_start(self, now: float) -> None:
+        """Headless runs (interface.md, exec): no ``SessionStart`` within
+        ``session_start_timeout`` of the spawn is logged once (``session_start_missing``)
+        and added to the run's warnings (retried at the next poll while the store is busy);
+        the run goes on. Checked once."""
+        timeout = self.session_start_timeout
+        if timeout is None or self.session_start_checked or now < self.spawned_at + timeout:
+            return
+        sid, run_no = self.alloc.csession_id, self.alloc.run
+        warning = (
+            f"no SessionStart within {timeout:g}s of the spawn: the injected hooks may be"
+            " suppressed (disableAllHooks or managed-only hooks), so the run's state is not"
+            " tracked"
+        )
+        if not self.session_start_logged:
+            # Checked once: after the log line, a retry only retries the add, so the log and
+            # the run's warnings never disagree.
+            if self.st.run_record(sid, run_no)["session_started_at"] is not None:
+                self.session_start_checked = True
+                return
+            self.session_start_logged = True
+            launch.log_best_effort(
+                self.log,
+                "session_start_missing",
+                level="warn",
+                csession_id=sid,
+                run=run_no,
+                message=warning,
+            )
+        try:
+            self.st.add_run_warnings(sid, run_no, [warning])
+        except sqlite3.OperationalError:
+            return  # retried at the next poll
+        self.session_start_checked = True
 
     def _log_sent(self, signum: int, why: str) -> None:
         launch.log_best_effort(
@@ -512,6 +592,10 @@ def _implicit(
     return Mapped("done", "normal")
 
 
+# End reasons whose final event has a cause of its own (the others: ``exit``).
+_FINAL_CAUSES = {"auto_exit": "auto_exit", "timeout": "timeout"}
+
+
 def _final(mapped: Mapped, parsed: HeadlessResult) -> store.Final:
     is_error = None
     if parsed.final is not None and isinstance(parsed.final.get("is_error"), bool):
@@ -522,9 +606,9 @@ def _final(mapped: Mapped, parsed: HeadlessResult) -> store.Final:
         end_reason=mapped.end_reason,
         exit_code=EXIT_CODES[mapped.outcome],
         state=endmap.final_state(mapped.outcome),
-        # The final event's cause (interface.md, State transitions): auto_exit when exec ended
-        # claude for auto-exit, else exit. TODO(#19): timeout for a bound's end.
-        cause="auto_exit" if mapped.end_reason == "auto_exit" else "exit",
+        # The final event's cause (interface.md, State transitions): auto_exit or timeout when
+        # exec ended claude for auto-exit or at the run's bound, else exit.
+        cause=_FINAL_CAUSES.get(mapped.end_reason, "exit"),
         cost_usd=parsed.cost_usd,
         num_turns=parsed.num_turns,
         is_error=is_error,
@@ -567,15 +651,18 @@ def run_session(
     implicit_done: bool,
     auto_exit: bool,
     signals: ExecSignals,
+    bound: float | None = None,
 ) -> Ended:
     """Spawn, record, supervise and finish (see the module docs). A spawn that fails ends
     the run in the launch phase (exit 12); so does a signal received before the spawn
-    (``LaunchInterrupted``, re-raised once the run is final, like a ``KeyboardInterrupt``)."""
+    (``LaunchInterrupted``, re-raised once the run is final, like a ``KeyboardInterrupt``).
+    ``bound``: the run's wall-clock bound in seconds, counted from the spawn (None: none)."""
     sid, run_no = alloc.csession_id, alloc.run
     secret = prepared.run_secret
     signals.defer()  # nothing interrupts the spawn: a signal during it is forwarded after
     try:  # only the spawn here: its finally closes the output descriptors
         child = spawn(prepared, v, process, signals, mode=mode)
+        spawned_at = time.monotonic()
     except Exception as exc:
         error = launch.interrupted(exc, _not_started(exc))
         launch.end_launch(st, alloc, v, None, process, error, exc=exc)
@@ -604,7 +691,19 @@ def run_session(
             pid=child.pid,
             decision_ids=list(_decision_ids(record)),
         )
-        returncode = Supervision(st, cfg, alloc, child, signals, log, auto_exit=auto_exit).wait()
+        returncode = Supervision(
+            st,
+            cfg,
+            alloc,
+            child,
+            signals,
+            log,
+            auto_exit=auto_exit,
+            bound=bound,
+            # Interactive runs are exempt: they may wait at the trust dialog.
+            session_start_timeout=cfg.session_start_timeout if mode == "headless" else None,
+            spawned_at=spawned_at,
+        ).wait()
         signals.defer()  # the child is gone: later signals are recorded and dropped
     except BaseException:
         _internal_error(st, cfg, alloc, v, child)
@@ -719,33 +818,43 @@ def _finalize_internal_error(st: store.Store, sid: str, run_no: int) -> None:
 # The outcome object
 
 
+def report_of(row: dict[str, Any]) -> dict[str, Any] | None:
+    """The run's report as the outcome object shows it (``report``), from a ``run_record``
+    row; None when the run has none."""
+    if row["report_status"] is None:
+        return None
+    artifact = None
+    if row["artifact_name"] is not None:
+        artifact = {
+            "name": row["artifact_name"],
+            "path": row["artifact_path"],
+            "sha256": row["artifact_sha256"],
+            "size": row["artifact_size"],
+        }
+    return {
+        "status": row["report_status"],
+        "implicit": bool(row["report_implicit"]),
+        "summary": row["report_summary"],
+        "reason": row["report_reason"],
+        "artifact": artifact,
+        "reported_at": row["reported_at"],
+    }
+
+
 def outcome_object(
     st: store.Store, sid: str, run_no: int, extra: tuple[str, ...] = ()
 ) -> dict[str, Any]:
     """The run's outcome object (schemas/cli/outcome.json ``$defs/outcome``)."""
-    row = st.run_record(sid, run_no)
-    report = None
-    if row["report_status"] is not None and row["outcome"] in endmap.REPORT_OUTCOMES:
-        artifact = None
-        if row["artifact_name"] is not None:
-            artifact = {
-                "name": row["artifact_name"],
-                "path": row["artifact_path"],
-                "sha256": row["artifact_sha256"],
-                "size": row["artifact_size"],
-            }
-        report = {
-            "status": row["report_status"],
-            "implicit": bool(row["report_implicit"]),
-            "summary": row["report_summary"],
-            "reason": row["report_reason"],
-            "artifact": artifact,
-            "reported_at": row["reported_at"],
-        }
+    return outcome_of_row(st.run_record(sid, run_no), extra)
+
+
+def outcome_of_row(row: dict[str, Any], extra: tuple[str, ...] = ()) -> dict[str, Any]:
+    """The outcome object of a ``run_record`` row (one read: every field from ``row``)."""
+    report = report_of(row) if row["outcome"] in endmap.REPORT_OUTCOMES else None
     warnings = json.loads(row["warnings_json"] or "[]")
     return {
-        "csession_id": sid,
-        "run": run_no,
+        "csession_id": row["csession_id"],
+        "run": row["run_no"],
         "forked_from": row["session_forked_from"],
         "claude_session_id": row["session_claude_session_id"],
         "phase": row["phase"],
