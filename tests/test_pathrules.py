@@ -541,7 +541,7 @@ def test_profile_paths_inside_the_own_session_and_tmpdir_pass(world: World) -> N
                 "allow": ["Read(/{csdir}/inputs/**)", "Edit(/{csdir}/artifacts/**)"],
                 "deny": ["Read(/{state}/**)"],
             },
-            "sandbox": {"filesystem": {"allowWrite": ["{tmpdir}/x"], "denyRead": ["{state}"]}},
+            "sandbox": {"filesystem": {"allowWrite": ["{tmpdir}"], "denyRead": ["{state}"]}},
         },
         world,
     )
@@ -651,9 +651,9 @@ def test_resolve_tool(world: World) -> None:
     (world.root / "opt" / "first").mkdir()
     (world.root / "opt" / "first" / "tool").write_text("not executable")
     entries = [str(world.root / "opt" / "first"), str(world.bin)]
-    assert pathrules.resolve_tool("tool", entries, writable) == str(tool)
+    assert pathrules.resolve_tool("tool", entries, writable) == (str(tool), "tool")
     assert pathrules.resolve_tool("absent", entries, writable) is None
-    assert pathrules.resolve_tool(str(tool), [], writable) == str(tool)
+    assert pathrules.resolve_tool(str(tool), [], writable) == (str(tool), "tool")
 
 
 def test_resolve_tool_refuses_session_writable_binaries(world: World) -> None:
@@ -882,7 +882,8 @@ def test_resolve_tool_returns_the_realpath(world: World) -> None:
     writable = world.writable(cwd=world.repo)
     real = executable(world.root / "opt" / "real-tool")
     (world.bin / "tool").symlink_to(real)
-    assert pathrules.resolve_tool("tool", [str(world.bin)], writable) == str(real)
+    resolved = pathrules.resolve_tool("tool", [str(world.bin)], writable)
+    assert resolved is not None and resolved.path == str(real)
 
 
 def test_writable_hop(world: World) -> None:
@@ -981,10 +982,10 @@ def test_user_entries_inside_a_session_writable_path_are_refused(world: World) -
     content = {"sandbox": {"filesystem": {"allowRead": [str(world.repo / "tools")]}}}
     with pytest.raises(InvalidPermissionProfile, match="session-writable"):
         rules.check_profile(content, isolated=True, writable=writable)
-    # Entries equal to a session-writable path, inside the run's own directories, or
-    # elsewhere (also missing) stay allowed.
-    rules.check_write_dirs([str(world.repo), str(world.csdir / "outbox" / "x")], writable)
-    rules.check_read_dirs([str(world.csdir / "inputs"), str(world.root / "missing")], writable)
+    # Entries equal to a session-writable path or one of the run's own directories, or
+    # elsewhere (also missing), stay allowed.
+    rules.check_write_dirs([str(world.repo), str(world.csdir / "outbox")], writable)
+    rules.check_read_dirs([str(world.csdir), str(world.root / "missing")], writable)
 
 
 def test_read_dir_inside_a_write_dir_is_refused(world: World) -> None:
@@ -1102,3 +1103,128 @@ def test_home_root_is_refused(home: str) -> None:
     with pytest.raises(LaunchValidationError) as info:
         Host.from_environ({"HOME": home}, state_root="/s")
     assert info.value.end_reason == "unsafe_path"
+
+
+# Round-2 verification findings
+
+
+def _data_link(world: World) -> tuple[Path, Path]:
+    """``<repo>/lnk -> <root>/data``: an entry through a symlink the agent can re-point."""
+    data = world.root / "data"
+    data.mkdir()
+    link = world.repo / "lnk"
+    link.symlink_to(data)
+    return link, data
+
+
+def test_profile_sandbox_entries_through_a_symlink_in_the_cwd_are_refused(world: World) -> None:
+    link, _data = _data_link(world)
+    rules = world.rules(cwd=world.repo)
+    writable = world.writable(cwd=world.repo)
+    for content in (
+        {"sandbox": {"filesystem": {"allowRead": [str(link)]}}},
+        {"sandbox": {"filesystem": {"allowWrite": [str(link)]}}},
+        {"permissions": {"additionalDirectories": ["lnk"]}},
+        {"permissions": {"additionalDirectories": [str(link)]}},
+    ):
+        with pytest.raises(InvalidPermissionProfile, match="session-writable"):
+            rules.check_profile(content, isolated=True, writable=writable)
+
+
+def test_read_and_write_dirs_through_a_symlink_in_the_cwd_are_refused(world: World) -> None:
+    link, data = _data_link(world)
+    rules = world.rules(cwd=world.repo)
+    writable = world.writable(cwd=world.repo)
+    with pytest.raises(InvalidPermissionProfile, match="read_dirs"):
+        rules.check_read_dirs([str(link)], writable)
+    with pytest.raises(InvalidPermissionProfile, match="write_dirs"):
+        rules.check_write_dirs([str(link)], writable)
+    with pytest.raises(InvalidPermissionProfile, match="read_dirs"):
+        rules.check_read_dirs([str(link / "sub")], writable)
+    # The resolved target itself, named directly, stays allowed.
+    rules.check_read_dirs([str(data)], writable)
+    rules.check_write_dirs([str(data)], writable)
+
+
+def test_user_entry_through_a_symlink_into_the_cwd_is_refused(world: World) -> None:
+    (world.repo / "tools").mkdir()
+    via = world.root / "via"
+    via.symlink_to(world.repo / "tools")  # a safe symlink to a path inside the cwd
+    rules = world.rules(cwd=world.repo)
+    with pytest.raises(InvalidPermissionProfile, match="read_dirs"):
+        rules.check_read_dirs([str(via)], world.writable(cwd=world.repo))
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["{csdir}/outbox/sub", "{csdir}/work/sub", "{csdir}/artifacts/x", "{tmpdir}/sub"],
+)
+def test_user_entries_below_the_runs_own_directories_are_refused(world: World, entry: str) -> None:
+    path = entry.format(**{k: str(v) for k, v in vars(world).items()})
+    rules = world.rules(cwd=world.repo)
+    writable = world.writable(cwd=world.repo)
+    with pytest.raises(InvalidPermissionProfile, match="write_dirs"):
+        rules.check_write_dirs([path], writable)
+    with pytest.raises(InvalidPermissionProfile, match="read_dirs"):
+        rules.check_read_dirs([path], writable)
+
+
+def test_user_entries_equal_to_the_runs_own_directories_pass(world: World) -> None:
+    rules = world.rules(cwd=world.repo)
+    writable = world.writable(cwd=world.repo)
+    own = [str(world.csdir / name) for name in ("outbox", "artifacts", "work")]
+    rules.check_write_dirs(own, writable)
+    rules.check_read_dirs([str(world.csdir), *own], writable)
+    content = {"sandbox": {"filesystem": {"allowWrite": [str(world.tmpdir)]}}}
+    rules.check_profile(content, isolated=True, writable=writable)
+
+
+def test_resolve_tool_keeps_the_tool_name_for_argv0(world: World) -> None:
+    writable = world.writable(cwd=world.repo)
+    shim = executable(world.root / "opt" / "volta-shim")
+    (world.bin / "node").symlink_to(shim)
+    resolved = pathrules.resolve_tool("node", [str(world.bin)], writable)
+    assert resolved == pathrules.ResolvedTool(path=str(shim), name="node")
+    absolute = pathrules.resolve_tool(str(world.bin / "node"), [], writable)
+    assert absolute is not None and absolute.name == "node" and absolute.path == str(shim)
+
+
+def _aliased(world: World) -> Path:
+    """``<root>/alias -> <root>``: a symlinked ancestor (macOS ``/tmp -> /private/tmp``)."""
+    alias = world.root / "alias"
+    alias.symlink_to(world.root)
+    return alias
+
+
+def test_exceptions_hold_through_a_symlinked_ancestor(world: World) -> None:
+    alias = _aliased(world)
+    rel = lambda p: alias / p.relative_to(world.root)  # noqa: E731
+    rules = PathRules(
+        world.host(),
+        session_dir=str(rel(world.csdir)),
+        cwd=str(rel(world.work)),
+        caller_cwd=str(world.repo),
+        tmpdir=str(rel(world.tmpdir)),
+    )
+    assert rules.write_target_problem(str(world.work)) is None
+    assert rules.write_target_problem(str(rel(world.work))) is None
+    assert rules.write_target_problem(str(world.tmpdir / "x")) is None
+    rules.check_cwd()
+
+
+def test_swapped_final_component_through_a_symlinked_ancestor_loses_the_exception(
+    world: World,
+) -> None:
+    alias = _aliased(world)
+    os.rmdir(world.work)
+    world.work.symlink_to(world.home / ".ssh")
+    rules = PathRules(
+        world.host(),
+        session_dir=str(alias / world.csdir.relative_to(world.root)),
+        cwd=str(alias / world.work.relative_to(world.root)),
+        caller_cwd=str(world.repo),
+        tmpdir=str(world.tmpdir),
+    )
+    assert rules.write_target_problem(str(world.home / ".ssh")) is not None
+    with pytest.raises(LaunchValidationError):
+        rules.check_cwd()

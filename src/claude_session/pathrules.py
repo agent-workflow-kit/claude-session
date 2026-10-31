@@ -43,7 +43,7 @@ import sys
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import sessiondir
 from .errors import InvalidPermissionProfile, LaunchValidationError, UsageError
@@ -651,23 +651,45 @@ class PathRules:
 
     def user_entry_problem(self, path: str, writable: SessionWritable) -> str | None:
         """Isolated runs: a user-supplied sandbox entry (``read_dirs``, ``write_dirs``, a
-        profile's ``allowRead``, ``allowWrite`` or ``additionalDirectories``) may not be
-        inside a session-writable path (a proper ancestor of it): the agent could rename an
-        ancestor and swap in a symlink. Entries inside the run's own ``$CSESSION_DIR`` or
-        private tmpdir are exempt."""
+        profile's ``allowRead``, ``allowWrite`` or ``additionalDirectories``) reaches the
+        settings as written, so no step of resolving it may be changeable by the agent:
+        walked as ``writable_hop`` walks (``_resolution_steps``), no literal prefix, path
+        visited or realpath may lie strictly inside a session-writable path (the agent
+        could rename a parent and swap in a symlink), and no symlink followed may sit in a
+        session-writable directory (the agent could re-point it). An entry equal to the
+        run's own ``$CSESSION_DIR``, ``outbox/``, ``artifacts/``, ``work/`` or private
+        tmpdir (by realpath, each a real directory) is exempt from the first part; an entry
+        strictly below one of them is refused (list the directory itself)."""
         if path == _SETTINGS_RELATIVE:
             return "is relative to the generated settings file, inside the state root"
-        try:
-            ref = _ref(path)
-        except ValueError:
+        if not os.path.isabs(path):
+            return "is not an absolute path"
+        steps = _resolution_steps(path)
+        if steps is None:
             return "cannot be resolved"
-        if _exactly_under(ref, self._session) or self._in_tmpdir(ref):
+        for step, holds_link in steps:
+            if holds_link and writable(step):
+                return (
+                    "is reached through a symlink in a session-writable directory"
+                    f" ({_shown(step)}; the session could re-point it)"
+                )
+        real = os.path.realpath(path)  # _resolution_steps succeeded, so this does too
+        own = [*self._own, *([self._tmpdir] if self._tmpdir else []), self._session]
+        if any(real == ref.real for ref in own):
             return None
-        if writable.encloses(path):
-            return (
-                "is inside a session-writable path (the session could replace a parent"
-                " directory with a symlink)"
-            )
+        for ref in own:
+            if _under(real, ref.real):
+                return (
+                    f"is below the run's own directory {_shown(ref.real)} (list that"
+                    " directory itself: the session could replace a subdirectory with a"
+                    " symlink)"
+                )
+        for step, _holds_link in steps:
+            if writable.encloses(step):
+                return (
+                    "is inside a session-writable path (the session could replace a parent"
+                    " directory with a symlink)"
+                )
         return None
 
     # Read entries
@@ -893,17 +915,23 @@ def _hidden_dirs(home: _Ref, label: str) -> tuple[_Hidden, ...]:
 
 
 def _exception_dir(path: str) -> _Ref | None:
-    """The run's own directory ``path`` as an exception, or None: granted only while it is
-    a real directory (``lstat``: not a symlink) whose realpath is its normalized path, so
-    a ``work`` swapped for a symlink widens nothing."""
+    """The run's own directory ``path`` as an exception, or None: granted only while its
+    final component is a real directory (``lstat``: not a symlink) and its realpath is the
+    realpath of its parent joined with its name, so a ``work`` swapped for a symlink widens
+    nothing, while a symlinked ancestor (macOS ``/tmp -> /private/tmp``) keeps it. The
+    exception is compared by its realpath."""
     literal = os.path.normpath(path)
     try:
         info = os.lstat(literal)
+        if not stat.S_ISDIR(info.st_mode):
+            return None
+        real = os.path.realpath(literal)
+        parent = os.path.realpath(os.path.dirname(literal))
     except (OSError, ValueError):
         return None
-    if not stat.S_ISDIR(info.st_mode) or os.path.realpath(literal) != literal:
+    if real != os.path.join(parent, os.path.basename(literal)):
         return None
-    return _ref(literal)
+    return _ref(real)
 
 
 # read_dirs and write_dirs
@@ -950,7 +978,9 @@ class WriteDirs:
 def resolve_write_dirs(resolved: Sequence[str], *, session_dir: str) -> WriteDirs:
     """Sort resolved ``write_dirs``: one under ``$CSESSION_DIR`` must be inside ``outbox/``,
     ``artifacts/`` or ``work/`` (else ``InvalidPermissionProfile``) and is created when
-    missing; any other must exist, else it is skipped with a warning.
+    missing; any other must exist, else it is skipped with a warning. For isolated runs
+    ``check_write_dirs`` then refuses an entry strictly below ``outbox/``, ``artifacts/`` or
+    ``work/`` (``user_entry_problem``).
 
     TODO(#15): exec creates ``create`` (private-directory helpers) before launch."""
     session = os.path.realpath(session_dir)
@@ -985,19 +1015,17 @@ def sanitize_path(value: str) -> list[str]:
     return [entry for entry in value.split(":") if entry and os.path.isabs(entry)]
 
 
-def writable_hop(path: str, writable: Callable[[str], bool]) -> str | None:
-    """The first session-writable step of resolving ``path``, or None: every literal
-    normalized prefix of ``path``, every path visited while following its symlinks one
-    component at a time (``lstat``), the directory holding each symlink followed, and the
-    final realpath are checked with ``writable``. A symlink whose directory is
-    session-writable can be re-pointed by the agent, even when the final target is safe.
-    More than ``MAX_SYMLINKS`` symlinks, or a path that cannot be resolved, is returned as
-    it is (fail closed)."""
+def _resolution_steps(path: str) -> list[tuple[str, bool]] | None:
+    """The steps of resolving ``path``, in order, each paired with whether it is the
+    directory holding a symlink followed: every literal normalized prefix of ``path``, every
+    path visited while following its symlinks one component at a time (``lstat``), the
+    directory holding each symlink followed, and the final realpath. None for more than
+    ``MAX_SYMLINKS`` symlinks or a path that cannot be resolved (callers fail closed)."""
     try:
         literal = os.path.normpath(path)
-        steps = [literal]
+        steps = [(literal, False)]
         parts = [part for part in literal.split("/") if part]
-        steps += ["/" + "/".join(parts[:end]) for end in range(1, len(parts))]
+        steps += [("/" + "/".join(parts[:end]), False) for end in range(1, len(parts))]
         current = "/"
         links = 0
         while parts:
@@ -1008,7 +1036,7 @@ def writable_hop(path: str, writable: Callable[[str], bool]) -> str | None:
                 current = os.path.dirname(current)
                 continue
             candidate = os.path.join(current, name)
-            steps.append(candidate)
+            steps.append((candidate, False))
             try:
                 info = os.lstat(candidate)
             except OSError:
@@ -1019,16 +1047,30 @@ def writable_hop(path: str, writable: Callable[[str], bool]) -> str | None:
                 continue
             links += 1
             if links > MAX_SYMLINKS:
-                return path
-            steps.append(current)  # the directory holding the link
+                return None
+            steps.append((current, True))  # the directory holding the link
             target = os.readlink(candidate)
             if target.startswith("/"):
                 current = "/"
             parts = [part for part in target.split("/") if part] + parts
-        steps.append(os.path.realpath(literal))
+        steps.append((os.path.realpath(literal), False))
     except (OSError, ValueError):
+        return None
+    return list(dict.fromkeys(steps))
+
+
+def writable_hop(path: str, writable: Callable[[str], bool]) -> str | None:
+    """The first session-writable step of resolving ``path``, or None: every literal
+    normalized prefix of ``path``, every path visited while following its symlinks one
+    component at a time (``lstat``), the directory holding each symlink followed, and the
+    final realpath are checked with ``writable`` (``_resolution_steps``). A symlink whose
+    directory is session-writable can be re-pointed by the agent, even when the final target
+    is safe. More than ``MAX_SYMLINKS`` symlinks, or a path that cannot be resolved, is
+    returned as it is (fail closed)."""
+    steps = _resolution_steps(path)
+    if steps is None:
         return path
-    for step in dict.fromkeys(steps):
+    for step, _holds_link in steps:
         if writable(step):
             return step
     return None
@@ -1048,14 +1090,29 @@ def check_path_entries(entries: Sequence[str], writable: Callable[[str], bool]) 
             )
 
 
+class ResolvedTool(NamedTuple):
+    """A resolved executable: ``path`` is its realpath, the file to execute, and ``name``
+    the bare tool name (the basename of the name given) to pass as ``argv[0]``, so a launcher
+    that dispatches on ``argv[0]`` (volta, mise or snap symlink shims) still sees the tool it
+    was invoked as."""
+
+    path: str
+    name: str
+
+
 def resolve_tool(
     name: str, path_entries: Sequence[str], writable: Callable[[str], bool]
-) -> str | None:
-    """The realpath of executable ``name`` on the (sanitized) ``path_entries``, or None
-    when it is not found. An absolute ``name`` is used as it is; a relative name with a
-    ``/`` is refused. No step of resolving the found file (``writable_hop``: its literal
-    prefixes, every symlink hop and its realpath) may be session-writable. Raises
-    ``LaunchValidationError`` (``unsafe_path``)."""
+) -> ResolvedTool | None:
+    """Executable ``name`` on the (sanitized) ``path_entries``, or None when it is not
+    found. An absolute ``name`` is used as it is; a relative name with a ``/`` is refused.
+    No step of resolving the found file (``writable_hop``: its literal prefixes, every
+    symlink hop and its realpath) may be session-writable. The tool is executed from its
+    realpath (``ResolvedTool.path``: no symlink the agent could re-point is followed at
+    exec time) with ``argv[0]`` set to the bare tool name (``ResolvedTool.name``). Raises
+    ``LaunchValidationError`` (``unsafe_path``).
+
+    TODO(#15): the launch path execs ``path`` (through ``gateway``) with ``argv[0]`` =
+    ``name``."""
     if not name or "\x00" in name:
         raise LaunchValidationError("empty or invalid executable name", end_reason="unsafe_path")
     if "/" in name:
@@ -1075,7 +1132,7 @@ def resolve_tool(
                 f"executable is inside a session-writable path: {_shown(candidate)!r}",
                 end_reason="unsafe_path",
             )
-        return os.path.realpath(candidate)
+        return ResolvedTool(path=os.path.realpath(candidate), name=os.path.basename(candidate))
     return None
 
 
