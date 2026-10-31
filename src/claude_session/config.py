@@ -419,6 +419,16 @@ def load(
         where = _source(("default_kind",), sources, from_env)
         detail = f"default_kind: names no built-in or configured kind (in {where})"
         raise UsageError("invalid config", detail=detail)
+    for repo_id, repo in cfg.repos.items():
+        for kind in repo.kinds:
+            if kind not in cfg.kinds:
+                loc = ("repos", repo_id, "kinds", kind)
+                where = _source(loc, sources, from_env)
+                detail = (
+                    f"repos.{repo_id}.kinds.{kind}: names no built-in or configured kind"
+                    f" (in {where})"
+                )
+                raise UsageError("invalid config", detail=detail)
     return cfg
 
 

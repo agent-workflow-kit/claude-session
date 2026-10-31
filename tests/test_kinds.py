@@ -152,15 +152,28 @@ def test_unknown_kind_uses_the_configured_review_profile(cfg_dir: Path) -> None:
     assert result.origins["sandbox"] == "builtin"
 
 
-def test_unknown_kind_gets_no_per_repo_overrides(cfg_dir: Path) -> None:
+def test_unknown_kind_resolves_like_review_including_its_repo_override(cfg_dir: Path) -> None:
     cfg = load(
         cfg_dir,
-        f"repos: {{{REPO}: {{kinds: {{review: {{sandbox: 'off'}}, nope: {{sandbox: 'off'}}}}}}}}\n",
+        f"""\
+        kinds: {{review: {{sandbox: preferred}}}}
+        repos: {{{REPO}: {{kinds: {{review: {{sandbox: required, model: r}}}}}}}}
+        """,
     )
-    result = resolve(cfg, "nope", repo=REPO)
-    assert result.profile.sandbox == "required"
-    assert result.origins["sandbox"] == "builtin"
+    result = resolve(cfg, "typo", repo=REPO)
+    assert result.kind == "typo"
+    assert result.fallback is True
+    assert len(result.warnings) == 1
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("required", "repo")
+    assert (result.profile.model, result.origins["model"]) == ("r", "repo")
+    assert result.profile == resolve(cfg, "review", repo=REPO).profile
     assert result.repo == REPO
+
+
+def test_unknown_kind_with_review_override_still_takes_flags(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, f"repos: {{{REPO}: {{kinds: {{review: {{model: r}}}}}}}}\n")
+    result = resolve(cfg, "typo", repo=REPO, flags={"model": "m1"})
+    assert (result.profile.model, result.origins["model"]) == ("m1", "flag")
 
 
 def test_unknown_kind_still_takes_flags(cfg_dir: Path) -> None:
@@ -203,6 +216,27 @@ def test_unknown_default_kind_from_the_environment_names_the_variable(cfg_dir: P
             env={"XDG_CONFIG_HOME": str(cfg_dir.parent), "CSESSION_DEFAULT_KIND": "nope"},
         )
     assert "CSESSION_DEFAULT_KIND" in str(info.value.detail)
+
+
+@pytest.mark.parametrize("kind", ["nope", "typo"])
+def test_per_repo_override_of_an_unknown_kind_is_an_invalid_config(
+    cfg_dir: Path, kind: str
+) -> None:
+    with pytest.raises(UsageError) as info:
+        load(cfg_dir, f"repos: {{{REPO}: {{kinds: {{{kind}: {{sandbox: 'off'}}}}}}}}\n")
+    assert info.value.exit_code == 2
+    assert info.value.message == "invalid config"
+    detail = str(info.value.detail)
+    assert f"repos.{REPO}.kinds.{kind}" in detail
+    assert "names no built-in or configured kind" in detail
+    assert "config.yaml" in detail
+
+
+def test_per_repo_override_of_a_configured_kind_is_valid(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir, f"kinds: {{mine: {{}}}}\nrepos: {{{REPO}: {{kinds: {{mine: {{model: r}}}}}}}}\n"
+    )
+    assert resolve(cfg, "mine", repo=REPO).profile.model == "r"
 
 
 def test_default_kind_may_name_a_configured_kind(cfg_dir: Path) -> None:
@@ -391,7 +425,7 @@ def test_default_bounds_per_mode(cfg_dir: Path) -> None:
         ({"setting_sources": "user,bogus"}, "--setting-sources"),
         ({"setting_sources": "user,user"}, "--setting-sources"),
         ({"setting_sources": ","}, "--setting-sources"),
-        ({"permission_profile": "a/b"}, "--permission-profile"),
+        ({"permission_profile": "-x"}, "--permission-profile"),
         ({"auto_exit": "yes"}, "--[no-]auto-exit"),
     ],
 )
@@ -435,50 +469,106 @@ def test_permission_profile_flag(cfg_dir: Path) -> None:
     result = resolve(load(cfg_dir), "implement", flags={"permission_profile": "readonly"})
     assert result.profile.permission_profile == "readonly"
     assert result.origins["permission_profile"] == "flag"
+    assert result.permission_profile_file is None
+    assert "permission_profile_file" not in result.origins
+
+
+@pytest.mark.parametrize("value", ["/x/p.json", "p.yaml", "p.yml", "dir/p", "a/b"])
+def test_permission_profile_file_is_carried_raw(cfg_dir: Path, value: str) -> None:
+    result = resolve(load(cfg_dir), "implement", flags={"permission_profile": value})
+    assert result.permission_profile_file == value
+    assert result.origins["permission_profile_file"] == "flag"
+    assert result.profile.permission_profile == "default"
+    assert result.origins["permission_profile"] == "builtin"
+
+
+def test_carried_permission_profile_file_has_origin_previous_run(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"permission_profile": "/x/p.json"})
+    result = resolve(load(cfg_dir), "implement", previous=previous)
+    assert result.permission_profile_file == "/x/p.json"
+    assert result.origins["permission_profile_file"] == "previous_run"
+
+
+def test_permission_profile_name_now_replaces_a_carried_file(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"permission_profile": "/x/p.json"})
+    result = resolve(
+        load(cfg_dir), "implement", previous=previous, flags={"permission_profile": "readonly"}
+    )
+    assert result.permission_profile_file is None
+    assert (result.profile.permission_profile, result.origins["permission_profile"]) == (
+        "readonly",
+        "flag",
+    )
 
 
 # --env-allow / --env-allowlist-only
 
 
-def test_env_allow_adds_to_the_kind_allowlist(cfg_dir: Path) -> None:
+def test_env_allow_is_kept_apart_from_the_kind_allowlist(cfg_dir: Path) -> None:
     cfg = load(cfg_dir, "kinds: {implement: {env: {allow: [A]}}}\n")
     result = resolve(cfg, "implement", flags={"env_allow": ["B", "A", "B"]})
-    assert result.profile.env.allow == ["A", "B"]
+    assert result.profile.env.allow == ["A"]
+    assert result.origins["env.allow"] == "config"
+    assert result.env_allow == ("B", "A")
+    assert result.origins["env_allow"] == "flag"
+    assert result.env_allowlist_only is None
+    assert "env_allowlist_only" not in result.origins
+    assert result.env_allowlist() == ["A", "B"]
     assert result.profile.env.inherit is True
-    assert result.origins["env.allow"] == "flag"
     assert result.origins["env.inherit"] == "builtin"
+
+
+def test_no_env_flags(cfg_dir: Path) -> None:
+    result = resolve(load(cfg_dir), "implement")
+    assert result.env_allow == ()
+    assert result.env_allowlist_only is None
+    assert "env_allow" not in result.origins
 
 
 def test_env_allowlist_only_replaces_the_list_and_stops_inheritance(cfg_dir: Path) -> None:
     cfg = load(cfg_dir, "kinds: {implement: {env: {allow: [A]}}}\n")
     result = resolve(cfg, "implement", flags={"env_allowlist_only": ["C"]})
-    assert result.profile.env.allow == ["C"]
+    assert result.profile.env.allow == ["A"]  # the kind's list, never flag names
+    assert result.origins["env.allow"] == "config"
+    assert result.env_allowlist_only == ("C",)
+    assert result.origins["env_allowlist_only"] == "flag"
+    assert result.env_allowlist() == ["C"]
     assert result.profile.env.inherit is False
-    assert result.origins["env.allow"] == "flag"
     assert result.origins["env.inherit"] == "flag"
 
 
+def test_repo_env_allow_keeps_origin_repo_with_env_allow_flag(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, f"repos: {{{REPO}: {{kinds: {{implement: {{env: {{allow: [S]}}}}}}}}}}\n")
+    result = resolve(cfg, "implement", repo=REPO, flags={"env_allow": ["T"]})
+    assert (result.profile.env.allow, result.origins["env.allow"]) == (["S"], "repo")
+    assert result.env_allow == ("T",)
+
+
 @pytest.mark.parametrize(
-    ("names", "expected"), [([""], []), (["", "X"], ["X"]), (["X", ""], ["X"])]
+    ("names", "expected"), [([""], ()), (["", "X"], ("X",)), (["X", ""], ("X",))]
 )
-def test_empty_allowlist_only_name(cfg_dir: Path, names: list[str], expected: list[str]) -> None:
+def test_empty_allowlist_only_name(
+    cfg_dir: Path, names: list[str], expected: tuple[str, ...]
+) -> None:
     result = resolve(load(cfg_dir), "implement", flags={"env_allowlist_only": names})
-    assert result.profile.env.allow == expected
+    assert result.env_allowlist_only == expected
+    assert result.env_allowlist() == list(expected)
     assert result.profile.env.inherit is False
 
 
 def test_env_allow_adds_to_a_replaced_list(cfg_dir: Path) -> None:
     flags = {"env_allowlist_only": ["C"], "env_allow": ["D"]}
     result = resolve(load(cfg_dir), "implement", flags=flags)
-    assert result.profile.env.allow == ["C", "D"]
+    assert result.env_allowlist() == ["C", "D"]
 
 
 def test_env_flags_are_carried_separately(cfg_dir: Path) -> None:
     previous = kinds.Previous(repo=None, flags={"env_allowlist_only": ["C"], "env_allow": ["D"]})
     result = resolve(load(cfg_dir), "implement", previous=previous, flags={"env_allow": ["E"]})
-    assert result.profile.env.allow == ["C", "E"]  # env_allow now replaces the stored one only
+    assert result.env_allowlist() == ["C", "E"]  # env_allow now replaces the stored one only
+    assert result.origins["env_allow"] == "flag"
+    assert result.origins["env_allowlist_only"] == "previous_run"
     assert result.profile.env.inherit is False  # allowlist-only mode persists
-    assert result.origins["env.allow"] == "flag"
     assert result.origins["env.inherit"] == "previous_run"
 
 
@@ -491,12 +581,35 @@ def test_env_flags_are_carried_separately(cfg_dir: Path) -> None:
         ("env_allowlist_only", ["A=B"]),
         ("env_allow", "A"),  # a string, not a list
         ("env_allow", [1]),
+        ("env_allow", ["*"]),
+        ("env_allow", ["GH_*"]),
+        ("env_allow", ["a b"]),
+        ("env_allow", ["$(x)"]),
+        ("env_allow", ["1X"]),
+        ("env_allow", ["é"]),
+        ("env_allowlist_only", ["*"]),
+        ("env_allowlist_only", ["GH_*"]),
+        ("env_allowlist_only", ["a b"]),
+        ("env_allowlist_only", ["1X"]),
+        ("env_allowlist_only", ["é"]),
     ],
 )
 def test_invalid_env_names_are_usage_errors(cfg_dir: Path, key: str, names: Any) -> None:
     with pytest.raises(UsageError) as info:
         resolve(load(cfg_dir), "implement", flags={key: names})
     assert "--" + key.replace("_", "-") in info.value.message
+
+
+def test_invalid_carried_env_name_is_a_usage_error(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"env_allow": ["GH_*"]})
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", previous=previous)
+    assert "previous run" in info.value.message
+
+
+@pytest.mark.parametrize("name", ["A", "_x", "GH_TOKEN_2", "a1"])
+def test_valid_env_names(cfg_dir: Path, name: str) -> None:
+    assert resolve(load(cfg_dir), "implement", flags={"env_allow": [name]}).env_allow == (name,)
 
 
 # --reads-third-party
@@ -531,18 +644,83 @@ def test_reads_third_party_now_beats_a_carried_sandbox(cfg_dir: Path) -> None:
     assert (result.profile.sandbox, result.origins["sandbox"]) == ("required", "flag-implied")
 
 
-def test_carried_reads_third_party_keeps_its_carried_explicit_settings(cfg_dir: Path) -> None:
+def test_carried_explicit_settings_never_beat_carried_reads_third_party(cfg_dir: Path) -> None:
     previous = kinds.Previous(repo=None, flags={"reads_third_party": True, "sandbox": "off"})
     result = resolve(load(cfg_dir), "implement", previous=previous)
-    assert (result.profile.sandbox, result.origins["sandbox"]) == ("off", "previous_run")
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("required", "flag-implied")
     assert result.origins["setting_sources"] == "flag-implied"
     assert result.origins["reads_third_party"] == "previous_run"
+    assert any("--sandbox" in w and "--reads-third-party" in w for w in result.warnings)
 
 
-def test_sandbox_given_now_beats_carried_reads_third_party(cfg_dir: Path) -> None:
+def test_three_run_chain_keeps_the_implications(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir)
+    carried = {"sandbox": "off", "setting_sources": "user,project,local"}
+    # Run 2: the stored flags of run 1 are carried; --reads-third-party is given now.
+    run2 = resolve(
+        cfg, "implement", previous=kinds.Previous(None, carried), flags={"reads_third_party": True}
+    )
+    assert (run2.profile.sandbox, run2.origins["sandbox"]) == ("required", "flag-implied")
+    assert run2.profile.setting_sources == []
+    # Run 3: everything is carried; nothing is given now.
+    run3 = resolve(
+        cfg, "implement", previous=kinds.Previous(None, {**carried, "reads_third_party": True})
+    )
+    assert (run3.profile.sandbox, run3.origins["sandbox"]) == ("required", "flag-implied")
+    assert (run3.profile.setting_sources, run3.origins["setting_sources"]) == (
+        [],
+        "flag-implied",
+    )
+    assert run3.origins["reads_third_party"] == "previous_run"
+    assert any("--setting-sources" in w for w in run3.warnings)
+
+
+def test_sandbox_given_now_does_not_beat_carried_reads_third_party(cfg_dir: Path) -> None:
     previous = kinds.Previous(repo=None, flags={"reads_third_party": True})
-    result = resolve(load(cfg_dir), "implement", previous=previous, flags={"sandbox": "preferred"})
-    assert (result.profile.sandbox, result.origins["sandbox"]) == ("preferred", "flag")
+    result = resolve(load(cfg_dir), "implement", previous=previous, flags={"sandbox": "off"})
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("required", "flag-implied")
+    assert any("--sandbox" in w and "flags" in w for w in result.warnings)
+
+
+def test_sandbox_and_reads_third_party_both_now_give_off(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"reads_third_party": True})
+    flags = {"reads_third_party": True, "sandbox": "off"}
+    result = resolve(load(cfg_dir), "implement", previous=previous, flags=flags)
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("off", "flag")
+    assert result.warnings == ()
+
+
+def test_matching_carried_value_gives_no_warning(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"sandbox": "required", "env_allowlist_only": ["A"]})
+    result = resolve(
+        load(cfg_dir), "implement", previous=previous, flags={"reads_third_party": True}
+    )
+    assert result.origins["sandbox"] == "flag-implied"
+    assert result.origins["env.inherit"] == "flag-implied"
+    assert result.warnings == ()
+
+
+def test_kind_reads_third_party_lets_flags_set_the_profile(cfg_dir: Path) -> None:
+    # Without --reads-third-party there are no implications: the kind's values apply, and
+    # explicit flags (given now or carried) replace them as usual.
+    now = resolve(load(cfg_dir), "review", flags={"sandbox": "off"})
+    assert (now.profile.sandbox, now.origins["sandbox"]) == ("off", "flag")
+    carried = resolve(load(cfg_dir), "review", previous=kinds.Previous(None, {"sandbox": "off"}))
+    assert (carried.profile.sandbox, carried.origins["sandbox"]) == ("off", "previous_run")
+
+
+@pytest.mark.parametrize("value", [False, 0, "", "yes"])
+def test_only_true_reads_third_party_counts_as_given(cfg_dir: Path, value: Any) -> None:
+    cfg = load(cfg_dir)
+    now = resolve(cfg, "review", flags={"reads_third_party": value})
+    assert (now.profile.reads_third_party, now.origins["reads_third_party"]) == (True, "builtin")
+    previous = kinds.Previous(repo=None, flags={"reads_third_party": value})
+    carried = resolve(cfg, "review", previous=previous)
+    assert carried.profile.reads_third_party is True
+    assert carried.origins["reads_third_party"] == "builtin"
+    plain = resolve(cfg, "implement", flags={"reads_third_party": value})
+    assert plain.profile.sandbox == "off"
+    assert "flag-implied" not in plain.origins.values()
 
 
 def test_allowlist_only_in_the_same_call_sets_inherit(cfg_dir: Path) -> None:
@@ -656,11 +834,18 @@ class FakeRun:
     def __init__(self, result: subprocess.CompletedProcess[str] | Exception) -> None:
         self.result = result
         self.calls: list[tuple[list[str], float | None]] = []
+        self.envs: list[dict[str, str] | None] = []
 
     def __call__(
-        self, argv: list[str], *, stdin: str | None = None, timeout: float | None = None
+        self,
+        argv: list[str],
+        *,
+        stdin: str | None = None,
+        timeout: float | None = None,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append((argv, timeout))
+        self.envs.append(env)
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -687,6 +872,62 @@ def test_git_origin_url_runs_hardened_read_only_git(monkeypatch: pytest.MonkeyPa
     ):
         assert argv[argv.index(setting) - 1] == "-c"
     assert timeout is not None and timeout > 0
+
+
+GIT_DISCOVERY_VARIABLES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_NAMESPACE",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+    "GIT_CONFIG_KEY_12",
+    "GIT_CONFIG_VALUE_12",
+)
+
+
+def test_git_origin_url_ignores_the_callers_git_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in GIT_DISCOVERY_VARIABLES:
+        monkeypatch.setenv(name, "/elsewhere")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "0")
+    monkeypatch.setenv("CSESSION_KEEP_ME", "1")
+    fake = FakeRun(completed(0, "https://example.com/a/b\n"))
+    monkeypatch.setattr(gateway, "run", fake)
+    kinds.git_origin_url("/w")
+    (env,) = fake.envs
+    assert env is not None
+    for name in GIT_DISCOVERY_VARIABLES:
+        assert name not in env
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["CSESSION_KEEP_ME"] == "1"
+
+
+def test_real_git_lookup_ignores_git_dir(
+    cfg_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repos = {}
+    for name, url in (
+        ("work", "https://example.com/group/project"),
+        ("other", "https://example.com/x/y"),
+    ):
+        path = tmp_path / name
+        path.mkdir()
+        git = ["git", "-c", "core.hooksPath=/dev/null", "-C", str(path)]
+        subprocess.run([*git, "init", "-q"], check=True)
+        subprocess.run([*git, "remote", "add", "origin", url], check=True)
+        repos[name] = path
+    monkeypatch.setenv("GIT_DIR", str(repos["other"] / ".git"))
+    assert kinds.git_origin_url(str(repos["work"])) == "https://example.com/group/project"
 
 
 def test_git_origin_url_trims_only_one_newline(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -28,6 +28,8 @@ PERMISSION_PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}")
 ARTIFACT_NAME = re.compile(r"[A-Za-z0-9._-]{1,128}")
 LABEL_KEY = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
+# Environment variable names (--env-allow, --env-allowlist-only); ASCII only.
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 LABEL_VALUE = re.compile(r"[A-Za-z0-9._:/#@+=,-]{0,256}")
 # Prefix input after `cs-`: what any id prefix of at least MIN_PREFIX_LENGTH can look like.
 ID_PREFIX_BODY = re.compile(r"[a-z2-7]{4,8}")
@@ -131,6 +133,10 @@ def is_kind_name(name: str) -> bool:
 def is_permission_profile_name(name: str) -> bool:
     # TODO(#22): enforce on --permission-profile names.
     return PERMISSION_PROFILE_NAME.fullmatch(name) is not None
+
+
+def is_env_name(name: str) -> bool:
+    return ENV_NAME.fullmatch(name) is not None
 
 
 def is_skill_name(name: str) -> bool:

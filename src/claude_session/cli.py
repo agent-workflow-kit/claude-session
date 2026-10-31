@@ -14,7 +14,7 @@ import re
 import sys
 import traceback
 from collections.abc import Callable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from . import durations, fsutil, ids
@@ -371,20 +371,28 @@ def _check_timeout(args: argparse.Namespace) -> None:
         _check_duration("--timeout", args.timeout, bound=True)
 
 
-def _check_since(text: str) -> None:
-    """``--since``: an ISO 8601 time, or a duration (that long ago)."""
+def since_threshold(text: str, *, now: datetime | None = None) -> datetime:
+    """The time ``--since`` stands for (timezone-aware). A duration (that long before ``now``)
+    is tried first, so bare digits such as ``20240101`` are seconds; then an ISO 8601 time,
+    UTC when it has no offset."""
     try:
-        datetime.fromisoformat(text)
-        return
+        seconds = durations.parse(text)
     except ValueError:
         pass
+    else:
+        return (now or datetime.now(UTC)) - timedelta(seconds=seconds)
     try:
-        durations.parse(text)
+        when = datetime.fromisoformat(text)
     except ValueError:
         raise UsageError(
             "--since: expected an ISO 8601 time or a duration (seconds or <number><unit> "
             "with unit ms, s, m, h or d)"
         ) from None
+    return when if when.tzinfo is not None else when.replace(tzinfo=UTC)
+
+
+def _check_since(text: str) -> None:
+    since_threshold(text)
 
 
 def _split_hook(flag: str, entry: str) -> str:
@@ -419,6 +427,14 @@ def _check_launch_flags(args: argparse.Namespace) -> None:
         if name in basenames:
             raise UsageError(f"duplicate --input-file name {name!r}")
         basenames.add(name)
+    for dest in ("env_allow", "env_allowlist_only"):
+        for name in getattr(args, dest) or []:
+            if name == "" and dest == "env_allowlist_only":
+                continue  # `--env-allowlist-only ''`: an empty list
+            if not ids.is_env_name(name):
+                raise UsageError(
+                    f"{_flag(dest)}: invalid variable name {name!r} (^{ids.ENV_NAME.pattern}$)"
+                )
     if args.setting_sources:
         for source in args.setting_sources.split(","):
             if source not in SETTING_SOURCES:

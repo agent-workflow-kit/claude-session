@@ -63,7 +63,26 @@ _IMPLIED: tuple[tuple[str, Any, str | None], ...] = (
     ("env.inherit", False, "env_allowlist_only"),
     ("mcp", "none", None),
 )
-_RANK: dict[str, int] = {"previous_run": 0, "flag": 1}
+# `--permission-profile` values naming a file (interface.md, Launch flags).
+_PROFILE_FILE_SUFFIXES = (".json", ".yaml", ".yml")
+# Variables that would point git at another repository or config than the one at ``cwd``.
+_GIT_ENV_DROP = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_NAMESPACE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    }
+)
+_GIT_ENV_DROP_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 
 # Hardening for every git call (design.md, Git calls).
 GIT_HARDENING = (
@@ -95,19 +114,50 @@ class Previous:
 
 @dataclass(frozen=True)
 class Resolution:
-    """The effective kind profile of a run and where each value came from."""
+    """The effective kind profile of a run and where each value came from.
+
+    ``profile`` holds the kind's values (built-in, config, per-repo override) with the explicit
+    flags applied, except for the flag values kept apart below so their provenance survives:
+
+    - ``env_allow``: names from ``--env-allow`` (given now or carried); () when not given.
+    - ``env_allowlist_only``: names from ``--env-allowlist-only``; None when not given, ()
+      for ``--env-allowlist-only ''``. When set it replaces ``profile.env.allow`` in the
+      effective allowlist (``env_allowlist()``); ``profile.env.inherit`` is then false.
+    - ``permission_profile_file``: the raw ``--permission-profile`` value when it names a file
+      (contains ``/`` or ends in ``.json``, ``.yaml`` or ``.yml``); None otherwise.
+      ``profile.permission_profile`` then keeps the kind's profile name.
+
+    So ``profile.env.allow`` only ever holds names from the built-in, config and per-repo
+    layers. ``origins`` has an entry ``env_allow``, ``env_allowlist_only`` or
+    ``permission_profile_file`` (``flag`` or ``previous_run``) exactly when that field is set.
+    """
 
     kind: str  # the kind as given (also when it fell back to the review profile)
     builtin: bool
     fallback: bool  # unknown kind: the review profile is used
     repo: str | None
     profile: config.Kind
-    origins: dict[str, Origin]  # ORIGIN_FIELDS, plus "repo" when there is one
+    origins: dict[str, Origin]  # ORIGIN_FIELDS, "repo" and the flag-only fields when set
     warnings: tuple[str, ...] = ()
+    # TODO(#10): the env builder must never let these flag-supplied names unlock a secret_env
+    # variable; only profile.env.allow (the kind's config env.allow) can.
+    env_allow: tuple[str, ...] = ()
+    env_allowlist_only: tuple[str, ...] | None = None
+    # TODO(#22): resolve, read and snapshot the permission profile file.
+    permission_profile_file: str | None = None
 
     def timeout(self, mode: Mode) -> float | None:
         """The run's wall-clock bound in ``mode`` (seconds; None: no bound)."""
         return self.profile.timeout if mode == "headless" else self.profile.interactive_timeout
+
+    def env_allowlist(self) -> list[str]:
+        """The effective allowlist: ``env_allowlist_only`` (when set) or the kind's
+        ``env.allow``, then the ``env_allow`` names not already in it."""
+        base = (
+            self.profile.env.allow if self.env_allowlist_only is None else self.env_allowlist_only
+        )
+        names = list(base)
+        return names + [name for name in self.env_allow if name not in names]
 
 
 def resolve(
@@ -135,17 +185,21 @@ def resolve(
         raise UsageError(f"invalid kind name {name!r} (^{ids.KIND_NAME.pattern}$)")
     warnings: list[str] = []
     fallback = name not in cfg.kinds
+    # An unknown kind resolves exactly as `--kind review` would (including the repo's
+    # per-repo `review` override); it keeps its own name.
     base_name = FALLBACK_KIND if fallback else name
     if fallback:
         warnings.append(f"unknown kind {name!r}: using the {FALLBACK_KIND} profile")
     base = cfg.kinds[base_name]
+    # TODO(#27): the dry-run serializer must rename env.set -> env.set_names (names only),
+    # add the profile's name, and take the top-level `timeout` origin from the mode's key
+    # (`timeout` or `interactive_timeout`).
     origins = _config_origins(base_name, base)
 
     repo_id, repo_origin = _resolve_repo(base, repo, cwd, previous, origin_url)
-    # The fallback is the whole review profile: per-repo overrides of neither name apply.
-    profile = base if fallback else config.kind_settings(cfg, name, repo_id)
-    if not fallback and repo_id is not None and repo_id in cfg.repos:
-        override = cfg.repos[repo_id].kinds.get(name)
+    profile = config.kind_settings(cfg, base_name, repo_id)
+    if repo_id is not None and repo_id in cfg.repos:
+        override = cfg.repos[repo_id].kinds.get(base_name)
         if override is not None:
             for key in _override_fields(override):
                 origins[key] = "repo"
@@ -153,7 +207,8 @@ def resolve(
         origins["repo"] = repo_origin
 
     explicit = _explicit(previous.flags if previous else {}, flags or {})
-    profile = _apply_flags(profile, explicit, origins, mode)
+    extra: dict[str, Any] = {}
+    profile = _apply_flags(profile, explicit, origins, mode, extra, warnings)
     return Resolution(
         kind=name,
         builtin=name in BUILTIN_KINDS,
@@ -162,6 +217,7 @@ def resolve(
         profile=profile,
         origins=origins,
         warnings=tuple(warnings),
+        **extra,
     )
 
 
@@ -198,16 +254,28 @@ def _check_repo(value: str, where: str) -> None:
 def git_origin_url(cwd: str) -> str | None:
     """The URL of the ``origin`` remote of the repository at ``cwd`` (hardened, read-only git),
     or None when there is none or git fails. Only git's trailing newline is removed."""
-    # TODO(#15): run git through the #51 gateway: the absolute git resolved at launch, with
-    # GIT_CONFIG_NOSYSTEM=1 in its environment and the cwd set by the gateway.
+    # TODO(#15): run git through the #51 gateway: the absolute git resolved at launch and the
+    # cwd set by the gateway; the environment cleanup below (git_env) moves there too.
     argv = ["git", *GIT_HARDENING, "-C", os.fspath(cwd), "remote", "get-url", "origin"]
     try:
-        result = gateway.run(argv, timeout=GIT_TIMEOUT)
+        result = gateway.run(argv, timeout=GIT_TIMEOUT, env=git_env(os.environ))
     except (OSError, ValueError, gateway.subprocess.SubprocessError):
         return None
     if result.returncode != 0:
         return None
     return result.stdout.removesuffix("\n")
+
+
+def git_env(env: Mapping[str, str]) -> dict[str, str]:
+    """``env`` without the variables that select another repository or extra config
+    (``GIT_DIR``, ``GIT_CONFIG_*`` and the like), with ``GIT_CONFIG_NOSYSTEM=1``."""
+    clean = {
+        key: value
+        for key, value in env.items()
+        if key not in _GIT_ENV_DROP and not key.startswith(_GIT_ENV_DROP_PREFIXES)
+    }
+    clean["GIT_CONFIG_NOSYSTEM"] = "1"
+    return clean
 
 
 # Origins of the built-in and config layers
@@ -254,8 +322,10 @@ def _explicit(previous: Mapping[str, Any], now: Mapping[str, Any]) -> dict[str, 
         if unknown:
             raise TypeError(f"not a launch-setting flag: {unknown}")
         for key, value in layer.items():
-            if value is not None:
-                explicit[key] = (value, origin)
+            # `--reads-third-party` can only force true: any other stored value is not given.
+            if value is None or (key == "reads_third_party" and value is not True):
+                continue
+            explicit[key] = (value, origin)
     return explicit
 
 
@@ -264,10 +334,17 @@ def _apply_flags(
     explicit: Mapping[str, tuple[Any, Origin]],
     origins: dict[str, Origin],
     mode: Mode,
+    extra: dict[str, Any],
+    warnings: list[str],
 ) -> config.Kind:
+    """Apply the explicit flags to ``profile``. Flag values kept apart from the profile go to
+    ``extra`` (``Resolution`` field -> value) with their origin in ``origins``."""
     data = profile.model_dump()
     env = data["env"]
     sources: dict[str, Origin] = {}  # field -> origin of the flag that set it (for errors)
+
+    def get(key: str) -> Any:
+        return env[key.removeprefix("env.")] if key.startswith("env.") else data[key]
 
     def put(key: str, value: Any, origin: Origin) -> None:
         if key.startswith("env."):
@@ -277,6 +354,10 @@ def _apply_flags(
         origins[key] = origin
         sources.setdefault(key.partition(".")[0], origin)
 
+    def keep(key: str, value: Any, origin: Origin) -> None:
+        extra[key] = value
+        origins[key] = origin
+
     for key in FLAG_KEYS:
         if key not in explicit:
             continue
@@ -285,26 +366,31 @@ def _apply_flags(
             put("timeout" if mode == "headless" else "interactive_timeout", value, origin)
         elif key == "setting_sources":
             put(key, _setting_sources(value), origin)
-        elif key == "env_allowlist_only":
-            put("env.allow", _env_names(value, key, origin, allow_empty=True), origin)
-            put("env.inherit", False, origin)
-        elif key == "env_allow":
-            names = _env_names(value, key, origin, allow_empty=False)
-            current = list(env["allow"])
-            allowlist = explicit.get("env_allowlist_only")
-            if allowlist is not None and _RANK[allowlist[1]] > _RANK[origin]:
-                origin = allowlist[1]
-            put("env.allow", current + [n for n in names if n not in current], origin)
+        elif key in ("env_allowlist_only", "env_allow"):
+            only = key == "env_allowlist_only"
+            keep(key, tuple(_env_names(value, key, origin, allow_empty=only)), origin)
+            if only:
+                put("env.inherit", False, origin)
+        elif key == "permission_profile" and _is_profile_file(value):
+            keep("permission_profile_file", value, origin)
         else:
             put(key, value, origin)
 
+    # `--reads-third-party` implications (interface.md, Launch flags): an explicit flag beats
+    # one only when it and `--reads-third-party` are both given in the current call; a
+    # carried flag never does.
     third_party = explicit.get("reads_third_party")
-    if third_party is not None and third_party[0] is True:
-        rank = _RANK[third_party[1]]
+    if third_party is not None:
         for key, value, flag in _IMPLIED:
             given = explicit.get(flag) if flag is not None else None
-            if given is None or _RANK[given[1]] < rank:
-                put(key, value, "flag-implied")
+            if given is not None and given[1] == "flag" and third_party[1] == "flag":
+                continue
+            if flag is not None and given is not None and get(key) != value:
+                warnings.append(
+                    f"{_FLAG_NAMES[flag]} (from {_LAYER_NAMES[given[1]]}) is overridden by "
+                    "--reads-third-party; give both in the same call to keep it"
+                )
+            put(key, value, "flag-implied")
 
     def where(loc: tuple[str | int, ...]) -> str:
         top = str(loc[0]) if loc else ""
@@ -317,11 +403,16 @@ def _apply_flags(
     return config.validate_kind(data, where)
 
 
+def _is_profile_file(value: Any) -> bool:
+    """Whether a ``--permission-profile`` value names a file rather than a config profile."""
+    return isinstance(value, str) and ("/" in value or value.endswith(_PROFILE_FILE_SUFFIXES))
+
+
 def _flag_for(field_name: str) -> str | None:
     if field_name in ("timeout", "interactive_timeout"):
         return "--timeout"
     if field_name == "env":
-        return "--env-allow/--env-allowlist-only"
+        return "--env-allowlist-only"
     return _FLAG_NAMES.get(field_name)
 
 
@@ -345,10 +436,9 @@ def _env_names(value: Any, key: str, origin: Origin, *, allow_empty: bool) -> li
             raise UsageError(f"{flag}: expected variable names ({_LAYER_NAMES[origin]})")
         if name == "" and allow_empty:
             continue
-        if name == "" or "=" in name or "\0" in name:
+        if not ids.is_env_name(name):
             raise UsageError(
-                f"{flag}: a variable name must be non-empty and contain no '=' or NUL"
-                f" ({_LAYER_NAMES[origin]})"
+                f"{flag}: invalid variable name (^{ids.ENV_NAME.pattern}$) ({_LAYER_NAMES[origin]})"
             )
         if name not in names:
             names.append(name)
