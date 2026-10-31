@@ -3,6 +3,7 @@ ingestion): validation, size caps, both artifact forms, run.json, the outbox fil
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -334,6 +335,53 @@ def test_the_run_secret_in_the_artifact_is_refused(run: Run) -> None:
     usage(run, "artifact contains a secret", artifact="out.txt")
 
 
+@pytest.mark.parametrize("field", ["summary", "reason", "artifact"])
+def test_the_run_secret_in_upper_case_is_refused(run: Run, field: str) -> None:
+    upper = run.secret.upper()
+    assert upper != run.secret
+    if field == "summary":
+        usage(run, "summary contains a secret", summary=f"token {upper} here")
+    elif field == "reason":
+        reason = run.write_artifact("reason.md", upper.encode())
+        usage(run, "reason contains a secret", status="blocked", reason_file=reason)
+    else:
+        run.write_artifact("out.txt", b"prefix " + upper.encode() + b" suffix")
+        usage(run, "artifact contains a secret", artifact="out.txt")
+
+
+# The outbox write
+
+
+def test_the_request_is_written_and_renamed_within_the_outbox(
+    run: Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In the sandbox outbox/ and artifacts/ are separate bind mounts: a rename between them
+    fails with EXDEV, so the temporary file must live in outbox/ itself."""
+    real_rename = os.rename
+
+    def same_dir_only(
+        src: Any, dst: Any, *, src_dir_fd: Any = None, dst_dir_fd: Any = None
+    ) -> None:
+        if src_dir_fd is not None and dst_dir_fd is not None:
+            a, b = os.fstat(src_dir_fd), os.fstat(dst_dir_fd)
+            if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+        real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "rename", same_dir_only)
+    run.write_artifact("a.md", b"a")
+    queued = run.report(artifact="a.md")
+    assert listing(run.outbox) == [f"{queued.request_id}.json"]
+    assert listing(run.artifacts) == ["a.md"]
+
+
+def test_temporary_names_are_reserved_and_never_request_names() -> None:
+    name = outbox.temp_name()
+    assert outbox.is_temp_name(name) and not outbox.is_request_name(name)
+    assert not outbox.is_temp_name(f"{outbox.new_request_id()}.json")
+    assert not outbox.is_temp_name(".tmp-xyz")
+
+
 # The session: environment, run.json, directories
 
 
@@ -382,6 +430,24 @@ def test_artifact_path_through_the_symlinked_csession_dir(run: Run, tmp_path: Pa
     run.write_artifact("a.md", b"a")
     environ = {"CSESSION_ID": SID, "CSESSION_DIR": str(link)}
     queued = run.report(artifact=str(link / "artifacts" / "a.md"), environ=environ)
+    assert queued.artifact == "a.md"
+
+
+def test_the_real_path_form_of_a_symlinked_csession_dir_is_refused(
+    run: Run, tmp_path: Path
+) -> None:
+    """The lexical parent must be exactly $CSESSION_DIR/artifacts: no symlink resolution."""
+    link = tmp_path / "link"
+    link.symlink_to(run.csession_dir)
+    run.write_artifact("a.md", b"a")
+    real = os.path.join(os.path.realpath(run.csession_dir), "artifacts", "a.md")
+    environ = {"CSESSION_ID": SID, "CSESSION_DIR": str(link)}
+    usage(run, r"\$CSESSION_DIR/artifacts/<name>", artifact=real, environ=environ)
+
+
+def test_repeated_slashes_in_the_artifact_path_are_collapsed(run: Run) -> None:
+    run.write_artifact("a.md", b"a")
+    queued = run.report(artifact=run.csession_dir + "//artifacts///a.md")
     assert queued.artifact == "a.md"
 
 

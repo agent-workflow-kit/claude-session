@@ -57,14 +57,20 @@ REQUEST_FIELDS = frozenset(
 )
 # The request file is at most 4 x summary_max_bytes + this (interface.md, report).
 REQUEST_OVERHEAD = 16 * 1024
-# A drain reads at most this many directory entries of outbox/ (and of claimed/) and
-# processes at most this many requests (design.md, Claim).
+# A drain reads at most DRAIN_MAX_READ directory entries of outbox/ (and of claimed/),
+# claims at most DRAIN_MAX_ENTRIES requests (junk and temporary names do not count) and
+# processes at most DRAIN_MAX_REQUESTS of them (design.md, Claim).
+DRAIN_MAX_READ = 4096
 DRAIN_MAX_ENTRIES = 64
 DRAIN_MAX_REQUESTS = 16
+# Seconds a drain may spend claiming and checking: half the 60 s timeout of the hooks that
+# drain (settings_builder.HOOKS, tested equal); the rest waits for the next drain.
+DRAIN_BUDGET = 30.0
 # run.json is written by exec; anything larger is not one.
 RUN_JSON_MAX_BYTES = 1024 * 1024
 SECRET_CHARS = 64
-# Scan copies older than this are leftovers of a canceled hook (hook timeouts are 60 s).
+# Scan copies and report temporary files older than this are leftovers of a canceled hook
+# or report (hook timeouts are 60 s).
 SCAN_LEFTOVER_AGE = 600.0
 
 # Names (sessiondir's constants; sessiondir is not on the hook path, so they are restated
@@ -86,6 +92,9 @@ SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # A UUIDv7 in its canonical lowercase form; request files are named ``<uuid>.json``.
 UUID7 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 REQUEST_SUFFIX = ".json"
+# report's temporary file in outbox/: a reserved name a drain never claims (design.md,
+# Claim).
+TEMP_NAME = re.compile(r"\.tmp-[0-9a-f]{16}")
 CREATED = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z")
 
 # Rejection reasons (interface.md, report) and the fixed, trusted sentence the PostToolUse
@@ -153,8 +162,22 @@ def is_request_name(name: str) -> bool:
     return suffix == REQUEST_SUFFIX and UUID7.fullmatch(stem) is not None
 
 
+def temp_name() -> str:
+    """A fresh reserved temporary name for ``report``'s request file in ``outbox/``."""
+    return f".tmp-{secrets.token_hex(8)}"
+
+
+def is_temp_name(name: str) -> bool:
+    return TEMP_NAME.fullmatch(name) is not None
+
+
 def is_artifact_name(name: str) -> bool:
     return ARTIFACT_NAME.fullmatch(name) is not None and name not in (".", "..")
+
+
+def _has_secret(data: bytes, secret: str) -> bool:
+    """Whether the run secret (lowercase hex) occurs in ``data`` in any letter case."""
+    return secret.encode("ascii") in data.lower()
 
 
 def secret_sha256(value: str) -> str:
@@ -199,11 +222,11 @@ class _BadFile(Exception):
         self.reason = reason  # not_regular_file or too_large
 
 
-def _read_regular(dir_fd: int, name: str, cap: int) -> bytes:
-    """Read ``name`` in ``dir_fd``: opened without following a symlink and without waiting on
-    a FIFO, a regular file with one link owned by us, at most ``cap`` bytes (checked with
-    ``fstat`` before reading and again while reading). ``FileNotFoundError`` when missing,
-    ``_BadFile`` for the rest."""
+def _open_regular(dir_fd: int, name: str, cap: int) -> int:
+    """Open ``name`` in ``dir_fd`` for reading: without following a symlink and without
+    waiting on a FIFO, a regular file with one link owned by us, at most ``cap`` bytes by
+    ``fstat`` (the caller checks the size again while reading). ``FileNotFoundError`` when
+    missing, ``_BadFile`` for the rest."""
     try:
         fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
     except FileNotFoundError:
@@ -216,6 +239,16 @@ def _read_regular(dir_fd: int, name: str, cap: int) -> bytes:
             raise _BadFile("not_regular_file")
         if info.st_size > cap:
             raise _BadFile("too_large")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_regular(dir_fd: int, name: str, cap: int) -> bytes:
+    """Read ``name`` in ``dir_fd`` (``_open_regular``), at most ``cap`` bytes."""
+    fd = _open_regular(dir_fd, name, cap)
+    try:
         chunks: list[bytes] = []
         size = 0
         while size <= cap:
@@ -386,21 +419,17 @@ def _check_text(text: str, what: str, cap: int) -> None:
         raise _usage(f"the {what} is empty")
 
 
-def _artifact_name(value: str, csession_dir: str, real_dir: str) -> str:
-    """``--artifact``: a bare name, or a path whose lexical parent (no symlink resolution) is
-    exactly ``$CSESSION_DIR/artifacts``. Only the name is used afterwards; the file is opened
-    relative to the verified ``artifacts/`` descriptor."""
+def _artifact_name(value: str, csession_dir: str) -> str:
+    """``--artifact``: a bare name, or a path whose lexical parent (no symlink resolution;
+    repeated slashes collapsed) is exactly ``$CSESSION_DIR/artifacts``. Only the name is used
+    afterwards; the file is opened relative to the verified ``artifacts/`` descriptor."""
     if "/" not in value:
         name = value
     else:
         parent, name = os.path.split(value)
         if any(part in (".", "..") for part in parent.split("/")):
             raise _usage(f"--artifact {value}: the path must be $CSESSION_DIR/artifacts/<name>")
-        allowed = {
-            os.path.normpath(os.path.join(csession_dir, ARTIFACTS)),
-            os.path.join(real_dir, ARTIFACTS),
-        }
-        if os.path.normpath(parent) not in allowed:
+        if os.path.normpath(parent) != os.path.normpath(os.path.join(csession_dir, ARTIFACTS)):
             raise _usage(f"--artifact {value}: the path must be $CSESSION_DIR/artifacts/<name>")
     if not is_artifact_name(name):
         raise _usage(
@@ -498,7 +527,7 @@ def file_report(
         name = digest = None
         data = b""
         if artifact is not None:
-            name = _artifact_name(artifact, csession_dir, real_dir)
+            name = _artifact_name(artifact, csession_dir)
             try:
                 data = _read_regular(artifacts_fd, name, info.artifact_max_bytes)
             except FileNotFoundError as exc:
@@ -515,15 +544,15 @@ def file_report(
                     "(symbolic links and hard links are refused)"
                 ) from exc
             digest = hashlib.sha256(data).hexdigest()
-        # The run secret is the one secret value report can see; the full contains_secret
-        # scan (every configured value) runs at ingestion.
-        token = secret.encode("ascii")
+        # The run secret is the one secret value report can see (refused in any letter case,
+        # as ingestion does); the full contains_secret scan (every configured value) runs at
+        # ingestion.
         for what, blob in (
             ("summary", (summary_text or "").encode("utf-8")),
             ("reason", (reason_text or "").encode("utf-8")),
             ("artifact", data),
         ):
-            if token in blob:
+            if _has_secret(blob, secret):
                 raise _usage(f"the {what} contains a secret value (the run secret); remove it")
 
         created = (clock or (lambda: datetime.now(UTC)))()
@@ -542,18 +571,20 @@ def file_report(
         if len(encoded) > 4 * cap + REQUEST_OVERHEAD:
             raise _usage("the report is larger than the request size limit")
         rid = request_id()
-        _write_request(artifacts_fd, outbox_fd, rid, encoded)
+        _write_request(outbox_fd, rid, encoded)
         return Queued(request_id=rid, status=status, artifact=name)
     finally:
         for fd in fds:
             os.close(fd)
 
 
-def _write_request(tmp_dir_fd: int, outbox_fd: int, rid: str, data: bytes) -> None:
-    """Write ``outbox/<rid>.json`` atomically: the temporary file is created in
-    ``artifacts/`` (same file system, never drained), so a drain never sees a partial
-    request, then renamed into the outbox."""
-    tmp_name = f".report-{secrets.token_hex(8)}.tmp"
+def _write_request(outbox_fd: int, rid: str, data: bytes) -> None:
+    """Write ``outbox/<rid>.json`` atomically: the temporary file is created in ``outbox/``
+    itself under a reserved name a drain never claims, then renamed within ``outbox/``. (In
+    the sandbox ``outbox/`` and ``artifacts/`` are separate bind mounts, so a rename between
+    them fails with ``EXDEV``.)"""
+    tmp_dir_fd = outbox_fd
+    tmp_name = temp_name()
     final = rid + REQUEST_SUFFIX
     try:
         fd = os.open(tmp_name, _CREATE_FLAGS, 0o600, dir_fd=tmp_dir_fd)
@@ -683,6 +714,8 @@ class Item:
     rejection: str | None = None  # a rejection code found before the transaction
     request: Request | None = None
     unchecked: bool = False  # over the drain cap: discarded without being processed
+    superseded: bool = False  # older than the winner: discarded without being read
+    deferred: bool = False  # past the drain's deadline: left in claimed/ for the next drain
     copy_name: str | None = None  # the artifact copy in scan/
     artifact_size: int | None = None
     frozen: bool = False
@@ -693,6 +726,11 @@ class Item:
     @property
     def name(self) -> str:
         return self.request_id + REQUEST_SUFFIX
+
+    @property
+    def processed(self) -> bool:
+        """Read and checked by this drain (whatever the outcome)."""
+        return not (self.unchecked or self.superseded or self.deferred or self.gone)
 
 
 @dataclass(frozen=True)
@@ -714,6 +752,8 @@ class IngestStore(Protocol):
     ) -> bool: ...
 
     def ingested_count(self, csession_id: str, run_no: int) -> int: ...
+
+    def latest_ingested(self, csession_id: str, run_no: int) -> str | None: ...
 
     def set_report(
         self,
@@ -741,8 +781,12 @@ class Drain:
     private_run_dir: str
     items: list[Item]
     removed_malformed: int = 0
+    # Why recording failed (an exception type name), set by the caller that rolled it back.
+    failure: str | None = None
     _fds: dict[str, int] = field(default_factory=dict)
     recorded: bool = False
+    _deadline: float = float("inf")
+    _clock: Callable[[], float] = time.monotonic
 
     # Preparation (before any transaction)
 
@@ -760,15 +804,20 @@ class Drain:
         secret_sha256: str,
         limits: Callable[[], Limits],
         scanner: Scanner | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> Drain:
         """Claim the run's outbox requests (and pick up those claimed earlier but never
-        recorded) and pre-check them. ``private_run_fd`` is the verified private run
-        directory; it stays owned by the caller. ``limits`` is called only when there is a
-        request to check. ``scanner`` is ``contains_secret``.
+        recorded) and pre-check them, newest first, until one passes every check (the
+        winner). ``private_run_fd`` is the verified private run directory; it stays owned by
+        the caller. ``limits`` is called only when there is a request to check. ``scanner``
+        is ``contains_secret``. Claiming and checking stop ``DRAIN_BUDGET`` seconds (by
+        ``clock``) after the start; what is left waits for the next drain.
 
         Raises ``OutboxDirError`` when ``outbox/`` cannot be trusted (nothing is claimed) and
         ``OSError`` for an unusable private directory."""
         drain = cls(csession_id, run_no, private_run_dir, [])
+        drain._clock = clock
+        drain._deadline = clock() + DRAIN_BUDGET
         try:
             drain._prepare(
                 csession_dir=csession_dir,
@@ -783,6 +832,9 @@ class Drain:
             drain.finish()
             raise
         return drain
+
+    def _past_deadline(self) -> bool:
+        return self._clock() > self._deadline
 
     def _prepare(
         self,
@@ -817,10 +869,17 @@ class Drain:
         caps = limits()
         scan_fd = fsutil.ensure_private_dir_at(private_run_fd, SCAN)
         self._fds["scan"] = scan_fd
-        _remove_scan_leftovers(scan_fd)
+        _remove_leftovers(scan_fd)
         self._fds["private_run"] = os.dup(private_run_fd)
-        for item in checked:
-            self._check(item, caps, secret_sha256, artifacts_dev_ino, scanner)
+        winner_found = False
+        for item in reversed(checked):  # newest first: the first valid one wins
+            if winner_found:
+                item.superseded = True
+            elif self._past_deadline():
+                item.deferred = True
+            else:
+                self._check(item, caps, secret_sha256, artifacts_dev_ino, scanner)
+                winner_found = item.request is not None
 
     @staticmethod
     def _open_session_dir(csession_dir: str) -> int:
@@ -844,12 +903,22 @@ class Drain:
     def _claim(self, outbox_fd: int, claimed_fd: int) -> list[str]:
         """Rename up to ``DRAIN_MAX_ENTRIES`` outbox requests into ``claimed/`` (only the
         process whose rename succeeds owns a request) and return every request name now in
-        ``claimed/`` (at most ``DRAIN_MAX_ENTRIES``). Other names are malformed and removed."""
+        ``claimed/``. Of at most ``DRAIN_MAX_READ`` entries read, other names (and
+        directories) are malformed and removed, without counting against the claim cap;
+        ``report``'s temporary names are left alone until they are leftovers."""
+        claims = 0
+        now = time.time()
         for name, is_dir in _entries(outbox_fd):
+            if is_temp_name(name):
+                _remove_leftover(outbox_fd, name, now)
+                continue
             if not is_request_name(name) or is_dir:
                 self.removed_malformed += 1
                 _remove_entry(outbox_fd, name)
                 continue
+            if claims >= DRAIN_MAX_ENTRIES or self._past_deadline():
+                continue
+            claims += 1
             try:
                 os.rename(name, name, src_dir_fd=outbox_fd, dst_dir_fd=claimed_fd)
             except FileNotFoundError:
@@ -895,8 +964,13 @@ class Drain:
         if not hmac.compare_digest(secret_sha256(parsed.secret), secret_sha256_hex):
             item.rejection = "bad_secret"
             return
+        # The secret matched, so parsed.secret is the run secret: refused in any letter case
+        # in the texts and the artifact, independently of the scanner.
         for text in (parsed.summary, parsed.reason):
-            if text is not None and _scan(scanner, text.encode("utf-8")):
+            if text is None:
+                continue
+            blob = text.encode("utf-8")
+            if _has_secret(blob, parsed.secret) or _scan(scanner, blob):
                 item.rejection = "contains_secret"
                 return
         if parsed.artifact is not None:
@@ -924,38 +998,47 @@ class Drain:
         expected_dir: str,
         scanner: Scanner | None,
     ) -> str | None:
-        """Copy the artifact through one ``O_NOFOLLOW`` descriptor into a private file in
-        ``scan/``; only that copy is hashed, scanned and later frozen. Returns a rejection
-        code, or None."""
+        """Copy the artifact in chunks through one ``O_NOFOLLOW`` descriptor into a private
+        file in ``scan/``, hashing it and looking for the run secret as it goes; only that
+        copy is scanned and later frozen. Returns a rejection code, or None."""
         assert request.artifact is not None
         artifacts_fd = self._artifacts_fd(expected_dir)
         if artifacts_fd is None:
             return "outside_dir"
+        cap = caps.artifact_max_bytes
         try:
-            data = _read_regular(artifacts_fd, request.artifact, caps.artifact_max_bytes)
+            src = _open_regular(artifacts_fd, request.artifact, cap)
         except FileNotFoundError:
             return "artifact_missing"
         except _BadFile as exc:
             return exc.reason
         copy_name = f"{item.request_id}.{secrets.token_hex(8)}.tmp"
         scan_fd = self._fds["scan"]
-        fd = os.open(copy_name, _CREATE_FLAGS, 0o600, dir_fd=scan_fd)
-        item.copy_name = copy_name
         try:
-            os.fchmod(fd, 0o600)
-            view = memoryview(data)
-            while view:
-                view = view[os.write(fd, view) :]
-            os.fsync(fd)
+            fd = os.open(copy_name, _CREATE_FLAGS, 0o600, dir_fd=scan_fd)
+            item.copy_name = copy_name
+            try:
+                os.fchmod(fd, 0o600)
+                size, digest, found = _copy_stream(src, fd, cap, request.secret)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         finally:
-            os.close(fd)
-        # ``data`` is exactly the copy's content: the agent can neither read nor change the
-        # copy, so hashing and scanning these bytes is hashing and scanning the copy.
-        if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), request.artifact_sha256 or ""):
+            os.close(src)
+        if size > cap:
+            return "too_large"  # it grew after the fstat
+        # The copy holds exactly the bytes hashed and searched: the agent can neither read
+        # nor change it, so checking these bytes is checking the copy.
+        if not hmac.compare_digest(digest, request.artifact_sha256 or ""):
             return "artifact_changed"
-        if _scan(scanner, data):
+        if found:
             return "contains_secret"
-        item.artifact_size = len(data)
+        if scanner is not None:
+            # TODO(#26): give the scanner the copy in chunks; until then it reads the copy
+            # (at most artifact_max_bytes, and only the winner's artifact is copied).
+            if _scan(scanner, _read_regular(scan_fd, copy_name, cap)):
+                return "contains_secret"
+        item.artifact_size = size
         return None
 
     # Recording (inside the caller's transaction)
@@ -969,17 +1052,19 @@ class Drain:
         return None
 
     def record(self, store: IngestStore, *, run_no: int, live: bool) -> str | None:
-        """Record every claimed request in ``requests`` (``request_id`` is the primary key,
-        so a request is ingested at most once) and ingest the winner: freeze its artifact as
-        ``artifact/<ingest_seq>/<name>`` and store the report. Call inside the transaction,
-        after the hook's own row; ``run_no`` and ``live`` describe the run as that
-        transaction sees it. Returns the ingested report's status, or None."""
+        """Record every claimed request this drain decided on in ``requests``
+        (``request_id`` is the primary key, so a request is recorded at most once) and
+        ingest the winner unless a newer request of the run was already ingested: freeze its
+        artifact as ``artifact/<ingest_seq>/<name>`` and store the report. Call inside the
+        transaction, after the hook's own row; ``run_no`` and ``live`` describe the run as
+        that transaction sees it (requests are recorded under the run they were drained
+        for). Returns the ingested report's status, or None."""
         winner = self.winner
         status = None
         for item in self.items:
-            if item.gone:
-                continue
-            if item.unchecked or (item.request is not None and item is not winner):
+            if item.gone or item.deferred:
+                continue  # deferred requests stay in claimed/ for the next drain
+            if item.unchecked or item.superseded:
                 result = "discarded"
             elif item.rejection is not None:
                 result = item.rejection
@@ -988,8 +1073,11 @@ class Drain:
             elif not live:
                 result = "not_live"
             else:
-                result = "ingested"
-            if not store.record_request(self.csession_id, run_no, item.request_id, result):
+                assert item is winner
+                latest = store.latest_ingested(self.csession_id, self.run_no)
+                # A newer report already ingested (by a concurrent or later drain) wins.
+                result = "ingested" if latest is None or item.request_id > latest else "discarded"
+            if not store.record_request(self.csession_id, self.run_no, item.request_id, result):
                 item.duplicate = True
                 continue
             item.result = result
@@ -997,11 +1085,11 @@ class Drain:
                 assert item.request is not None
                 frozen = None
                 if item.request.artifact is not None:
-                    seq = store.ingested_count(self.csession_id, run_no)
+                    seq = store.ingested_count(self.csession_id, self.run_no)
                     frozen = self._freeze(item, seq)
                 store.set_report(
                     self.csession_id,
-                    run_no,
+                    self.run_no,
                     status=item.request.status,
                     summary=item.request.summary,
                     reason=item.request.reason,
@@ -1009,6 +1097,15 @@ class Drain:
                 )
                 status = item.request.status
         return status
+
+    def rolled_back(self, failure: str | None = None) -> None:
+        """Forget what ``record`` decided (its savepoint was rolled back): the requests stay
+        in ``claimed/`` unless recorded again. ``failure`` names why, when it failed."""
+        if failure is not None:
+            self.failure = failure
+        for item in self.items:
+            item.result = None
+            item.duplicate = False
 
     def _freeze(self, item: Item, seq: int) -> Frozen:
         """Rename the private copy to ``artifact/<seq>/<name>``. A directory left by an
@@ -1040,11 +1137,7 @@ class Drain:
     def feedback(self) -> str | None:
         """The rejection to give the agent: that of the newest processed request, when it was
         rejected (an older request's rejection no longer matters)."""
-        processed = [
-            item
-            for item in self.items
-            if not item.unchecked and not item.duplicate and not item.gone
-        ]
+        processed = [item for item in self.items if item.processed and not item.duplicate]
         if not processed:
             return None
         newest = processed[-1]
@@ -1075,6 +1168,33 @@ class Drain:
             self.finish()
 
 
+def _copy_stream(src: int, dst: int, cap: int, secret: str) -> tuple[int, str, bool]:
+    """Copy ``src`` to ``dst`` in chunks, reading at most ``cap + 1`` bytes. Returns the size
+    read, the SHA-256 of the bytes written and whether the run secret occurs in them in any
+    letter case (searched across chunk boundaries)."""
+    token = secret.encode("ascii")
+    keep = len(token) - 1
+    hasher = hashlib.sha256()
+    size = 0
+    tail = b""
+    found = False
+    while size <= cap:
+        chunk = os.read(src, min(_READ_CHUNK, cap + 1 - size))
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > cap:
+            break
+        view = memoryview(chunk)
+        while view:
+            view = view[os.write(dst, view) :]
+        hasher.update(chunk)
+        window = tail + chunk.lower()
+        found = found or token in window
+        tail = window[-keep:] if keep else b""
+    return size, hasher.hexdigest(), found
+
+
 def _scan(scanner: Scanner | None, data: bytes) -> bool:
     # TODO(#26): the hook path passes the scanner built from the run's secret-index
     # (keyed q-gram index); until then no scanner is given and nothing is found.
@@ -1082,7 +1202,7 @@ def _scan(scanner: Scanner | None, data: bytes) -> bool:
 
 
 def _entries(dir_fd: int) -> list[tuple[str, bool]]:
-    """Up to ``DRAIN_MAX_ENTRIES`` entries of ``dir_fd``: ``(name, is a directory)`` (from
+    """Up to ``DRAIN_MAX_READ`` entries of ``dir_fd``: ``(name, is a directory)`` (from
     the directory entry, never following a symlink)."""
     found: list[tuple[str, bool]] = []
     with os.scandir(dir_fd) as scan:
@@ -1092,7 +1212,7 @@ def _entries(dir_fd: int) -> list[tuple[str, bool]]:
             except OSError:
                 is_dir = False
             found.append((entry.name, is_dir))
-            if len(found) >= DRAIN_MAX_ENTRIES:
+            if len(found) >= DRAIN_MAX_READ:
                 break
     return found
 
@@ -1105,24 +1225,19 @@ def _unlink_quietly(dir_fd: int, name: str) -> None:
 
 
 def _remove_entry(dir_fd: int, name: str) -> None:
-    """Remove a malformed entry: a file, symlink or FIFO is unlinked, an empty directory
-    removed; a non-empty directory in the agent's outbox is left alone (it only blocks the
-    agent's own channel)."""
+    """Remove a malformed entry: a file, symlink or FIFO is unlinked, a directory removed
+    with its contents (fd-based, never following a symlink)."""
     try:
         os.unlink(name, dir_fd=dir_fd)
     except (IsADirectoryError, PermissionError):
-        try:
-            os.rmdir(name, dir_fd=dir_fd)
-        except OSError:
-            pass
+        _remove_tree(dir_fd, name)
     except OSError:
         pass
 
 
 def _remove_tree(dir_fd: int, name: str) -> None:
-    """Remove a directory tree inside the private directory (fd-based, never following a
-    symlink)."""
-    import shutil  # rare: only a directory raced into claimed/
+    """Remove a directory tree (fd-based, never following a symlink)."""
+    import shutil  # rare: only junk directories
 
     try:
         shutil.rmtree(name, dir_fd=dir_fd)
@@ -1130,14 +1245,19 @@ def _remove_tree(dir_fd: int, name: str) -> None:
         pass
 
 
-def _remove_scan_leftovers(scan_fd: int) -> None:
-    """Remove copies left by a canceled drain (older than ``SCAN_LEFTOVER_AGE``); a
-    concurrent drain's fresh copies are kept."""
+def _remove_leftover(dir_fd: int, name: str, now: float) -> None:
+    """Remove ``name`` when it is older than ``SCAN_LEFTOVER_AGE`` (left by a canceled drain
+    or ``report``); a fresh one may still be in use and is kept."""
+    try:
+        info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if now - info.st_mtime > SCAN_LEFTOVER_AGE:
+        _remove_entry(dir_fd, name)
+
+
+def _remove_leftovers(scan_fd: int) -> None:
+    """Remove copies left by a canceled drain; a concurrent drain's fresh copies are kept."""
     now = time.time()
     for name, _ in _entries(scan_fd):
-        try:
-            info = os.stat(name, dir_fd=scan_fd, follow_symlinks=False)
-        except OSError:
-            continue
-        if now - info.st_mtime > SCAN_LEFTOVER_AGE:
-            _unlink_quietly(scan_fd, name)
+        _remove_leftover(scan_fd, name, now)

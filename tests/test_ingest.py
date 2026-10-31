@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,16 @@ def log_events(run: Run) -> list[tuple[str, str | None]]:
     for record in run.log():
         validate(record, "claude-session/log.json")
     return [(r["event"], r.get("reason")) for r in run.log()]
+
+
+def malformed_counts(run: Run) -> list[int]:
+    """The ``count`` of each aggregate ``report_rejected`` ``malformed`` record."""
+    log_events(run)  # validates every record
+    return [
+        r["count"]
+        for r in run.log()
+        if r["event"] == "report_rejected" and r.get("reason") == "malformed"
+    ]
 
 
 def assert_rejected(run: Run, code: str, output: str) -> None:
@@ -402,12 +412,50 @@ def test_other_names_are_removed_as_malformed(run: Run, name: str) -> None:
     assert log_events(run) == [("report_rejected", "malformed")]
 
 
-def test_an_empty_junk_directory_is_removed_and_a_full_one_left(run: Run) -> None:
+def test_junk_directories_are_removed_empty_or_not(run: Run) -> None:
     (run.outbox / "empty").mkdir()
-    (run.outbox / "full").mkdir()
-    (run.outbox / "full" / "x").write_text("x")
+    (run.outbox / "full" / "deeper").mkdir(parents=True)
+    (run.outbox / "full" / "deeper" / "x").write_text("x")
     run.post_tool_use()
-    assert listing(run.outbox) == ["full"]
+    assert listing(run.outbox) == []
+    assert malformed_counts(run) == [2]
+
+
+def test_junk_never_starves_a_request(run: Run) -> None:
+    """Junk does not count against the claim cap: one drain claims the request behind 200
+    non-empty junk directories, removes them all and logs one aggregate record."""
+    for n in range(200):
+        (run.outbox / f"junk-{n:03d}").mkdir()
+        (run.outbox / f"junk-{n:03d}" / "x").write_text("x")
+    run.report(summary="behind the junk")
+    run.post_tool_use()
+    assert results(run) == ["ingested"]
+    assert listing(run.outbox) == []
+    assert malformed_counts(run) == [200]
+    run.post_tool_use()
+    assert malformed_counts(run) == [200]  # nothing left to log
+
+
+def test_a_fresh_report_temp_file_is_left_alone_and_an_old_one_removed(run: Run) -> None:
+    """report's temporary file lives in outbox/ under a reserved name: never claimed, never
+    logged, removed only once it is older than a canceled report could leave it."""
+    fresh, old = outbox.temp_name(), outbox.temp_name()
+    (run.outbox / fresh).write_bytes(b"partial")
+    (run.outbox / old).write_bytes(b"partial")
+    os.utime(run.outbox / old, (0, 0))
+    run.report()
+    run.post_tool_use()
+    assert listing(run.outbox) == [fresh]
+    assert results(run) == ["ingested"]
+    assert [event for event, _ in log_events(run)] == ["report_ingested"]
+
+
+def test_temp_names_do_not_count_against_the_claim_cap(run: Run) -> None:
+    for _ in range(outbox.DRAIN_MAX_ENTRIES + 10):
+        (run.outbox / outbox.temp_name()).write_bytes(b"partial")
+    run.report()
+    run.post_tool_use()
+    assert results(run) == ["ingested"]
 
 
 def test_the_log_never_contains_agent_text(run: Run) -> None:
@@ -495,7 +543,7 @@ def test_an_older_rejection_after_a_newer_valid_request_is_not_fed_back(run: Run
     run.plant(run.request(secret="0" * 64))
     run.report(summary="valid")
     assert run.post_tool_use() == ""
-    assert sorted(results(run)) == ["bad_secret", "ingested"]
+    assert sorted(results(run)) == ["discarded", "ingested"]  # never even checked
 
 
 def test_at_most_sixteen_requests_are_processed(run: Run) -> None:
@@ -509,13 +557,22 @@ def test_at_most_sixteen_requests_are_processed(run: Run) -> None:
     assert sum("over the drain cap" in m for m in messages) == 4
 
 
-def test_a_drain_reads_at_most_64_outbox_entries(run: Run) -> None:
-    for n in range(100):
-        (run.outbox / f"junk-{n:03d}").write_text("x")
+def test_a_drain_claims_at_most_64_requests(run: Run) -> None:
+    for _ in range(outbox.DRAIN_MAX_ENTRIES + 6):
+        run.plant(run.request())
     run.post_tool_use()
-    assert len(listing(run.outbox)) == 36
+    assert len(run.requests()) == outbox.DRAIN_MAX_ENTRIES
+    assert len(listing(run.outbox)) == 6
     run.post_tool_use()
     assert listing(run.outbox) == []
+
+
+def test_a_drain_reads_a_bounded_number_of_outbox_entries(run: Run) -> None:
+    for n in range(outbox.DRAIN_MAX_READ + 5):
+        (run.outbox / f"junk-{n:05d}").write_text("x")
+    run.post_tool_use()
+    assert len(listing(run.outbox)) == 5
+    assert malformed_counts(run) == [outbox.DRAIN_MAX_READ]
 
 
 def test_requests_claimed_by_a_canceled_drain_are_processed_by_the_next(run: Run) -> None:
@@ -527,19 +584,19 @@ def test_requests_claimed_by_a_canceled_drain_are_processed_by_the_next(run: Run
     assert listing(run.claimed) == []
 
 
-def test_a_failed_transaction_leaves_the_claimed_request_for_the_next_drain(
+def test_a_failed_recording_leaves_the_claimed_request_for_the_next_drain(
     run: Run, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run.write_artifact("a.md", b"a")
     run.report(artifact="a.md")
 
     def broken(*args: object, **kwargs: object) -> None:
-        raise sqlite3.OperationalError("database is locked")
+        raise sqlite3.OperationalError("disk I/O error")
 
     monkeypatch.setattr(Store, "set_report", broken)
-    with pytest.raises(sqlite3.OperationalError):
-        run.post_tool_use()
+    assert run.post_tool_use() == ""
     assert run.requests() == [] and run.run()["report_status"] is None
+    assert [r["message"] for r in run.log()] == ["PostToolUse: outbox drain: OperationalError"]
     assert len(listing(run.claimed)) == 1
     assert listing(run.private_run / "scan") == []
     monkeypatch.undo()
@@ -564,7 +621,12 @@ def test_a_request_is_ingested_at_most_once(run: Run) -> None:
     assert ("outbox_discarded", None) in log_events(run)
 
 
-def prepared(run: Run) -> outbox.Drain:
+def prepared(
+    run: Run,
+    *,
+    scanner: outbox.Scanner | None = None,
+    clock: Callable[[], float] | None = None,
+) -> outbox.Drain:
     with Store.open(run.db) as store:
         hook_run = store.hook_run(SID)
     assert hook_run is not None
@@ -580,6 +642,8 @@ def prepared(run: Run) -> outbox.Drain:
             artifacts_dev_ino=hook_run.artifacts_dev_ino or "",
             secret_sha256=hook_run.secret_sha256 or "",
             limits=lambda: outbox.Limits(SUMMARY_MAX, ARTIFACT_MAX),
+            scanner=scanner,
+            **({} if clock is None else {"clock": clock}),
         )
     finally:
         os.close(fd)
@@ -625,7 +689,7 @@ def test_record_rejects_a_request_once_the_run_changed(run: Run) -> None:
         with store.transaction():
             assert drain.record(store, run_no=2, live=True) is None
         drain.finish(committed=True)
-    assert results(run) == ["stale_run"]
+    assert [(r["result"], r["run_no"]) for r in run.requests()] == [("stale_run", 1)]
 
 
 def test_record_rejects_when_the_run_is_not_live(run: Run) -> None:
@@ -750,3 +814,167 @@ def test_a_previous_runs_leftover_request_is_stale(tmp_path: Path) -> None:
     output = run.post_tool_use()
     assert rejection(output) == "stale_run"
     assert [(r["result"], r["run_no"]) for r in run.requests()] == [("stale_run", 2)]
+
+
+# Secrets refused by ingestion itself (independent of the #26 scanner)
+
+
+@pytest.mark.parametrize("field", ["summary", "reason", "artifact"])
+@pytest.mark.parametrize("case", ["lower", "upper"])
+def test_ingestion_refuses_the_run_secret(
+    run: Run, field: str, case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(outbox, "_READ_CHUNK", 16)  # the secret spans read chunks
+    value = run.secret if case == "lower" else run.secret.upper()
+    if field == "summary":
+        doc = run.request(summary=f"leak {value}")
+    elif field == "reason":
+        doc = run.request(status="blocked", summary=None, reason=f"leak {value}")
+    else:
+        data = b"x" * 10 + value.encode() + b"y"
+        run.write_artifact("a.md", data)
+        digest = hashlib.sha256(data).hexdigest()
+        doc = run.request(artifact="a.md", artifact_sha256=digest)
+    run.plant(doc)
+    assert_rejected(run, "contains_secret", run.post_tool_use())
+    assert run.secret not in (run.root / "log.jsonl").read_text().lower()
+    assert listing(run.private_run / "scan") == []
+
+
+# One winner, a time budget
+
+
+def test_only_the_winners_artifact_is_copied(run: Run) -> None:
+    """Requests older than the winner are discarded unread: their artifacts are never opened
+    (a removed one is not artifact_missing) or copied."""
+    run.write_artifact("old.md", b"old")
+    older = run.report(artifact="old.md")
+    (run.artifacts / "old.md").unlink()
+    run.write_artifact("new.md", b"new")
+    newer = run.report(artifact="new.md")
+    drain = prepared(run)
+    try:
+        assert [i.request_id for i in drain.items if i.copy_name] == [newer.request_id]
+        assert len(listing(run.private_run / "scan")) == 1
+    finally:
+        drain.finish()
+    run.post_tool_use()
+    assert {r["request_id"]: r["result"] for r in run.requests()} == {
+        older.request_id: "discarded",
+        newer.request_id: "ingested",
+    }
+    messages = [r.get("message", "") for r in run.log() if r["event"] == "outbox_discarded"]
+    assert messages == [f"request {older.request_id}: superseded by a newer request"]
+
+
+def test_a_drain_stops_checking_past_its_deadline(run: Run) -> None:
+    """Past half the hook budget the drain stops; the unchecked requests stay claimed for the
+    next drain."""
+    ids = [run.report(summary=f"report {n}").request_id for n in range(3)]
+    now = [0.0]
+
+    def slow_scanner(data: bytes) -> bool:
+        now[0] += outbox.DRAIN_BUDGET + 1  # the first check uses up the budget
+        return True
+
+    drain = prepared(run, scanner=slow_scanner, clock=lambda: now[0])
+    with Store.open(run.db) as store:
+        with store.transaction():
+            drain.record(store, run_no=1, live=True)
+        drain.finish(committed=True)
+    assert {r["request_id"]: r["result"] for r in run.requests()} == {ids[2]: "contains_secret"}
+    assert listing(run.claimed) == sorted(f"{rid}.json" for rid in ids[:2])
+    run.post_tool_use()
+    assert {r["request_id"]: r["result"] for r in run.requests()} == {
+        ids[0]: "discarded",
+        ids[1]: "ingested",
+        ids[2]: "contains_secret",
+    }
+
+
+def test_a_drain_stops_claiming_past_its_deadline(run: Run) -> None:
+    run.report()
+    ticks = iter([0.0] + [outbox.DRAIN_BUDGET + 1] * 10)
+    drain = prepared(run, clock=lambda: next(ticks))
+    try:
+        assert drain.items == []
+    finally:
+        drain.finish()
+    assert len(listing(run.outbox)) == 1
+
+
+# Concurrency and ordering of recorded reports
+
+
+def test_a_stop_blocks_when_a_concurrent_drain_rejected_its_winner(run: Run) -> None:
+    """Both drains pre-check the same request; the other one records it rejected first, so
+    this Stop ingests nothing and the backstop must still block."""
+    run.report()
+    mine, other = prepared(run), prepared(run)
+    assert mine.winner is not None and other.winner is not None
+    with Store.open(run.db) as store:
+        with store.transaction():
+            other.record(store, run_no=1, live=False)
+        other.finish(committed=True)
+        hook = hookevent.classify("Stop", json.dumps({"stop_hook_active": False}).encode())
+        assert hook is not None
+        applied = hookevent.apply_hook(store, SID, hook, mine)
+        mine.finish(committed=applied.drained)
+    assert applied.output == hookevent.backstop_output()
+    assert results(run) == ["not_live"]
+    assert run.run()["report_status"] is None and run.run()["backstop_used"] == 1
+    assert run.state() == ("working", None, "working")  # a blocked Stop changes nothing
+
+
+def test_an_older_request_never_replaces_a_newer_ingested_report(run: Run) -> None:
+    t = 1_800_000_000_000_000_000
+    newer = outbox.new_request_id(now_ns=lambda: t + 1_000_000)
+    older = outbox.new_request_id(now_ns=lambda: t)
+    run.plant(run.request(summary="newer"), rid=newer)
+    run.post_tool_use()
+    run.plant(run.request(summary="older"), rid=older)
+    assert run.post_tool_use() == ""
+    assert run.run()["report_summary"] == "newer"
+    assert {r["request_id"]: r["result"] for r in run.requests()} == {
+        newer: "ingested",
+        older: "discarded",
+    }
+    assert len(run.report_events()) == 1
+
+
+def test_a_freeze_failure_still_applies_the_hooks_own_event(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    Store.open(str(root / "state.db")).close()
+    run = Run(root).setup(state="idle", activity="idle")
+    run.write_artifact("a.md", b"a")
+    run.report(artifact="a.md")
+    (run.private_run / "artifact").write_text("not a directory")
+    assert run.post_tool_use() == ""
+    assert run.state() == ("working", None, "working")
+    assert run.requests() == [] and run.run()["report_status"] is None
+    assert len(listing(run.claimed)) == 1
+    assert listing(run.private_run / "scan") == []
+    (record,) = run.log()
+    assert record["event"] == "hook_event_failed"
+    assert record["message"].startswith("PostToolUse: outbox drain: ")
+    (run.private_run / "artifact").unlink()
+    run.post_tool_use()
+    assert results(run) == ["ingested"]
+
+
+def test_a_freeze_failure_in_a_headless_stop_blocks(run: Run) -> None:
+    run.write_artifact("a.md", b"a")
+    run.report(artifact="a.md")
+    (run.private_run / "artifact").write_text("not a directory")
+    assert json.loads(run.stop_hook()) == hookevent.backstop_output()
+    assert run.run()["report_status"] is None
+    assert len(listing(run.claimed)) == 1
+
+
+def test_the_drain_budget_is_half_the_draining_hooks_timeout() -> None:
+    from claude_session import settings_builder
+
+    timeouts = {
+        event: t for event, _, t in settings_builder.HOOKS if event in ("PostToolUse", "Stop")
+    }
+    assert set(timeouts.values()) == {outbox.DRAIN_BUDGET * 2}

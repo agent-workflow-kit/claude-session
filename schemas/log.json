@@ -124,6 +124,11 @@
         "string",
         "null"
       ]
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "For the aggregate report_rejected record with reason malformed: how many malformed outbox entries one drain removed."
     }
   },
   "required": [

@@ -589,7 +589,18 @@ class Applied:
 def _apply_report(store: Store, csession_id: str, drain: outbox.Drain) -> None:
     """Record the drained requests after the hook's own row (interface.md: "its row applies
     after that hook's own event") and apply the ingested report through the table, with a
-    ``report`` event even when only the report changed."""
+    ``report`` event even when only the report changed. Runs in a savepoint: a failure (for
+    example an artifact that cannot be frozen) rolls back only the drain, which keeps its
+    requests in ``claimed/`` and its failure for the log, so the hook's own event still
+    applies (design.md, Ingestion)."""
+    try:
+        with store.savepoint("drain"):
+            _record_report(store, csession_id, drain)
+    except Exception as exc:
+        drain.rolled_back(type(exc).__name__)
+
+
+def _record_report(store: Store, csession_id: str, drain: outbox.Drain) -> None:
     run = store.hook_run(csession_id)  # reloaded: the hook's own row changed it
     assert run is not None
     before = values_from(
@@ -618,14 +629,37 @@ def _apply_report(store: Store, csession_id: str, drain: outbox.Drain) -> None:
     )
 
 
+class _Backstop(Exception):
+    """Rolls back a headless Stop that ended without a report, so the backstop can block."""
+
+
+def _apply_own_row(store: Store, run: HookRun, hook: Hook) -> None:
+    """The hook's own row: the transition table and its event."""
+    before = values_from(
+        state=run.state,
+        activity=run.activity,
+        needs_input_reason=run.needs_input_reason,
+        escalation_open=_escalation_open(store, run),
+        has_report=run.report_status is not None,
+    )
+    started = run.session_started_at is not None
+    after = transition(before, hook.event, mode=run.mode or "", session_started=started)
+    state, reason, activity = derive(after)
+    # TODO(#20): post-state-change delivery picks up the appended event.
+    store.apply_state(
+        run, state=state, activity=activity, needs_input_reason=reason, cause=hook.cause
+    )
+
+
 def apply_hook(
     store: Store, csession_id: str, hook: Hook, drain: outbox.Drain | None = None
 ) -> Applied:
     """In one transaction: load the session's current run, record SessionStart and SessionEnd
-    facts, decide the Stop backstop, apply the table and append the event, then record the
-    drained outbox requests (``drain``, prepared before the transaction) and apply an
-    ingested report. A run that is not adopted, already ended or not in a live state is left
-    alone (its claimed requests stay for the next drain)."""
+    facts, apply the table and append the event, then record the drained outbox requests
+    (``drain``, prepared before the transaction) and apply an ingested report, and decide
+    the Stop backstop on whether the run then has a report. A run that is not adopted,
+    already ended or not in a live state is left alone (its claimed requests stay for the
+    next drain)."""
     with store.transaction():
         run = store.hook_run(csession_id)
         if run is None:
@@ -635,7 +669,10 @@ def apply_hook(
         if not run.adopted_and_open or run.state not in LIVE_STATES:
             return Applied(None)
         if drain is not None and drain.run_no != run.run_no:
-            drain = None  # a new run began after the drain was prepared: leave its requests
+            # A new run began after the drain was prepared: leave its requests.
+            # TODO(#15): requests claimed into the old run's claimed/ are processed by that
+            # run's final drain or salvage, which also reads runs/<n>/claimed/.
+            drain = None
         if hook.claude_session_id is not None:
             assert hook.source is not None
             store.record_session_start(
@@ -646,37 +683,33 @@ def apply_hook(
             )
         if hook.session_end_reason is not None:
             store.record_session_end_reason(run, hook.session_end_reason)
-        started = run.session_started_at is not None
-        if (
+        backstop = (
             hook.backstop_candidate
-            and started
+            and run.session_started_at is not None
             and run.mode == "headless"
             and run.report_status is None
-            and (drain is None or drain.winner is None)  # a report drained by this Stop
             and not run.backstop_used
-            and store.take_backstop(run)
-        ):
+        )
+        try:
+            with store.savepoint("hook"):
+                _apply_own_row(store, run, hook)
+                if drain is not None:
+                    _apply_report(store, csession_id, drain)
+                if backstop:
+                    after = store.hook_run(csession_id)
+                    if after is not None and after.report_status is None:
+                        raise _Backstop  # no report, even after this Stop's own drain
+        except _Backstop:
             # A blocked Stop changes nothing and records no event (design.md, State machine);
-            # the drained requests (all rejected) are still recorded.
-            if drain is not None:
-                drain.record(store, run_no=run.run_no, live=True)
-            return Applied(run, backstop_output(), drained=drain is not None)
-        before = values_from(
-            state=run.state,
-            activity=run.activity,
-            needs_input_reason=run.needs_input_reason,
-            escalation_open=_escalation_open(store, run),
-            has_report=run.report_status is not None,
-        )
-        after = transition(before, hook.event, mode=run.mode or "", session_started=started)
-        state, reason, activity = derive(after)
-        # TODO(#20): post-state-change delivery picks up the appended event.
-        store.apply_state(
-            run, state=state, activity=activity, needs_input_reason=reason, cause=hook.cause
-        )
-        if drain is not None:
-            _apply_report(store, csession_id, drain)
-    return Applied(run, drained=drain is not None)
+            # the drained requests (none ingested) are recorded again, unless recording failed.
+            taken = store.take_backstop(run)
+            assert taken  # backstop_used and report_status were read in this transaction
+            if drain is not None and drain.failure is None:
+                drain.rolled_back()
+                _apply_report(store, csession_id, drain)
+            drained = drain is not None and drain.failure is None
+            return Applied(run, backstop_output(), drained=drained)
+    return Applied(run, drained=drain is not None and drain.failure is None)
 
 
 class _Log:
@@ -695,6 +728,7 @@ class _Log:
         *,
         reason: str | None = None,
         message: str | None = None,
+        count: int | None = None,
     ) -> None:
         try:
             from . import logs
@@ -706,6 +740,7 @@ class _Log:
                 run=run_no,
                 reason=reason,
                 message=message,
+                count=count,
             )
         except Exception:  # logging is best effort (interface.md, Audit and log)
             pass
@@ -721,12 +756,25 @@ class _Log:
             pass
 
 
+def log_malformed(log: _Log, drain: outbox.Drain) -> None:
+    """One aggregate ``report_rejected`` ``malformed`` record (with ``count``) for the
+    malformed entries the drain removed, if any."""
+    if drain.removed_malformed:
+        log.write(
+            "report_rejected",
+            "warn",
+            drain.csession_id,
+            drain.run_no,
+            reason="malformed",
+            count=drain.removed_malformed,
+        )
+
+
 def log_drain(log: _Log, drain: outbox.Drain) -> None:
-    """One record per drained request: ``report_ingested``, ``report_rejected`` (with the
-    reason) or ``outbox_discarded``; plus the malformed entries removed from the outbox."""
+    """One record per recorded request: ``report_ingested``, ``report_rejected`` (with the
+    reason) or ``outbox_discarded``; plus the aggregate record of the malformed entries."""
     sid, run_no = drain.csession_id, drain.run_no
-    for _ in range(drain.removed_malformed):
-        log.write("report_rejected", "warn", sid, run_no, reason="malformed")
+    log_malformed(log, drain)
     for item in drain.items:
         request = f"request {item.request_id}"
         if item.duplicate:
@@ -734,7 +782,12 @@ def log_drain(log: _Log, drain: outbox.Drain) -> None:
         elif item.result == "ingested":
             log.write("report_ingested", "info", sid, run_no, message=request)
         elif item.result == "discarded":
-            why = "over the drain cap" if item.unchecked else "superseded by a newer request"
+            if item.unchecked:
+                why = "over the drain cap"
+            elif item.superseded:
+                why = "superseded by a newer request"
+            else:
+                why = "a newer report was already ingested"
             log.write("outbox_discarded", "info", sid, run_no, message=f"{request}: {why}")
         elif item.result is not None:
             log.write("report_rejected", "warn", sid, run_no, reason=item.result, message=request)
@@ -779,8 +832,10 @@ def main(
             rejection = drain.feedback()
             if cause == "PostToolUse" and rejection is not None:
                 output = outbox.rejection_output(rejection)
-        elif drain.removed_malformed:
-            log_drain(log, drain)
+        else:
+            log_malformed(log, drain)
+        if drain.failure is not None:
+            log.failure(csession_id, f"{cause}: outbox drain: {drain.failure}")
     if run is not None and cause == "SessionStart":
         if run.csession_dir is None or run.private_dir is None:
             raise HookEventError("session has no directories")

@@ -633,6 +633,23 @@ class Store:
                     self.conn.execute("ROLLBACK")
             raise
 
+    @contextmanager
+    def savepoint(self, name: str) -> Iterator[None]:
+        """A ``SAVEPOINT`` inside the current transaction: released on success, rolled back
+        to (and released) on error, which is re-raised. ``name`` is a fixed identifier."""
+        if not name.isidentifier():
+            raise ValueError("savepoint names are identifiers")
+        self.conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+        except BaseException:
+            if self.conn.in_transaction:
+                with suppress(sqlite3.Error):
+                    self.conn.execute(f"ROLLBACK TO {name}")
+                    self.conn.execute(f"RELEASE {name}")
+            raise
+        self.conn.execute(f"RELEASE {name}")
+
     # Schema version
 
     def schema_version(self) -> Version:
@@ -1051,6 +1068,16 @@ class Store:
             (csession_id, run_no),
         ).fetchone()
         return int(count)
+
+    def latest_ingested(self, csession_id: str, run_no: int) -> str | None:
+        """The newest (largest UUIDv7) ``request_id`` of the run that was ingested, or None:
+        an older request never replaces a newer report."""
+        (latest,) = self.conn.execute(
+            "SELECT MAX(request_id) FROM requests WHERE csession_id = ? AND run_no = ? "
+            "AND result = 'ingested'",
+            (csession_id, run_no),
+        ).fetchone()
+        return latest
 
     def set_report(
         self,
