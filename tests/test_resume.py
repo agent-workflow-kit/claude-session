@@ -703,6 +703,46 @@ def test_start_resume_creates_a_pending_run_that_adoption_runs(env: Env) -> None
     assert flag_value(record, "--model") == "m3"
 
 
+def test_a_late_adopter_never_takes_over_a_later_callers_pending_run(env: Env) -> None:
+    """Caller A's pending run 2 expires; caller B's ``start --resume`` (its liveness check
+    ends run 2 ``never_adopted``) gets run 3. A's late argv names run 2: it is refused
+    ``expired`` and leaves run 3 pending, with B's outcome file, for B's own argv."""
+    sid = exec_session(env)["csession_id"]
+    proc_a, a = run_cs(env, ["start", "--json", "--resume", sid, "--model", "model-of-a"])
+    assert proc_a.returncode == 0 and a["run"] == 2, proc_a.stdout + proc_a.stderr
+    assert a["argv"][1:] == ["exec", "--session-id", sid, "--run", "2"]
+    env.write_db(
+        "UPDATE runs SET expires_at = '2000-01-01T00:00:00.000Z' "
+        "WHERE csession_id = ? AND run_no = 2",
+        (sid,),
+    )
+    out_b = env.tmp_path / "b-outcome.json"
+    proc_b, b = run_cs(
+        env,
+        ["start", "--json", "--resume", sid, "--model", "model-of-b"]
+        + ["--outcome-file", str(out_b)],
+    )
+    assert proc_b.returncode == 0 and b["run"] == 3, proc_b.stdout + proc_b.stderr
+    assert env.run_row(sid, 2)["end_reason"] == "never_adopted"
+    out_a = env.tmp_path / "a-outcome.json"
+    late = env.cs([*a["argv"][1:], "--json", "--outcome-file", str(out_a)])
+    assert late.returncode == 20, late.stdout + late.stderr
+    error = json.loads(late.stdout)
+    validate(error, "claude-session/cli/error.json")
+    assert (error["error"]["code"], error["error"]["reason"]) == ("refused", "expired")
+    row = env.run_row(sid, 3)
+    assert row["wrapper_pid"] is None and row["ended_at"] is None
+    assert row["outcome_file"] == str(out_b)
+    # A's own outcome file holds A's refusal, never run 3's outcome.
+    assert json.loads(out_a.read_text(encoding="utf-8"))["error"]["reason"] == "expired"
+    assert len(starts(env)) == 1
+    proc, outcome = env.adopt(sid, "--run", "3")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (outcome["run"], outcome["outcome"]) == (3, "done")
+    assert flag_value(starts(env)[-1], "--model") == "model-of-b"
+    assert env.run_row(sid, 3)["outcome_file"] == str(out_b)
+
+
 def test_start_resume_fork_allocates_the_fork(env: Env) -> None:
     sid = exec_session(env)["csession_id"]
     proc, out = run_cs(env, ["start", "--json", "--resume", sid, "--fork"])

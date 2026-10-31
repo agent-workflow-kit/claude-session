@@ -1391,12 +1391,16 @@ class Store:
         wrapper_start: str,
         outcome_file: str | None = None,
         hook_interpreter: str | None = None,
+        run_no: int | None = None,
     ) -> Adoption:
         """The adoption compare-and-set (interface.md, Launch order; design.md, Launch,
         adoption and pending runs), one ``BEGIN IMMEDIATE`` transaction on the session's
         current run:
 
         - a forgotten (or unknown) session: ``not_found`` (exit 10);
+        - ``run_no`` given (the ``--run`` of the argv ``start`` printed) and the current run
+          is another one: ``expired``, changing nothing (the named run ended and a later
+          caller's run took its place, or it never existed);
         - a final run (any end): ``expired``;
         - a run that has a wrapper: ``already_adopted``;
         - a pending run at or past ``expires_at`` (or without one): finalized ``not-started``
@@ -1420,16 +1424,18 @@ class Store:
             ).fetchone()
             if row is None or row[0] is not None:
                 return Adoption("not_found", None)
-            _, run_no, wrapper, ended, expires, forked_from, claude_id, third_party = row
-            if ended is not None:
+            _, current, wrapper, ended, expires, forked_from, claude_id, third_party = row
+            if run_no is not None and run_no != current:
                 return Adoption("expired", run_no)
+            if ended is not None:
+                return Adoption("expired", current)
             if wrapper is not None:
-                return Adoption("already_adopted", run_no)
+                return Adoption("already_adopted", current)
             if self.past_deadline(expires):
-                self._finalize(conn, csession_id, run_no, NEVER_ADOPTED)
+                self._finalize(conn, csession_id, current, NEVER_ADOPTED)
                 # TODO(#21): write the run's outcome file with the never_adopted outcome.
                 # TODO(#20): the run's exactly one final post-state-change.
-                return Adoption("expired", run_no, expired_now=True)
+                return Adoption("expired", current, expired_now=True)
             if forked_from is not None and claude_id is None:
                 try:
                     _recheck_fork_taint(conn, csession_id, forked_from, bool(third_party))
@@ -1439,21 +1445,21 @@ class Store:
                         message=f"the fork source {forked_from} became tainted; a run that is"
                         " not third-party-reading is refused",
                     )
-                    self._finalize(conn, csession_id, run_no, final)
+                    self._finalize(conn, csession_id, current, final)
                     # TODO(#21): write the run's outcome file with the never_adopted outcome.
                     # TODO(#20): the run's exactly one final post-state-change.
-                    return Adoption("tainted", run_no, expired_now=True)
+                    return Adoption("tainted", current, expired_now=True)
             cursor = conn.execute(
                 "UPDATE runs SET wrapper_pid = ?, wrapper_start = ?, "
                 "outcome_file = COALESCE(?, outcome_file), "
                 "hook_interpreter = COALESCE(?, hook_interpreter) "
                 "WHERE csession_id = ? AND run_no = ? AND wrapper_pid IS NULL "
                 "AND ended_at IS NULL",
-                (wrapper_pid, wrapper_start, outcome_file, hook_interpreter, csession_id, run_no),
+                (wrapper_pid, wrapper_start, outcome_file, hook_interpreter, csession_id, current),
             )
             if cursor.rowcount != 1:  # not reachable inside the transaction
-                raise InternalError(f"adoption of run {run_no} of session {csession_id} lost")
-        return Adoption("adopted", run_no)
+                raise InternalError(f"adoption of run {current} of session {csession_id} lost")
+        return Adoption("adopted", current)
 
     def expire_pending(self, csession_id: str, run_no: int, *, cause: str = "adopt") -> bool:
         """Finalize run ``run_no`` ``not-started`` (``never_adopted``) when it is still
@@ -1929,7 +1935,8 @@ NEVER_ADOPTED = Final(
 class Adoption:
     """The result of ``Store.adopt``: ``outcome`` is ``adopted``, ``already_adopted``,
     ``expired``, ``tainted`` or ``not_found``; ``run_no`` the session's current run (None
-    when not found); ``expired_now`` whether this call finalized the run ``never_adopted``."""
+    when not found; the run asked for when it is not the current one); ``expired_now``
+    whether this call finalized the run ``never_adopted``."""
 
     outcome: str
     run_no: int | None

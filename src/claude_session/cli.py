@@ -68,7 +68,7 @@ RESETTABLE = {
     "auto-exit": "auto_exit",
 }
 # The only flags `exec --session-id` accepts (interface.md, Exit codes, exit 2).
-ADOPTION_FLAGS = {"json", "dry_run", "outcome_file", "verbose", "quiet", "yes"}
+ADOPTION_FLAGS = {"json", "dry_run", "outcome_file", "verbose", "quiet", "yes", "run"}
 OUTCOME_FILE_COMMANDS = ("exec", "start", "resume", "wait")
 # Session id arguments (dest -> flag; None for the positional id). verify-secret is not
 # listed: it requires the full id and answers a mismatch with exit 11, never a usage error.
@@ -493,6 +493,7 @@ def build_parser() -> _Parser:
     p = _command(commands, leaves, "exec", "exec", "run a session in the foreground")
     _add_launch_flags(p, resumable=False)
     p.add_argument("--session-id", metavar="ID", help="adopt a pending run created by start")
+    p.add_argument("--run", type=int, metavar="N", help="with --session-id: the run to adopt")
 
     p = _command(commands, leaves, "start", "start", "prepare a session for another process")
     _add_launch_flags(p, resumable=True)
@@ -720,6 +721,11 @@ def _check_new_headless(args: argparse.Namespace) -> None:
 
 
 def _check_exec(args: argparse.Namespace) -> None:
+    if args.run is not None:
+        if args.session_id is None:
+            raise UsageError("--run requires --session-id")
+        if not 1 <= args.run <= MAX_INTEGER:
+            raise UsageError(f"--run must be a positive integer (at most {MAX_INTEGER})")
     if args.session_id is not None:
         defaults = vars(build_parser().parse_args(["exec"]))
         for dest, value in vars(args).items():

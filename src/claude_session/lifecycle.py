@@ -455,7 +455,10 @@ def start(
     return {
         "csession_id": alloc.csession_id,
         "csession_dir": alloc.session_dir,
-        "argv": [process.claude_session, "exec", "--session-id", alloc.csession_id],
+        "argv": [
+            process.claude_session,
+            *("exec", "--session-id", alloc.csession_id, "--run", str(alloc.run)),
+        ],
         "run": alloc.run,
         "forked_from": forked_from,
         "expires_at": expires_at,
@@ -693,6 +696,17 @@ def lookup(st: store.Store, given: str) -> tuple[str, dict[str, Any]]:
     if record is None or record["session_forgotten_at"] is not None:
         raise NotFoundError(f"unknown session: {given}")
     return sid, record
+
+
+def check_run(sid: str, record: Mapping[str, Any], run: int | None) -> None:
+    """The run ``--run`` names must be the current run (``record``); another one exits 20
+    ``expired``: it ended and a later run took its place, or it never existed. Without
+    ``--run`` (an argv printed before it existed) the current run is adopted."""
+    if run is not None and record["run_no"] != run:
+        raise RefusedError(
+            f"cannot adopt run {run} of {sid}: expired (the current run is {record['run_no']})",
+            reason="expired",
+        )
 
 
 def refusal(record: Mapping[str, Any], now_past: bool) -> str | None:
@@ -941,6 +955,7 @@ def adopt(
     ``RefusedError`` (exit 20) or ``NotFoundError`` (exit 10) and change nothing (an expired
     pending run is finalized ``never_adopted`` first, and its launch spec deleted)."""
     sid, record = lookup(st, args.session_id)
+    check_run(sid, record, args.run)
     outcome_file = None if args.outcome_file is None else os.path.abspath(args.outcome_file)
     # TODO(#21): an isolated run's --outcome-file under a session-writable path exits 2 here,
     # before the compare-and-set, and the run stays pending.
@@ -965,6 +980,7 @@ def adopt(
         wrapper_start=store.start_time(os.getpid()),
         outcome_file=outcome_file,
         hook_interpreter=process.interpreter,
+        run_no=args.run,
     )
     if result.outcome == "not_found":
         raise NotFoundError(f"unknown session: {args.session_id}")
@@ -1085,6 +1101,7 @@ def adoption_plan(
     no plan to print (interface.md, Dry run): a refused adoption exits 20 with the refusal
     envelope and any other one 12 (``failed``)."""
     sid, record = lookup(st, args.session_id)
+    check_run(sid, record, args.run)
     would_refuse = refusal(record, st.past_deadline(record["expires_at"]))
     if would_refuse is None and st.fork_source_taints(sid):
         would_refuse = "tainted"

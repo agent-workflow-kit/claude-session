@@ -46,7 +46,10 @@ FULL_INVOCATIONS: dict[str, list[str]] = {
         *("--decision-id", "d1", "--decision-id", "d2", "--dry-run"),
         *("--json", "--config", "c.yaml", "--verbose"),
     ],
-    "exec-adopt": ["exec", "--session-id", SID, "--dry-run", "--outcome-file", "o", "--json"],
+    "exec-adopt": [
+        "exec",
+        *("--session-id", SID, "--run", "2", "--dry-run", "--outcome-file", "o", "--json"),
+    ],
     "start": [
         "start",
         *("--kind", "implement", "--mode", "interactive", "--auto-exit", "--label", "a=b"),
@@ -252,6 +255,12 @@ def test_resume_only_flags_are_parsed() -> None:
         ["model", "sandbox"],
         True,
     )
+
+
+def test_adoption_run_is_parsed() -> None:
+    args = parse(FULL_INVOCATIONS["exec-adopt"])
+    assert (args.session_id, args.run) == (SID, 2)
+    assert parse(["exec", "--session-id", SID]).run is None
 
 
 def test_nested_commands_and_positionals() -> None:
