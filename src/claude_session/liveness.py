@@ -416,9 +416,10 @@ def _finalize_lost(
             final = _final(mapped, parsed, cause, tuple(warnings))
             if st.finalize_run(sid, run, final, report_status=expected, expect=_dead(row)):
                 return True, _action(record, parsed, headless), warnings
-            if st.run_record(sid, run)["ended_at"] is not None:
+            now = st.run_record(sid, run)
+            if now["ended_at"] is not None:
                 return False, "", []
-            if any(record[key] != value for key, value in _dead(row).items()):
+            if any(now[key] != value for key, value in _dead(row).items()):
                 return False, "", []  # the run changed hands: never finalized here
         return False, "", []
     finally:
