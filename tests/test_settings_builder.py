@@ -16,7 +16,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from claude_session import config, kinds, settings_builder
-from claude_session.errors import FailedError
+from claude_session.errors import FailedError, LaunchValidationError
 from claude_session.sessiondir import SessionDirs
 from claude_session.settings_builder import Launch, Paths, Tools
 
@@ -503,21 +503,21 @@ SHELL_UNSAFE_CHARS = [" ", "\t", "'", '"', "$", "`", ";", "&", "|", "<", ">", "!
 
 @pytest.mark.parametrize("char", RULE_UNSAFE_CHARS)
 def test_check_rule_paths_refuses_rule_characters_in_the_state_root(char: str) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings_builder.check_rule_paths(f"/state/a{char}b", CS_PATH)
     assert info.value.end_reason == "unsafe_path"
 
 
 @pytest.mark.parametrize("char", RULE_UNSAFE_CHARS + SHELL_UNSAFE_CHARS)
 def test_check_rule_paths_refuses_unsafe_claude_session_paths(char: str) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings_builder.check_rule_paths(STATE, f"/opt/my{char}tools/claude-session")
     assert info.value.end_reason == "unsafe_path"
 
 
 @pytest.mark.parametrize("path", ["claude-session", "/opt/cs\n", "/opt/../cs"])
 def test_check_rule_paths_refuses_malformed_paths(path: str) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings_builder.check_rule_paths(STATE, path)
     assert info.value.end_reason == "unsafe_path"
 
@@ -529,7 +529,7 @@ def test_check_rule_paths_accepts_normal_paths() -> None:
 
 def test_settings_refuse_an_unsafe_claude_session_path_as_unsafe_path(cfg: config.Config) -> None:
     tools = Tools(interpreter=PYTHON, claude_session="/opt/my tools/claude-session", claude=CLAUDE)
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings(resolve(cfg), tools=tools)
     assert info.value.end_reason == "unsafe_path"
 
@@ -577,7 +577,7 @@ def test_profile_mode_wins_for_trusted_runs(cfg: config.Config, mode: str, sourc
 
 @pytest.mark.parametrize("mode", ["", 3, None, ["default"], "notAMode", "Default", "dontask"])
 def test_profile_mode_must_be_a_known_mode(cfg: config.Config, mode: Any) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings(resolve(cfg), profile(defaultMode=mode))
     assert info.value.end_reason == "invalid_permission_profile"
 
@@ -586,7 +586,7 @@ def test_profile_mode_must_be_a_known_mode(cfg: config.Config, mode: Any) -> Non
 def test_profile_additional_directories_must_be_a_string_list(
     cfg: config.Config, value: Any
 ) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings(resolve(cfg), profile(additionalDirectories=value))
     assert info.value.end_reason == "invalid_permission_profile"
 
@@ -609,7 +609,7 @@ def test_profile_rules_are_kept_and_generated_rules_added(cfg: config.Config) ->
 @pytest.mark.parametrize("key", ["allow", "deny", "ask"])
 @pytest.mark.parametrize("value", ["Bash(x)", [1], [None], {"a": 1}])
 def test_profile_rule_lists_must_be_string_lists(cfg: config.Config, key: str, value: Any) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings(resolve(cfg), profile(**{key: value}))
     assert info.value.end_reason == "invalid_permission_profile"
 

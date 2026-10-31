@@ -192,6 +192,20 @@ def write_private_file_at(
 
 # Deeper trees are refused by ``remove_tree_at`` (bounded recursion and open descriptors).
 MAX_TREE_DEPTH = 256
+# Descriptors left free below RLIMIT_NOFILE while a tree is removed (one is open per level).
+FD_MARGIN = 64
+
+
+def tree_depth_cap() -> int:
+    """The depth ``remove_tree_at`` refuses beyond: ``MAX_TREE_DEPTH``, lowered to the soft
+    ``RLIMIT_NOFILE`` minus ``FD_MARGIN`` (at least 1), so a deep tree fails cleanly with
+    ``UnsafePathError`` instead of ``EMFILE`` partway down."""
+    import resource
+
+    soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY or soft < 0:
+        return MAX_TREE_DEPTH
+    return max(1, min(MAX_TREE_DEPTH, soft - FD_MARGIN))
 
 
 def remove_tree_at(dir_fd: int, name: str) -> None:
@@ -199,25 +213,25 @@ def remove_tree_at(dir_fd: int, name: str) -> None:
     directory descriptors and never following a symlink: a symlink (anywhere, including
     ``name`` itself) is unlinked, never followed. Directories must be owned by the effective
     user; their modes are repaired (0700) so contents can be listed and removed. A tree
-    deeper than ``MAX_TREE_DEPTH`` is refused. Raises ``OSError``; on failure part of the tree
-    may already be gone."""
+    deeper than ``tree_depth_cap()`` is refused (``UnsafePathError``). Raises ``OSError``; on
+    failure part of the tree may already be gone."""
     _check_segment(name)
-    _remove_at(dir_fd, name, 0)
+    _remove_at(dir_fd, name, 0, tree_depth_cap())
 
 
-def _remove_at(dir_fd: int, name: str, depth: int) -> None:
+def _remove_at(dir_fd: int, name: str, depth: int, cap: int) -> None:
     info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     if not stat.S_ISDIR(info.st_mode):
         os.unlink(name, dir_fd=dir_fd)
         return
-    if depth >= MAX_TREE_DEPTH:
-        raise UnsafePathError(f"{name}: directory tree deeper than {MAX_TREE_DEPTH} levels")
+    if depth >= cap:
+        raise UnsafePathError(f"{name}: directory tree deeper than {cap} levels")
     fd = open_private_dir_at(dir_fd, name)  # no-follow, ours, mode repaired to 0700
     try:
         if _identity(fd) != (info.st_dev, info.st_ino):
             raise UnsafePathError(f"{name}: replaced while it was being removed")
         for child in os.listdir(fd):
-            _remove_at(fd, child, depth + 1)
+            _remove_at(fd, child, depth + 1, cap)
     finally:
         os.close(fd)
     os.rmdir(name, dir_fd=dir_fd)

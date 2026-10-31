@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_session import sessiondir
+from claude_session import fsutil, sessiondir
 from claude_session.errors import FailedError, UsageError
 from claude_session.sessiondir import DirId, InputFile, SessionDirs
 
@@ -1060,3 +1060,39 @@ def test_isolated_prepare_is_repeatable(root: Path, dirs: SessionDirs) -> None:
     for run in (1, 2, 3):
         dirs.prepare_run(run, isolated=True)
     assert list((sdir(root) / "gh-empty").iterdir()) == []
+
+
+def test_isolated_prepare_warns_on_a_leftover_it_cannot_remove_and_sweeps_it_later(
+    root: Path, dirs: SessionDirs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dirs.prepare_run(1, isolated=True)
+    session = sdir(root)
+    (session / "gh-empty" / "a" / "b" / "c" / "d").mkdir(parents=True)
+    (session / "empty-gitconfig").unlink()
+    (session / "empty-gitconfig" / "x" / "y" / "z").mkdir(parents=True)
+    monkeypatch.setattr(fsutil, "MAX_TREE_DEPTH", 2)
+    layout = dirs.prepare_run(2, isolated=True)
+    # Both leftovers were attempted (both too deep), the launch preparation still succeeded.
+    assert len(layout.warnings) == 2
+    assert all("cannot remove leftover" in warning for warning in layout.warnings)
+    assert list((session / "gh-empty").iterdir()) == []
+    assert (session / "empty-gitconfig").read_bytes() == b""
+    trash = sorted(p.name for p in pdir(root).iterdir() if p.name.endswith(".trash"))
+    assert len(trash) == 2
+    monkeypatch.setattr(fsutil, "MAX_TREE_DEPTH", 256)
+    assert dirs.prepare_run(3, isolated=True).warnings == ()
+    assert sorted(p.name for p in pdir(root).iterdir()) == ["runs"]
+
+
+def test_leftover_warnings_never_name_entries_inside_the_tree(
+    root: Path, dirs: SessionDirs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dirs.prepare_run(1, isolated=True)
+    (sdir(root) / "gh-empty" / "planted\x1bname" / "deeper").mkdir(parents=True)
+    monkeypatch.setattr(fsutil, "MAX_TREE_DEPTH", 1)
+    warnings = dirs.prepare_run(2, isolated=True).warnings
+    assert warnings and not any("planted" in warning for warning in warnings)
+
+
+def test_trusted_prepare_has_no_warnings(dirs: SessionDirs) -> None:
+    assert dirs.prepare_run(1).warnings == ()

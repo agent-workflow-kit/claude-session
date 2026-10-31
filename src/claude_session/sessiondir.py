@@ -17,7 +17,8 @@ design.md, Session directories; interface.md, Concepts and File handling:
 - The standard instructions contain no per-run values (design.md, Prompt delivery).
 
 TODO(#15): call prepare_run, write_prompt/write_inputs and write_run_files from exec's
-launch step 7, and record the layout and secret digest with Store.record_run_files.
+launch step 7, record the layout and secret digest with Store.record_run_files, and add
+RunLayout.warnings (leftovers that could not be removed) to the run's warnings.
 TODO(#28): start stages with stage(); the adopting exec calls place_staged().
 TODO(#29): fork copy of the source's inputs/ (fd-based; no symlinks, non-regular files or
 nlink > 1) and the carry-over of a not-started run's prompt and inputs.
@@ -58,6 +59,8 @@ GH_EMPTY = "gh-empty"
 EMPTY_GITCONFIG = "empty-gitconfig"
 
 SECRET_BYTES = 32
+# The private-directory names _recreate_empty moves replaced entries to.
+_TRASH = re.compile(r"\.[0-9a-f]{8}\.trash")
 _READ_CHUNK = 1 << 16
 # C0 and C1 controls and DEL: never inside the executable path written into the instructions.
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -134,10 +137,13 @@ class DirId:
 
 @dataclass(frozen=True)
 class RunLayout:
-    """The agent-writable directories of a run as ``exec`` prepared them."""
+    """The agent-writable directories of a run as ``exec`` prepared them, and the warnings of
+    the preparation (leftovers that could not be removed; ``exec`` adds them to the run's
+    warnings)."""
 
     outbox: DirId
     artifacts: DirId
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -479,19 +485,25 @@ class SessionDirs:
             finally:
                 os.close(fd)
         os.close(self._run_private_dir(run))
-        layout = RunLayout(outbox=idents[OUTBOX], artifacts=idents[ARTIFACTS])
+        warnings = self._recreate_empty() if isolated else []
+        layout = RunLayout(
+            outbox=idents[OUTBOX], artifacts=idents[ARTIFACTS], warnings=tuple(warnings)
+        )
         self._layouts[run] = layout
-        if isolated:
-            self._recreate_empty()
         return layout
 
-    def _recreate_empty(self) -> None:
+    def _recreate_empty(self) -> list[str]:
         """Replace ``gh-empty/`` with a new empty directory and ``empty-gitconfig`` with an
         empty file. Whatever is at either name (a directory with content, a file, a symlink)
         is first moved into the private directory by rename, never followed, and removed
         there once the new entry is in place. The new directory is created in the private
         directory and renamed into place, like every file (no temporary name in the session
-        directory)."""
+        directory).
+
+        Removing the moved entries is best effort: every one is attempted and a failure
+        (for example a tree too deep to remove) is returned as a warning, not raised; the
+        leftovers (``.<hex>.trash``) are swept again at the start of the next call."""
+        warnings = self._sweep_trash()
         trash = [self._move_to_private(name) for name in (GH_EMPTY, EMPTY_GITCONFIG)]
         tmp = f".{secrets.token_hex(4)}.tmp"
         try:
@@ -502,10 +514,30 @@ class SessionDirs:
         self._write(self._sfd, EMPTY_GITCONFIG, b"", self.session_path)
         for name in trash:
             if name is not None:
-                try:
-                    fsutil.remove_tree_at(self._pfd, name)
-                except OSError as exc:
-                    raise _failed(os.path.join(self.private_path, name), exc) from exc
+                warnings += self._remove_trash(name)
+        return warnings
+
+    def _sweep_trash(self) -> list[str]:
+        """Remove leftover ``.<hex>.trash`` entries of earlier calls (best effort)."""
+        try:
+            names = os.listdir(self._pfd)
+        except OSError as exc:
+            return [f"cannot list {self.private_path} for leftovers: {exc.strerror or exc}"]
+        warnings: list[str] = []
+        for name in sorted(names):
+            if _TRASH.fullmatch(name):
+                warnings += self._remove_trash(name)
+        return warnings
+
+    def _remove_trash(self, name: str) -> list[str]:
+        try:
+            fsutil.remove_tree_at(self._pfd, name)
+        except OSError as exc:
+            # Never the exception text: it may name an entry the agent created.
+            reason = exc.strerror or "unsafe entry or directory tree too deep"
+            path = os.path.join(self.private_path, name)
+            return [f"cannot remove leftover {path} (retried next run): {reason}"]
+        return []
 
     def _move_to_private(self, name: str) -> str | None:
         """Rename the session-directory entry ``name`` (any type) into the private directory

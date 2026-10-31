@@ -27,10 +27,14 @@ caller's for ``exec``, the adopting process's for ``exec --session-id``); it nev
    executable directory, ``env.path_prepend``, the kind's ``PATH``. Config validation
    already refuses invalid ``env.set``, ``env.allow`` and ``path_prepend`` entries; the checks
    here are a backstop.
-6. (#24) PATH sanitizing for isolated runs.
-7. Third-party-reading runs: the ``GIT_CONFIG_COUNT``/``KEY``/``VALUE`` hardening entries
-   appended after the existing ones (renumbered; a malformed existing set is replaced) and
-   ``GIT_OPTIONAL_LOCKS=0``. After step 5, so they win over ``env.set``.
+6. (#24) PATH sanitizing for isolated runs. Isolated runs also lose the dynamic-loader
+   variables (``LD_PRELOAD``, ``LD_LIBRARY_PATH``, ``LD_AUDIT``, every ``DYLD_*``), also ones
+   ``env.set`` sets: they would reach the unsandboxed hook interpreter.
+7. Third-party-reading runs: the git variables that override config or redirect git
+   (``GIT_CONFIG_PARAMETERS``, ``GIT_SSH``, ``GIT_DIR``, ...; ``GIT_ENV_DROP``) removed, then
+   the ``GIT_CONFIG_COUNT``/``KEY``/``VALUE`` hardening entries appended after the existing
+   ones (renumbered; a malformed existing set is replaced) and ``GIT_OPTIONAL_LOCKS=0``.
+   After step 5, so they win over ``env.set``.
 8. Every ``CSESSION_*`` removed, then ``CSESSION_ID``, ``CSESSION_DIR``, ``CSESSION_KIND`` and,
    when a private temporary directory is given, ``TMPDIR`` and ``CLAUDE_CODE_TMPDIR`` set.
 
@@ -99,11 +103,31 @@ GIT_HARDENING = (
     ("diff.external", ""),
     ("core.pager", "cat"),
 )
+# Step 7: removed first; each beats the hardening entries (GIT_CONFIG_PARAMETERS is applied
+# after the GIT_CONFIG_COUNT entries) or points git at other commands or another repository.
+# Not kinds._GIT_ENV_DROP: that one also drops the GIT_CONFIG_COUNT set kept here.
+GIT_ENV_DROP = (
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_ASKPASS",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
 GIT_CONFIG_COUNT = "GIT_CONFIG_COUNT"
 GIT_CONFIG_KEY = "GIT_CONFIG_KEY_"
 GIT_CONFIG_VALUE = "GIT_CONFIG_VALUE_"
 # An existing GIT_CONFIG_COUNT above this (or not plain ASCII digits) is treated as malformed.
 MAX_GIT_CONFIG_COUNT = 1000
+# Step 6: dynamic-loader variables removed for isolated runs.
+LOADER_DROP = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT")
+LOADER_DROP_PREFIX = "DYLD_"
 # Step 8.
 CSESSION_PREFIX = "CSESSION_"
 TMPDIR_ENV = ("TMPDIR", "CLAUDE_CODE_TMPDIR")
@@ -215,8 +239,13 @@ def build(
 
     # 6. TODO(#24): sanitize PATH for isolated runs (drop empty and relative entries, refuse
     #    entries inside session-writable paths with unsafe_path).
+    if resolution.isolated():
+        for name in [n for n in env if n in LOADER_DROP or n.startswith(LOADER_DROP_PREFIX)]:
+            del env[name]
     # 7. Git hardening (after step 5: it wins over env.set).
     if profile.reads_third_party:
+        for name in GIT_ENV_DROP:
+            env.pop(name, None)
         _git_hardening(env)
 
     # 8. CSESSION_* and the private temporary directory.

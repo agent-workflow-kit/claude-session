@@ -47,24 +47,18 @@ SNAPSHOT_NAME = "permission-profile.json"
 HASH_PREFIX = 16  # hex characters of the sha256 in ``file:<prefix>`` (the schemas allow 12-64)
 MAX_FILE_BYTES = config.MAX_FILE_BYTES
 SECTIONS = ("permissions", "sandbox")
-# Keys an isolated run's profile may not set at all (interface.md, Permission profiles): the
-# generated isolation keys, and sandbox escapes (host sockets, local listeners, proxies, a
-# weaker sandbox, ignored violations).
-REFUSED_ISOLATED = (
-    ("sandbox", "enabled"),
-    ("sandbox", "failIfUnavailable"),
-    ("sandbox", "allowUnsandboxedCommands"),
-    ("sandbox", "excludedCommands"),
-    ("sandbox", "enableWeakerNestedSandbox"),
-    ("sandbox", "ignoreViolations"),
-    ("sandbox", "network", "allowUnixSockets"),
-    ("sandbox", "network", "allowAllUnixSockets"),
-    ("sandbox", "network", "allowLocalBinding"),
-    ("sandbox", "network", "httpProxyPort"),
-    ("sandbox", "network", "socksProxyPort"),
-    ("permissions", "additionalDirectories"),
-)
-# ... and this one only as anything but false (the generated value is false).
+# The only sandbox keys an isolated run's profile may set (interface.md, Permission profiles):
+# an allowlist, since any other key may be a sandbox escape (host sockets, local listeners,
+# proxies, a weaker or disabled sandbox, ignored violations) or a generated isolation key.
+# A mapping value lists the allowed keys below it; None: a leaf.
+ISOLATED_SANDBOX_KEYS: dict[str, frozenset[str] | None] = {
+    "filesystem": frozenset({"allowRead", "denyRead", "allowWrite", "denyWrite"}),
+    "network": frozenset({"allowedDomains", "deniedDomains"}),
+    "autoAllowBashIfSandboxed": None,
+}
+# Permission keys an isolated run's profile may not set at all.
+REFUSED_ISOLATED = (("permissions", "additionalDirectories"),)
+# ... and this one only as false (the generated value is false).
 AUTO_ALLOW = ("sandbox", "autoAllowBashIfSandboxed")
 # Values the settings builder merges with generated rules: lists of strings when present.
 STRING_LISTS = (
@@ -78,6 +72,7 @@ STRING_LISTS = (
     ("sandbox", "filesystem", "allowWrite"),
     ("sandbox", "filesystem", "denyWrite"),
     ("sandbox", "network", "allowedDomains"),
+    ("sandbox", "network", "deniedDomains"),
 )
 MAPPINGS = (("sandbox", "filesystem"), ("sandbox", "network"))
 STRINGS = (("permissions", "defaultMode"),)
@@ -221,7 +216,8 @@ def _require_check(isolated: bool, session_writable: Callable[[str], bool] | Non
 def validate(content: Any, *, isolated: bool, source: str = "permission profile") -> None:
     """Check ``content``: a mapping of ``permissions`` and ``sandbox`` mappings whose known
     rule lists are lists of strings and whose numbers are finite. For isolated runs, also the
-    refused keys. Raises ``InvalidPermissionProfile`` listing every problem (key paths only)."""
+    sandbox key allowlist and the refused keys. Raises ``InvalidPermissionProfile`` listing
+    every problem (key paths only)."""
     # TODO(#24): refused paths (state root, /tmp/csession-<uid>, unsafe write targets) are
     # checked on the expanded profile, for trusted and isolated runs; for isolated runs also
     # sandbox.filesystem.allowRead against the read_dirs credential paths (interface.md, Path
@@ -454,6 +450,19 @@ def _refused(content: dict[str, Any]) -> list[str]:
         for loc in REFUSED_ISOLATED
         if _get(content, loc)[0]
     ]
+    sandbox = content.get("sandbox") or {}
+    for key, value in sandbox.items():
+        if key not in ISOLATED_SANDBOX_KEYS:
+            problems.append(f"sandbox.{_safe(key)}: not allowed for isolated runs")
+            continue
+        allowed = ISOLATED_SANDBOX_KEYS[key]
+        if allowed is None or not isinstance(value, dict):
+            continue
+        problems.extend(
+            f"sandbox.{key}.{_safe(sub)}: not allowed for isolated runs"
+            for sub in value
+            if sub not in allowed
+        )
     found, value = _get(content, AUTO_ALLOW)
     if found and value is not False:
         problems.append(f"{'.'.join(AUTO_ALLOW)}: only false is allowed for isolated runs")

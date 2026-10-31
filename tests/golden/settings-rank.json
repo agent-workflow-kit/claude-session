@@ -91,17 +91,25 @@
       "Read(//home/user/.local/state/claude-session/private/**)"
     ],
     "defaultMode": "dontAsk",
-    "blockReadsOutsideWorkingDirectories": true
+    "blockReadsOutsideWorkingDirectories": true,
+    "disableAutoMode": "disable",
+    "disableBypassPermissionsMode": "disable"
   },
   "sandbox": {
     "enabled": true,
     "failIfUnavailable": false,
     "allowUnsandboxedCommands": false,
     "autoAllowBashIfSandboxed": false,
+    "allowNestedUserNamespaces": false,
+    "allowAppleEvents": false,
+    "enableWeakerNestedSandbox": false,
+    "enableWeakerNetworkIsolation": false,
     "network": {
-      "allowedDomains": []
+      "allowedDomains": [],
+      "strictAllowlist": true
     },
     "filesystem": {
+      "disabled": false,
       "denyRead": [
         "/"
       ],
@@ -109,9 +117,13 @@
         "/home/user/.local/state/claude-session/sessions/cs-abcd2345/work",
         "/home/user/.local/state/claude-session/sessions/cs-abcd2345",
         "/usr",
+        "/bin",
         "/usr/bin",
+        "/sbin",
         "/usr/sbin",
+        "/lib",
         "/usr/lib",
+        "/lib64",
         "/usr/lib64",
         "/etc",
         "/usr/local/bin",

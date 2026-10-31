@@ -14,7 +14,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from claude_session import config, kinds, permission_profiles, settings_builder
-from claude_session.errors import InvalidPermissionProfile
+from claude_session.errors import InvalidPermissionProfile, LaunchValidationError
 from claude_session.settings_builder import Isolation, Launch, Paths, Tools
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,7 +36,19 @@ REPO = "/work/repo"
 GIT_DIR = "/work/main/.git"
 WT_GIT_DIR = "/work/main/.git/worktrees/repo"
 PLUGIN = "/opt/plugins/review-kit"
-SYSTEM = ("/usr", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/etc")
+# system_read_dirs() on a usr-merged system: each literal path, then its realpath.
+SYSTEM = (
+    "/usr",
+    "/bin",
+    "/usr/bin",
+    "/sbin",
+    "/usr/sbin",
+    "/lib",
+    "/usr/lib",
+    "/lib64",
+    "/usr/lib64",
+    "/etc",
+)
 TOOL_DIRS = ("/usr/bin", "/usr/local/bin", "/opt/claude/versions")
 PYTHON_DIRS = ("/opt/claude-session", "/opt/python/3.12")
 
@@ -195,7 +207,7 @@ def test_profile_mode_is_ignored_for_isolated_runs(cfg: config.Config, mode: str
 
 
 def test_profile_mode_must_still_be_valid(cfg: config.Config) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings(cfg, perm={"permissions": {"defaultMode": "yolo"}})
     assert end_reason(info) == "invalid_permission_profile"
 
@@ -266,6 +278,12 @@ def test_profile_ask_rules_are_kept(cfg: config.Config) -> None:
         {"sandbox": {"network": {"allowLocalBinding": True}}},
         {"sandbox": {"network": {"httpProxyPort": 8080}}},
         {"sandbox": {"network": {"socksProxyPort": 1080}}},
+        {"sandbox": {"filesystem": {"disabled": True}}},
+        {"sandbox": {"allowNestedUserNamespaces": True}},
+        {"sandbox": {"allowAppleEvents": True}},
+        {"sandbox": {"network": {"allowMachLookup": ["com.apple.x"]}}},
+        {"sandbox": {"enableWeakerNetworkIsolation": True}},
+        {"sandbox": {"network": {"strictAllowlist": False}}},
         {"permissions": {"additionalDirectories": ["/"]}},
     ],
 )
@@ -317,7 +335,8 @@ def test_preferred_sandbox_does_not_fail_if_unavailable(cfg: config.Config) -> N
 def test_sandbox_off_third_party_run_keeps_the_permission_layer(cfg: config.Config) -> None:
     data = settings(cfg, resolution=resolve(cfg, "review", sandbox="off"), tmpdir=None)
     sandbox = data["sandbox"]
-    assert "enabled" not in sandbox and "failIfUnavailable" not in sandbox
+    # Explicitly off: user or managed settings cannot enable a sandbox without the tmpdir.
+    assert sandbox["enabled"] is False and "failIfUnavailable" not in sandbox
     assert sandbox["autoAllowBashIfSandboxed"] is False
     assert sandbox["allowUnsandboxedCommands"] is False
     assert data["permissions"]["defaultMode"] == "dontAsk"
@@ -336,7 +355,6 @@ def test_sandbox_never_auto_allows_bash_or_runs_unsandboxed(cfg: config.Config, 
 @pytest.mark.parametrize("kind", ISOLATED_KINDS)
 def test_sandbox_escape_keys_are_never_emitted(cfg: config.Config, kind: str) -> None:
     sandbox = settings(cfg, kind)["sandbox"]
-    assert "enableWeakerNestedSandbox" not in sandbox
     assert "ignoreViolations" not in sandbox
     for key in (
         "allowUnixSockets",
@@ -346,6 +364,42 @@ def test_sandbox_escape_keys_are_never_emitted(cfg: config.Config, kind: str) ->
         "socksProxyPort",
     ):
         assert key not in sandbox["network"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "sandbox_mode"),
+    [*((kind, None) for kind in ISOLATED_KINDS), *((kind, "off") for kind in THIRD_PARTY_KINDS)],
+)
+def test_sandbox_escape_keys_are_explicitly_false(
+    cfg: config.Config, kind: str, sandbox_mode: str | None
+) -> None:
+    # --settings outranks user settings: a user setting cannot turn these on.
+    resolution = resolve(cfg, kind, **({"sandbox": sandbox_mode} if sandbox_mode else {}))
+    data = settings(cfg, kind, resolution=resolution, tmpdir=None if sandbox_mode else TMP)
+    sandbox = data["sandbox"]
+    for key in (
+        "allowNestedUserNamespaces",
+        "allowAppleEvents",
+        "enableWeakerNestedSandbox",
+        "enableWeakerNetworkIsolation",
+    ):
+        assert sandbox[key] is False
+    assert sandbox["filesystem"]["disabled"] is False
+    assert sandbox["network"]["strictAllowlist"] is True
+
+
+@pytest.mark.parametrize("kind", ISOLATED_KINDS)
+def test_unattended_modes_are_disabled(cfg: config.Config, kind: str) -> None:
+    perm = {"permissions": {"disableAutoMode": "allow", "disableBypassPermissionsMode": "x"}}
+    permissions = settings(cfg, kind, perm=perm)["permissions"]
+    assert permissions["disableAutoMode"] == "disable"
+    assert permissions["disableBypassPermissionsMode"] == "disable"
+
+
+def test_trusted_runs_do_not_disable_modes(cfg: config.Config) -> None:
+    data = settings_builder.build_settings(resolve(cfg, "implement"), {}, PATHS, TOOLS, cwd=REPO)
+    assert "disableAutoMode" not in data["permissions"]
+    assert "disableBypassPermissionsMode" not in data["permissions"]
 
 
 @pytest.mark.parametrize("kind", ISOLATED_KINDS)
@@ -425,14 +479,14 @@ def test_tmpdir_is_writable_but_never_readable_by_allow_read(cfg: config.Config,
 
 @pytest.mark.parametrize("entry", [TMP, f"{TMP}/sub"])
 def test_read_dirs_inside_the_tmpdir_are_refused(cfg: config.Config, entry: str) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings(cfg, read_dirs=(entry,))
     assert end_reason(info) == "invalid_permission_profile"
 
 
 def test_profile_allow_read_inside_the_tmpdir_is_refused(cfg: config.Config) -> None:
     perm = {"sandbox": {"filesystem": {"allowRead": [TMP]}}}
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings(cfg, perm=perm)
     assert end_reason(info) == "invalid_permission_profile"
 
@@ -441,7 +495,7 @@ def test_profile_allow_read_inside_the_tmpdir_is_refused(cfg: config.Config) -> 
 def test_generated_read_entries_inside_the_tmpdir_are_refused(
     cfg: config.Config, field: str
 ) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         iso: dict[str, Any] = {field: (f"{TMP}/x",)}
         settings(cfg, **iso)
     assert end_reason(info) == "unsafe_read_dir"
@@ -524,18 +578,54 @@ def test_plugin_dirs_are_read_only(cfg: config.Config, kind: str) -> None:
             assert f"{tool}(/{plugin}/**)" in perms["deny"]
 
 
-@pytest.mark.parametrize("kind", ISOLATED_KINDS)
-def test_cwd_dot_git_is_always_write_denied(cfg: config.Config, kind: str) -> None:
+def dot_git_denied(data: dict[str, Any], cwd: str) -> bool:
+    deny = data["permissions"]["deny"]
+    rules = [f"{tool}(/{cwd}/.git{tail})" for tool in ("Edit", "Write") for tail in ("", "/**")]
+    in_rules = all(rule in deny for rule in rules)
+    in_sandbox = f"{cwd}/.git" in sandbox_fs(data)["denyWrite"]
+    assert in_rules == in_sandbox
+    return in_rules
+
+
+@pytest.mark.parametrize("kind", THIRD_PARTY_KINDS)
+def test_cwd_dot_git_is_always_write_denied_on_third_party_runs(
+    cfg: config.Config, kind: str
+) -> None:
     for git_dir in (None, GIT_DIR):
-        data = settings(cfg, kind, git_dir=git_dir)
-        cwd = cwd_of(kind)
-        assert f"{cwd}/.git" in sandbox_fs(data)["denyWrite"]
-        for tool in ("Edit", "Write"):
-            assert f"{tool}(/{cwd}/.git)" in data["permissions"]["deny"]
-            assert f"{tool}(/{cwd}/.git/**)" in data["permissions"]["deny"]
+        assert dot_git_denied(settings(cfg, kind, git_dir=git_dir), cwd_of(kind))
 
 
-@pytest.mark.parametrize("kind", ISOLATED_KINDS)
+SANDBOXED_TRUSTED = [("rank", {}), ("implement", {"sandbox": "preferred"})]
+
+
+@pytest.mark.parametrize(("kind", "flags"), SANDBOXED_TRUSTED)
+def test_sandboxed_trusted_run_without_git_dir_denies_dot_git(
+    cfg: config.Config, kind: str, flags: dict[str, Any]
+) -> None:
+    data = settings(cfg, resolution=resolve(cfg, kind, **flags), perm={}, cwd=REPO)
+    assert dot_git_denied(data, REPO)
+
+
+@pytest.mark.parametrize(("kind", "flags"), SANDBOXED_TRUSTED)
+def test_sandboxed_trusted_run_with_git_dir_can_commit(
+    cfg: config.Config, kind: str, flags: dict[str, Any]
+) -> None:
+    # design.md, Git directory: read-only only on third-party-reading runs (Q28).
+    data = settings(
+        cfg,
+        resolution=resolve(cfg, kind, **flags),
+        perm={},
+        cwd=REPO,
+        git_dir=GIT_DIR,
+        worktree_git_dir=WT_GIT_DIR,
+    )
+    assert not dot_git_denied(data, REPO)
+    for git_dir in (GIT_DIR, WT_GIT_DIR):
+        assert git_dir not in sandbox_fs(data)["denyWrite"]
+        assert not any(git_dir in rule for rule in data["permissions"]["deny"])
+
+
+@pytest.mark.parametrize("kind", THIRD_PARTY_KINDS)
 def test_git_directory_is_read_only(cfg: config.Config, kind: str) -> None:
     data = settings(cfg, kind, git_dir=GIT_DIR, worktree_git_dir=WT_GIT_DIR)
     fs = sandbox_fs(data)
@@ -661,20 +751,20 @@ def test_home_at_root_still_denies_credentials(cfg: config.Config) -> None:
 
 @pytest.mark.parametrize("char", ["*", "?", "[", "]", "{", "}", "(", ")", "\\", "\n", "\x7f"])
 def test_unsafe_cwd_is_refused(cfg: config.Config, char: str) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings(cfg, "respond", perm={}, cwd=f"/work/re{char}po")
     assert end_reason(info) == "unsafe_cwd"
 
 
 @pytest.mark.parametrize("cwd", ["relative/repo", "/work/../repo", "/work/repo/", "//work/repo"])
 def test_unnormalized_cwd_is_refused(cfg: config.Config, cwd: str) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings(cfg, "respond", perm={}, cwd=cwd)
     assert end_reason(info) == "unsafe_cwd"
 
 
 def test_unsafe_plugin_dir_is_refused(cfg: config.Config) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings(cfg, plugin_dirs=("/opt/plugins/x*",))
     assert end_reason(info) == "unsafe_plugin_dir"
 
@@ -694,7 +784,7 @@ def test_unsafe_plugin_dir_is_refused(cfg: config.Config) -> None:
 def test_unsafe_list_entries_are_refused(
     cfg: config.Config, field: str, reason: str, value: str
 ) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         iso: dict[str, Any] = {field: (value,)}
         settings(cfg, **iso)
     assert end_reason(info) == reason
@@ -703,10 +793,11 @@ def test_unsafe_list_entries_are_refused(
 @pytest.mark.parametrize("field", ["home", "git_dir", "tmpdir"])
 @pytest.mark.parametrize("value", ["", "relative", "/a/../b", "/a/*", "/a\nb"])
 def test_unsafe_single_paths_are_refused(cfg: config.Config, field: str, value: str) -> None:
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         iso: dict[str, Any] = {field: value}
         settings(cfg, perm={}, **iso)
-    assert end_reason(info) == ("tmpdir_unsafe" if field == "tmpdir" else "unsafe_path")
+    expected = {"tmpdir": "tmpdir_unsafe", "git_dir": "unsafe_read_dir", "home": "unsafe_path"}
+    assert end_reason(info) == expected[field]
 
 
 def test_paths_with_spaces_and_unicode_are_accepted(cfg: config.Config) -> None:
@@ -906,6 +997,7 @@ def test_interpreter_outside_writable_paths_passes(tmp_path: Path) -> None:
         session_writable=writable_under(str(tmp_path / "cwd")),
         prefixes=("/opt/venv", "/usr"),
         package_dir="/opt/venv/lib/python3.12/site-packages/claude_session",
+        link_dirs=(),
     )
 
 
@@ -932,12 +1024,15 @@ def test_interpreter_inside_a_writable_path_is_refused(tmp_path: Path, where: st
             prefixes = ("/opt/base", str(venv))
         else:
             package = str(cwd / "src" / "claude_session")
-    with pytest.raises(settings_builder.LaunchValidationError) as info:
+    with pytest.raises(LaunchValidationError) as info:
         settings_builder.check_interpreter(
             interpreter,
             session_writable=writable_under(str(cwd)),
             prefixes=prefixes,
             package_dir=package,
+            sys_path=(),
+            site_dirs=(),
+            link_dirs=(),
         )
     assert end_reason(info) == "unsafe_path"
 
@@ -949,7 +1044,7 @@ def test_interpreter_check_defaults_to_this_python() -> None:
         seen.append(path)
         return False
 
-    settings_builder.check_interpreter(sys.executable, session_writable=record)
+    settings_builder.check_interpreter(sys.executable, session_writable=record, link_dirs=())
     assert sys.prefix in seen and sys.exec_prefix in seen
     assert os.path.dirname(settings_builder.__file__) in seen
 
@@ -961,15 +1056,24 @@ def test_system_read_dirs_skip_missing_and_resolve_symlinks(tmp_path: Path) -> N
     (tmp_path / "usr" / "bin").mkdir(parents=True)
     (tmp_path / "etc").mkdir()
     (tmp_path / "bin").symlink_to(tmp_path / "usr" / "bin")
+    (tmp_path / "sbin").symlink_to(tmp_path / "usr" / "bin")
     dirs = settings_builder.system_read_dirs(
         (
             str(tmp_path / "usr"),
             str(tmp_path / "bin"),
+            str(tmp_path / "sbin"),
             str(tmp_path / "lib32"),
             str(tmp_path / "etc"),
         )
     )
-    assert dirs == (str(tmp_path / "usr"), str(tmp_path / "usr" / "bin"), str(tmp_path / "etc"))
+    # A symlinked (usr-merged) system dir yields both its literal path and its target.
+    assert dirs == (
+        str(tmp_path / "usr"),
+        str(tmp_path / "bin"),
+        str(tmp_path / "usr" / "bin"),
+        str(tmp_path / "sbin"),
+        str(tmp_path / "etc"),
+    )
 
 
 def test_system_read_dirs_default_list() -> None:
@@ -1023,7 +1127,6 @@ def python_layout(tmp_path: Path) -> dict[str, Any]:
             str(tmp_path / "missing"),
         ),
         "user_site": None,
-        "cwd": str(caller),
     }
 
 
@@ -1036,15 +1139,23 @@ def test_python_read_dirs(tmp_path: Path) -> None:
         str(tmp_path / "venv" / "lib" / "site-packages" / "claude_session"),
         str(tmp_path / "venv"),
         str(tmp_path / "base"),
+        str(tmp_path / "caller"),
+        str(tmp_path / "caller" / "src"),
         str(tmp_path / "extra-path"),
     )
 
 
-def test_python_read_dirs_drop_cwd_derived_and_relative_entries(tmp_path: Path) -> None:
+def test_python_read_dirs_drop_empty_and_relative_entries(tmp_path: Path) -> None:
     dirs = settings_builder.python_read_dirs(**python_layout(tmp_path))
-    assert not any(d.startswith(str(tmp_path / "caller")) for d in dirs)
     assert "" not in dirs and "relative/dir" not in dirs
     assert all(os.path.isabs(d) for d in dirs)
+
+
+def test_python_read_dirs_keep_entries_inside_the_caller_cwd(tmp_path: Path) -> None:
+    # Not dropped silently: check_interpreter refuses one inside a session-writable path,
+    # and #24's generated-entry checks refuse the caller's cwd.
+    dirs = settings_builder.python_read_dirs(**python_layout(tmp_path))
+    assert str(tmp_path / "caller" / "src") in dirs
 
 
 def test_python_read_dirs_include_the_user_site_when_used(tmp_path: Path) -> None:
@@ -1080,6 +1191,281 @@ def test_python_read_dirs_resolve_symlinks(tmp_path: Path) -> None:
 
 
 def test_python_read_dirs_defaults_to_this_interpreter() -> None:
-    dirs = settings_builder.python_read_dirs(cwd="/nonexistent-cwd")
+    dirs = settings_builder.python_read_dirs()
     assert os.path.realpath(sys.prefix) in dirs
     assert os.path.realpath(os.path.dirname(settings_builder.__file__)) in dirs
+
+
+# Setting sources (review round 1, R2)
+
+
+@pytest.mark.parametrize("kind", THIRD_PARTY_KINDS)
+@pytest.mark.parametrize("source", ["user", "project", "local"])
+def test_third_party_runs_refuse_setting_sources(
+    cfg: config.Config, kind: str, source: str
+) -> None:
+    resolution = resolve(cfg, kind, setting_sources=[source])
+    with pytest.raises(LaunchValidationError) as info:
+        settings(cfg, kind, resolution=resolution)
+    assert end_reason(info) == "unsafe_setting_sources"
+
+
+def test_reads_third_party_flag_with_explicit_setting_sources_is_refused(
+    cfg: config.Config,
+) -> None:
+    resolution = resolve(cfg, "implement", reads_third_party=True, setting_sources=["user"])
+    with pytest.raises(LaunchValidationError) as info:
+        settings(cfg, resolution=resolution, perm={}, cwd=REPO)
+    assert end_reason(info) == "unsafe_setting_sources"
+
+
+@pytest.mark.parametrize("kind", THIRD_PARTY_KINDS)
+def test_third_party_runs_without_setting_sources_pass(cfg: config.Config, kind: str) -> None:
+    settings(cfg, kind, resolution=resolve(cfg, kind, setting_sources=[]))
+    assert settings_builder.isolation_warnings(resolve(cfg, kind)) == ()
+
+
+def test_sandboxed_trusted_run_with_setting_sources_warns(cfg: config.Config) -> None:
+    resolution = resolve(cfg, "implement", sandbox="preferred", setting_sources=["user"])
+    settings(cfg, resolution=resolution, perm={}, cwd=REPO)  # not refused
+    warnings = settings_builder.isolation_warnings(resolution)
+    assert any("setting sources" in warning and "merge" in warning for warning in warnings)
+
+
+def test_sandboxed_trusted_run_without_setting_sources_does_not_warn(cfg: config.Config) -> None:
+    resolution = resolve(cfg, "implement", sandbox="preferred", setting_sources=[])
+    assert settings_builder.isolation_warnings(resolution) == ()
+
+
+def test_trusted_run_with_setting_sources_does_not_warn(cfg: config.Config) -> None:
+    resolution = resolve(cfg, "implement", setting_sources=["user", "project"])
+    assert settings_builder.isolation_warnings(resolution) == ()
+
+
+# Entries that contain the state root, the private root or the tmp parent (R3)
+
+
+def test_cwd_containing_the_state_root_is_refused(cfg: config.Config) -> None:
+    paths = Paths(state_root="/srv/me/state", csession_id=SID, run=1)
+    with pytest.raises(LaunchValidationError) as info:
+        settings_builder.build_settings(
+            resolve(cfg, "respond"),
+            {},
+            paths,
+            TOOLS,
+            cwd="/srv/me",
+            isolation=isolation(tmpdir=TMP),
+        )
+    assert end_reason(info) == "unsafe_cwd"
+
+
+@pytest.mark.parametrize(
+    ("iso", "reason"),
+    [
+        ({"read_dirs": ("/tmp",)}, "invalid_permission_profile"),
+        ({"read_dirs": ("/tmp/csession-1000",)}, "invalid_permission_profile"),
+        ({"read_dirs": (HOME,)}, "invalid_permission_profile"),
+        ({"write_dirs": (f"{HOME}/.local",)}, "invalid_permission_profile"),
+        ({"python_dirs": (HOME,)}, "unsafe_read_dir"),
+        ({"python_dirs": ("/",)}, "unsafe_read_dir"),
+        ({"tool_dirs": (f"{HOME}/.local/state",)}, "unsafe_read_dir"),
+        ({"path_prepend": ("/tmp",)}, "unsafe_read_dir"),
+        ({"system_dirs": (STATE,)}, "unsafe_read_dir"),
+        ({"git_dir": PRIVATE}, "unsafe_read_dir"),
+    ],
+)
+def test_entries_containing_the_state_root_or_tmp_parent_are_refused(
+    cfg: config.Config, iso: dict[str, Any], reason: str
+) -> None:
+    with pytest.raises(LaunchValidationError) as info:
+        settings(cfg, **iso)
+    assert end_reason(info) == reason
+
+
+def test_plugin_dir_containing_the_state_root_is_refused(cfg: config.Config) -> None:
+    with pytest.raises(LaunchValidationError) as info:
+        settings(cfg, plugin_dirs=(f"{HOME}/.local",))
+    assert end_reason(info) == "unsafe_plugin_dir"
+
+
+@pytest.mark.parametrize("key", ["allowRead", "allowWrite"])
+@pytest.mark.parametrize("value", ["/", "/tmp", f"{HOME}/.local/state", PRIVATE])
+def test_profile_entries_containing_the_state_root_are_refused(
+    cfg: config.Config, key: str, value: str
+) -> None:
+    with pytest.raises(LaunchValidationError) as info:
+        settings(cfg, perm={"sandbox": {"filesystem": {key: [value]}}})
+    assert end_reason(info) == "invalid_permission_profile"
+
+
+def test_own_session_dir_entries_stay_allowed(cfg: config.Config) -> None:
+    data = settings(cfg, read_dirs=(CSDIR,), write_dirs=(f"{CSDIR}/outbox/x",))
+    assert CSDIR in sandbox_fs(data)["allowRead"]
+
+
+# Rule-path end reasons and ordering (R12)
+
+
+def test_bad_cwd_is_unsafe_cwd_before_any_profile_problem(cfg: config.Config) -> None:
+    perm = {"sandbox": {"enabled": False}, "permissions": {"defaultMode": "yolo"}}
+    with pytest.raises(LaunchValidationError) as info:
+        settings(cfg, "respond", perm=perm, cwd="/work/re*po")
+    assert end_reason(info) == "unsafe_cwd"
+
+
+@pytest.mark.parametrize("cwd", ["/work/re*po", "relative", "/a/../b"])
+def test_check_cwd(cwd: str) -> None:
+    with pytest.raises(LaunchValidationError) as info:
+        settings_builder.check_cwd(cwd)
+    assert end_reason(info) == "unsafe_cwd"
+    settings_builder.check_cwd("/work/my repo")
+
+
+def test_bad_cwd_is_unsafe_cwd_even_when_the_profile_does_not_use_it(cfg: config.Config) -> None:
+    # The launch path runs check_cwd before permission_profiles.expand: an unused ${CWD}
+    # would never be checked there.
+    content = {"permissions": {"allow": ["Bash(make:*)"]}}
+    permission_profiles.expand(content, {"CWD": "/work/re*po"})  # unused: no failure
+    with pytest.raises(LaunchValidationError) as info:
+        settings_builder.check_cwd("/work/re*po")
+    assert end_reason(info) == "unsafe_cwd"
+
+
+# Interpreter check: sys.path, .pth, two-way containment, hard links (R4-R6)
+
+
+def interpreter_layout(tmp_path: Path) -> dict[str, Any]:
+    base = tmp_path / "base"
+    (base / "lib" / "python3.12").mkdir(parents=True)
+    venv = tmp_path / "venv"
+    site_dir = venv / "lib" / "python3.12" / "site-packages"
+    package = site_dir / "claude_session"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (venv / "bin").mkdir()
+    python = venv / "bin" / "python"
+    python.write_text("")
+    return {
+        "interpreter": str(python),
+        "prefixes": (str(venv), str(venv), str(base), str(base)),
+        "package_dir": str(package),
+        "sys_path": (str(base / "lib" / "python3.12"), str(site_dir)),
+        "site_dirs": (str(site_dir),),
+        "link_dirs": (str(package), str(site_dir)),
+    }
+
+
+def check(layout: dict[str, Any], *writable: str) -> None:
+    layout = dict(layout)
+    interpreter = layout.pop("interpreter")
+    settings_builder.check_interpreter(
+        interpreter,
+        session_writable=writable_under(*writable),
+        writable_paths=writable,
+        **layout,
+    )
+
+
+def refused_reason(layout: dict[str, Any], *writable: str) -> str:
+    with pytest.raises(LaunchValidationError) as info:
+        check(layout, *writable)
+    return end_reason(info)
+
+
+def test_interpreter_layout_passes(tmp_path: Path) -> None:
+    (tmp_path / "cwd").mkdir()
+    check(interpreter_layout(tmp_path), str(tmp_path / "cwd"))
+
+
+def test_sys_path_entry_inside_a_writable_path_is_refused(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    cwd = tmp_path / "cwd"
+    (cwd / "src").mkdir(parents=True)
+    layout["sys_path"] = (*layout["sys_path"], str(cwd / "src"))
+    assert refused_reason(layout, str(cwd)) == "unsafe_path"
+
+
+def test_pth_entry_pointing_into_a_writable_path_is_refused(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    cwd = tmp_path / "cwd"
+    (cwd / "src").mkdir(parents=True)
+    site_dir = Path(layout["site_dirs"][0])
+    (site_dir / "_editable.pth").write_text(f"# editable\nimport os\n{cwd / 'src'}\n")
+    assert refused_reason(layout, str(cwd)) == "unsafe_path"
+
+
+def test_relative_pth_entry_is_resolved_against_its_directory(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    site_dir = Path(layout["site_dirs"][0])
+    (site_dir / "extra").mkdir()
+    (site_dir / "rel.pth").write_text("extra\n")
+    assert refused_reason(layout, str(site_dir / "extra")) == "unsafe_path"
+
+
+def test_pth_import_lines_are_not_paths(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    site_dir = Path(layout["site_dirs"][0])
+    (site_dir / "hook.pth").write_text(f"import sys; sys.path.append('{cwd}')\n")
+    check(layout, str(cwd))
+
+
+def test_writable_venv_site_packages_is_refused(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    site_dir = layout["site_dirs"][0]
+    assert refused_reason(layout, site_dir) == "unsafe_path"
+
+
+def test_writable_base_stdlib_dir_is_refused(tmp_path: Path) -> None:
+    # Only the reverse containment catches this one: the stdlib dir is inside base_prefix.
+    layout = interpreter_layout(tmp_path)
+    stdlib = str(tmp_path / "base" / "lib" / "python3.12")
+    layout["sys_path"] = ()
+    with pytest.raises(LaunchValidationError) as info:
+        settings_builder.check_interpreter(
+            layout.pop("interpreter"),
+            session_writable=lambda _path: False,
+            writable_paths=(stdlib,),
+            **layout,
+        )
+    assert end_reason(info) == "unsafe_path"
+    assert "contains a session-writable path" in info.value.message
+
+
+def test_interpreter_check_defaults_include_base_prefixes_and_sys_path() -> None:
+    seen: list[str] = []
+
+    def record(path: str) -> bool:
+        seen.append(path)
+        return False
+
+    settings_builder.check_interpreter(sys.executable, session_writable=record, link_dirs=())
+    for path in (sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix):
+        assert path in seen
+    assert all(entry in seen for entry in sys.path if entry and os.path.isabs(entry))
+
+
+def test_hard_linked_file_is_refused(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    module = Path(layout["package_dir"]) / "__init__.py"
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    os.link(module, cache / "archived.py")
+    with pytest.raises(LaunchValidationError) as info:
+        check(layout)
+    assert end_reason(info) == "unsafe_path"
+    assert "--link-mode=copy" in info.value.message
+
+
+def test_copied_file_passes_the_hard_link_check(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    module = Path(layout["package_dir"]) / "__init__.py"
+    (tmp_path / "copy.py").write_bytes(module.read_bytes())
+    check(layout)
+
+
+def test_hard_link_check_ignores_symlinks(tmp_path: Path) -> None:
+    layout = interpreter_layout(tmp_path)
+    (Path(layout["package_dir"]) / "link.py").symlink_to(tmp_path / "base")
+    check(layout)

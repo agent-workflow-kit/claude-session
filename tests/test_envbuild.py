@@ -1208,3 +1208,78 @@ def test_git_config_names_git_never_reads_are_dropped(cfg_dir: Path, name: str) 
     env = env_of(load(cfg_dir, GIT_INHERIT), "review", {**CALLER, name: "core.fsmonitor"})
     assert name not in env
     assert git_entries(env) == HARDENING
+
+
+# Git overrides and loader variables (review round 1, R7 and R8)
+
+GIT_OVERRIDES = (
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_ASKPASS",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+
+
+def env_set_config(cfg_dir: Path, kind: str, names: tuple[str, ...]) -> config.Config:
+    pairs = ", ".join(f"{name}: /x" for name in names)
+    return load(
+        cfg_dir,
+        f"""
+        kinds:
+          {kind}:
+            env: {{inherit: true, allow: [], set: {{{pairs}}}, path_prepend: []}}
+        """,
+    )
+
+
+@pytest.mark.parametrize("name", GIT_OVERRIDES)
+def test_git_overrides_set_by_env_set_are_removed_on_third_party_runs(
+    cfg_dir: Path, name: str
+) -> None:
+    env = env_of(env_set_config(cfg_dir, "review", (name,)), "review")
+    assert name not in env
+    assert git_entries(env) == HARDENING
+
+
+@pytest.mark.parametrize("name", GIT_OVERRIDES)
+def test_inherited_git_overrides_are_removed_on_third_party_runs(cfg_dir: Path, name: str) -> None:
+    env = env_of(load(cfg_dir, GIT_INHERIT), "review", {**CALLER, name: "/x"})
+    assert name not in env
+    assert git_entries(env) == HARDENING
+
+
+def test_git_overrides_are_kept_on_other_runs(cfg_dir: Path) -> None:
+    env = env_of(env_set_config(cfg_dir, "implement", GIT_OVERRIDES), "implement")
+    assert all(env[name] == "/x" for name in GIT_OVERRIDES)
+
+
+LOADER = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_X")
+
+
+@pytest.mark.parametrize(
+    ("kind", "flags"),
+    [("review", None), ("rank", None), ("implement", {"sandbox": "preferred"})],
+)
+def test_loader_variables_are_removed_on_isolated_runs(
+    cfg_dir: Path, kind: str, flags: dict[str, Any] | None
+) -> None:
+    environ = {**CALLER, **dict.fromkeys(LOADER, "/x")}
+    inherited = env_of(load(cfg_dir, GIT_INHERIT), kind, environ, flags=flags)
+    assert not set(LOADER) & set(inherited)
+    configured = env_of(env_set_config(cfg_dir, kind, LOADER), kind, flags=flags)
+    assert not set(LOADER) & set(configured)
+
+
+def test_loader_variables_are_kept_on_trusted_runs(cfg_dir: Path) -> None:
+    inherited = env_of(load(cfg_dir), "implement", {**CALLER, **dict.fromkeys(LOADER, "/x")})
+    assert set(LOADER) <= set(inherited)
+    configured = env_of(env_set_config(cfg_dir, "implement", LOADER), "implement")
+    assert set(LOADER) <= set(configured)

@@ -126,22 +126,31 @@ class LaunchFailedError(CliError):
         }
 
 
-class LaunchValidationError(Exception):
+class LaunchValidationError(FailedError):
     """A launch validation failed (interface.md, Launch order, step 5): the run ends
-    ``not-started`` with ``end_reason`` and the command exits 12 (``start``: as
-    ``LaunchFailedError``). Not a ``CliError``: the launch path maps it, since only it knows
-    the session id and run. ``message`` and ``detail`` never hold values from profile content;
-    they may name file paths, profile names and key paths."""
+    ``not-started`` with ``end_reason`` and the command exits 12.
+
+    A ``FailedError`` subclass (code ``failed``, exit 12), so an error that reaches the CLI
+    error mapping uncaught still exits 12 like a not-started run; the launch path maps it to
+    the run's outcome first, since only it knows the session id and run (``start``: as
+    ``LaunchFailedError``). ``end_reason`` is a class-level default that subclasses set
+    (``InvalidPermissionProfile``) and the ``end_reason=`` keyword overrides; the base class
+    has none, so raising it needs the keyword. ``message`` and ``detail`` never hold values
+    from profile content; they may name file paths, profile names and key paths."""
 
     # TODO(#15): the launch path maps LaunchValidationError to a not-started run (end_reason,
-    # exit 12; start: LaunchFailedError).
+    # exit 12; start: LaunchFailedError) instead of the plain `failed` envelope.
 
-    end_reason: ClassVar[str]
+    end_reason: str
 
-    def __init__(self, message: str, *, detail: str | None = None) -> None:
-        super().__init__(message)
-        self.message = message
-        self.detail = detail
+    def __init__(
+        self, message: str, *, detail: str | None = None, end_reason: str | None = None
+    ) -> None:
+        super().__init__(message, detail=detail)
+        if end_reason is not None:
+            self.end_reason = end_reason
+        elif not isinstance(getattr(type(self), "end_reason", None), str):
+            raise TypeError(f"{type(self).__name__} needs an end_reason")
 
 
 class InvalidPermissionProfile(LaunchValidationError):
