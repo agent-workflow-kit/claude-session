@@ -38,8 +38,13 @@ resets each signal that has a Python handler here (and SIGTERM) to its default a
 restoring the mask, so a signal arriving between fork and exec gets the default action and never
 runs this process's handlers in the child. Only the forking thread blocks signals: other threads
 still take them, and Python runs every handler in the main thread of this process, which is
-harmless to the child. Residual: signals to the forking thread wait until the child has exec'd
-(or failed to).
+harmless to the child. Such a handler can run in the forking thread at any point between its
+Python statements, even with every signal blocked there, so ``spawn`` changes the mask through the
+C function behind ``signal.pthread_sigmask``, not through its Python wrapper: a handler that
+raises then does so only after the mask is restored, never before (Python 3.13 runs pending
+handlers on entry to a Python function). Residuals: signals to the forking thread wait until the
+child has exec'd (or failed to); a handler (for a signal another thread took) that raises inside
+``Popen`` after the fork, before ``spawn`` holds the ``Popen``, leaves that child running.
 
 ``run`` reads the child's output with its own loop rather than ``Popen.communicate``, which
 reaps the child when a ``KeyboardInterrupt`` interrupts it: on Linux the child stays unreaped
@@ -58,7 +63,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, Protocol, runtime_checkable
 
@@ -271,6 +276,14 @@ def _prctl() -> Callable[..., int]:
     import ctypes  # lazy: keeps the hook-event import path light
 
     return ctypes.CDLL(None, use_errno=True).prctl
+
+
+def _c_pthread_sigmask() -> Callable[[int, Iterable[int]], set[int]]:
+    """``signal.pthread_sigmask`` without its Python wrapper: no handler can run before the C
+    call changes the mask (Python 3.13 runs pending handlers on entry to the wrapper)."""
+    import importlib  # lazy: keeps the hook-event import path light
+
+    return importlib.import_module("_signal").pthread_sigmask
 
 
 def _libc() -> _Libc:
@@ -609,14 +622,15 @@ class SystemGateway:
             return _PopenChild(start(None))
         # Read the mask without changing it; block inside the try, so the finally restores the
         # mask even when a pending handler raises from the blocking call itself.
-        saved_mask = {int(sig) for sig in signal.pthread_sigmask(signal.SIG_BLOCK, [])}
+        sigmask = _c_pthread_sigmask()  # see the module docstring
+        saved_mask = {int(sig) for sig in sigmask(signal.SIG_BLOCK, [])}
         popen = None
         try:
-            signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+            sigmask(signal.SIG_BLOCK, signal.valid_signals())
             popen = start(_pdeathsig_preexec(saved_mask))
         finally:
             try:
-                signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
+                sigmask(signal.SIG_SETMASK, saved_mask)
             except BaseException:
                 if popen is not None:  # started, but the caller never gets it
                     _kill_and_reap(popen)

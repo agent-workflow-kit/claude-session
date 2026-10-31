@@ -10,8 +10,9 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -894,15 +895,16 @@ def test_die_with_parent_restores_the_mask_when_blocking_raises(
 ) -> None:
     # A pending handler can raise from the very call that blocked every signal.
     before = _sigmask()
-    real = signal.pthread_sigmask
+    real = gateway._c_pthread_sigmask()  # pyright: ignore[reportPrivateUsage]
 
-    def raising_after_blocking_all(how: int, mask: object) -> object:
-        old = real(how, mask)  # type: ignore[arg-type]
-        if how == signal.SIG_BLOCK and signal.SIGTERM in set(mask):  # type: ignore[arg-type]
+    def raising_after_blocking_all(how: int, mask: Iterable[int]) -> set[int]:
+        mask = set(mask)
+        old = real(how, mask)
+        if how == signal.SIG_BLOCK and signal.SIGTERM in mask:
             raise Interrupted
         return old
 
-    monkeypatch.setattr(signal, "pthread_sigmask", raising_after_blocking_all)
+    monkeypatch.setattr(gateway, "_c_pthread_sigmask", lambda: raising_after_blocking_all)
     with pytest.raises(Interrupted):
         gw.spawn(["/bin/true"], die_with_parent=True)
     monkeypatch.undo()
@@ -914,14 +916,16 @@ def test_die_with_parent_kills_and_reaps_the_child_when_restoring_the_mask_raise
     gw: SystemGateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # SIGUSR1 arrives while spawn blocks every signal; its handler raises once the mask is
-    # restored. The child already started must not be left behind.
+    # restored. The child already started must not be left behind. The signal is sent to this
+    # thread: sent to the process, another thread (the cleanup fixture's watchdog) could take it
+    # and the handler could then run anywhere in spawn, not only once the mask is restored.
     started: list[subprocess.Popen[Any]] = []
     real_popen = subprocess.Popen
 
     def recording_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
         popen: subprocess.Popen[Any] = real_popen(*args, **kwargs)
         started.append(popen)
-        os.kill(os.getpid(), signal.SIGUSR1)  # pending until spawn restores the mask
+        signal.pthread_kill(threading.get_ident(), signal.SIGUSR1)  # pending until restored
         return popen
 
     def on_usr1(signum: int, frame: object) -> None:
@@ -945,6 +949,32 @@ def test_die_with_parent_kills_and_reaps_the_child_when_restoring_the_mask_raise
     assert leftover == []
     assert started[0].returncode == -signal.SIGKILL
     assert _sigmask() == before
+
+
+@linux_only
+def test_die_with_parent_restores_the_mask_before_a_pending_handler_can_run(
+    gw: SystemGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A handler for a signal another thread took runs in this thread at the next Python
+    # function entry, even with every signal blocked here: Python 3.13 runs it on entry to
+    # signal.pthread_sigmask's Python wrapper, before the C call. Simulate that handler raising
+    # in this process; the restore must not depend on the wrapper.
+    parent = os.getpid()
+    real = signal.pthread_sigmask
+
+    def handler_runs_first(how: int, mask: Iterable[int]) -> object:
+        if os.getpid() == parent:
+            raise Interrupted
+        return real(how, mask)
+
+    before = _sigmask()
+    monkeypatch.setattr(signal, "pthread_sigmask", handler_runs_first)
+    try:
+        child = gw.spawn(["/bin/true"], die_with_parent=True)
+    finally:
+        monkeypatch.undo()
+        assert _sigmask() == before
+    assert child.wait(timeout=30) == 0
 
 
 @linux_only
