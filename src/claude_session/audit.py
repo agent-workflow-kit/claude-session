@@ -1,16 +1,19 @@
-"""``audit.jsonl`` writer (interface.md, Audit and log; schemas/audit.json).
+"""``audit.jsonl`` writer and record parser (interface.md, Audit and log; schemas/audit.json).
 
 Text fields are redacted against the secret values; identifiers, enums and timestamps are
 validated instead (by hand: the writers never import ``jsonschema``). A record that cannot be
 written raises: the caller must not take the audited action (interface.md, Audit and log).
+``parse_record`` reads one line back for ``export``, accepting only what the schema allows.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Collection, Iterable, Mapping
 from datetime import datetime
+from typing import Any
 
 from .logs import (
     JSONValue,
@@ -185,3 +188,76 @@ def append(
     }
     append_record(path, record)
     return record
+
+
+# Reading records back (export).
+
+RECORD_KEYS = frozenset({"ts", "actor", "decision_id", "target", "action", "inputs", "result"})
+# RFC 3339 date-time (schemas/audit.json ``format: date-time``) in the form ``fromisoformat``
+# also reads: ASCII digits, upper-case ``T`` and ``Z``, an optional fraction, a zone always.
+TS = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
+)
+
+
+class _Malformed(ValueError):
+    pass
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    keys = [key for key, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise _Malformed("duplicate key")
+    return dict(pairs)
+
+
+def _no_constant(name: str) -> Any:
+    raise _Malformed(f"{name} is not JSON")
+
+
+def parse_ts(text: object) -> datetime:
+    """The timezone-aware time of a record's ``ts``; ``ValueError`` unless it is an RFC 3339
+    date-time with a zone (a leap second is refused: ``datetime`` cannot hold it)."""
+    if not isinstance(text, str) or not TS.fullmatch(text):
+        raise ValueError("ts is not an RFC 3339 date-time")
+    return datetime.fromisoformat(text)  # Python 3.12 or later: fraction digits beyond 6 cut
+
+
+def check_record(value: object) -> dict[str, JSONValue]:
+    """``value`` (parsed JSON) as an audit record, or ``ValueError`` when schemas/audit.json
+    does not allow it: exactly the record keys, every value as the writer validates it."""
+    if not isinstance(value, dict) or set(value) != RECORD_KEYS:
+        raise ValueError("not an audit record")
+    parse_ts(value["ts"])
+    if not isinstance(value["actor"], str):
+        raise ValueError("audit actor must be a string")
+    ids = value["decision_id"]
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        raise ValueError("decision_id must be a list of strings")
+    if not is_csession_id(value["target"]):
+        raise ValueError("audit target is not a csession_id")
+    if value["action"] not in ACTIONS:
+        raise ValueError("unknown audit action")
+    if value["result"] not in RESULTS:
+        raise ValueError("unknown audit result")
+    inputs = value["inputs"]
+    if inputs is not None:
+        if not isinstance(inputs, dict):
+            raise ValueError("audit inputs must be an object or null")
+        _check_inputs(inputs)
+    return value
+
+
+def parse_record(line: bytes) -> dict[str, JSONValue] | None:
+    """One ``audit.jsonl`` line (without its newline) as a record, or None when it is not one
+    the schema allows: not strict UTF-8, not JSON, NaN or an infinity, a duplicate key, nested
+    too deep, or a value schemas/audit.json refuses. Never raises for any input."""
+    try:
+        value = json.loads(
+            line.decode("utf-8"),
+            object_pairs_hook=_unique_keys,
+            parse_constant=_no_constant,
+        )
+        return check_record(value)
+    except (ValueError, RecursionError):  # UnicodeDecodeError and JSONDecodeError included
+        return None
