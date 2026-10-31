@@ -26,11 +26,25 @@ class CliError(Exception):
         return {}
 
     def envelope(self) -> dict[str, Any]:
-        """The ``--json`` error envelope for this error."""
+        """The ``--json`` error envelope for this error. Its text never carries a lone
+        surrogate (an argv byte that is not UTF-8 arrives surrogate-escaped): U+FFFD instead,
+        so the envelope encodes as strict UTF-8."""
         error: dict[str, Any] = {"code": self.code, "message": self.message, **self.fields()}
         if self.detail is not None:
             error["detail"] = self.detail
-        return {"error": error}
+        return {"error": _no_surrogates(error)}
+
+
+def _no_surrogates(value: Any) -> Any:
+    from .terminal import no_surrogates  # only on an error: keeps the hook path's imports lean
+
+    if isinstance(value, str):
+        return no_surrogates(value)
+    if isinstance(value, list):
+        return [_no_surrogates(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _no_surrogates(item) for key, item in value.items()}
+    return value
 
 
 class InternalError(CliError):
