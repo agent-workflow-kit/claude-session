@@ -31,7 +31,7 @@ git directory included), ``check_claude_args``, and passes ``session_writable`` 
 ``permission_profiles.select``, ``envbuild.build``, ``resolve_tool`` (``claude_bin``,
 ``bwrap``, ``socat``, ``git`` on the sanitized PATH) and
 ``settings_builder.check_interpreter``; trusted runs call ``check_profile`` (refused paths
-only). TODO(#28): adoption repeats them.
+only). The adopting ``exec`` repeats them against its own environment (``lifecycle``).
 """
 
 from __future__ import annotations

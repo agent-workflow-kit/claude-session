@@ -1221,6 +1221,7 @@ class Store:
         wrapper_pid: int,
         wrapper_start: str,
         outcome_file: str | None = None,
+        hook_interpreter: str | None = None,
     ) -> Adoption:
         """The adoption compare-and-set (interface.md, Launch order; design.md, Launch,
         adoption and pending runs), one ``BEGIN IMMEDIATE`` transaction on the session's
@@ -1231,8 +1232,10 @@ class Store:
         - a run that has a wrapper: ``already_adopted``;
         - a pending run at or past ``expires_at`` (or without one): finalized ``not-started``
           with ``never_adopted`` in this transaction (cause ``adopt``), then ``expired``;
-        - otherwise the wrapper is set (this process), and ``outcome_file``, when given,
-          replaces the stored path: ``adopted``. Exactly one caller ever wins."""
+        - otherwise the wrapper is set (this process), and ``outcome_file`` and
+          ``hook_interpreter`` (the adopting process's, written into the injected hooks),
+          when given, replace the stored values: ``adopted``. Exactly one caller ever
+          wins."""
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT s.forgotten_at, r.run_no, r.wrapper_pid, r.ended_at, r.expires_at "
@@ -1253,10 +1256,11 @@ class Store:
                 return Adoption("expired", run_no, expired_now=True)
             cursor = conn.execute(
                 "UPDATE runs SET wrapper_pid = ?, wrapper_start = ?, "
-                "outcome_file = COALESCE(?, outcome_file) "
+                "outcome_file = COALESCE(?, outcome_file), "
+                "hook_interpreter = COALESCE(?, hook_interpreter) "
                 "WHERE csession_id = ? AND run_no = ? AND wrapper_pid IS NULL "
                 "AND ended_at IS NULL",
-                (wrapper_pid, wrapper_start, outcome_file, csession_id, run_no),
+                (wrapper_pid, wrapper_start, outcome_file, hook_interpreter, csession_id, run_no),
             )
             if cursor.rowcount != 1:  # not reachable inside the transaction
                 raise InternalError(f"adoption of run {run_no} of session {csession_id} lost")

@@ -663,6 +663,7 @@ def adopt(
         wrapper_pid=os.getpid(),
         wrapper_start=store.start_time(os.getpid()),
         outcome_file=outcome_file,
+        hook_interpreter=process.interpreter,
     )
     if result.outcome == "not_found":
         raise NotFoundError(f"unknown session: {args.session_id}")
@@ -741,12 +742,20 @@ def adoption_plan(
     without adopting it or finalizing anything (interface.md, Dry run): ``would_refuse``
     (``already_adopted``, ``expired``), ``config_hash_changed``, and the step-5 checks with
     the adoption's comparisons (``would_fail``). An invalid stored config exits 2 as an
-    invalid config, as a dry run of a new session does."""
+    invalid config, as a dry run of a new session does. When the stored run cannot be read
+    back (no launch spec: a failed ``start``), a refused adoption exits 20 with the refusal
+    envelope and any other one 12 (``failed``): there is no plan to print."""
     sid, record = lookup(st, args.session_id)
     would_refuse = refusal(record, st.past_deadline(record["expires_at"]))
     try:
         adoption = load_adoption(record, process, dry_run=True)
     except LaunchValidationError as error:
+        if would_refuse is not None:
+            # A run that never got a launch spec (its start failed) or lost it: no plan can
+            # be built, and adopting it would be refused first.
+            raise RefusedError(
+                f"cannot adopt {sid}: {would_refuse.replace('_', ' ')}", reason=would_refuse
+            ) from None
         if error.end_reason == "config_invalid":
             raise UsageError("invalid config", detail=error.detail or error.message) from None
         raise

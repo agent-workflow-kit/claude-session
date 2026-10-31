@@ -398,16 +398,23 @@ def test_a_dry_run_still_applies_usage_checks(tmp_path: Path, tools: Path, work:
     [
         ["resume", "cs-abcd2345", "--dry-run", "--json"],
         ["start", "--resume", "cs-abcd2345", "--dry-run", "--json"],
-        ["exec", "--session-id", "cs-abcd2345", "--dry-run", "--json"],
     ],
 )
 def test_dry_runs_of_existing_sessions_are_not_implemented_yet(
     args: list[str], tmp_path: Path, tools: Path, work: Path
 ) -> None:
-    adoption = "--session-id" in args  # accepts no --config
-    proc = cli(args, cwd=work, tools=tools, tmp_path=tmp_path, with_config=not adoption)
+    proc = cli(args, cwd=work, tools=tools, tmp_path=tmp_path)
     assert proc.returncode == 1
     assert error_of(proc)["error"]["code"] == "internal"
+
+
+def test_the_adoption_dry_run_of_an_unknown_session_exits_10(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    args = ["exec", "--session-id", "cs-abcd2345", "--dry-run", "--json"]
+    proc = cli(args, cwd=work, tools=tools, tmp_path=tmp_path, with_config=False)
+    assert proc.returncode == 10
+    assert error_of(proc)["error"]["code"] == "not_found"
 
 
 # kinds

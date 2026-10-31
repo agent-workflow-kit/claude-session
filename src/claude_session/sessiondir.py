@@ -16,7 +16,7 @@ design.md, Session directories; interface.md, Concepts and File handling:
 - The run secret is rotated every run; only its SHA-256 leaves this module besides the file.
 - The standard instructions contain no per-run values (design.md, Prompt delivery).
 
-TODO(#28): start stages with stage(); the adopting exec calls place_staged().
+``start`` stages with stage(); the adopting exec calls place_staged() (``launch.prepare``).
 TODO(#29): fork copy of the source's inputs/ (fd-based; no symlinks, non-regular files or
 nlink > 1) and the carry-over of a not-started run's prompt and inputs.
 TODO(#34): fd-based retention deletion of both directories.
@@ -834,11 +834,9 @@ class SessionDirs:
 
     def stage(self, run: int, prompt: bytes | None, inputs: Sequence[InputFile]) -> None:
         """``start``: stage the prompt and inputs in ``private/<id>/runs/<run>/staged/``
-        (which must not exist yet), so the caller may delete its files afterwards.
-
-        TODO(#28): a session-directory failure during staging ends the launch
-        ``session_dir_unsafe`` (``start``: ``launch_failed``, exit 12), as in exec's step 7.
-        """
+        (which must not exist yet), so the caller may delete its files afterwards. A failure
+        raises ``SessionDirUnsafe``: ``start`` ends the run ``session_dir_unsafe`` and exits 12
+        with ``launch_failed`` (``lifecycle.start``)."""
         _check_run(run)
         check_input_names([item.name for item in inputs])
         run_fd = self._run_private_dir(run)

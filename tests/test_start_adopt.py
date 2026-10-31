@@ -571,3 +571,164 @@ def test_the_adoption_dry_run_of_an_adopted_run(env: Env) -> None:
     env.write_db("UPDATE runs SET wrapper_pid = 1, wrapper_start = 'x'")
     proc, plan = env.adopt(sid, "--dry-run")
     assert proc.returncode == 20 and plan["would_refuse"] == "already_adopted"
+
+
+def test_a_session_dir_cwd_is_frozen_and_used_at_adoption(env: Env) -> None:
+    sid = env.started("--mode", "headless", "--cwd", "session-dir")["csession_id"]
+    proc, _ = env.adopt(sid, cwd=env.tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert env.run_row(sid)["cwd"] == str(env.state / "sessions" / sid / "work")
+
+
+def test_a_profile_file_is_frozen_at_start(env: Env) -> None:
+    profile = env.work / "p.json"
+    profile.write_text('{"permissions": {"allow": ["Read"]}}')
+    out = env.started("--mode", "headless", "--permission-profile", "./p.json")
+    sid = out["csession_id"]
+    label = env.run_row(sid)["permission_profile"]
+    assert label.startswith("file:")
+    snapshot = env.private_run(sid) / "permission-profile.json"
+    assert json.loads(snapshot.read_text()) == {"permissions": {"allow": ["Read"]}}
+    profile.write_text('{"permissions": {"allow": ["Bash"]}}')  # changed after start
+    proc, _ = env.adopt(sid)
+    assert proc.returncode == 0, proc.stderr
+    settings = json.loads((env.private_run(sid) / "settings.json").read_text())
+    assert "Read" in settings["permissions"]["allow"]
+    assert "Bash" not in settings["permissions"]["allow"]
+    assert env.run_row(sid)["permission_profile"] == label
+
+
+def test_a_named_profile_is_frozen_at_start(env: Env) -> None:
+    env.write_config(
+        "permission_profiles:\n  mine:\n    permissions: {allow: [Read]}\n"
+        "kinds:\n  implement:\n    permission_profile: mine\n"
+    )
+    sid = env.started()["csession_id"]
+    env.write_config(
+        "permission_profiles:\n  mine:\n    permissions: {allow: [Bash]}\n"
+        "kinds:\n  implement:\n    permission_profile: mine\n"
+    )
+    proc, _ = env.adopt(sid)
+    assert proc.returncode == 0, proc.stderr
+    settings = json.loads((env.private_run(sid) / "settings.json").read_text())
+    assert "Read" in settings["permissions"]["allow"]
+    assert "Bash" not in settings["permissions"]["allow"]
+
+
+def test_a_plugin_dir_swapped_for_a_symlink_fails_the_adoption(env: Env, tmp_path: Path) -> None:
+    plugin, other = tmp_path / "plugin", tmp_path / "other"
+    plugin.mkdir()
+    other.mkdir()
+    sid = env.started("--mode", "headless", "--plugin-dir", str(plugin))["csession_id"]
+    plugin.rmdir()
+    plugin.symlink_to(other)
+    proc, out = env.adopt(sid)
+    assert_not_started(proc, out, "unsafe_plugin_dir")
+
+
+def test_a_removed_plugin_dir_fails_the_adoption(env: Env, tmp_path: Path) -> None:
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    sid = env.started("--mode", "headless", "--plugin-dir", "../plugin")["csession_id"]
+    plugin.rmdir()
+    proc, out = env.adopt(sid, cwd=tmp_path)  # a relative dir was resolved at start
+    assert_not_started(proc, out, "plugin_dir_missing")
+
+
+def test_a_unicode_prompt_is_delivered_byte_for_byte(env: Env) -> None:
+    text = "Tâche: ünïcödé ‮\U0001f600 '; DROP TABLE runs; --\n"
+    sid = env.started(prompt=text)["csession_id"]
+    proc, _ = env.adopt(sid)
+    assert proc.returncode == 0, proc.stderr
+    assert (env.state / "sessions" / sid / "prompt.md").read_text() == text
+
+
+@pytest.mark.parametrize("given", ["cs-'; DROP TABLE runs; --", "cs-aaaa%", "cs-AAAA*"])
+def test_an_injection_shaped_session_id_is_refused(env: Env, given: str) -> None:
+    proc = env.cs(["exec", "--session-id", given, "--json"])
+    assert proc.returncode in (2, 10)
+    assert json.loads(proc.stdout)["error"]["code"] in ("usage", "not_found")
+
+
+def test_the_adopting_process_hook_interpreter_is_recorded(env: Env) -> None:
+    sid = env.started()["csession_id"]
+    env.write_db("UPDATE runs SET hook_interpreter = '/old/python'")
+    proc, _ = env.adopt(sid)
+    assert proc.returncode == 0, proc.stderr
+    assert env.run_row(sid)["hook_interpreter"] != "/old/python"
+
+
+def test_an_interactive_run_with_a_tty_stays_pending_until_supported(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from claude_session.cli import main
+
+    sid = env.started("--mode", "interactive")["csession_id"]
+    monkeypatch.setattr(lifecycle, "has_tty", lambda: True)
+    assert main(["exec", "--session-id", sid, "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"]["detail"] == "not_implemented"
+    row = env.run_row(sid)
+    assert row["wrapper_pid"] is None and row["ended_at"] is None
+
+
+# The launch spec, read back
+
+
+def spec_text(**changes: Any) -> bytes:
+    base: dict[str, Any] = {
+        "version": lifecycle.SPEC_VERSION,
+        "resolution": {"kind": "implement"},
+        "request": {},
+        "caller_cwd": None,
+        "cwd": "/w",
+        "plugin_dirs": [],
+        "profile": {"name": "x", "content": {}, "snapshot": None},
+        "config": {},
+    }
+    return json.dumps({**base, **changes}).encode()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"",
+        b"\xff\xfe",
+        b"[]",
+        b"null",
+        spec_text(version=2),
+        spec_text(cwd=5),
+        spec_text(plugin_dirs="/x"),
+        spec_text(resolution={"kind": "implement"}),  # incomplete
+        spec_text(profile={"name": None, "content": [], "snapshot": None}),
+    ],
+)
+def test_an_unusable_launch_spec_is_session_dir_unsafe(raw: bytes) -> None:
+    from claude_session.sessiondir import SessionDirUnsafe
+
+    with pytest.raises(SessionDirUnsafe) as info:
+        lifecycle.parse_spec(raw, "/p/launch-spec.json")
+    assert info.value.end_reason == "session_dir_unsafe"
+    assert "/p/launch-spec.json" in info.value.message
+
+
+def test_the_launch_spec_round_trips(env: Env) -> None:
+    env.write_config("kinds:\n  implement:\n    env:\n      set: {A: b}\n")
+    sid = env.started("--mode", "headless", "--env-allow", "X", "--timeout", "90s")["csession_id"]
+    raw = (env.private_run(sid) / lifecycle.SPEC_NAME).read_bytes()
+    frozen = lifecycle.parse_spec(raw, "spec")
+    resolution = frozen.resolution
+    assert resolution.profile.env.set == {"A": "b"}
+    assert resolution.env_allow == ("X",)
+    assert resolution.profile.timeout == 90
+    assert lifecycle.parse_spec(lifecycle.spec_bytes(json.loads(raw)), "spec") == frozen
+
+
+def test_the_adoption_dry_run_of_a_failed_start_is_refused(env: Env) -> None:
+    env.config.write_text(f"claude_bin: {env.tmp_path / 'missing'}\n", encoding="utf-8")
+    proc, out = env.start()
+    sid = out["error"]["csession_id"]
+    proc, err = env.adopt(sid, "--dry-run")
+    assert proc.returncode == 20
+    assert (err["error"]["code"], err["error"]["reason"]) == ("refused", "expired")
+    proc, err = env.adopt(sid)
+    assert proc.returncode == 20 and err["error"]["reason"] == "expired"

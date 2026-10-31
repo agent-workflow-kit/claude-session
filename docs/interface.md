@@ -48,6 +48,8 @@ Normative sections: [Launch order](#launch-order), [Flags at start and adoption]
   ```text
   runs/<n>/staged/                        prompt and input copies made by start, moved
                                           into the session directory at adoption
+  runs/<n>/launch-spec.json               the launch specification start froze (read at
+                                          adoption)
   runs/<n>/settings.json                  generated Claude Code settings (--settings)
   runs/<n>/hookconf.json                  configuration read by hook-event
   runs/<n>/result.json                    headless `--output-format stream-json --verbose`
