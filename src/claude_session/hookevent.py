@@ -592,11 +592,15 @@ def _apply_report(store: Store, csession_id: str, drain: outbox.Drain) -> None:
     ``report`` event even when only the report changed. Runs in a savepoint: a failure (for
     example an artifact that cannot be frozen) rolls back only the drain, which keeps its
     requests in ``claimed/`` and its failure for the log, so the hook's own event still
-    applies (design.md, Ingestion)."""
+    applies (design.md, Ingestion). A failure after which SQLite rolled the whole
+    transaction back is re-raised: nothing may then run in autocommit, so the hook fails as
+    a whole (logged ``hook_event_failed``, nothing committed)."""
     try:
         with store.savepoint("drain"):
             _record_report(store, csession_id, drain)
     except Exception as exc:
+        if not store.conn.in_transaction:
+            raise
         drain.rolled_back(type(exc).__name__)
 
 
@@ -700,6 +704,8 @@ def apply_hook(
                     if after is not None and after.report_status is None:
                         raise _Backstop  # no report, even after this Stop's own drain
         except _Backstop:
+            if not store.conn.in_transaction:
+                raise  # the transaction is gone: never take the backstop in autocommit
             # A blocked Stop changes nothing and records no event (design.md, State machine);
             # the drained requests (none ingested) are recorded again, unless recording failed.
             taken = store.take_backstop(run)

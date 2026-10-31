@@ -5,6 +5,7 @@ freeze, rejection feedback through PostToolUse, drain caps, latest valid report 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -434,6 +435,37 @@ def test_junk_never_starves_a_request(run: Run) -> None:
     assert malformed_counts(run) == [200]
     run.post_tool_use()
     assert malformed_counts(run) == [200]  # nothing left to log
+
+
+def test_junk_removal_stops_at_the_drain_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A junk tree whose removal crosses the deadline is left partly removed for the next
+    drain; the drain returns and the hook's own event still applies."""
+    root = tmp_path / "state"
+    Store.open(str(root / "state.db")).close()
+    run = Run(root).setup(state="idle", activity="idle")
+    junk = run.outbox / "junk"
+    (junk / "deeper").mkdir(parents=True)
+    for n in range(100):
+        (junk / f"f{n:03d}").write_text("x")
+        (junk / "deeper" / f"f{n:03d}").write_text("x")
+    ticks = iter(range(10_000))  # every clock reading is one second later
+    real = outbox.Drain.prepare
+
+    def with_clock(cls: type[outbox.Drain], **kwargs: Any) -> outbox.Drain:
+        return real(**kwargs, clock=lambda: float(next(ticks)))
+
+    monkeypatch.setattr(outbox.Drain, "prepare", classmethod(with_clock))
+    assert run.post_tool_use() == ""
+    assert run.state() == ("working", None, "working")
+    left = sum(len(files) for _, _, files in os.walk(junk))
+    assert 0 < left < 200
+    assert malformed_counts(run) == []  # counted once it is removed
+    monkeypatch.undo()
+    run.post_tool_use()
+    assert listing(run.outbox) == []
+    assert malformed_counts(run) == [1]
 
 
 def test_a_fresh_report_temp_file_is_left_alone_and_an_old_one_removed(run: Run) -> None:
@@ -978,3 +1010,52 @@ def test_the_drain_budget_is_half_the_draining_hooks_timeout() -> None:
         event: t for event, _, t in settings_builder.HOOKS if event in ("PostToolUse", "Stop")
     }
     assert set(timeouts.values()) == {outbox.DRAIN_BUDGET * 2}
+
+
+def test_a_drain_auto_rollback_fails_the_whole_hook(
+    run: Run, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SQLite rolled the transaction back inside the drain: nothing may run in autocommit,
+    so the Stop fails as a whole through the contained-error path (no backstop taken)."""
+    from claude_session import __main__ as entry
+
+    def auto_rolled_back(self: outbox.Drain, store: Store, **kwargs: Any) -> None:
+        store.conn.execute("ROLLBACK")
+        raise sqlite3.OperationalError("database or disk is full")
+
+    real_main = hookevent.main
+
+    def hook_main(argv: list[str]) -> int:
+        payload = json.dumps({"hook_event_name": "Stop", "stop_hook_active": False}).encode()
+        return real_main(argv, stdin=io.BytesIO(payload), environ=run.environ())
+
+    run.report()
+    monkeypatch.setattr(outbox.Drain, "record", auto_rolled_back)
+    monkeypatch.setattr(hookevent, "main", hook_main)
+    monkeypatch.setattr(entry, "_silence_output", entry._restore_output)
+    monkeypatch.setenv("CSESSION_ID", SID)
+    assert entry.main(["hook-event", "--state-dir", str(run.root), "Stop"]) == 0
+    assert capsys.readouterr().out == ""
+    r = run.run()
+    assert r["backstop_used"] == 0 and r["report_status"] is None
+    assert run.state() == ("working", None, "working")
+    assert run.events() == [] and run.requests() == []
+    assert len(listing(run.claimed)) == 1  # left for the next drain
+    assert [(e["event"], e["level"]) for e in run.log()] == [("hook_event_failed", "error")]
+    assert run.log()[0]["message"] == "Stop: OperationalError"
+
+
+def test_a_backstop_is_never_taken_after_an_auto_rollback(
+    run: Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = hookevent._apply_own_row
+
+    def auto_rolled_back(store: Store, *args: Any) -> None:
+        real(store, *args)
+        store.conn.execute("ROLLBACK")
+
+    monkeypatch.setattr(hookevent, "_apply_own_row", auto_rolled_back)
+    with pytest.raises(hookevent._Backstop):
+        run.stop_hook()
+    assert run.run()["backstop_used"] == 0
+    assert run.events() == []

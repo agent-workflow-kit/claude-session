@@ -869,7 +869,7 @@ class Drain:
         caps = limits()
         scan_fd = fsutil.ensure_private_dir_at(private_run_fd, SCAN)
         self._fds["scan"] = scan_fd
-        _remove_leftovers(scan_fd)
+        _remove_leftovers(scan_fd, self._past_deadline)
         self._fds["private_run"] = os.dup(private_run_fd)
         winner_found = False
         for item in reversed(checked):  # newest first: the first valid one wins
@@ -905,18 +905,23 @@ class Drain:
         process whose rename succeeds owns a request) and return every request name now in
         ``claimed/``. Of at most ``DRAIN_MAX_READ`` entries read, other names (and
         directories) are malformed and removed, without counting against the claim cap;
-        ``report``'s temporary names are left alone until they are leftovers."""
+        ``report``'s temporary names are left alone until they are leftovers. Past the
+        deadline nothing more is claimed or removed (a junk tree is left partly removed);
+        the rest waits for the next drain."""
         claims = 0
         now = time.time()
+        stop = self._past_deadline
         for name, is_dir in _entries(outbox_fd):
+            if stop():
+                break
             if is_temp_name(name):
-                _remove_leftover(outbox_fd, name, now)
+                _remove_leftover(outbox_fd, name, now, stop)
                 continue
             if not is_request_name(name) or is_dir:
-                self.removed_malformed += 1
-                _remove_entry(outbox_fd, name)
+                if _remove_entry(outbox_fd, name, stop):
+                    self.removed_malformed += 1
                 continue
-            if claims >= DRAIN_MAX_ENTRIES or self._past_deadline():
+            if claims >= DRAIN_MAX_ENTRIES:
                 continue
             claims += 1
             try:
@@ -927,12 +932,12 @@ class Drain:
         for name, is_dir in _entries(claimed_fd):
             if is_dir:
                 # A directory swapped in between the check and the rename: never processed.
-                _remove_tree(claimed_fd, name)
-                self.removed_malformed += 1
+                if _remove_tree(claimed_fd, name, stop):
+                    self.removed_malformed += 1
             elif is_request_name(name):
                 names.append(name)
             else:
-                _remove_entry(claimed_fd, name)
+                _remove_entry(claimed_fd, name, stop)
         return names
 
     def _check(
@@ -1224,28 +1229,71 @@ def _unlink_quietly(dir_fd: int, name: str) -> None:
         pass
 
 
-def _remove_entry(dir_fd: int, name: str) -> None:
+def _remove_entry(dir_fd: int, name: str, stop: Callable[[], bool]) -> bool:
     """Remove a malformed entry: a file, symlink or FIFO is unlinked, a directory removed
-    with its contents (fd-based, never following a symlink)."""
+    with its contents (``_remove_tree``). False when ``stop`` cut a tree removal short."""
     try:
         os.unlink(name, dir_fd=dir_fd)
     except (IsADirectoryError, PermissionError):
-        _remove_tree(dir_fd, name)
+        return _remove_tree(dir_fd, name, stop)
     except OSError:
         pass
+    return True
 
 
-def _remove_tree(dir_fd: int, name: str) -> None:
-    """Remove a directory tree (fd-based, never following a symlink)."""
-    import shutil  # rare: only junk directories
+_TREE_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
+
+def _remove_tree(dir_fd: int, name: str, stop: Callable[[], bool]) -> bool:
+    """Remove a directory tree (fd-based, never following a symlink), checking ``stop``
+    before each entry: once it is true the walk ends and the rest of the tree stays for the
+    next drain (returns False). Iterative, so a deep tree cannot exhaust the Python stack;
+    an entry that cannot be removed is skipped."""
     try:
-        shutil.rmtree(name, dir_fd=dir_fd)
+        top = os.open(name, _TREE_FLAGS, dir_fd=dir_fd)
     except OSError:
-        pass
+        return True
+    # Each frame: (parent fd, name in the parent, its fd, names that could not be removed).
+    stack: list[tuple[int, str, int, set[str]]] = [(dir_fd, name, top, set())]
+    try:
+        while stack:
+            _, _, fd, skip = stack[-1]
+            child = None
+            with os.scandir(fd) as scan:
+                for entry in scan:
+                    if stop():
+                        return False
+                    if entry.name in skip:
+                        continue
+                    try:
+                        os.unlink(entry.name, dir_fd=fd)
+                    except (IsADirectoryError, PermissionError):
+                        child = entry.name
+                        break
+                    except OSError:
+                        skip.add(entry.name)
+            if child is not None:
+                try:
+                    child_fd = os.open(child, _TREE_FLAGS, dir_fd=fd)
+                except OSError:
+                    skip.add(child)
+                    continue
+                stack.append((fd, child, child_fd, set()))
+                continue
+            parent_fd, own_name, fd, _ = stack.pop()
+            os.close(fd)
+            try:
+                os.rmdir(own_name, dir_fd=parent_fd)
+            except OSError:
+                if stack:
+                    stack[-1][3].add(own_name)
+        return True
+    finally:
+        for _, _, fd, _ in stack:
+            os.close(fd)
 
 
-def _remove_leftover(dir_fd: int, name: str, now: float) -> None:
+def _remove_leftover(dir_fd: int, name: str, now: float, stop: Callable[[], bool]) -> None:
     """Remove ``name`` when it is older than ``SCAN_LEFTOVER_AGE`` (left by a canceled drain
     or ``report``); a fresh one may still be in use and is kept."""
     try:
@@ -1253,11 +1301,14 @@ def _remove_leftover(dir_fd: int, name: str, now: float) -> None:
     except OSError:
         return
     if now - info.st_mtime > SCAN_LEFTOVER_AGE:
-        _remove_entry(dir_fd, name)
+        _remove_entry(dir_fd, name, stop)
 
 
-def _remove_leftovers(scan_fd: int) -> None:
-    """Remove copies left by a canceled drain; a concurrent drain's fresh copies are kept."""
+def _remove_leftovers(scan_fd: int, stop: Callable[[], bool]) -> None:
+    """Remove copies left by a canceled drain; a concurrent drain's fresh copies are kept.
+    Stops once ``stop`` is true."""
     now = time.time()
     for name, _ in _entries(scan_fd):
-        _remove_leftover(scan_fd, name, now)
+        if stop():
+            return
+        _remove_leftover(scan_fd, name, now, stop)

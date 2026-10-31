@@ -636,7 +636,9 @@ class Store:
     @contextmanager
     def savepoint(self, name: str) -> Iterator[None]:
         """A ``SAVEPOINT`` inside the current transaction: released on success, rolled back
-        to (and released) on error, which is re-raised. ``name`` is a fixed identifier."""
+        to (and released) on error, which is re-raised. When SQLite already rolled the whole
+        transaction back, the error is re-raised as is and the caller must not continue in it
+        (``conn.in_transaction`` is then false). ``name`` is a fixed identifier."""
         if not name.isidentifier():
             raise ValueError("savepoint names are identifiers")
         self.conn.execute(f"SAVEPOINT {name}")
