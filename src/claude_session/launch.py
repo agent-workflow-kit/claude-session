@@ -240,11 +240,44 @@ def parse_mode(given: str | None) -> Mode:
     raise UsageError(f"unknown mode {given!r}")
 
 
+# The audit and log records carry the effective actor and the ``--decision-id`` values; with
+# the hooks' ids (``toolhooks.DECISION_IDS_MAX_BYTES``) they must stay well inside the 4 MiB
+# audit record limit. Both are measured as escaped ASCII JSON, the form the records are
+# written in (one character can take up to 12 bytes). Over a cap, the launch is a usage error
+# before anything is read or allocated.
+ACTOR_MAX_ESCAPED_BYTES = 4 * 1024
+ARGV_DECISION_IDS_MAX_BYTES = toolhooks.DECISION_IDS_MAX_BYTES
+
+
+def check_audit_values(actor: str, decision_ids: Sequence[str]) -> None:
+    """The effective ``actor`` is at most ``ACTOR_MAX_ESCAPED_BYTES`` and the ``--decision-id``
+    values at most ``ARGV_DECISION_IDS_MAX_BYTES`` in all (each one's escaped size plus a
+    separator byte, as for the hooks' ids), else ``UsageError`` (exit 2). The work is bounded:
+    it stops at the first value that crosses the cap."""
+    if len(actor) > ACTOR_MAX_ESCAPED_BYTES or (
+        toolhooks.escaped_size(actor) > ACTOR_MAX_ESCAPED_BYTES
+    ):
+        raise UsageError(f"--actor is too long (at most {ACTOR_MAX_ESCAPED_BYTES} bytes escaped)")
+    budget = ARGV_DECISION_IDS_MAX_BYTES
+    for item in decision_ids:
+        # An escaped character takes at least one byte, so a longer value cannot fit.
+        if len(item) >= budget or toolhooks.escaped_size(item) + 1 > budget:
+            raise UsageError(
+                f"the --decision-id values are too long (at most {ARGV_DECISION_IDS_MAX_BYTES}"
+                " bytes in all, escaped as JSON, one byte more for each)"
+            )
+        budget -= toolhooks.escaped_size(item) + 1
+
+
 def read_request(args: argparse.Namespace, cfg: Config) -> Request:
     """Launch step 2 for ``exec``: the TTY check of interactive mode, the flags (already
     checked by ``cli``'s flag rules), the prompt and the input files read into memory (each
-    at most ``input_max_bytes``; a bad file is a ``UsageError``, exit 2)."""
+    at most ``input_max_bytes``; a bad file is a ``UsageError``, exit 2). The effective actor
+    and the ``--decision-id`` values are capped first (``check_audit_values``)."""
     mode = parse_mode(args.mode)
+    actor = _actor(args.actor, cfg)
+    decision_ids = tuple(args.decision_id or ())
+    check_audit_values(actor, decision_ids)
     check_tty(mode, args.prompt_file)
     cap = cfg.input_max_bytes
     prompt = None
@@ -265,8 +298,8 @@ def read_request(args: argparse.Namespace, cfg: Config) -> Request:
         cwd=args.cwd,
         labels=tuple(args.label or ()),
         flags=flags,
-        actor=_actor(args.actor, cfg),
-        decision_ids=tuple(args.decision_id or ()),
+        actor=actor,
+        decision_ids=decision_ids,
         hooks=tuple(args.hook or ()),
         hook_timeouts=tuple(args.hook_timeout or ()),
         # Joined, not abspath: `..` applies after symlinks, as when the file is written.
@@ -1802,9 +1835,8 @@ def pre_launch(
         audited = OverrideAudit(
             path=os.path.join(process.state_root, AUDIT_NAME),
             actor=req.actor,
-            # TODO(#72): cap the escaped size of the argv --decision-id values (and --actor)
-            # so this record stays within the audit record limit (#68, #39); the hooks' ids
-            # are capped (toolhooks.DECISION_IDS_MAX_BYTES), these are not yet.
+            # Within the audit record limit: the argv values were capped by read_request
+            # (check_audit_values), the hooks' ids by toolhooks.DECISION_IDS_MAX_BYTES.
             decision_ids=(*req.decision_ids, *verdict.decision_ids),
             inputs={
                 "run_kind": resolution.kind,
