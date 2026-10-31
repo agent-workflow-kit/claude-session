@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -193,3 +194,81 @@ def test_a_group_leader_that_left_its_group_is_killed_through_its_pidfd() -> Non
         if leader.returncode is None:
             leader.kill()
             leader.wait(timeout=5)
+
+
+# Fakes started by a process the test started (``FAKE_CLAUDE_STARTED_DIR``)
+
+
+@linux_only
+def test_the_fake_records_its_pid_and_start_ticks(tmp_path: Path) -> None:
+    from tests.fakeclaude import FAKE_CLAUDE
+
+    env = {**os.environ, conftest.STARTED_ENV: str(tmp_path)}
+    proc = subprocess.Popen([str(FAKE_CLAUDE), "--version"], env=env, stdout=subprocess.DEVNULL)
+    stat = _stat(proc.pid)
+    assert proc.wait(timeout=30) == 0
+    assert stat is not None
+    assert [p.name for p in tmp_path.iterdir()] == [f"{proc.pid}.{stat[2]}"]
+
+
+@linux_only
+def test_a_fake_that_cannot_write_its_start_record_fails(tmp_path: Path) -> None:
+    from tests.fakeclaude import FAKE_CLAUDE
+
+    env = {**os.environ, conftest.STARTED_ENV: str(tmp_path / "missing")}
+    result = subprocess.run(
+        [str(FAKE_CLAUDE), "--version"], env=env, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 99
+    assert "start record" in result.stderr
+
+
+@linux_only
+@pytest.mark.skipif(not conftest.PIDFD, reason="needs a pidfd")
+def test_a_recorded_process_still_running_is_killed_and_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(conftest, "LEFTOVER_FAKE_GRACE", 0.1)
+    proc = subprocess.Popen(["/bin/sleep", "30"])
+    stat = _stat(proc.pid)
+    assert stat is not None
+    (tmp_path / f"{proc.pid}.{stat[2]}").touch()
+    try:
+        leftovers = conftest._end_leftover_fakes(str(tmp_path))  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _kill_exact(proc.pid, stat[2])
+        proc.wait(timeout=5)
+    assert leftovers == [f"{proc.pid} (SIGKILLed)"]
+    assert proc.returncode == -signal.SIGKILL
+
+
+@linux_only
+def test_a_record_whose_start_ticks_differ_signals_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The PID now names another process (a reuse): it is neither waited for nor signalled.
+    monkeypatch.setattr(conftest, "LEFTOVER_FAKE_GRACE", 0.1)
+    proc = subprocess.Popen(["/bin/sleep", "30"])
+    stat = _stat(proc.pid)
+    assert stat is not None
+    (tmp_path / f"{proc.pid}.{stat[2] - 1}").touch()
+    try:
+        leftovers = conftest._end_leftover_fakes(str(tmp_path))  # pyright: ignore[reportPrivateUsage]
+        assert leftovers == []
+        assert _alive(proc.pid)
+    finally:
+        _kill_exact(proc.pid, stat[2])
+        proc.wait(timeout=5)
+
+
+def test_a_recorded_fake_that_already_exited_is_no_leftover(tmp_path: Path) -> None:
+    proc = subprocess.Popen(["/bin/true"])
+    proc.wait(timeout=5)
+    (tmp_path / f"{proc.pid}.1").touch()
+    assert conftest._end_leftover_fakes(str(tmp_path)) == []  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_fixture_points_the_fake_at_a_directory_of_its_own() -> None:
+    directory = os.environ.get(conftest.STARTED_ENV)
+    assert directory is not None
+    assert os.path.isdir(directory)
