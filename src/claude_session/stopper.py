@@ -14,29 +14,39 @@
    outcome file written and the final event delivered (``canceled: true``). When adoption won,
    the signal path follows.
 3. **Signal path**: SIGTERM to the verified wrapper (it forwards to ``claude`` as ``stopped``,
-   or, in its launch window, ends the run ``canceled``). A wrapper that is gone with a live
-   child gets nothing; the child gets the SIGTERM instead, with ``pending_cause`` ``stopped``
-   recorded first (as ``exec`` records its cause before it signals). After ``--grace``
-   (default ``kill_grace``): ``pending_cause`` ``stopped`` (unless the run has a cause) and
-   SIGKILL to the verified child; the wrapper is given ``kill_grace`` to reap it and finalize,
-   then SIGKILLed if it still runs (at once when there is no child). Whenever the wrapper is
-   found gone, ``stop`` finalizes the run itself through the liveness path (cause ``stop``,
-   ``recorded_by_stop``) and delivers its final event. A run ``start`` released meanwhile
-   (pending again) is canceled.
+   or, in its launch window, ends the run ``canceled``). A wrapper that cannot be verified, or
+   that is gone with a live child, gets nothing; the verified child gets the SIGTERM instead,
+   with ``pending_cause`` ``stopped`` recorded first (as ``exec`` records its cause before it
+   signals). Signals are remembered per process (PID and start token): a wrapper or child
+   recorded after a signal (a hand-over) gets its own, and a send that did not happen is
+   tried again on the next poll. After ``--grace`` (default ``kill_grace``): ``pending_cause``
+   ``stopped`` (unless the run has a cause) and SIGKILL to the verified child (also to an
+   orphaned child found later); the wrapper is always given ``kill_grace`` more to reap it and
+   finalize, also when no child SIGKILL was sent. Then the run is re-read: a child recorded
+   meanwhile gets its SIGKILL first, and the wrapper is SIGKILLed (``pending_cause``
+   ``stopped`` first when a child is recorded), except while a recorded child's PID exists but
+   cannot be verified: that wrapper is left to supervise it (``signal_not_sent``), the run
+   stays live. A cause this ``stop`` recorded is cleared again when its signal was not sent.
+   Whenever the wrapper is found gone, ``stop`` finalizes the run itself through the liveness
+   path (cause ``stop``, ``recorded_by_stop``) and delivers its final event. A run ``start``
+   released meanwhile (pending again) is canceled. A run found final before this ``stop``
+   sent anything is ``already_final`` (it lost the race).
 4. ``stop`` waits until the run is final, up to grace + ``kill_grace`` + 5 s from the first
    signal; a run still live then is ``ended: false`` (exit 12).
 
 **Exact PIDs only.** A wrapper or child is signaled only when its recorded PID and start-time
 token (procinfo) match the running process: on Linux through a pidfd opened before the token is
-checked, so the signal can never reach a reused PID. Without a pidfd (macOS, a Python built
-without ``os.pidfd_open``, a Linux kernel before 5.3) the token is checked right before
-``kill``, which leaves a PID-reuse window as long as that check.
+checked, so the signal can never reach a reused PID (``gateway.pidfd_open``: the os function,
+else the syscall through ``ctypes`` on x86_64 and aarch64). Without a pidfd (macOS, another
+machine, a Linux kernel before 5.3) the token is checked right before ``kill``, which leaves a
+PID-reuse window as long as that check.
 An empty token (not readable when it was recorded) is never a match: such a process is not
 signaled (``signal_not_sent`` is logged). Every signal sent is logged ``signal_sent`` with its
 PID. Nothing is ever signaled by name or pattern.
 
 ``--dry-run`` writes nothing (no audit record, no request, no signal): it prints the first
-signal that would be sent, or the cancel or the liveness end that would happen.
+signal that would be sent, or the cancel or the liveness end that would happen. It always
+exits 0 (no wait happens; ``ended`` reflects the current state or the predicted end).
 """
 
 from __future__ import annotations
@@ -51,6 +61,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from . import audit, endmap, lifecycle, liveness, logs, outcomefile, store, toolhooks
+from . import gateway as gw
 from .errors import InternalError
 
 if TYPE_CHECKING:
@@ -138,12 +149,11 @@ def verified(pid: Any, token: Any) -> bool:
 
 
 def _pidfd(pid: int) -> int | None:
-    """A pidfd for ``pid``; None when the process is gone; ``NO_PIDFD`` when this Python or
-    kernel has none (a build without ``os.pidfd_open``, a kernel before 5.3)."""
+    """A pidfd for ``pid`` (``gateway.pidfd_open``: the os function, else the syscall through
+    ctypes on x86_64 and aarch64); None when the process is gone; ``NO_PIDFD`` when this
+    platform or kernel has none (another machine, a kernel before 5.3)."""
     try:
-        return os.pidfd_open(pid)
-    except AttributeError:
-        return NO_PIDFD
+        return gw.pidfd_open(pid)
     except OSError as exc:
         return NO_PIDFD if exc.errno == errno.ENOSYS else None
 
@@ -161,7 +171,7 @@ def send_verified(pid: Any, token: Any, sig: int) -> bool:
         try:
             if not verified(pid, token):
                 return False
-            signal.pidfd_send_signal(fd, sig)
+            gw.pidfd_send_signal(fd, sig)
         except OSError:
             return False
         finally:
@@ -203,6 +213,9 @@ class Stop:
         self.state_root = os.path.dirname(st.path)
         self.log = logs.EventLog(os.path.join(self.state_root, LOG_NAME))
         self.poll = min(float(cfg.poll_interval), POLL)
+        # (role, signal, pid, start token) of each signal sent, and of each not-sent logged.
+        self._sent: set[tuple[Any, ...]] = set()
+        self._noted: set[tuple[Any, ...]] = set()
 
     def run(self, given: str, *, dry_run: bool = False) -> Stopped:
         sid, _ = lifecycle.lookup(self.st, given)
@@ -256,16 +269,30 @@ class Stop:
     # Signals
 
     def _signal_path(self, result: Stopped) -> None:
+        """Poll the run and signal it until it is final or the wait is over (module docs,
+        step 3). Signals are remembered per (role, signal, PID, start token): a wrapper or
+        child recorded later (a hand-over) gets its own, and a send that did not happen is
+        tried again on the next poll."""
         sid, run = result.csession_id, result.run
         start = time.monotonic()
         kill_at = start + self.grace
         give_up = kill_at + float(self.cfg.kill_grace) + SETTLE
         wrapper_kill_at: float | None = None
-        wrapper_termed = child_termed = kill_phase = wrapper_killed = False
+        first = True
         while True:
             record = self.st.run_record(sid, run)
             if record["ended_at"] is not None:
+                # Ended by another process before this stop did anything: it lost the race.
+                result.already_final = first and not result.signals
                 return
+            first = False
+            now = time.monotonic()
+            kill_phase = now >= kill_at
+            if kill_phase and wrapper_kill_at is None:
+                # Grace is over: SIGKILL to the child; the wrapper always gets kill_grace to
+                # reap it and finalize (also with no child, or one already gone).
+                self._signal_child(result, record, signal.SIGKILL)
+                wrapper_kill_at = now + float(self.cfg.kill_grace)
             verdict = liveness.classify(self.st, record)
             if verdict == liveness.PENDING:
                 # ``start`` released the run (it was not pending when stop looked).
@@ -274,50 +301,89 @@ class Stop:
                     result.recorded_by_stop = bool(result.signals)
                     return
             elif verdict == liveness.LIVE:
-                if not wrapper_termed:
-                    wrapper_termed = True
-                    self._send(result, record, "wrapper", signal.SIGTERM)
+                if wrapper_kill_at is not None and now >= wrapper_kill_at:
+                    self._kill_wrapper(result, sid, run)
+                elif not self._signal(result, record, "wrapper", signal.SIGTERM):
+                    # The wrapper cannot be verified: the verified child gets the SIGTERM
+                    # instead (pending_cause first), as an orphan would.
+                    if not kill_phase:
+                        self._signal_child(result, record, signal.SIGTERM)
             elif verdict == liveness.ORPHAN:
-                if not child_termed and not kill_phase:
-                    child_termed = True
-                    self._signal_child(result, record, signal.SIGTERM)
+                self._signal_child(result, record, signal.SIGKILL if kill_phase else signal.SIGTERM)
             else:  # the wrapper is gone: stop records the end itself (liveness path)
                 if self._finalize(sid, run, max(0.0, give_up - time.monotonic())):
                     result.recorded_by_stop = True
                     return
-            now = time.monotonic()
-            if not kill_phase and now >= kill_at:
-                kill_phase = True
-                record = self.st.run_record(sid, run)
-                if record["ended_at"] is not None:
-                    return
-                killed = self._signal_child(result, record, signal.SIGKILL)
-                wrapper_kill_at = now + (float(self.cfg.kill_grace) if killed else 0.0)
-            if wrapper_kill_at is not None and not wrapper_killed and now >= wrapper_kill_at:
-                wrapper_killed = True
-                record = self.st.run_record(sid, run)
-                if record["ended_at"] is not None:
-                    return
-                self._send(result, record, "wrapper", signal.SIGKILL)
-            if now >= give_up:
+            if time.monotonic() >= give_up:
                 return
             time.sleep(self.poll)
 
+    def _kill_wrapper(self, result: Stopped, sid: str, run: int) -> None:
+        """kill_grace is over: re-read the run; a child recorded meanwhile gets its SIGKILL
+        first, then the wrapper (``pending_cause`` ``stopped`` recorded first when a child is
+        recorded). A recorded child whose PID exists but cannot be verified keeps its wrapper:
+        without it nobody could stop that child, so the run stays live."""
+        record = self.st.run_record(sid, run)
+        if record["ended_at"] is not None:
+            return
+        child_pid, child_start = record["child_pid"], record["child_start"]
+        if child_pid is None:
+            self._signal(result, record, "wrapper", signal.SIGKILL)
+            return
+        if verified(child_pid, child_start):
+            self._signal_child(result, record, signal.SIGKILL)
+        elif liveness.process_alive(self.st, child_pid, child_start):
+            self._note(
+                result,
+                ("wrapper", signal.SIGKILL, record["wrapper_pid"], record["wrapper_start"]),
+                "the recorded child runs but cannot be verified; the wrapper is left to"
+                " supervise it",
+            )
+            return
+        key = ("wrapper", signal.SIGKILL, record["wrapper_pid"], record["wrapper_start"])
+        if key in self._sent:
+            return
+        recorded = self.st.set_pending_cause(sid, run, STOPPED)
+        if not self._signal(result, record, "wrapper", signal.SIGKILL) and recorded:
+            self.st.clear_pending_cause(sid, run, STOPPED)
+
     def _signal_child(self, result: Stopped, record: dict[str, Any], sig: int) -> bool:
         """``pending_cause`` ``stopped`` (an earlier cause stands), then ``sig`` to the
-        verified child. Returns whether it was sent."""
-        if record["child_pid"] is None:
+        verified child; the cause this call recorded is cleared again when the signal was
+        not sent. Returns whether it was sent (now or earlier)."""
+        pid, token = record["child_pid"], record["child_start"]
+        if pid is None:
             return False
-        if not verified(record["child_pid"], record["child_start"]):
-            self._not_sent(result, "child", sig, "the child is gone or cannot be verified")
+        key = ("child", sig, pid, token)
+        if key in self._sent:
+            return True
+        if not verified(pid, token):
+            self._note(result, key, "the child is gone or cannot be verified")
             return False
-        self.st.set_pending_cause(result.csession_id, result.run, STOPPED)
-        return self._send(result, record, "child", sig)
+        sid, run = result.csession_id, result.run
+        recorded = self.st.set_pending_cause(sid, run, STOPPED)
+        if self._signal(result, record, "child", sig):
+            return True
+        if recorded:
+            self.st.clear_pending_cause(sid, run, STOPPED)
+        return False
+
+    def _signal(self, result: Stopped, record: dict[str, Any], role: str, sig: int) -> bool:
+        """``sig`` to the ``role`` once per recorded (PID, start token): True when it was sent,
+        now or earlier. A send that did not happen is logged once and tried again later."""
+        key = (role, sig, record[f"{role}_pid"], record[f"{role}_start"])
+        if key in self._sent:
+            return True
+        if not self._send(result, record, role, sig):
+            self._note(result, key, f"the {role} is gone or cannot be verified")
+            return False
+        self._sent.add(key)
+        return True
 
     def _send(self, result: Stopped, record: dict[str, Any], role: str, sig: int) -> bool:
+        """One send to the exact recorded process; logged ``signal_sent`` when it happened."""
         pid, token = record[f"{role}_pid"], record[f"{role}_start"]
         if not send_verified(pid, token, sig):
-            self._not_sent(result, role, sig, f"the {role} is gone or cannot be verified")
             return False
         name = signal.Signals(sig).name
         result.signals.append({"pid": pid, "role": role, "signal": name})
@@ -325,6 +391,13 @@ class Stop:
             "signal_sent", result, pid=pid, signal=name, message=f"stop: {role}", level="info"
         )
         return True
+
+    def _note(self, result: Stopped, key: tuple[Any, ...], why: str) -> None:
+        """``signal_not_sent`` for ``key`` (role, signal, PID, token), once per key."""
+        if key in self._noted:
+            return
+        self._noted.add(key)
+        self._not_sent(result, key[0], key[1], why)
 
     def _not_sent(self, result: Stopped, role: str, sig: int, why: str) -> None:
         self._log(

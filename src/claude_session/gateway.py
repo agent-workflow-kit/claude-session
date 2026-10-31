@@ -69,11 +69,19 @@ reaps the child when a ``KeyboardInterrupt`` interrupts it: on Linux the child s
 until it has exited, so its process group can still be ended safely when an exception escapes.
 Best effort without ``os.waitid`` (macOS): the final wait is ``Popen.wait``, which can reap the
 leader when interrupted, after which its group is no longer signaled.
+
+``pidfd_open`` and ``pidfd_send_signal`` (``stop``'s exact signals; Linux 5.3+) use
+``os.pidfd_open`` and ``signal.pidfd_send_signal`` where this Python has them and otherwise the
+syscalls themselves through ``ctypes`` on x86_64 and aarch64 Linux (``pidfd_support`` tells
+which); anywhere else they raise ``OSError(ENOSYS)``. They live here because this is the only
+module that calls libc directly.
 """
 
 from __future__ import annotations
 
 import enum
+import errno
+import functools
 import os
 import select
 import selectors
@@ -366,6 +374,89 @@ def _libc() -> _Libc:
     libc_signal.restype = ctypes.c_void_p
     libc_signal.argtypes = (ctypes.c_int, ctypes.c_void_p)
     return _Libc(_prctl(), libc_signal, ctypes.get_errno)
+
+
+# Pidfds
+
+# (SYS_pidfd_open, SYS_pidfd_send_signal) by machine, for Pythons built without the os and
+# signal wrappers. Any other machine has no pidfd here.
+_PIDFD_SYSCALLS = {"x86_64": (434, 424), "aarch64": (434, 424)}
+# ``pidfd_support`` values.
+PIDFD_NATIVE = "os"
+PIDFD_SYSCALL = "syscall"
+
+
+def _native_pidfd() -> bool:
+    return hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+
+
+@functools.cache
+def _pidfd_syscall() -> Callable[..., int] | None:
+    """libc's ``syscall`` where the pidfd syscall numbers are known, else None."""
+    if not sys.platform.startswith("linux") or os.uname().machine not in _PIDFD_SYSCALLS:
+        return None
+    import ctypes  # lazy: keeps the hook-event import path light
+
+    try:
+        fn = ctypes.CDLL(None, use_errno=True).syscall
+    except (OSError, AttributeError):
+        return None
+    fn.restype = ctypes.c_long
+    return fn
+
+
+def pidfd_support() -> str | None:
+    """How pidfds are reached here: ``PIDFD_NATIVE`` (the os and signal functions),
+    ``PIDFD_SYSCALL`` (the syscalls through ``ctypes``) or None (no pidfd). The kernel may still
+    lack them (before Linux 5.3): the calls then raise ``OSError(ENOSYS)``."""
+    if _native_pidfd():
+        return PIDFD_NATIVE
+    return PIDFD_SYSCALL if _pidfd_syscall() is not None else None
+
+
+def _syscall(which: int, *args: object) -> int:
+    """The pidfd syscall ``which`` (0: pidfd_open, 1: pidfd_send_signal) with ``args``."""
+    import ctypes
+
+    fn = _pidfd_syscall()
+    if fn is None:
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+    number = _PIDFD_SYSCALLS[os.uname().machine][which]
+    ctypes.set_errno(0)
+    result = fn(ctypes.c_long(number), *args)
+    if result < 0:
+        err = ctypes.get_errno() or errno.EIO
+        raise OSError(err, os.strerror(err))  # ESRCH arrives as ProcessLookupError
+    return result
+
+
+def pidfd_open(pid: int) -> int:
+    """A pidfd naming the process ``pid`` (the caller closes it). Raises ``OSError``: ESRCH
+    when there is no such process, ENOSYS when this platform has no pidfd."""
+    if _native_pidfd():
+        return os.pidfd_open(pid)
+    if not 0 < pid < 2**31:
+        raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+    import ctypes
+
+    return _syscall(0, ctypes.c_int(pid), ctypes.c_uint(0))
+
+
+def pidfd_send_signal(fd: int, sig: int) -> None:
+    """Send ``sig`` to the process ``fd`` names. Raises ``OSError`` (ESRCH once it has exited,
+    ENOSYS when this platform has no pidfd)."""
+    if _native_pidfd():
+        signal.pidfd_send_signal(fd, sig)
+        return
+    import ctypes
+
+    _syscall(
+        1,
+        ctypes.c_int(fd),
+        ctypes.c_int(sig),
+        ctypes.c_void_p(None),
+        ctypes.c_uint(0),
+    )
 
 
 def _pdeathsig_preexec(

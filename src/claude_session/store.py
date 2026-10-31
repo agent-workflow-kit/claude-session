@@ -1291,6 +1291,18 @@ class Store:
             )
         return cursor.rowcount == 1
 
+    def clear_pending_cause(self, csession_id: str, run_no: int, cause: str) -> bool:
+        """Undo ``set_pending_cause`` when the signal it preceded was not sent: clears the
+        cause only while it is still ``cause`` and the run is not final. The caller clears
+        only a cause its own ``set_pending_cause`` recorded. Returns whether it was cleared."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET pending_cause = NULL WHERE csession_id = ? AND run_no = ? "
+                "AND pending_cause = ? AND ended_at IS NULL",
+                (csession_id, run_no, cause),
+            )
+        return cursor.rowcount == 1
+
     def set_auto_exit_cause(self, csession_id: str, run_no: int, event_id: int) -> bool:
         """The auto-exit re-check and its ``pending_cause`` in one compare-and-set: recorded
         only while the run is live with no cause, its report is ``done`` and ``event_id`` is

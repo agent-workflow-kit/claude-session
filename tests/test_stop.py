@@ -484,6 +484,448 @@ def test_the_liveness_launch_end_of_a_stop_request_is_canceled(
     assert run_row(st, sid)["end_reason"] == "canceled"
 
 
+def log_records(root: str, event: str) -> list[dict[str, Any]]:
+    return [r for r in read_jsonl(Path(root) / "log.jsonl") if r["event"] == event]
+
+
+def set_child(st: Store, sid: str, child: tuple[int, str]) -> None:
+    st.conn.execute(
+        "UPDATE runs SET child_pid = ?, child_start = ?, phase = 'session' "
+        "WHERE csession_id = ? AND run_no = 1",
+        (child[0], child[1], sid),
+    )
+
+
+def set_wrapper(st: Store, sid: str, wrapper: tuple[int, str]) -> None:
+    st.conn.execute(
+        "UPDATE runs SET wrapper_pid = ?, wrapper_start = ? WHERE csession_id = ? AND run_no = 1",
+        (wrapper[0], wrapper[1], sid),
+    )
+
+
+def on_first_kill_phase(monkeypatch: pytest.MonkeyPatch, action: Any) -> None:
+    """Run ``action`` once, right after stop's grace-end SIGKILL step for a run that has no
+    child recorded (the kill phase has started)."""
+    real = stopper.Stop._signal_child  # pyright: ignore[reportPrivateUsage]
+    done: list[bool] = []
+
+    def signal_child(self: stopper.Stop, result: Any, record: dict[str, Any], sig: int) -> bool:
+        sent_now = real(self, result, record, sig)
+        if sig == signal.SIGKILL and record["child_pid"] is None and not done:
+            done.append(True)
+            action()
+        return sent_now
+
+    monkeypatch.setattr(stopper.Stop, "_signal_child", signal_child)
+
+
+def after_send(monkeypatch: pytest.MonkeyPatch, role: str, sig: int, action: Any) -> None:
+    """Run ``action`` once, right after stop sent ``sig`` to the ``role``."""
+    real = stopper.Stop._send  # pyright: ignore[reportPrivateUsage]
+    done: list[bool] = []
+
+    def send(
+        self: stopper.Stop, result: Any, record: dict[str, Any], role_: str, sig_: int
+    ) -> bool:
+        sent_now = real(self, result, record, role_, sig_)
+        if sent_now and (role_, sig_) == (role, sig) and not done:
+            done.append(True)
+            action()
+        return sent_now
+
+    monkeypatch.setattr(stopper.Stop, "_send", send)
+
+
+# The kill phase (review round 1)
+
+
+def test_a_wrapper_whose_child_is_gone_still_gets_kill_grace(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    """No child SIGKILL was needed (the child had exited), yet the wrapper gets kill_grace to
+    finish its closing pass before its SIGKILL; pending_cause stopped is recorded first."""
+    wrapper = stubborn(procs, tmp_path, "wrapper")
+    sid = session(st, root, wrapper=wrapper, child=procs.dead())
+    began = time.monotonic()
+    code, out = run_stop(capsys, config, sid, "--grace", "0.3s")
+    took = time.monotonic() - began
+    assert code == 0
+    assert sent(out) == [(wrapper[0], "wrapper", "SIGTERM"), (wrapper[0], "wrapper", "SIGKILL")]
+    assert 0.3 + 0.5 <= took < 10, took
+    assert run_row(st, sid)["pending_cause"] == "stopped"
+    assert (out["end_reason"], out["recorded_by_stop"]) == ("stopped", True)
+
+
+def test_a_child_recorded_during_kill_grace_is_killed_before_the_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    wrapper = stubborn(procs, tmp_path, "wrapper")
+    child = stubborn(procs, tmp_path, "child")
+    sid = session(st, root, wrapper=wrapper)
+    on_first_kill_phase(monkeypatch, lambda: set_child(st, sid, child))
+    code, out = run_stop(capsys, config, sid, "--grace", "0.2s")
+    assert code == 0
+    assert sent(out) == [
+        (wrapper[0], "wrapper", "SIGTERM"),
+        (child[0], "child", "SIGKILL"),
+        (wrapper[0], "wrapper", "SIGKILL"),
+    ]
+    assert run_row(st, sid)["pending_cause"] == "stopped"
+    assert out["ended"] is True
+    assert not procs.running(wrapper[0]) and not procs.running(child[0])
+
+
+def test_a_live_child_that_cannot_be_verified_keeps_its_wrapper(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    """The child's PID exists but its token is empty: SIGKILLing the wrapper would leave it
+    unsupervised, so the wrapper is not SIGKILLed and the run stays live (exit 12)."""
+    wrapper = stubborn(procs, tmp_path, "wrapper")
+    child_pid, _ = procs.live()
+    sid = session(st, root, wrapper=wrapper, child=(child_pid, ""))
+    code, out = run_stop(capsys, config, sid, "--grace", "0.1s")
+    assert (code, out["ended"]) == (12, False)
+    assert sent(out) == [(wrapper[0], "wrapper", "SIGTERM")]
+    assert procs.running(wrapper[0]) and procs.running(child_pid)
+    assert any(
+        r["signal"] == "SIGKILL" and "wrapper" in r["message"]
+        for r in log_records(root, "signal_not_sent")
+    )
+
+
+def test_with_an_unverifiable_wrapper_the_child_gets_sigterm_before_sigkill(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    wrapper_pid, _ = procs.live()
+    child = stubborn(procs, tmp_path, "child")
+    sid = session(st, root, wrapper=(wrapper_pid, ""), child=child)
+    code, out = run_stop(capsys, config, sid, "--grace", "0.3s")
+    assert code == 12  # the unverifiable wrapper stays live
+    assert sent(out) == [(child[0], "child", "SIGTERM"), (child[0], "child", "SIGKILL")]
+    assert run_row(st, sid)["pending_cause"] == "stopped"
+    log = log_records(root, "signal_sent")
+    term, kill = (r for r in log if r["pid"] == child[0])
+    assert term["signal"] == "SIGTERM" and kill["signal"] == "SIGKILL"
+    assert procs.running(wrapper_pid)
+
+
+def test_a_wrapper_that_took_over_after_the_sigterm_gets_one_too(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    """The run changes hands (another wrapper recorded) after stop's SIGTERM to the first one:
+    the new wrapper gets its own SIGTERM, not just the grace-end SIGKILL."""
+    first, second = procs.live(), procs.live()
+    sid = session(st, root, wrapper=first)
+    after_send(monkeypatch, "wrapper", signal.SIGTERM, lambda: set_wrapper(st, sid, second))
+    code, out = run_stop(capsys, config, sid, "--grace", "5s")
+    assert code == 0
+    assert sent(out) == [(first[0], "wrapper", "SIGTERM"), (second[0], "wrapper", "SIGTERM")]
+    assert not procs.running(second[0])
+
+
+def test_an_orphan_that_appears_in_the_kill_phase_gets_sigkill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    wrapper = stubborn(procs, tmp_path, "wrapper")
+    child = stubborn(procs, tmp_path, "child")
+    dead = procs.dead()
+    sid = session(st, root, wrapper=wrapper)
+
+    def orphan() -> None:
+        set_child(st, sid, child)
+        set_wrapper(st, sid, dead)
+
+    on_first_kill_phase(monkeypatch, orphan)
+    code, out = run_stop(capsys, config, sid, "--grace", "0.2s")
+    assert code == 0
+    assert sent(out) == [(wrapper[0], "wrapper", "SIGTERM"), (child[0], "child", "SIGKILL")]
+    assert (out["end_reason"], out["recorded_by_stop"]) == ("stopped", True)
+    assert not procs.running(child[0])
+
+
+def test_an_orphaned_child_ignoring_sigterm_is_killed_after_grace(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    child = stubborn(procs, tmp_path, "child")
+    sid = session(st, root, wrapper=procs.dead(), child=child)
+    began = time.monotonic()
+    code, out = run_stop(capsys, config, sid, "--grace", "0.3s")
+    took = time.monotonic() - began
+    assert code == 0
+    assert sent(out) == [(child[0], "child", "SIGTERM"), (child[0], "child", "SIGKILL")]
+    assert 0.3 <= took < 10, took
+    assert (out["outcome"], out["end_reason"], out["recorded_by_stop"]) == (
+        "killed",
+        "stopped",
+        True,
+    )
+
+
+# Races and failures (review round 1)
+
+
+def test_a_run_ended_while_stop_cancels_it_is_already_final(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+) -> None:
+    """Another process ends the pending run between stop's request and its cancel: stop lost
+    the race, sent nothing and reports already_final."""
+    sid = pending(st, root)
+    real = Store.cancel_pending
+
+    def cancel_pending(self: Store, csession_id: str, run_no: int, final: Final) -> bool:
+        self.finalize_run(csession_id, run_no, Final("session", "lost", "lost", 17, "lost", "exit"))
+        return real(self, csession_id, run_no, final)
+
+    monkeypatch.setattr(Store, "cancel_pending", cancel_pending)
+    code, out = run_stop(capsys, config, sid)
+    assert (code, out["already_final"], out["canceled"], out["signals"]) == (0, True, False, [])
+    assert out["end_reason"] == "lost"
+
+
+def test_a_signal_not_sent_clears_the_cause_stop_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    config = tmp_path / "fast.yaml"
+    config.write_text("kill_grace: 0.1s\npoll_interval: 0.05s\n", encoding="utf-8")
+    child = procs.live()
+    sid = session(st, root, wrapper=procs.dead(), child=child)
+    monkeypatch.setattr(stopper, "send_verified", lambda pid, token, sig: False)
+    code, out = run_stop(capsys, config, sid, "--grace", "0.1s")
+    assert (code, out["signals"]) == (12, [])
+    assert run_row(st, sid)["pending_cause"] is None
+    assert procs.running(child[0])
+
+
+def test_clearing_the_cause_leaves_another_cause_alone(st: Store, root: str, procs: Procs) -> None:
+    sid = session(st, root, wrapper=procs.live(), pending_cause="timeout")
+    assert not st.set_pending_cause(sid, 1, "stopped")
+    assert not st.clear_pending_cause(sid, 1, "stopped")
+    assert run_row(st, sid)["pending_cause"] == "timeout"
+
+
+def test_a_start_release_before_the_first_signal_is_a_cancel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    """start releases its run (pending again) after stop saw it held: stop cancels it with no
+    signal (canceled true)."""
+    outcome_file = tmp_path / "outcome.json"
+    wrapper = procs.live()
+    sid = session(st, root, wrapper=wrapper, outcome_file=str(outcome_file))
+    spec = write_private(root, sid, 1, lifecycle.SPEC_NAME, b'{"env": "credential"}')
+    real = stopper.Stop._signal_path  # pyright: ignore[reportPrivateUsage]
+
+    def signal_path(self: stopper.Stop, result: stopper.Stopped) -> None:
+        assert st.release_pending(
+            sid, 1, wrapper_pid=wrapper[0], wrapper_start=wrapper[1], pending_for=3600
+        )
+        real(self, result)
+
+    monkeypatch.setattr(stopper.Stop, "_signal_path", signal_path)
+    code, out = run_stop(capsys, config, sid)
+    assert code == 0
+    assert (out["canceled"], out["recorded_by_stop"], out["signals"]) == (True, False, [])
+    assert out["end_reason"] == "canceled"
+    assert not spec.exists()
+    assert json.loads(outcome_file.read_text())["end_reason"] == "canceled"
+    assert final_events(st, sid) == [(1, "stop", "not-started")]
+    assert procs.running(wrapper[0])
+
+
+def test_a_start_release_after_the_sigterm_is_ended_by_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    """start releases the run after stop's SIGTERM reached it: stop cancels the pending run,
+    but it was signaled, so canceled is false and recorded_by_stop true."""
+    outcome_file = tmp_path / "outcome.json"
+    wrapper = stubborn(procs, tmp_path, "start")
+    sid = session(st, root, wrapper=wrapper, outcome_file=str(outcome_file))
+    spec = write_private(root, sid, 1, lifecycle.SPEC_NAME, b'{"env": "credential"}')
+
+    def release() -> None:
+        assert st.release_pending(
+            sid, 1, wrapper_pid=wrapper[0], wrapper_start=wrapper[1], pending_for=3600
+        )
+
+    after_send(monkeypatch, "wrapper", signal.SIGTERM, release)
+    code, out = run_stop(capsys, config, sid, "--grace", "5s")
+    assert code == 0
+    assert (out["canceled"], out["recorded_by_stop"]) == (False, True)
+    assert sent(out) == [(wrapper[0], "wrapper", "SIGTERM")]
+    assert (out["outcome"], out["end_reason"]) == ("not-started", "canceled")
+    assert not spec.exists()
+    assert json.loads(outcome_file.read_text())["end_reason"] == "canceled"
+    assert final_events(st, sid) == [(1, "stop", "not-started")]
+
+
+def test_a_failed_stop_adds_a_best_effort_error_record(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    procs: Procs,
+) -> None:
+    sid = session(st, root, wrapper=procs.live())
+
+    def fail(self: stopper.Stop, sid_: str, run: int) -> stopper.Stopped:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(stopper.Stop, "_stop", fail)
+    code, out = run_stop(capsys, config, sid)
+    assert (code, out["error"]["code"]) == (1, "internal")
+    assert [(r["action"], r["result"]) for r in audit_records(root)] == [
+        ("stop", "ok"),
+        ("stop", "error"),
+    ]
+
+
+# Dry runs (review round 1)
+
+
+def test_a_dry_run_on_a_final_run_is_already_final(
+    capsys: pytest.CaptureFixture[str], config: Path, st: Store, root: str, procs: Procs
+) -> None:
+    sid = session(st, root, wrapper=procs.live())
+    st.finalize_run(sid, 1, Final("session", "lost", "lost", 17, "lost", "exit"))
+    code, out = run_stop(capsys, config, sid, "--dry-run")
+    assert (code, out["already_final"], out["ended"], out["end_reason"]) == (0, True, True, "lost")
+
+
+def test_a_dry_run_predicts_the_liveness_end_and_changes_nothing(
+    capsys: pytest.CaptureFixture[str], config: Path, st: Store, root: str, procs: Procs
+) -> None:
+    sid = session(st, root, wrapper=procs.dead())
+    code, out = run_stop(capsys, config, sid, "--dry-run")
+    assert (code, out["already_final"], out["ended"]) == (0, True, True)
+    assert (out["outcome"], out["end_reason"], out["signals"]) == (
+        "not-started",
+        "launch_interrupted",
+        [],
+    )
+    assert run_row(st, sid)["ended_at"] is None
+    assert final_events(st, sid) == []
+
+
+def test_a_dry_run_on_an_orphan_names_the_child_sigterm(
+    capsys: pytest.CaptureFixture[str], config: Path, st: Store, root: str, procs: Procs
+) -> None:
+    child = procs.live()
+    sid = session(st, root, wrapper=procs.dead(), child=child)
+    code, out = run_stop(capsys, config, sid, "--dry-run")
+    assert (code, out["ended"], sent(out)) == (0, False, [(child[0], "child", "SIGTERM")])
+    assert procs.running(child[0])
+    assert run_row(st, sid)["pending_cause"] is None
+
+
+# Exact signals through pidfds (review round 1)
+
+
+PIDFD_MACHINE = sys.platform.startswith("linux") and os.uname().machine in ("x86_64", "aarch64")
+
+
+@pytest.mark.skipif(not PIDFD_MACHINE, reason="pidfds: x86_64 and aarch64 Linux only")
+def test_a_signal_goes_through_a_pidfd_on_linux(
+    monkeypatch: pytest.MonkeyPatch, procs: Procs
+) -> None:
+    from claude_session import gateway
+
+    calls: list[int] = []
+    real = gateway.pidfd_send_signal
+
+    def spy(fd: int, sig: int) -> None:
+        calls.append(sig)
+        real(fd, sig)
+
+    monkeypatch.setattr(gateway, "pidfd_send_signal", spy)
+    pid, token = procs.live()
+    assert stopper.send_verified(pid, token, signal.SIGTERM)
+    assert calls == [signal.SIGTERM]
+    proc = next(p for p in procs.started if p.pid == pid)
+    assert proc.wait(timeout=30) == -signal.SIGTERM
+
+
+def test_without_a_pidfd_the_token_is_checked_before_kill(
+    monkeypatch: pytest.MonkeyPatch, procs: Procs
+) -> None:
+    import errno
+
+    from claude_session import gateway
+
+    def no_pidfd(pid: int) -> int:
+        raise OSError(errno.ENOSYS, "no pidfd")
+
+    monkeypatch.setattr(gateway, "pidfd_open", no_pidfd)
+    pid, token = procs.live()
+    assert not stopper.send_verified(pid, "0:1", signal.SIGTERM)
+    assert procs.running(pid)
+    assert stopper.send_verified(pid, token, signal.SIGTERM)
+    proc = next(p for p in procs.started if p.pid == pid)
+    assert proc.wait(timeout=30) == -signal.SIGTERM
+
+
+def test_a_dead_pid_is_never_signaled(procs: Procs) -> None:
+    pid, token = procs.dead()
+    assert not stopper.send_verified(pid, token, signal.SIGTERM)
+
+
 # End to end: a real exec and the fake claude
 
 
