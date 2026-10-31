@@ -31,6 +31,11 @@ ACTIONS = frozenset(
     {"resume_tainted", "forget", "stop", "launch_escalation_override", "sandbox_lowered"}
 )
 RESULTS = frozenset({"ok", "refused", "error"})
+# The longest record line (bytes, newline included; interface.md, Audit and log). ``append``
+# refuses a longer record like any it cannot write; ``exporter`` reads no longer line. JSON
+# escapes expand a byte up to six times, so an argv well under ARG_MAX can exceed it.
+# TODO(#31): cap hook stdout feeding decision_id so a record stays under MAX_RECORD_BYTES.
+MAX_RECORD_BYTES = 4 * 1024 * 1024
 SANDBOX_LEVELS = frozenset({"required", "preferred", "off"})
 # schemas/audit.json inputs.grace: seconds, at most 2**53 (exact as a JSON number).
 GRACE_MIN = 0
@@ -96,7 +101,7 @@ def _check_inputs(inputs: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         checked["overridden_hooks"] = list(hooks)
     for key in ("sandbox_from", "sandbox_to"):
         level = checked.get(key)
-        if level is not None and level not in SANDBOX_LEVELS:
+        if level is not None and not (isinstance(level, str) and level in SANDBOX_LEVELS):
             raise ValueError(f"audit input {key} must be one of {sorted(SANDBOX_LEVELS)}")
     grace = checked.get("grace")
     # Only a float can be NaN or infinite; the bounds check compares without converting a
@@ -160,8 +165,9 @@ def append(
     ``=`` (it would reveal part of the secret), or when ``<key>=redacted`` would still contain
     one.
 
-    Raises ``ValueError`` for a value the schema does not allow and ``OSError`` when the file
-    cannot be written. Never swallow either: the audited action must not be taken without its
+    Raises ``ValueError`` for a value the schema does not allow or a record longer than
+    ``MAX_RECORD_BYTES`` (nothing is written), and ``OSError`` when the file cannot be
+    written. Never swallow either: the audited action must not be taken without its
     record.
     """
     # Callers pass the values of the configured secret_env and claude_auth_env variables
@@ -186,7 +192,7 @@ def append(
         "inputs": None if checked is None else _redact_inputs(checked, secret_set),
         "result": result,
     }
-    append_record(path, record)
+    append_record(path, record, max_bytes=MAX_RECORD_BYTES)
     return record
 
 
@@ -236,9 +242,9 @@ def check_record(value: object) -> dict[str, JSONValue]:
         raise ValueError("decision_id must be a list of strings")
     if not is_csession_id(value["target"]):
         raise ValueError("audit target is not a csession_id")
-    if value["action"] not in ACTIONS:
+    if not (isinstance(value["action"], str) and value["action"] in ACTIONS):
         raise ValueError("unknown audit action")
-    if value["result"] not in RESULTS:
+    if not (isinstance(value["result"], str) and value["result"] in RESULTS):
         raise ValueError("unknown audit result")
     inputs = value["inputs"]
     if inputs is not None:
@@ -259,5 +265,7 @@ def parse_record(line: bytes) -> dict[str, JSONValue] | None:
             parse_constant=_no_constant,
         )
         return check_record(value)
-    except (ValueError, RecursionError):  # UnicodeDecodeError and JSONDecodeError included
+    # UnicodeDecodeError and JSONDecodeError are ValueErrors; TypeError is a backstop for an
+    # unhashable value reaching a set membership test.
+    except (ValueError, TypeError, RecursionError):
         return None

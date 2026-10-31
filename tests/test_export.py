@@ -4,8 +4,10 @@ file read without following a symlink; human output one inert line per record.""
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -354,6 +356,14 @@ BAD_LINES: dict[str, bytes] = {
     "inputs grace inf": b'{"ts":"2026-10-30T12:00:00.000Z","actor":"a","decision_id":[],'
     b'"target":"cs-aaaaaaaa","action":"stop","inputs":{"grace":1e999},"result":"ok"}\n',
     "inputs hooks string": line(good_record(inputs={"overridden_hooks": "h"})),
+    "action list": line(good_record(action=["stop"])),
+    "action object": line(good_record(action={"stop": 1})),
+    "result list": line(good_record(result=["ok"])),
+    "result object": line(good_record(result={"ok": 1})),
+    "inputs sandbox_from list": line(good_record(inputs={"sandbox_from": ["off"]})),
+    "inputs sandbox_from object": line(good_record(inputs={"sandbox_from": {"off": 1}})),
+    "inputs sandbox_to list": line(good_record(inputs={"sandbox_to": ["off"]})),
+    "inputs sandbox_to object": line(good_record(inputs={"sandbox_to": {"off": 1}})),
     "ts not a string": line(good_record(ts=0)),
     "ts no zone": line(good_record(ts="2026-10-30T12:00:00.000")),
     "ts date only": line(good_record(ts="2026-10-30")),
@@ -399,16 +409,22 @@ def test_an_unreadable_line_never_reaches_the_output(
         assert "evil" not in out
 
 
-def test_a_half_written_last_line_is_skipped(
+def test_a_half_written_last_line_is_not_shown_or_counted(
     audit_file: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """A final line without its newline that is not a record may be an append in progress:
+    it is neither shown nor counted. Once the next append has terminated it, it is counted."""
     write(audit_file, target="cs-aaaaaaaa")
     with audit_file.open("ab") as f:
         f.write(line(good_record(target="cs-bbbbbbbb"))[:-20])
     code, records, err = run_json([], capsys)
-    assert code == 0
+    assert (code, err) == (0, "")
     assert [r["target"] for r in records] == ["cs-aaaaaaaa"]
-    assert "skipped 1 unreadable line" in err
+    write(audit_file, target="cs-cccccccc")
+    code, records, err = run_json([], capsys)
+    assert code == 0
+    assert [r["target"] for r in records] == ["cs-aaaaaaaa", "cs-cccccccc"]
+    assert err == "claude-session: warning: skipped 1 unreadable line in audit.jsonl\n"
 
 
 def test_a_complete_last_record_without_its_newline_is_read(
@@ -428,11 +444,9 @@ def test_a_complete_last_record_without_its_newline_is_read(
     ]
 
 
-def test_a_crlf_line_ending_is_unreadable(
-    audit_file: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The writer ends lines with LF only; JSON allows the CR as whitespace, but a line the
-    writer cannot have written is not trusted either way, so it is read like any record."""
+def test_a_crlf_line_ending_is_read(audit_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The writer ends lines with LF only, but JSON reads the CR before the LF as trailing
+    whitespace, so the record parses and is exported."""
     with audit_file.open("ab") as f:
         f.write(line(good_record())[:-1] + b"\r\n")
     assert len(exported([], capsys)) == 1
@@ -465,7 +479,8 @@ def test_an_overlong_line_is_skipped_without_holding_it(
     write(audit_file, actor="human:" + "x" * 5000, target="cs-bbbbbbbb")  # a record, too long
     write(audit_file, actor="human:" + "y" * 3900, target="cs-cccccccc")  # within the cap
     with audit_file.open("ab") as f:
-        f.write(b"z" * 20_000)  # an overlong unterminated tail
+        f.write(b"z" * 20_000 + b"\n")  # an overlong line
+        f.write(b"z" * 20_000)  # an overlong unterminated tail: an append in progress
     code, records, err = run_json([], capsys)
     assert code == 0
     assert [r["target"] for r in records] == ["cs-aaaaaaaa", "cs-cccccccc"]
@@ -487,6 +502,23 @@ def test_a_line_exactly_at_the_cap_is_read(
     code, records, err = run_json([], capsys)
     assert [r["target"] for r in records] == ["cs-aaaaaaaa"]
     assert "skipped 1 unreadable line" in err
+
+
+def test_the_line_cap_is_the_writers_record_limit() -> None:
+    assert exporter.MAX_LINE_BYTES == audit.MAX_RECORD_BYTES - 1  # newline excluded
+
+
+def test_the_largest_record_the_writer_accepts_is_exported(
+    audit_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    probe = write(audit_file.with_name("probe.jsonl"), actor="human:")
+    base = audit_file.with_name("probe.jsonl").stat().st_size
+    assert probe["actor"] == "human:"
+    actor = "human:" + "a" * (audit.MAX_RECORD_BYTES - base)
+    write(audit_file, actor=actor, target="cs-aaaaaaaa")
+    assert audit_file.stat().st_size == audit.MAX_RECORD_BYTES
+    [record] = exported([], capsys)
+    assert record["actor"] == actor
 
 
 def test_only_bytes_present_at_open_are_read(
@@ -531,6 +563,8 @@ def test_a_dangling_symlink_is_refused(
     audit_file.symlink_to(tmp_path / "missing.jsonl")
     code, envelope, _ = run_json([], capsys)
     assert (code, envelope["error"]["code"]) == (12, "failed")
+    assert envelope["error"]["message"] == "unsafe audit file"
+    assert envelope["error"]["detail"] == f"{audit_file}: a symlink"
 
 
 def test_a_fifo_is_refused_without_blocking(
@@ -539,7 +573,8 @@ def test_a_fifo_is_refused_without_blocking(
     os.mkfifo(audit_file, 0o600)
     code, envelope, _ = run_json([], capsys)
     assert (code, envelope["error"]["code"]) == (12, "failed")
-    assert "not a regular file" in envelope["error"]["message"]
+    assert envelope["error"]["message"] == "unsafe audit file"
+    assert envelope["error"]["detail"] == f"{audit_file}: not a regular file"
 
 
 def test_a_directory_is_refused(audit_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -555,7 +590,8 @@ def test_a_hard_linked_audit_file_is_refused(
     os.link(audit_file, tmp_path / "other-name")
     code, envelope, _ = run_json([], capsys)
     assert (code, envelope["error"]["code"]) == (12, "failed")
-    assert "links" in envelope["error"]["message"]
+    assert envelope["error"]["message"] == "unsafe audit file"
+    assert envelope["error"]["detail"] == f"{audit_file}: file has 2 links"
 
 
 def test_an_unreadable_audit_file_fails(
@@ -567,6 +603,9 @@ def test_an_unreadable_audit_file_fails(
     audit_file.chmod(0o200)
     code, envelope, _ = run_json([], capsys)
     assert (code, envelope["error"]["code"]) == (12, "failed")
+    validate(envelope, "claude-session/cli/error.json")
+    assert envelope["error"]["message"] == "cannot read the audit file"
+    assert envelope["error"]["detail"] == f"{audit_file}: Permission denied"
 
 
 def test_a_symlinked_state_dir_component_is_followed_like_the_writer(
@@ -700,6 +739,32 @@ def test_json_output_keeps_unicode_text(
 # Reader unit checks
 
 
+def test_read_records_keeps_only_matching_records(
+    audit_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--since and --action are applied while reading: a non-matching record is parsed and
+    dropped, never held."""
+    seed(audit_file)
+    kept: list[dict[str, Any]] = []
+    real_parse = audit.parse_record
+
+    def parse(raw: bytes) -> dict[str, Any] | None:
+        record = real_parse(raw)
+        if record is not None:
+            kept.append(record)
+        return record
+
+    monkeypatch.setattr(exporter.audit, "parse_record", parse)
+    result = exporter.read_records(
+        str(audit_file), since=T0 + timedelta(hours=3), actions=frozenset({"forget"})
+    )
+    assert [(r["action"], r["target"]) for r in result.records] == [
+        ("forget", "cs-eeeeeeee"),
+        ("forget", "cs-ffffffff"),
+    ]
+    assert len(kept) == 7  # every record was parsed, only the matches came back
+
+
 def test_read_records_reports_the_skip_count(audit_file: Path) -> None:
     write(audit_file)
     with audit_file.open("ab") as f:
@@ -735,3 +800,79 @@ def test_terminal_display_is_the_sanitizer(audit_file: Path) -> None:
     """The human line goes through terminal.display, the one sanitizer."""
     rec = good_record(actor="a\x1bb")
     assert terminal.display("a\x1bb", " ") in exporter.record_line(rec)
+
+
+# Human output: field collisions (null, [], [""], ["-"], "", "-", '""')
+
+
+@pytest.mark.parametrize(
+    ("decision_id", "shown"),
+    [
+        ([], "-"),
+        ([""], '""'),
+        (["-"], "\\x2d"),
+        (['""'], "\\x22\\x22"),
+        (["", ""], '"",""'),
+        (["a-b"], "a-b"),
+    ],
+)
+def test_human_list_values_are_distinct(
+    decision_id: list[str], shown: str, audit_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with audit_file.open("ab") as f:
+        f.write(line(good_record(decision_id=decision_id)))
+    main(["export"])
+    assert f" decision_id={shown}\n" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("actor", "shown"), [("", '""'), ("-", "\\x2d"), ('""', "\\x22\\x22"), ("a-", "a-")]
+)
+def test_human_string_values_are_distinct_from_null(
+    actor: str, shown: str, audit_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with audit_file.open("ab") as f:
+        f.write(line(good_record(actor=actor, inputs={"run_kind": None})))
+    main(["export"])
+    assert f" actor={shown} decision_id=- run_kind=-\n" in capsys.readouterr().out
+
+
+# Human output: Unicode whitespace
+
+
+UNICODE_SPACES = "\u00a0\u1680\u2000\u2005\u200a\u202f\u205f\u3000\u2028\u2029"
+
+
+def test_human_output_escapes_unicode_whitespace(
+    audit_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A value with a no-break or ideographic space cannot pass for more fields."""
+    write(
+        audit_file,
+        actor="human:x\u00a0result=ok\u3000decision_id=forged",
+        decision_ids=["d\u2000run=9", *UNICODE_SPACES],
+    )
+    main(["export"])
+    text = capsys.readouterr().out[:-1]
+    assert not any(char.isspace() and char != " " for char in text), text
+    tokens = text.split(" ")
+    assert [t.partition("=")[0] for t in tokens[4:]] == ["actor", "decision_id"]
+    assert tokens[4] == "actor=human:x\\xa0result=ok\\u3000decision_id=forged"
+    assert tokens[5].startswith("decision_id=d\\u2000run=9,\\xa0,\\u1680,")
+
+
+# Human output: a stdout that cannot encode every character
+
+
+def test_human_output_on_an_ascii_stdout_escapes_what_it_cannot_encode(
+    audit_file: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(audit_file, actor="human:日本")
+    raw = io.BytesIO()
+    stdout = io.TextIOWrapper(raw, encoding="ascii", newline="\n")
+    monkeypatch.setattr(sys, "stdout", stdout)
+    assert main(["export"]) == 0
+    stdout.flush()
+    assert raw.getvalue().decode("ascii") == (
+        "2026-10-30T12:00:00.000Z stop cs-aaaaaaaa ok actor=human:\\u65e5\\u672c decision_id=-\n"
+    )

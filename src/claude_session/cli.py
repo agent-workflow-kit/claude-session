@@ -177,9 +177,9 @@ def _export(args: argparse.Namespace) -> int:
     from . import exporter
 
     path = os.path.join(store.state_dir(), exporter.AUDIT_NAME)
-    read = exporter.read_records(path)
     since = None if args.since is None else since_threshold(args.since)
-    records = exporter.select(read.records, since=since, actions=frozenset(args.action or ()))
+    read = exporter.read_records(path, since=since, actions=frozenset(args.action or ()))
+    records = read.records
     if read.skipped and not args.quiet:
         lines = "line" if read.skipped == 1 else "lines"
         print(
@@ -190,7 +190,7 @@ def _export(args: argparse.Namespace) -> int:
         print(json.dumps([exporter.json_record(r) for r in records], allow_nan=False))
     else:
         for record in records:
-            print(exporter.record_line(record))
+            print(exporter.encodable(exporter.record_line(record), sys.stdout.encoding))
     return 0
 
 
