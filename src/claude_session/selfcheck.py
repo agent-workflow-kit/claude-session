@@ -10,8 +10,10 @@ and the other path rules, plugin directories, git directory, temporary directory
 ``claude_bin``, ``claude --version``, ``claude_args`` (isolated runs), sandbox
 prerequisites, socket path length. The caller runs ``tmpdir.check`` at the
 temporary-directory slot; ``self_check`` runs after ``claude_args``: sandbox prerequisites,
-socket path length, then (unless a dry run) ``tmpdir.create``, which validates the base and
-per-uid root again, so nothing is created before every check has passed.
+socket path length, then (unless a dry run) ``tmpdir.create_reporting``, which validates the
+base and per-uid root again, so nothing is created before every check has passed. A leftover
+it renamed aside and could not remove becomes a warning naming it with the ``rm -rf``
+command that removes it.
 
 - ``required``: a missing prerequisite fails the launch (``sandbox_unavailable``).
 - ``preferred``: it gives a warning and ``sandbox_active: false``; the run still gets its
@@ -35,8 +37,9 @@ runner to #51's ``Gateway`` there.
 TODO(#24): ``bwrap`` and ``socat`` come from the PATH sanitizing's absolute tool resolution
 (outside session-writable paths); this module only checks that they are absolute,
 executable regular files.
-TODO(#27): ``--dry-run`` calls ``self_check(..., create=False)`` for ``would_fail``,
-``sandbox_active`` and ``warnings``.
+TODO(#27): ``--dry-run`` calls ``tmpdir.check`` at the temporary-directory slot of launch
+step 5, then ``self_check(..., create=False)`` after the ``claude_args`` check, for
+``would_fail``, ``sandbox_active`` and ``warnings``.
 """
 
 from __future__ import annotations
@@ -186,7 +189,8 @@ def self_check(
     sandbox_exec: str = SANDBOX_EXEC,
 ) -> SelfCheck:
     """Run the sandbox self-check for a run with sandbox ``mode``: sandbox prerequisites,
-    socket path length, then the private tmpdir is created. The caller has run
+    socket path length, then the private tmpdir is created (a leftover moved aside and left
+    there is reported in ``warnings``). The caller has run
     ``tmpdir.check`` earlier in launch step 5. ``create=False`` (dry run) checks the same and
     does not touch the tmpdir at all; ``csession_id`` may then be None (a new session), and
     the socket path is checked for an id of the fixed length. Raises
@@ -203,7 +207,7 @@ def self_check(
     prerequisites = check_prerequisites(
         platform, bwrap=bwrap, socat=socat, runner=runner, sandbox_exec=sandbox_exec
     )
-    warnings: tuple[str, ...] = ()
+    warnings: list[str] = []
     if not prerequisites.available:
         if mode == "required":
             raise LaunchValidationError(
@@ -211,16 +215,21 @@ def self_check(
                 end_reason="sandbox_unavailable",
                 hint=prerequisites.hint,
             )
-        warnings = (
+        warnings.append(
             f"sandbox 'preferred' but unavailable ({prerequisites.problem}): the run is not"
-            f" sandboxed; {prerequisites.hint}",
+            f" sandboxed; {prerequisites.hint}"
         )
     check_socket_path(tmpdir.run_path(csession_id or _PLACEHOLDER_ID, tmp_base), platform)
     path = None if csession_id is None else tmpdir.run_path(csession_id, tmp_base)
     if create:
         assert csession_id is not None
-        path = tmpdir.create(csession_id, base=tmp_base)
-    return SelfCheck(sandbox_active=prerequisites.available, tmpdir=path, warnings=warnings)
+        path, stale = tmpdir.create_reporting(csession_id, base=tmp_base)
+        if stale is not None:
+            warnings.append(
+                f"leftover private temporary directory moved aside: {stale};"
+                f" remove it: rm -rf {stale}"
+            )
+    return SelfCheck(sandbox_active=prerequisites.available, tmpdir=path, warnings=tuple(warnings))
 
 
 # Session ids have a fixed length (ids.SESSION_ID); a dry run of a new session checks this one.

@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import selfcheck, tmpdir
+from claude_session import fsutil, selfcheck, tmpdir
 from claude_session.errors import LaunchValidationError
 from claude_session.selfcheck import Prerequisites
 
@@ -461,6 +461,44 @@ def test_self_check_does_not_check_the_tmpdir_itself(
     assert run_check("required", base, tools, FakeRunner(0)).sandbox_active
 
 
+@pytest.mark.parametrize(
+    ("mode", "probe_status"), [("required", 0), ("preferred", 0), ("preferred", 1)]
+)
+def test_self_check_warns_about_a_leftover_moved_aside(
+    base: Path,
+    tools: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    probe_status: int,
+) -> None:
+    # A leftover deeper than the removal accepts is renamed aside; when it cannot be removed
+    # under its new name either, the warning names it with the command that removes it.
+    monkeypatch.setattr(fsutil, "tree_depth_cap", lambda: 3)
+    run = Path(tmpdir.create(SID, base=str(base)))
+    path = run
+    for _ in range(6):
+        path = path / "d"
+        path.mkdir()
+    result = run_check(mode, base, tools, FakeRunner(by_tool={"socat": probe_status}))
+    assert result.tmpdir == str(run)
+    assert list(run.iterdir()) == []
+    (stale,) = Path(tmpdir.root_path(str(base))).glob(f"{tmpdir.STALE_PREFIX}*")
+    assert result.warnings[-1] == (
+        f"leftover private temporary directory moved aside: {stale}; remove it: rm -rf {stale}"
+    )
+    assert len(result.warnings) == (1 if probe_status == 0 else 2)
+
+
+def test_self_check_gives_no_leftover_warning_when_the_leftover_is_removed(
+    base: Path, tools: tuple[str, str]
+) -> None:
+    run = Path(tmpdir.create(SID, base=str(base)))
+    (run / "x").write_text("x")
+    result = run_check("required", base, tools, FakeRunner(0))
+    assert result.warnings == ()
+    assert list(run.iterdir()) == []
+
+
 @pytest.mark.parametrize("csession_id", [SID, None])
 def test_dry_run_does_not_touch_the_tmpdir(
     base: Path, tools: tuple[str, str], monkeypatch: pytest.MonkeyPatch, csession_id: str | None
@@ -473,6 +511,7 @@ def test_dry_run_does_not_touch_the_tmpdir(
 
     monkeypatch.setattr(tmpdir, "check", not_called)
     monkeypatch.setattr(tmpdir, "create", not_called)
+    monkeypatch.setattr(tmpdir, "create_reporting", not_called)
     result = run_check(
         "required", base, tools, FakeRunner(0), create=False, csession_id=csession_id
     )

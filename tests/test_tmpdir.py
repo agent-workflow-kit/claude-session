@@ -393,6 +393,29 @@ def test_create_moves_an_unremovable_leftover_aside(base: Path, low_depth_cap: i
     assert (stale / "d").is_dir()  # the second removal failed too: left for reconcile
 
 
+def test_create_reporting_names_a_leftover_left_aside(base: Path, low_depth_cap: int) -> None:
+    run = Path(tmpdir.create(SID, base=str(base)))
+    deep_tree(run, low_depth_cap + 3)
+    path, stale_path = tmpdir.create_reporting(SID, base=str(base))
+    assert path == str(run)
+    (stale,) = stale_entries(base)
+    assert stale_path == str(stale)
+
+
+def test_create_reporting_reports_nothing_without_a_stale_entry(base: Path) -> None:
+    run = Path(tmpdir.create(SID, base=str(base)))
+    (run / "x").write_text("x")
+    assert tmpdir.create_reporting(SID, base=str(base)) == (str(run), None)
+    assert tmpdir.create_reporting("cs-bbbb2345", base=str(base)) == (
+        str(root_of(base) / "cs-bbbb2345"),
+        None,
+    )
+
+
+def test_root_name_is_the_single_root_definition() -> None:
+    assert tmpdir.root_name(1000) == "csession-1000"
+
+
 def test_create_removes_the_moved_aside_leftover_when_it_can(
     base: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

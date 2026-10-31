@@ -1,10 +1,10 @@
 """The private temporary directory of sandboxed runs (interface.md, Isolation; design.md,
 Session directories). Standard library only.
 
-Layout: ``<base>/csession-<euid>/<csession_id>/`` with ``<base>`` the realpath of ``/tmp``
-(macOS: ``/private/tmp``). The base is world-writable, so another local user is assumed
-hostile: they may pre-create (squat) the per-uid root, plant a symlink or FIFO in its place,
-or create it with a mode that lets them in.
+Layout: ``<base>/<root_name(euid)>/<csession_id>/`` (``root_name``: ``csession-<euid>``) with
+``<base>`` the realpath of ``/tmp`` (macOS: ``/private/tmp``). The base is world-writable, so
+another local user is assumed hostile: they may pre-create (squat) the per-uid root, plant a
+symlink or FIFO in its place, or create it with a mode that lets them in.
 
 - The base must be a directory owned by root or by us; when group- or other-writable it must
   have the sticky bit, so nobody else can rename or delete our entries in it (that is what
@@ -19,7 +19,9 @@ or create it with a mode that lets them in.
   leftover that cannot be removed (a tree deeper than ``fsutil.tree_depth_cap()``, which a
   sandboxed agent can build in its own TMPDIR) is renamed aside in the root to
   ``.stale-<id>-<hex>`` (never a session id), so the session's path is free again; removing
-  it is retried once and it is left when that fails too.
+  it is retried once and it is left when that fails too: ``create_reporting`` returns its
+  path (``selfcheck.self_check`` turns it into a warning with the ``rm -rf`` command), and
+  ``remove`` raises ``TmpdirLeftover`` naming it.
 - A refusal names the failing entry (the base, the per-uid root or the run directory) by its
   full path and carries a hint for that entry; ``check`` and ``create`` report the same text.
   Before the per-uid root is opened, an ``lstat`` relative to the base learns its owner and
@@ -45,6 +47,8 @@ from . import fsutil, ids
 from .errors import LaunchValidationError
 
 DEFAULT_BASE = "/tmp"
+# The per-uid root's name is defined here only: ``root_name`` (and ``root_path`` from it).
+# TODO(#15): dedupe with pathrules.tmp_parent from #24 when both are merged.
 ROOT_PREFIX = "csession-"
 # Leftover run directories that cannot be removed are renamed to ".stale-<id>-<hex>": the
 # leading dot keeps the name outside the session id grammar.
@@ -85,11 +89,16 @@ class _Refusal(fsutil.UnsafePathError):
         self.hint = hint
 
 
+def root_name(uid: int) -> str:
+    """The name of the per-uid root of ``uid`` in the base: ``csession-<uid>``."""
+    return f"{ROOT_PREFIX}{uid}"
+
+
 def root_path(base: str = DEFAULT_BASE) -> str:
-    """``<realpath(base)>/csession-<euid>``; ``base`` must be absolute."""
+    """``<realpath(base)>/<root_name(euid)>``; ``base`` must be absolute."""
     if not os.path.isabs(base):
         raise ValueError(f"base must be absolute: {base!r}")
-    return os.path.join(os.path.realpath(base), f"{ROOT_PREFIX}{os.geteuid()}")
+    return os.path.join(os.path.realpath(base), root_name(os.geteuid()))
 
 
 def run_path(csession_id: str, base: str = DEFAULT_BASE) -> str:
@@ -122,6 +131,13 @@ def create(csession_id: str, *, base: str = DEFAULT_BASE) -> str:
     per-uid root (created when missing); a leftover directory (or any entry) of that name is
     removed first without following symlinks, or renamed aside when it cannot be removed.
     Returns its path. Raises ``TmpdirUnsafe``."""
+    return create_reporting(csession_id, base=base)[0]
+
+
+def create_reporting(csession_id: str, *, base: str = DEFAULT_BASE) -> tuple[str, str | None]:
+    """``create``, also returning the full path of a leftover that was renamed aside and could
+    not be removed under its new name either (None when nothing was left)."""
+    stale_path: str | None = None
     path = run_path(csession_id, base)
     root = os.path.dirname(path)
     try:
@@ -133,7 +149,7 @@ def create(csession_id: str, *, base: str = DEFAULT_BASE) -> str:
         assert root_fd is not None
         try:
             if _exists_at(root_fd, csession_id):
-                _clear_leftover(root_fd, root, csession_id)
+                stale_path = _clear_leftover(root_fd, root, csession_id)
             try:
                 os.close(fsutil.create_private_dir_at(root_fd, csession_id))
             except OSError as exc:
@@ -142,7 +158,7 @@ def create(csession_id: str, *, base: str = DEFAULT_BASE) -> str:
             os.close(root_fd)
     except _Refusal as exc:
         raise _unsafe(exc) from exc
-    return path
+    return path, stale_path
 
 
 def remove(csession_id: str, *, base: str = DEFAULT_BASE) -> bool:
@@ -282,12 +298,13 @@ def _check_root(fd: int, root: str) -> None:
         raise _Refusal(root, f"mode {stat.S_IMODE(info.st_mode):04o}, not 0700", _root_hint(root))
 
 
-def _clear_leftover(root_fd: int, root: str, name: str) -> None:
+def _clear_leftover(root_fd: int, root: str, name: str) -> str | None:
     """Remove the leftover entry ``name`` in the root; when that fails, rename it aside and
-    try once to remove it under its new name (left there when that fails too)."""
+    try once to remove it under its new name. Returns the full path of what is left there
+    when that fails too, else None."""
     try:
         fsutil.remove_tree_at(root_fd, name)
-        return
+        return None
     except OSError as exc:
         removal_error = exc
     path = os.path.join(root, name)
@@ -304,7 +321,8 @@ def _clear_leftover(root_fd: int, root: str, name: str) -> None:
     try:
         fsutil.remove_tree_at(root_fd, stale)
     except OSError:
-        pass  # left for reconcile (#29); the session's path is free
+        return os.path.join(root, stale)  # the session's path is free; reported by the caller
+    return None
 
 
 def _rename_aside(root_fd: int, name: str) -> str:
