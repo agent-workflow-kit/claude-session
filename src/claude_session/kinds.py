@@ -139,8 +139,8 @@ class Resolution:
     profile: config.Kind
     origins: dict[str, Origin]  # ORIGIN_FIELDS, "repo" and the flag-only fields when set
     warnings: tuple[str, ...] = ()
-    # TODO(#10): the env builder must never let these flag-supplied names unlock a secret_env
-    # variable; only profile.env.allow (the kind's config env.allow) can.
+    # These flag-supplied names never unlock a secret_env variable; only profile.env.allow
+    # (the kind's config env.allow) can (envbuild.build, step 3).
     env_allow: tuple[str, ...] = ()
     env_allowlist_only: tuple[str, ...] | None = None
     # TODO(#22): resolve, read and snapshot the permission profile file.
