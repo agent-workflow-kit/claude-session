@@ -32,7 +32,8 @@ the run with itself as its wrapper (``allocate(..., pending=...)``), runs ``vali
 makes the run pending once it is frozen (``Store.release_pending``); the adopting ``exec``
 runs ``run`` with its own effects (``Recording`` subclass comparing what ``start`` stored)
 and ``staged=True`` (step 7 moves ``start``'s staged prompt and inputs into place).
-TODO(#29): resume and fork build their request from the previous run (carry-over).
+Resumes and forks (``resume``) build their request from the previous run (carry-over) and
+allocate with ``allocate_resume`` or ``allocate(fork=...)``; the rest is shared.
 TODO(#31): launch step 6, the ``pre-launch`` hooks, between ``validate`` and ``prepare``.
 TODO(#40): ``claude --version`` against ``min_claude_version`` (``claude_too_old``) in
 ``validate``, after ``claude_bin`` is resolved.
@@ -80,7 +81,7 @@ from .sessiondir import InputFile, SessionDirs
 
 LOG_NAME = "log.jsonl"
 AUDIT_NAME = "audit.jsonl"
-RUN = 1  # a new session's run (resume: TODO(#29))
+RUN = 1  # a new session's (or fork's) run; a resume's comes from allocate_resume
 RESULT_FILE = "result.json"
 STDERR_FILE = "stderr.log"
 PROFILE_SNAPSHOT = "permission-profile.json"
@@ -91,6 +92,9 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # id (valid grammar; ids are random, so a real session with it is as unlikely as any other
 # collision).
 PLACEHOLDER_ID = "cs-aaaaaaaa"
+# The ``spec_json`` key beside a carried snapshot path (``--permission-profile``): the label
+# the snapshot's run recorded, which a later run carrying it again expects.
+CARRIED_LABEL = "permission_profile_label"
 # The tool name of a permission rule (``Tool`` or ``Tool(content)``).
 _RULE_TOOL = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 
@@ -140,8 +144,25 @@ class Process:
 
 
 @dataclass(frozen=True)
+class Conversation:
+    """Which Claude Code conversation the run continues (interface.md, Resume and fork
+    carry-over): none for a new session; ``resume_from`` (``--resume``) for a resume; a fork
+    adds ``fork`` (``--fork-session``) and its new ``session_id``; a resume or fork of a
+    session with no captured Claude id starts a fresh conversation (``session_id`` only).
+    ``resume`` selects the headless resume text of the bootstrap prompt."""
+
+    resume: bool = False
+    resume_from: str | None = None
+    fork: bool = False
+    session_id: str | None = None
+
+
+@dataclass(frozen=True)
 class Request:
-    """What ``exec`` was asked to launch, read and usage-checked (launch step 2)."""
+    """What ``exec`` was asked to launch, read and usage-checked (launch step 2). A resume or
+    fork adds the explicit flags it carries from the previous run (``carried``, stored in the
+    run's ``spec_json`` with the flags given now; ``kinds`` resolves them as
+    ``previous_run``) and the conversation it continues."""
 
     kind: str | None
     mode: str
@@ -158,6 +179,8 @@ class Request:
     hooks: tuple[str, ...]
     hook_timeouts: tuple[str, ...]
     outcome_file: str | None
+    carried: Mapping[str, Any] = field(default_factory=dict)
+    conversation: Conversation = field(default_factory=Conversation)
 
 
 def _actor(given: str | None, cfg: Config) -> str:
@@ -219,6 +242,9 @@ class Resolved:
 
     resolution: kinds.Resolution
     caller_cwd: str | None
+    # A fork without --cwd of a source whose cwd is a session work/ directory: the launch
+    # fails fork_cwd_unsupported (a launch validation, so after allocation).
+    fork_cwd_unsupported: bool = False
 
 
 def _path_entries(environ: Mapping[str, str], prepend: Sequence[str]) -> list[str]:
@@ -227,7 +253,7 @@ def _path_entries(environ: Mapping[str, str], prepend: Sequence[str]) -> list[st
     return pathrules.sanitize_path(":".join([*prepend, environ.get("PATH", "")]))
 
 
-def _caller_cwd(given: str | None, process: Process) -> str:
+def resolve_caller_cwd(given: str | None, process: Process) -> str:
     """``--cwd`` (made absolute against the caller's cwd) or the caller's cwd, resolved; it
     must be an existing directory (exit 2 otherwise)."""
     path = os.path.realpath(os.path.join(process.caller_cwd, given or "."))
@@ -295,7 +321,7 @@ def resolve_kind(req: Request, cfg: Config, process: Process) -> Resolved:
     session_dir_cwd = req.cwd == "session-dir"
     configured = cfg.kinds.get(req.kind or cfg.default_kind)
     prepend = configured.env.path_prepend if configured is not None else []
-    probe_cwd = None if session_dir_cwd else _caller_cwd(req.cwd, process)
+    probe_cwd = None if session_dir_cwd else resolve_caller_cwd(req.cwd, process)
     entries = _path_entries(process.environ, prepend)
     warnings: list[str] = []
 
@@ -354,6 +380,17 @@ class Allocated:
     cause: str = "launch"
     # The procinfo start-time token recorded as the run's wrapper_start (allocate).
     wrapper_start: str | None = None
+    # A resume: the previous run (its outbox is drained before the secret rotates) and the
+    # session's stored git directory, which the run's must equal (git_dir_changed).
+    previous_run: int | None = None
+    check_git_dir: bool = False
+    stored_git_dir: str | None = None
+    # A fork's run 1: the source session whose inputs/ is copied (step 5; None at adoption:
+    # start copied it), the source's not-started run whose undelivered inputs are carried
+    # instead of copied, and whether inputs/1/ may already hold copied inputs (merged).
+    fork_source: str | None = None
+    fork_exclude_run: int | None = None
+    forked: bool = False
 
 
 def _resolved_record(resolution: kinds.Resolution) -> dict[str, Any]:
@@ -388,26 +425,30 @@ class Pending:
     config_default: bool
 
 
-def allocate(
-    st: store.Store,
+def new_run(
     req: Request,
     resolved: Resolved,
     process: Process,
     *,
     pending: Pending | None = None,
-) -> Allocated:
-    """Launch step 4: the session id (checked against every live, forgotten and deleted id in
-    the inserting transaction) and the session and run rows, with this process as the run's
-    wrapper (plain ``exec`` performs every step; ``start`` until the run is frozen), its
-    labels and the ``launch`` event. With ``pending`` (``start``) the config hash and path
-    are frozen with it."""
+) -> store.NewRun:
+    """The run row of launch step 4 (``Store.allocate``, ``Store.allocate_resume``), with
+    this process as its wrapper. ``spec_json`` holds the explicit flags: those carried from
+    the previous run, replaced by those given now; ``--plugin-dir`` entries absolute (a later
+    run carries them from another cwd); a carried snapshot's label beside the snapshot
+    path."""
     resolution = resolved.resolution
     # TODO(#33): start_time() gives "" when the token cannot be read (plain exec and start
     # alike); the liveness check must never take an empty token as matching a live process.
     wrapper_start = store.start_time(os.getpid())
-    spec = {key: value for key, value in req.flags.items() if value is not None}
+    spec = {key: value for key, value in req.carried.items() if value is not None}
+    spec.update({key: value for key, value in req.flags.items() if value is not None})
+    if resolution.origins.get("permission_profile_file") == "previous_run":
+        spec[CARRIED_LABEL] = resolution.permission_profile_label
     if req.plugin_dirs:
-        spec["plugin_dir"] = list(req.plugin_dirs)
+        spec["plugin_dir"] = [
+            os.path.normpath(os.path.join(process.caller_cwd, entry)) for entry in req.plugin_dirs
+        ]
     invocation = {
         "hooks": list(req.hooks),
         "hook_timeouts": list(req.hook_timeouts),
@@ -419,7 +460,7 @@ def allocate(
     if pending is not None:
         invocation["config_default"] = pending.config_default
     warnings = tuple(resolution.warnings)
-    new = store.NewRun(
+    return store.NewRun(
         state_root=process.state_root,
         kind=resolution.kind,
         reads_third_party=resolution.profile.reads_third_party,
@@ -442,14 +483,79 @@ def allocate(
         warnings=warnings,
         outcome_file=req.outcome_file,
     )
-    csession_id = st.allocate(new, new_id=ids.new_session_id)
+
+
+@dataclass(frozen=True)
+class Fork:
+    """A fork's source: its session id and its current run when that run ended
+    ``not-started`` (its undelivered inputs become the fork's own, so its ``inputs/<n>/`` is
+    not copied)."""
+
+    source: str
+    exclude_run: int | None = None
+
+
+def allocate(
+    st: store.Store,
+    req: Request,
+    resolved: Resolved,
+    process: Process,
+    *,
+    pending: Pending | None = None,
+    fork: Fork | None = None,
+) -> Allocated:
+    """Launch step 4: the session id (checked against every live, forgotten and deleted id in
+    the inserting transaction) and the session and run rows, with this process as the run's
+    wrapper (plain ``exec`` performs every step; ``start`` until the run is frozen), its
+    labels and the ``launch`` event. With ``pending`` (``start``) the config hash and path
+    are frozen with it. A ``fork`` records ``forked_from`` and copies the source's taint
+    (``Store.allocate`` refuses ``tainted`` there)."""
+    new = new_run(req, resolved, process, pending=pending)
+    csession_id = st.allocate(
+        new,
+        new_id=ids.new_session_id,
+        forked_from=None if fork is None else fork.source,
+    )
     return Allocated(
         csession_id=csession_id,
         run=RUN,
         session_dir=sessiondir.session_dir(process.state_root, csession_id),
         private_dir=sessiondir.private_dir(process.state_root, csession_id),
-        warnings=warnings,
-        wrapper_start=wrapper_start,
+        warnings=new.warnings,
+        wrapper_start=new.wrapper_start,
+        fork_source=None if fork is None else fork.source,
+        fork_exclude_run=None if fork is None else fork.exclude_run,
+        forked=fork is not None,
+    )
+
+
+def allocate_resume(
+    st: store.Store,
+    req: Request,
+    resolved: Resolved,
+    process: Process,
+    *,
+    csession_id: str,
+    previous_run: int,
+    git_dir: str | None,
+    pending: Pending | None = None,
+) -> Allocated:
+    """Launch step 4 of a resume: run ``previous_run`` + 1 of ``csession_id``, with the
+    refusal checks in the same transaction (``Store.allocate_resume``: ``live``,
+    ``tainted``; an unknown or forgotten session exits 10). ``git_dir`` is the session's
+    stored git directory, which the run's must still be (``git_dir_changed``)."""
+    new = new_run(req, resolved, process, pending=pending)
+    run = st.allocate_resume(csession_id, new, previous_run=previous_run)
+    return Allocated(
+        csession_id=csession_id,
+        run=run,
+        session_dir=sessiondir.session_dir(process.state_root, csession_id),
+        private_dir=sessiondir.private_dir(process.state_root, csession_id),
+        warnings=new.warnings,
+        wrapper_start=new.wrapper_start,
+        previous_run=previous_run,
+        check_git_dir=True,
+        stored_git_dir=git_dir,
     )
 
 
@@ -748,9 +854,13 @@ def select_profile(
     cfg: Config, resolution: kinds.Resolution, writable: Callable[[str], bool]
 ) -> permission_profiles.Profile:
     """The run's permission profile (a file is read once, here; expanded once the git
-    directory is known)."""
+    directory is known). A carried snapshot must still have the label its run recorded
+    (``invalid_permission_profile`` otherwise)."""
     return permission_profiles.select(
-        cfg, resolution, session_writable=writable if resolution.isolated() else None
+        cfg,
+        resolution,
+        session_writable=writable if resolution.isolated() else None,
+        expected_label=resolution.permission_profile_label,
     )
 
 
@@ -1084,6 +1194,10 @@ class Recording(Effects):
         return cwd
 
     def record_git_dir(self, git_dirs: gitinfo.GitDirs | None) -> None:
+        """The first launch stores the git directory; a resume (or a fork in its source's
+        cwd) first compares it with the stored one (``git_dir_changed``)."""
+        if self.alloc.check_git_dir:
+            gitinfo.check_unchanged(self.alloc.stored_git_dir, git_dirs)
         self.st.update_session(self.alloc.csession_id, git_dir=gitinfo.stored_value(git_dirs))
 
     def create_write_dirs(self, write: pathrules.WriteDirs) -> None:
@@ -1117,6 +1231,11 @@ def checks(
     between goes through ``effects``. Raises ``LaunchValidationError``; the first failure
     wins."""
     resolution = resolved.resolution
+    if resolved.fork_cwd_unsupported:
+        raise LaunchValidationError(
+            "the source's cwd is a session work/ directory; pass --cwd to fork",
+            end_reason="fork_cwd_unsupported",
+        )
     isolated = resolution.isolated()
     home = os.path.realpath(process.environ.get("HOME", "/"))
     tmp = None if resolution.profile.sandbox == "off" else tmpdir.run_path(alloc.csession_id)
@@ -1209,14 +1328,27 @@ def validate(
     process: Process,
     *,
     effects: EffectsFactory | None = None,
+    stage: bool = True,
 ) -> Validated:
     """Launch step 5, in the order interface.md (Launch order) lists: rule paths, the
     session directories (``open_dirs``), then ``checks`` with the effects of a real launch
     (``Recording``, or ``effects``: ``start`` and the adopting ``exec``). Raises
-    ``LaunchValidationError``; the first failure wins."""
+    ``LaunchValidationError``; the first failure wins.
+
+    Once the directories are open, and before the checks, a fork's run copies the source's
+    ``inputs/`` (``SessionDirs.copy_inputs``; an unsafe entry is ``session_dir_unsafe``) and
+    the run's prompt and inputs are staged in its private ``staged/`` (``stage``; the
+    adopting ``exec`` passes False: ``start`` staged them), so a run that then ends
+    ``not-started`` keeps them for the next run (interface.md, Prompts and inputs)."""
     settings_builder.check_rule_paths(process.state_root, process.claude_session)
     dirs, layout = open_dirs(alloc, process, isolated=resolved.resolution.isolated())
     try:
+        if alloc.fork_source is not None:
+            dirs.copy_inputs(
+                alloc.fork_source, exclude_run=alloc.fork_exclude_run, cap=cfg.input_max_bytes
+            )
+        if stage:
+            dirs.stage(alloc.run, req.prompt, req.inputs)
         made = (effects or Recording)(st, alloc, dirs)
         checked = checks(cfg, req, resolved, alloc, process, made)
     except BaseException:
@@ -1279,6 +1411,32 @@ def audit_sandbox_lowered(
 # Step 7: prepare
 
 
+def drain_previous(st: store.Store, alloc: Allocated, dirs: SessionDirs, process: Process) -> None:
+    """A resume, before the secret rotates: the previous run's outbox requests are
+    discarded, recorded ``discarded`` under that run and logged (``outbox_discarded``). The
+    previous run is always final here: a resume of a run that is not final is refused
+    ``live`` (``Store.allocate_resume``).
+
+    TODO(#33): with the liveness check, a previous run still being finalized (``ended_at``
+    unset, wrapper dead) is ingested into instead (interface.md, Launch order step 7)."""
+    if alloc.previous_run is None:
+        return
+    discarded = dirs.discard_outbox(alloc.run)
+    if not discarded:
+        return
+    log = event_log(process)
+    for request_id in discarded:
+        st.record_request(alloc.csession_id, alloc.previous_run, request_id, "discarded")
+        log_best_effort(
+            log,
+            "outbox_discarded",
+            level="info",
+            csession_id=alloc.csession_id,
+            run=alloc.previous_run,
+            message=f"request {request_id}: the run is final",
+        )
+
+
 @dataclass
 class Prepared:
     """What step 7 wrote and the supervisor needs: the ``claude`` argv (``argv[0]`` the
@@ -1330,11 +1488,16 @@ def generate(
         claude_session=process.claude_session,
         claude=v.claude.path,
     )
+    conversation = req.conversation
     launch = settings_builder.Launch(
         mode="headless" if req.mode == "headless" else "interactive",
         cwd=v.cwd,
         skill=req.skill,
         prompt_path=prompt_path,
+        resume=conversation.resume,
+        resume_from=conversation.resume_from,
+        fork=conversation.fork,
+        session_id=conversation.session_id,
         plugin_dirs=v.plugin_dirs,
     )
     return settings_builder.build(
@@ -1350,30 +1513,24 @@ def prepare(
     alloc: Allocated,
     v: Validated,
     process: Process,
-    *,
-    staged: bool = False,
 ) -> Prepared:
-    """Launch step 7: the prompt and inputs (``staged``: the adopting ``exec`` moves the
-    copies ``start`` staged into place, ``place_staged``; they must be the prompt and input
-    names the run recorded), ``instructions.md``, ``run.json`` and a new secret (its digest
-    and the directory identities recorded), the secret index (before the agent can file a
-    report), the hook configuration, the profile snapshot, the generated settings and the
-    output files."""
+    """Launch step 7: a resume first drains the previous run's outbox (``drain_previous``),
+    then the staged prompt and inputs are moved into place (``place_staged``; they must be
+    the prompt and input names the run recorded), ``instructions.md``, ``run.json`` and a
+    new secret (its digest and the directory identities recorded), the secret index (before
+    the agent can file a report), the hook configuration, the profile snapshot, the
+    generated settings and the output files."""
     dirs, run, sid = v.dirs, alloc.run, alloc.csession_id
-    # TODO(#29): drain (ingest or discard) the previous run's outbox before the secret rotates.
-    if staged:
-        placed = dirs.place_staged(run)
-        expected = sorted(item.name for item in req.inputs)
-        if (placed.prompt_path is not None) != (req.prompt is not None) or sorted(
-            placed.input_names
-        ) != expected:
-            raise sessiondir.SessionDirUnsafe(
-                "the staged prompt and inputs differ from the ones start recorded"
-            )
-        prompt_path, names = placed.prompt_path, list(placed.input_names)
-    else:
-        prompt_path = None if req.prompt is None else dirs.write_prompt(run, req.prompt)
-        names = dirs.write_inputs(run, req.inputs)
+    drain_previous(st, alloc, dirs, process)
+    placed = dirs.place_staged(run, merge_inputs=alloc.forked and run == 1)
+    expected = sorted(item.name for item in req.inputs)
+    if (placed.prompt_path is not None) != (req.prompt is not None) or sorted(
+        placed.input_names
+    ) != expected:
+        raise sessiondir.SessionDirUnsafe(
+            "the staged prompt and inputs differ from the ones the run recorded"
+        )
+    prompt_path, names = placed.prompt_path, list(placed.input_names)
     secret = dirs.write_run_files(
         run,
         claude_session_path=process.claude_session,
@@ -1586,13 +1743,13 @@ def run(
     other error before ``claude`` is spawned (``launch_interrupted``), except a
     ``KeyboardInterrupt`` (or another ``BaseException``), which is re-raised once the run is
     final. The adopting ``exec`` passes its ``effects`` (``validate``) and ``staged``
-    (``prepare``)."""
+    (``start`` staged the prompt and inputs already)."""
     resolution = resolved.resolution
     v: Validated | None = None
     prepared: Prepared | None = None
     try:
         try:
-            v = validate(st, cfg, req, resolved, alloc, process, effects=effects)
+            v = validate(st, cfg, req, resolved, alloc, process, effects=effects, stage=not staged)
             secrets = sorted(envbuild.secret_values(v.session_env, process.environ))
             log_credential_warnings(process, alloc, v.credential_warnings, secrets)
             # The audit record is written before the run secret exists (prepare rotates it),
@@ -1600,7 +1757,7 @@ def run(
             # used for the log from here on, is that set plus the run secret.
             audit_sandbox_lowered(process, req, resolution, alloc, secrets)
             st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
-            prepared = prepare(st, cfg, req, resolution, alloc, v, process, staged=staged)
+            prepared = prepare(st, cfg, req, resolution, alloc, v, process)
             st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
         except LaunchValidationError as error:
             end_launch(st, alloc, v, prepared, process, error)

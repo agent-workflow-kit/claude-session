@@ -215,11 +215,8 @@ def _start(args: argparse.Namespace) -> int:
     """``start`` of a new session (interface.md, start): steps 1 to 5, the run frozen and
     left pending; prints the start object. A launch-validation failure exits 12 with
     ``launch_failed``."""
-    if args.resume is not None:
-        # TODO(#29): start --resume (and its --dry-run), with the carry-over.
-        raise InternalError("start --resume is not implemented yet", detail="not_implemented")
     if args.dry_run:
-        return _dry_run(args)
+        return _resume_dry_run(args) if args.resume is not None else _dry_run(args)
     from . import config, launch, lifecycle
     from .gateway import SystemGateway
 
@@ -230,6 +227,54 @@ def _start(args: argparse.Namespace) -> int:
         result = lifecycle.start(st, args, cfg, source, process)
     print(json.dumps(result, ensure_ascii=False, allow_nan=False))
     return 0
+
+
+def _resume(args: argparse.Namespace) -> int:
+    """``resume <id>`` (interface.md, resume): a new run of the session (or with ``--fork`` a
+    new session's run 1) built from the previous run (carry-over), launched and supervised
+    in the foreground like ``exec``; exits with the run's outcome code."""
+    if args.dry_run:
+        return _resume_dry_run(args)
+    from . import launch, resume, supervisor
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    # TODO(#17): install the signal handlers (interface.md, Signals) here, before allocation.
+    try:
+        with store.open_state() as st:
+            process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+            planned = resume.prepare(st, args, cfg, process)
+            alloc = resume.allocate(st, planned, process)
+            ended = launch.run(
+                st,
+                cfg,
+                planned.req,
+                planned.resolved,
+                alloc,
+                process,
+                supervise=supervisor.run_headless,
+            )
+            outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
+            # TODO(#20): deliver the run's post-state-change events (toolhooks.deliver) for a
+            # run that ended without a live wrapper delivering them.
+    except KeyboardInterrupt:
+        # TODO(#17): as for plain exec (SIGINT forwarded, or ignored in interactive mode).
+        _die_of_sigint()
+    _print_outcome(outcome, args.json)
+    return int(outcome["exit_code"]) if ended is None else ended.exit_code
+
+
+def _resume_dry_run(args: argparse.Namespace) -> int:
+    """``resume --dry-run`` and ``start --resume --dry-run``: the plan of the run a launch
+    would allocate, with ``would_refuse``; nothing allocated or finalized."""
+    from . import dryrun, resume
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    with store.open_state() as st:
+        process = dryrun.current_process(SystemGateway())
+        plan, message = resume.plan(st, args, cfg, process)
+    return _print_dry_run(args, plan, message)
 
 
 def _dry_run(args: argparse.Namespace) -> int:
@@ -345,8 +390,7 @@ def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
 HANDLERS: dict[str, Handler] = {
     "exec": _exec,
     "start": _start,
-    # TODO(#29): resume (and resume --dry-run).
-    "resume": _not_implemented,
+    "resume": _resume,
     "stop": _not_implemented,
     "wait": _not_implemented,
     "report": _report,

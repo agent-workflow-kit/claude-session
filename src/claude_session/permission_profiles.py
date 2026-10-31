@@ -261,7 +261,8 @@ def write_snapshot(
     # records the label and snapshot path in the run row; this helper writes to a path.
     # start reads the file (a relative path resolves against start's cwd, never at the
     # adopting exec), snapshots it and freezes the profile in its launch spec (lifecycle).
-    # TODO(#29): a resume stores the snapshot path as the --permission-profile flag value.
+    # A resume carries the snapshot path as the --permission-profile flag value, with the
+    # label its run recorded (resume.carry; kinds.Resolution.permission_profile_label).
     write(path, profile.snapshot_bytes())
 
 

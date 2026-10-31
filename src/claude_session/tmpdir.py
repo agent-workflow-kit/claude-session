@@ -35,7 +35,9 @@ passes the path as ``Isolation.tmpdir`` and ``envbuild``'s ``tmpdir``, and calls
 when the run ends (``supervisor.finish``; a not-started run's in ``launch.end_launch``).
 ``start`` removes the tmpdir its self-check created; the adopting ``exec`` calls ``check``
 and ``create`` again (``launch.checks``).
-TODO(#29): reconcile calls ``remove`` for leftover tmpdirs of final runs and of deleted
+A resume's self-check creates the tmpdir again (``create`` clears a leftover of an earlier
+run first).
+TODO(#33): reconcile calls ``remove`` for leftover tmpdirs of final runs and of deleted
 sessions.
 """
 
@@ -321,7 +323,7 @@ def _clear_leftover(root_fd: int, root: str, name: str) -> str | None:
             f" aside ({_reason(rename_error)})",
             _leftover_hint(path),
         ) from removal_error
-    # TODO(#29): reconcile removes .stale-* entries under the per-uid root.
+    # TODO(#33): reconcile removes .stale-* entries under the per-uid root.
     try:
         fsutil.remove_tree_at(root_fd, stale)
     except OSError:

@@ -299,10 +299,11 @@ def test_a_usage_error_at_start_allocates_nothing(env: Env) -> None:
     assert env.rows("SELECT COUNT(*) FROM sessions") == [(0,)]
 
 
-def test_start_resume_is_not_implemented_here(env: Env) -> None:
+def test_start_resume_of_an_unknown_session_exits_10(env: Env) -> None:
     proc = env.cs(["start", "--json", "--resume", "cs-abcdefgh", "--config", str(env.config)])
-    assert proc.returncode == 1
-    assert json.loads(proc.stdout)["error"]["detail"] == "not_implemented"
+    assert proc.returncode == 10
+    assert json.loads(proc.stdout)["error"]["code"] == "not_found"
+    assert env.rows("SELECT COUNT(*) FROM runs") == [(0,)]
 
 
 # Adoption

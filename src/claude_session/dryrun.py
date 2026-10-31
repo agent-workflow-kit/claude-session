@@ -36,9 +36,9 @@ and ``claude`` is not run at all.
 ``exec --session-id <id> --dry-run`` (``lifecycle.adoption_plan``) reuses ``run_checks``,
 ``unchecked_writable``, ``plan_sandbox``, ``plan_preview`` and ``plan_json`` with the pending
 run's real id and paths and the stored git directory.
-TODO(#29): ``start --resume --dry-run``.
-TODO(#29): ``resume --dry-run`` (carry-over from the previous run, the liveness check that
-only reports, ``would_refuse`` ``live``/``tainted``, the run number, ``fork``).
+``resume --dry-run`` and ``start --resume --dry-run`` (``resume.plan``) build the request
+from the previous run (carry-over) and reuse the same functions, with ``would_refuse``
+(``live``, ``tainted``) decided as the refusal checks would, without finalizing anything.
 """
 
 from __future__ import annotations
@@ -597,14 +597,14 @@ def _isatty(stream: Any) -> bool:
 def check_interactive_tty(args: argparse.Namespace) -> None:
     """The step-2 TTY checks of interactive mode (interface.md, Launch order): plain
     ``exec`` needs a TTY on stdin and stdout, and ``--prompt-file -`` refuses a TTY stdin
-    (``exec`` and ``start``; ``start`` never checks the TTY for the run). Exit 2."""
+    (``exec``, ``resume`` and ``start``; ``start`` never checks the TTY for the run). Exit
+    2."""
     if args.prompt_file == "-" and _isatty(sys.stdin):
         raise UsageError("--prompt-file - with a terminal on stdin in interactive mode")
-    if getattr(args, "handler", None) == "exec" and not (
-        _isatty(sys.stdin) and _isatty(sys.stdout)
-    ):
+    handler = getattr(args, "handler", None)
+    if handler in ("exec", "resume") and not (_isatty(sys.stdin) and _isatty(sys.stdout)):
         raise UsageError(
-            "interactive exec needs a terminal on stdin and stdout",
+            f"interactive {handler} needs a terminal on stdin and stdout",
             detail="pass --mode headless, or use start for a program caller",
         )
 
@@ -730,7 +730,7 @@ def run_checks(
         )
         launch.secret_index(values)
         prompt_path = (
-            None if req.prompt is None else os.path.join(alloc.session_dir, sessiondir.PROMPT)
+            None if req.prompt is None else sessiondir.prompt_path(alloc.session_dir, alloc.run)
         )
         found.generated = launch.generate(
             req, resolved.resolution, alloc, found.checked, process, prompt_path
@@ -853,13 +853,19 @@ def plan_json(
     override_escalation: bool = False,
     csession_id: str | None = None,
     run: int = 1,
+    fork: bool = False,
+    forked_from: str | None = None,
+    launch_kind: str | None = None,
+    labels: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """The dry-run plan (schemas/cli/exec-dry-run.json). With ``would_fail`` set,
     ``settings`` is empty and ``claude_argv``, ``env_names`` and the sandbox lists are
-    empty: a launch never gets that far."""
+    empty: a launch never gets that far. A resume or fork passes its ``fork``,
+    ``forked_from``, the session's ``launch_kind`` and the session's labels after the
+    launch (``labels``; default: a new session's)."""
     profile = resolution.profile
     mode: kinds.Mode = "headless" if req.mode == "headless" else "interactive"
-    labels = sorted({f"kind={resolution.kind}", *req.labels})
+    labels = sorted({f"kind={resolution.kind}", *req.labels} if labels is None else labels)
     generated = found.generated if found.would_fail is None else None
     checked = found.checked if found.would_fail is None else None
     settings: dict[str, Any] = {} if generated is None else generated.settings
@@ -882,9 +888,9 @@ def plan_json(
         "dry_run": True,
         "csession_id": csession_id,
         "run": run,
-        "fork": False,
-        "forked_from": None,
-        "launch_kind": resolution.kind,
+        "fork": fork,
+        "forked_from": forked_from,
+        "launch_kind": resolution.kind if launch_kind is None else launch_kind,
         "run_kind": resolution.kind,
         "labels": labels,
         "taints": profile.reads_third_party,

@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from .errors import FailedError, InternalError, SchemaNewerError
+from .errors import FailedError, InternalError, NotFoundError, RefusedError, SchemaNewerError
 
 if TYPE_CHECKING:
     from .outbox import Frozen
@@ -970,68 +970,64 @@ class Store:
 
     # Launch and supervision (exec). Each method is one transaction.
 
-    def allocate(self, run: NewRun, *, new_id: Callable[[Callable[[str], bool]], str]) -> str:
+    def allocate(
+        self,
+        run: NewRun,
+        *,
+        new_id: Callable[[Callable[[str], bool]], str],
+        forked_from: str | None = None,
+    ) -> str:
         """Launch step 4: allocate a session id (``new_id`` is ``ids.new_session_id``, given
         ``session_id_used`` so the check and the insert share this transaction) and insert the
         session (state ``starting``), its run 1 (phase ``launch``), its labels and the
         ``launch`` event. The run has its wrapper set already: plain ``exec``, which performs
         every step itself, or ``start``, which hands the run over to adoption only once it is
         frozen (``release_pending``). A third-party-reading run taints the session here
-        (interface.md, Taint). Returns the session id."""
+        (interface.md, Taint). Returns the session id.
+
+        A fork (``forked_from``: the source session) records ``forked_from`` and copies the
+        source's taint, read in this transaction: an unknown or forgotten source raises
+        ``NotFoundError``, and a tainted source forked into a run that is not
+        third-party-reading raises ``RefusedError`` (``tainted``)."""
         if run.wrapper_pid is None or run.wrapper_start is None:
             raise ValueError("a run is allocated with its wrapper")
         with self.transaction() as conn:
-            csession_id = new_id(self.session_id_used)
             now = format_ts(self.clock())
+            taint = (
+                (1, now, 1) if run.reads_third_party else (0, None, None)
+            )  # tainted, tainted_at, tainted_by_run
+            if forked_from is not None:
+                source = conn.execute(
+                    "SELECT forgotten_at, tainted, tainted_at FROM sessions WHERE csession_id = ?",
+                    (forked_from,),
+                ).fetchone()
+                if source is None or source[0] is not None:
+                    raise NotFoundError(f"unknown session: {forked_from}")
+                if source[1]:
+                    _refuse_tainted(forked_from, run.reads_third_party)
+                    # The fork inherits the source's taint (and its time); no run of the
+                    # fork caused it.
+                    taint = (1, source[2] or now, None)
+            csession_id = new_id(self.session_id_used)
             expires_at = None
             conn.execute(
                 "INSERT INTO sessions (csession_id, created_at, launch_kind, csession_dir, "
-                "private_dir, tainted, tainted_at, tainted_by_run, current_run, state, "
-                "state_since, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'starting', ?, ?)",
+                "private_dir, forked_from, tainted, tainted_at, tainted_by_run, current_run, "
+                "state, state_since, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'starting', ?, ?)",
                 (
                     csession_id,
                     now,
                     run.kind,
                     os.path.join(run.state_root, "sessions", csession_id),
                     os.path.join(run.state_root, "private", csession_id),
-                    int(run.reads_third_party),
-                    now if run.reads_third_party else None,
-                    1 if run.reads_third_party else None,
+                    forked_from,
+                    *taint,
                     now,
                     now,
                 ),
             )
-            conn.execute(
-                "INSERT INTO runs (csession_id, run_no, created_at, run_kind, reads_third_party, "
-                "mode, repo, model, skill, has_prompt, spec_json, resolved_json, config_hash, "
-                "invocation_json, decision_ids_json, warnings_json, hook_interpreter, "
-                "config_path, wrapper_pid, wrapper_start, outcome_file, expires_at, phase) "
-                "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "'launch')",
-                (
-                    csession_id,
-                    now,
-                    run.kind,
-                    int(run.reads_third_party),
-                    run.mode,
-                    run.repo,
-                    run.model,
-                    run.skill,
-                    int(run.has_prompt),
-                    json.dumps(run.spec, ensure_ascii=False, sort_keys=True),
-                    json.dumps(run.resolved, ensure_ascii=False, sort_keys=True),
-                    run.config_hash,
-                    json.dumps(run.invocation, ensure_ascii=False, sort_keys=True),
-                    json.dumps(list(run.decision_ids), ensure_ascii=False),
-                    json.dumps(list(run.warnings), ensure_ascii=False),
-                    run.hook_interpreter,
-                    run.config_path,
-                    run.wrapper_pid,
-                    run.wrapper_start,
-                    run.outcome_file,
-                    expires_at,
-                ),
-            )
+            self._insert_run(conn, csession_id, 1, run, now, expires_at)
             labels = sorted({f"kind={run.kind}", *run.labels})
             for label in labels:
                 key, _, value = label.partition("=")
@@ -1046,6 +1042,122 @@ class Store:
                 (csession_id, now, json.dumps(labels, ensure_ascii=False)),
             )
         return csession_id
+
+    def allocate_resume(self, csession_id: str, run: NewRun, *, previous_run: int) -> int:
+        """Launch step 4 of a resume (``resume``, ``start --resume``): the refusal checks and
+        the new run n + 1 in one transaction (interface.md, resume). The session must exist
+        and not be forgotten (``NotFoundError``); its current run must still be
+        ``previous_run`` (the run the carry-over was computed from) and final, else
+        ``RefusedError`` ``live``; a tainted session resumed into a run that is not
+        third-party-reading is refused ``tainted``. Then the run row (with its wrapper set,
+        as ``allocate``), the session's current run and state ``starting``, the taint of a
+        third-party-reading run, the given labels (added) and the ``launch`` event. Returns
+        the new run number."""
+        if run.wrapper_pid is None or run.wrapper_start is None:
+            raise ValueError("a run is allocated with its wrapper")
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT s.forgotten_at, s.current_run, s.tainted, s.state, s.activity, "
+                "r.ended_at FROM sessions s LEFT JOIN runs r "
+                "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
+                "WHERE s.csession_id = ?",
+                (csession_id,),
+            ).fetchone()
+            if row is None or row[0] is not None:
+                raise NotFoundError(f"unknown session: {csession_id}")
+            _, current, tainted, before_state, before_activity, ended = row
+            if current != previous_run:
+                raise RefusedError(
+                    f"cannot resume {csession_id}: another run started meanwhile", reason="live"
+                )
+            if ended is None:
+                raise RefusedError(f"cannot resume {csession_id}: it is live", reason="live")
+            if tainted:
+                _refuse_tainted(csession_id, run.reads_third_party)
+            run_no = previous_run + 1
+            now = format_ts(self.clock())
+            self._insert_run(conn, csession_id, run_no, run, now, None)
+            conn.execute(
+                "UPDATE sessions SET current_run = ?, state = 'starting', activity = NULL, "
+                "needs_input_reason = NULL, state_since = ?, updated_at = ? "
+                "WHERE csession_id = ?",
+                (run_no, now, now, csession_id),
+            )
+            if run.reads_third_party and not tainted:
+                conn.execute(
+                    "UPDATE sessions SET tainted = 1, tainted_at = ?, tainted_by_run = ? "
+                    "WHERE csession_id = ?",
+                    (now, run_no, csession_id),
+                )
+            for label in run.labels:
+                key, _, value = label.partition("=")
+                conn.execute(
+                    "INSERT OR IGNORE INTO labels (csession_id, key, value) VALUES (?, ?, ?)",
+                    (csession_id, key, value),
+                )
+            labels = [
+                f"{key}={value}"
+                for key, value in conn.execute(
+                    "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+                    (csession_id,),
+                )
+            ]
+            conn.execute(
+                "INSERT INTO events (csession_id, run_no, event_ts, from_state, to_state, "
+                "from_activity, to_activity, needs_input_reason, cause, final, labels_json) "
+                "VALUES (?, ?, ?, ?, 'starting', ?, NULL, NULL, 'launch', 0, ?)",
+                (
+                    csession_id,
+                    run_no,
+                    now,
+                    before_state,
+                    before_activity,
+                    json.dumps(labels, ensure_ascii=False),
+                ),
+            )
+        return run_no
+
+    def _insert_run(
+        self,
+        conn: sqlite3.Connection,
+        csession_id: str,
+        run_no: int,
+        run: NewRun,
+        now: str,
+        expires_at: str | None,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO runs (csession_id, run_no, created_at, run_kind, reads_third_party, "
+            "mode, repo, model, skill, has_prompt, spec_json, resolved_json, config_hash, "
+            "invocation_json, decision_ids_json, warnings_json, hook_interpreter, "
+            "config_path, wrapper_pid, wrapper_start, outcome_file, expires_at, phase) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "'launch')",
+            (
+                csession_id,
+                run_no,
+                now,
+                run.kind,
+                int(run.reads_third_party),
+                run.mode,
+                run.repo,
+                run.model,
+                run.skill,
+                int(run.has_prompt),
+                json.dumps(run.spec, ensure_ascii=False, sort_keys=True),
+                json.dumps(run.resolved, ensure_ascii=False, sort_keys=True),
+                run.config_hash,
+                json.dumps(run.invocation, ensure_ascii=False, sort_keys=True),
+                json.dumps(list(run.decision_ids), ensure_ascii=False),
+                json.dumps(list(run.warnings), ensure_ascii=False),
+                run.hook_interpreter,
+                run.config_path,
+                run.wrapper_pid,
+                run.wrapper_start,
+                run.outcome_file,
+                expires_at,
+            ),
+        )
 
     def update_run(self, csession_id: str, run_no: int, **fields: Any) -> None:
         """Set columns of a run row (only ``RUN_FIELDS``). ``InternalError`` when the run row
@@ -1341,6 +1453,38 @@ class Store:
         record["session_git_dir"], record["session_forgotten_at"] = session
         return record
 
+    def resume_source(self, csession_id: str) -> dict[str, Any] | None:
+        """What a resume or fork reads of a session (one consistent snapshot): ``run_record``
+        of its current run, plus the session's ``launch_kind``, ``tainted``, ``git_dir``,
+        ``forgotten_at`` and ``csession_dir`` (``session_`` prefixed), its labels
+        (``labels``, sorted ``key=value``) and the latest resolved cwd of any of its runs
+        (``last_cwd``: a run that ended before recording one has none). None when the
+        session or its current run row does not exist."""
+        with self.transaction():
+            record = self.current_run(csession_id)
+            if record is None:
+                return None
+            session = self.conn.execute(
+                "SELECT launch_kind, tainted, csession_dir FROM sessions WHERE csession_id = ?",
+                (csession_id,),
+            ).fetchone()
+            record["session_launch_kind"], record["session_tainted"] = session[0], session[1]
+            record["session_csession_dir"] = session[2]
+            record["labels"] = [
+                f"{key}={value}"
+                for key, value in self.conn.execute(
+                    "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+                    (csession_id,),
+                )
+            ]
+            row = self.conn.execute(
+                "SELECT cwd FROM runs WHERE csession_id = ? AND cwd IS NOT NULL "
+                "ORDER BY run_no DESC LIMIT 1",
+                (csession_id,),
+            ).fetchone()
+            record["last_cwd"] = None if row is None else row[0]
+        return record
+
     def run_record(self, csession_id: str, run_no: int) -> dict[str, Any]:
         """The run row joined with its session's ``forked_from``, ``claude_session_id`` and
         ``state`` (for the outcome object). ``InternalError`` when it does not exist."""
@@ -1575,6 +1719,19 @@ class Store:
             (run.csession_id, run.run_no),
         )
         return cursor.rowcount == 1
+
+
+def _refuse_tainted(csession_id: str, reads_third_party: bool) -> None:
+    """A tainted session resumed or forked into a run that is not third-party-reading is
+    refused (interface.md, Taint).
+
+    TODO(#30): ``--allow-tainted`` (human-only, audited ``resume_tainted``) lifts this
+    refusal; until then it is refused whatever the flags."""
+    if not reads_third_party:
+        raise RefusedError(
+            f"{csession_id} is tainted: a run of a kind that is not third-party-reading is refused",
+            reason="tainted",
+        )
 
 
 # Run and session columns ``exec`` sets after allocation (``update_run``, ``update_session``).

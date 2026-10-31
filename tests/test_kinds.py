@@ -486,10 +486,34 @@ def test_permission_profile_file_is_carried_raw(cfg_dir: Path, value: str) -> No
 
 
 def test_carried_permission_profile_file_has_origin_previous_run(cfg_dir: Path) -> None:
-    previous = kinds.Previous(repo=None, flags={"permission_profile": "/x/p.json"})
+    previous = kinds.Previous(
+        repo=None, flags={"permission_profile": "/x/p.json"}, permission_profile_label="file:ab"
+    )
     result = resolve(load(cfg_dir), "implement", previous=previous)
     assert result.permission_profile_file == "/x/p.json"
     assert result.origins["permission_profile_file"] == "previous_run"
+    # The snapshot is re-read expecting the label its run recorded.
+    assert result.permission_profile_label == "file:ab"
+
+
+def test_carried_permission_profile_file_without_a_label_is_a_usage_error(
+    cfg_dir: Path,
+) -> None:
+    # A carried profile file is its snapshot: never re-read without the recorded label.
+    previous = kinds.Previous(repo=None, flags={"permission_profile": "/x/p.json"})
+    with pytest.raises(UsageError, match="no recorded snapshot"):
+        resolve(load(cfg_dir), "implement", previous=previous)
+
+
+def test_a_profile_file_given_now_has_no_expected_label(cfg_dir: Path) -> None:
+    previous = kinds.Previous(
+        repo=None, flags={"permission_profile": "/x/p.json"}, permission_profile_label="file:ab"
+    )
+    result = resolve(
+        load(cfg_dir), "implement", previous=previous, flags={"permission_profile": "/y/q.json"}
+    )
+    assert result.permission_profile_file == "/y/q.json"
+    assert result.permission_profile_label is None
 
 
 def test_permission_profile_name_now_replaces_a_carried_file(cfg_dir: Path) -> None:
