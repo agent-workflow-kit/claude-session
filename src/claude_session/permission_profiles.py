@@ -1,0 +1,415 @@
+"""Permission profiles: selection, profile files, validation, variable expansion and snapshots
+(interface.md, Permission profiles; design.md, Generated settings).
+
+A profile is a Claude Code settings fragment ``{permissions: {...}, sandbox: {...}}``, named in
+config (``permission_profiles``) or read from a file given with ``--permission-profile``. The
+launch path uses this module in this order:
+
+1. ``select``: the run's profile, unexpanded and validated for the run's isolation (shape and
+   refused keys). A file is read once, here, at the launch that names it.
+2. ``expand``: ``${CSESSION_DIR}``, ``${CWD}``, ``${HOME}`` and ``${GIT_DIR}`` replaced; a
+   variable that expands empty fails. The result goes to the settings builder.
+3. ``write_snapshot`` (file profiles only): the canonical JSON of the unexpanded profile to
+   ``private/<id>/runs/<n>/permission-profile.json``. The run stores ``Profile.label``
+   (``file:<sha256 prefix>``) and the snapshot path; a later run carries the snapshot path as
+   its ``--permission-profile`` value, never the original path, so the file is never re-read.
+
+Every failure raises ``InvalidPermissionProfile`` (end reason ``invalid_permission_profile``).
+Messages name key paths and file paths, never values from the profile.
+
+Permission rules are evadable; the sandbox is the boundary. This module only keeps a profile
+from undoing the generated isolation keys, which the settings builder applies on top anyway.
+
+Never imported by the hook path: it needs ``config``.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import re
+import stat
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from . import config, fsutil, kinds
+from .errors import InvalidPermissionProfile, UsageError
+
+VARIABLES = ("CSESSION_DIR", "CWD", "HOME", "GIT_DIR")
+SNAPSHOT_NAME = "permission-profile.json"
+HASH_PREFIX = 16  # hex characters of the sha256 in ``file:<prefix>`` (the schemas allow 12-64)
+MAX_FILE_BYTES = config.MAX_FILE_BYTES
+SECTIONS = ("permissions", "sandbox")
+# Keys an isolated run's profile may not set at all (interface.md, Permission profiles).
+REFUSED_ISOLATED = (
+    ("sandbox", "enabled"),
+    ("sandbox", "failIfUnavailable"),
+    ("sandbox", "allowUnsandboxedCommands"),
+    ("sandbox", "excludedCommands"),
+    ("permissions", "additionalDirectories"),
+)
+# ... and this one only as anything but false (the generated value is false).
+AUTO_ALLOW = ("sandbox", "autoAllowBashIfSandboxed")
+# Values the settings builder merges with generated rules: lists of strings when present.
+STRING_LISTS = (
+    ("permissions", "allow"),
+    ("permissions", "deny"),
+    ("permissions", "ask"),
+    ("permissions", "additionalDirectories"),
+    ("sandbox", "excludedCommands"),
+    ("sandbox", "filesystem", "allowRead"),
+    ("sandbox", "filesystem", "denyRead"),
+    ("sandbox", "filesystem", "allowWrite"),
+    ("sandbox", "filesystem", "denyWrite"),
+    ("sandbox", "network", "allowedDomains"),
+)
+MAPPINGS = (("sandbox", "filesystem"), ("sandbox", "network"))
+STRINGS = (("permissions", "defaultMode"),)
+
+# Every `${`: a well-formed reference is `${NAME}`; anything else fails.
+_REFERENCE = re.compile(r"\$\{([^}]*)\}")
+# Variable values are absolute paths; glob and escape characters would change the meaning of
+# the rules they are put into, so they fail (as do control characters).
+_UNSAFE_VALUE = re.compile(r"[*?\[\]{}\\\x00-\x1f\x7f-\x9f]")
+_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+@dataclass(frozen=True)
+class Profile:
+    """A selected permission profile. ``content`` is unexpanded; ``name`` is the config name
+    (None for a file); ``sha256`` is the hash of the snapshot (file profiles only)."""
+
+    name: str | None
+    content: dict[str, Any]
+    sha256: str | None = None
+
+    @property
+    def is_file(self) -> bool:
+        return self.sha256 is not None
+
+    @property
+    def label(self) -> str:
+        """The name, or ``file:<sha256 prefix>`` (status, dry run, pre-launch payloads)."""
+        if self.sha256 is None:
+            assert self.name is not None
+            return self.name
+        return "file:" + self.sha256[:HASH_PREFIX]
+
+    def snapshot_bytes(self) -> bytes:
+        """The snapshot of a file profile: canonical JSON of the unexpanded content."""
+        if self.sha256 is None:
+            raise ValueError("only file profiles are snapshotted")
+        return _canonical(self.content)
+
+
+def select(
+    cfg: config.Config,
+    resolution: kinds.Resolution,
+    *,
+    session_writable: Callable[[str], bool] | None = None,
+) -> Profile:
+    """The run's profile for ``resolution``: the file in
+    ``permission_profile_file`` when set (a flag given now, or the previous run's snapshot),
+    else the config profile ``profile.permission_profile``. Validated for the run's isolation.
+    ``session_writable`` is the session-writable path check (see ``read_file``)."""
+    isolated = resolution.isolated()
+    if resolution.permission_profile_file is not None:
+        return read_file(
+            resolution.permission_profile_file,
+            isolated=isolated,
+            session_writable=session_writable,
+        )
+    name = resolution.profile.permission_profile
+    configured = cfg.permission_profiles.get(name)
+    if configured is None:  # kinds.resolve and config.load refuse this first
+        raise InvalidPermissionProfile(
+            "unknown permission profile",
+            detail=f"{name}: names no built-in or configured permission profile",
+        )
+    # Only the unset sections are left out; values inside them (including nulls) are kept.
+    content = {
+        key: copy.deepcopy(value)
+        for key in SECTIONS
+        if (value := getattr(configured, key)) is not None
+    }
+    validate(content, isolated=isolated, source=f"permission profile {name}")
+    return Profile(name=name, content=content)
+
+
+def read_file(
+    value: str,
+    *,
+    isolated: bool,
+    session_writable: Callable[[str], bool] | None = None,
+) -> Profile:
+    """Read, parse and validate the profile file ``value`` (relative to the current directory).
+
+    ``.json`` files are strict JSON; anything else is YAML with the config-file rules. For
+    isolated runs, a file whose real path ``session_writable`` accepts is refused before it is
+    read; the file is then opened at that real path without following symlinks, so a swap
+    after the check fails. At most ``MAX_FILE_BYTES``; regular files only."""
+    # TODO(#24): the launch path passes the session-writable path check here.
+    problem: str | None = None
+    try:
+        path = os.path.realpath(value)
+    except (ValueError, OSError):  # NUL in the path, or an unresolvable cwd
+        path = ""
+        problem = "invalid path"
+    if problem is not None:
+        raise InvalidPermissionProfile("cannot read permission profile file", detail=problem)
+    if isolated and session_writable is not None and session_writable(path):
+        raise InvalidPermissionProfile(
+            "permission profile file is under a session-writable path", detail=path
+        )
+    raw = _read_bytes(path)
+    data = _parse(raw, path, json_file=value.endswith(".json"))
+    validate(data, isolated=isolated, source=path)
+    return Profile(name=None, content=data, sha256=hashlib.sha256(_canonical(data)).hexdigest())
+
+
+def validate(content: Any, *, isolated: bool, source: str = "permission profile") -> None:
+    """Check ``content``: a mapping of ``permissions`` and ``sandbox`` mappings whose known
+    rule lists are lists of strings. For isolated runs, also the refused keys. Raises
+    ``InvalidPermissionProfile`` listing every problem (key paths only)."""
+    # TODO(#24): refused paths (state root, /tmp/csession-<uid>, unsafe write targets) are
+    # checked on the expanded profile, for trusted and isolated runs.
+    problems = _shape(content)
+    if not problems and isolated:
+        problems = _refused(content)
+    if problems:
+        raise InvalidPermissionProfile(
+            "invalid permission profile", detail=f"{'; '.join(problems)} (in {source})"
+        )
+
+
+def expand(content: Mapping[str, Any], variables: Mapping[str, str | None]) -> dict[str, Any]:
+    """A copy of ``content`` with ``${NAME}`` replaced in every string value (not in keys).
+    ``NAME`` is one of ``VARIABLES``; a missing, empty or ``None`` value fails, as do unknown
+    names, malformed references and unsafe values (relative, or with glob, escape or control
+    characters). Unused variables are not checked."""
+
+    def walk(node: Any, where: str) -> Any:
+        if isinstance(node, dict):
+            return {key: walk(value, _join(where, key)) for key, value in node.items()}
+        if isinstance(node, list):
+            return [walk(value, f"{where}.{index}") for index, value in enumerate(node)]
+        if isinstance(node, str) and "${" in node:
+            return _expand_string(node, where, variables)
+        return copy.deepcopy(node)
+
+    return walk(content, "")
+
+
+def write_snapshot(
+    profile: Profile,
+    path: str,
+    *,
+    write: Callable[[str, bytes], None] = fsutil.write_private_file,
+) -> None:
+    """Write the snapshot of a file profile to ``path`` (absolute; normally
+    ``private/<id>/runs/<n>/permission-profile.json``) with ``write`` (default: atomic, mode
+    0600, no-follow)."""
+    # TODO(#15): the launch path passes the run's private directory from the session-directory
+    # helpers (#11) and records the label and snapshot path in the run row.
+    write(path, profile.snapshot_bytes())
+
+
+# Reading and parsing
+
+
+def _read_bytes(path: str) -> bytes:
+    def fail(problem: str) -> InvalidPermissionProfile:
+        return InvalidPermissionProfile(
+            "cannot read permission profile file", detail=f"{path}: {problem}"
+        )
+
+    parent, name = os.path.split(path)
+    error: str | None = None
+    fd = -1
+    try:
+        dir_fd = fsutil.open_dir_nofollow(parent)
+        try:
+            fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        error = exc.strerror or "cannot open"
+    if error is not None:
+        raise fail(error)
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise fail("not a regular file")
+        while size <= MAX_FILE_BYTES:
+            chunk = os.read(fd, MAX_FILE_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as exc:
+        error = exc.strerror or "cannot read"
+    finally:
+        os.close(fd)
+    if error is not None:
+        raise fail(error)
+    if size > MAX_FILE_BYTES:
+        raise fail("larger than 1 MiB")
+    return b"".join(chunks)
+
+
+def _parse(raw: bytes, path: str, *, json_file: bool) -> Any:
+    def invalid(problem: str) -> InvalidPermissionProfile:
+        return InvalidPermissionProfile("invalid permission profile file", detail=problem)
+
+    if not json_file:
+        detail: str | None = None
+        try:
+            return config.parse_yaml(raw, Path(path), empty=False)
+        except UsageError as exc:  # its detail names the file and problem, never the content
+            detail = exc.detail
+        raise invalid(detail or path)
+    problem: str | None = None
+    data: Any = None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        problem = f"{path}: not UTF-8 ({exc.reason})"
+    else:
+        try:
+            data = json.loads(text, object_pairs_hook=_no_duplicates, parse_constant=_no_constant)
+        except _Duplicate:
+            problem = f"{path}: duplicate key"
+        except (ValueError, RecursionError):  # JSONDecodeError quotes nothing we show
+            problem = f"{path}: invalid JSON"
+    # Raised outside the handlers: the original exceptions may quote the content.
+    if problem is not None:
+        raise invalid(problem)
+    if not isinstance(data, dict):
+        raise invalid(f"top level: expected a mapping (in {path})")
+    try:
+        config.check_tree(data, Path(path))  # the config node and depth limits
+    except UsageError as exc:
+        problem = exc.detail
+    if problem is not None:
+        raise invalid(problem)
+    return data
+
+
+class _Duplicate(ValueError):
+    pass
+
+
+def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _Duplicate
+        result[key] = value
+    return result
+
+
+def _no_constant(name: str) -> Any:
+    raise ValueError("NaN and Infinity are not JSON")
+
+
+def _canonical(content: Mapping[str, Any]) -> bytes:
+    text = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return text.encode("utf-8")
+
+
+# Validation
+
+
+def _shape(content: Any) -> list[str]:
+    if not isinstance(content, dict):
+        return ["top level: expected a mapping"]
+    problems: list[str] = []
+    for key, value in content.items():
+        if key not in SECTIONS:
+            problems.append(f"{_safe(key)}: not allowed (only permissions and sandbox)")
+        elif not isinstance(value, dict):
+            problems.append(f"{key}: expected a mapping")
+    if problems:
+        return problems
+    for loc in MAPPINGS:
+        found, value = _get(content, loc)
+        if found and not isinstance(value, dict):
+            problems.append(f"{'.'.join(loc)}: expected a mapping")
+    for loc in STRINGS:
+        found, value = _get(content, loc)
+        if found and not isinstance(value, str):
+            problems.append(f"{'.'.join(loc)}: expected a string")
+    for loc in STRING_LISTS:
+        found, value = _get(content, loc)
+        if not found:
+            continue
+        where = ".".join(loc)
+        if not isinstance(value, list):
+            problems.append(f"{where}: expected a list of strings")
+            continue
+        problems.extend(
+            f"{where}.{index}: expected a string"
+            for index, item in enumerate(value)
+            if not isinstance(item, str)
+        )
+    return problems
+
+
+def _refused(content: dict[str, Any]) -> list[str]:
+    problems = [
+        f"{'.'.join(loc)}: not allowed for isolated runs"
+        for loc in REFUSED_ISOLATED
+        if _get(content, loc)[0]
+    ]
+    found, value = _get(content, AUTO_ALLOW)
+    if found and value is not False:
+        problems.append(f"{'.'.join(AUTO_ALLOW)}: only false is allowed for isolated runs")
+    return problems
+
+
+def _get(content: Mapping[str, Any], loc: tuple[str, ...]) -> tuple[bool, Any]:
+    node: Any = content
+    for part in loc:
+        if not isinstance(node, dict) or part not in node:
+            return False, None
+        node = node[part]
+    return True, node
+
+
+def _safe(key: Any) -> str:
+    """A key from a profile, shown printable and short."""
+    text = str(key)
+    shown = "".join(char if char.isprintable() else "?" for char in text[:64])
+    return shown + ("..." if len(text) > 64 else "")
+
+
+def _join(where: str, key: Any) -> str:
+    return f"{where}.{_safe(key)}" if where else _safe(key)
+
+
+# Expansion
+
+
+def _expand_string(text: str, where: str, variables: Mapping[str, str | None]) -> str:
+    def fail(problem: str) -> InvalidPermissionProfile:
+        return InvalidPermissionProfile("invalid permission profile", detail=f"{where}: {problem}")
+
+    if "${" in _REFERENCE.sub("", text):
+        raise fail("malformed ${...} reference")
+    for match in _REFERENCE.finditer(text):
+        name = match.group(1)
+        if name not in VARIABLES:
+            raise fail(f"unknown variable (expected one of {', '.join(VARIABLES)})")
+        value = variables.get(name)
+        if not value:
+            raise fail(f"${{{name}}} expands empty")
+        if not os.path.isabs(value) or _UNSAFE_VALUE.search(value):
+            raise fail(
+                f"${{{name}}} is not an absolute path free of glob, escape and control characters"
+            )
+    return _REFERENCE.sub(lambda m: str(variables[m.group(1)]), text)

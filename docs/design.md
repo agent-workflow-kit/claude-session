@@ -211,6 +211,7 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 | `defaults` | Standard library only: the built-in config values (every key of `config.example.yaml`, raw form), including the built-in kinds and permission profiles; `config` merges over it. |
 | `durations` | Standard library only: the duration syntax ([Identifiers, labels and durations](#identifiers-labels-and-durations)) for flags, config and environment overrides; returns seconds. |
 | `kinds` | Effective profile and its origins: built-in kind → config kind → per-repo override → previous run's explicit flags → flags given now (section [Resume](#resume-and-fork)); unknown-kind fallback; profile validation. |
+| `permission_profiles` | The run's permission profile: config name or file (`--permission-profile`), shape and refused-key validation, `${...}` expansion, file snapshots (canonical JSON of the unexpanded profile; `file:<sha256 prefix>` is the hash of the snapshot, so it is the same on every run that carries it). |
 | `settings_builder` | Pure function: effective profile + session paths → generated settings JSON, `claude` argv, sandbox lists. The security boundary; exhaustively unit-tested. |
 | `envbuild` | Session environment (section [Environment](#environment)). |
 | `sessiondir` | Both session directories, secret rotation, prompt and `--input-file` staging and placement, instructions file, `run.json`, directory inode pinning, no-follow writes relative to directory descriptors, private tmpdir (fd-based removal). |

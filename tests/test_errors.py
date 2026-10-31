@@ -7,7 +7,9 @@ from claude_session.errors import (
     CliError,
     FailedError,
     InternalError,
+    InvalidPermissionProfile,
     LaunchFailedError,
+    LaunchValidationError,
     NotFoundError,
     RefusedError,
     SchemaNewerError,
@@ -46,3 +48,12 @@ def test_envelope_matches_schema_and_exit_code(error: CliError, code: str, exit_
     validate(envelope, "claude-session/cli/error.json")
     assert envelope["error"]["code"] == code
     assert error.exit_code == exit_code
+
+
+def test_launch_validation_errors_carry_their_end_reason() -> None:
+    error = InvalidPermissionProfile("bad profile", detail="sandbox.enabled: refused")
+    assert isinstance(error, LaunchValidationError)
+    assert not isinstance(error, CliError)  # the launch path maps it to not-started, exit 12
+    assert error.end_reason == "invalid_permission_profile"
+    assert (error.message, error.detail) == ("bad profile", "sandbox.enabled: refused")
+    assert str(error) == "bad profile"

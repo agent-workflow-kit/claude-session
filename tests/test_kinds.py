@@ -465,7 +465,6 @@ def test_setting_sources_flag_forms(cfg_dir: Path, value: Any, expected: list[st
 
 
 def test_permission_profile_flag(cfg_dir: Path) -> None:
-    # TODO(#22): profile existence and files are validated by the permission-profile work.
     result = resolve(load(cfg_dir), "implement", flags={"permission_profile": "readonly"})
     assert result.profile.permission_profile == "readonly"
     assert result.origins["permission_profile"] == "flag"
@@ -499,6 +498,74 @@ def test_permission_profile_name_now_replaces_a_carried_file(cfg_dir: Path) -> N
         "readonly",
         "flag",
     )
+
+
+def test_permission_profile_file_now_replaces_a_carried_name(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"permission_profile": "readonly"})
+    result = resolve(
+        load(cfg_dir), "implement", previous=previous, flags={"permission_profile": "/x/p.json"}
+    )
+    assert result.permission_profile_file == "/x/p.json"
+    assert result.origins["permission_profile_file"] == "flag"
+    assert (result.profile.permission_profile, result.origins["permission_profile"]) == (
+        "default",
+        "builtin",
+    )
+
+
+def test_permission_profile_flag_may_name_a_configured_profile(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "permission_profiles: {Mine_1: {permissions: {allow: [Read]}}}\n")
+    result = resolve(cfg, "implement", flags={"permission_profile": "Mine_1"})
+    assert result.profile.permission_profile == "Mine_1"
+
+
+@pytest.mark.parametrize(
+    ("previous", "flags", "layer"),
+    [
+        ({}, {"permission_profile": "missing"}, "flags"),
+        ({"permission_profile": "missing"}, {}, "the previous run's flags"),
+    ],
+)
+def test_permission_profile_name_must_exist(
+    cfg_dir: Path, previous: dict[str, Any], flags: dict[str, Any], layer: str
+) -> None:
+    with pytest.raises(UsageError) as info:
+        resolve(
+            load(cfg_dir),
+            "implement",
+            previous=kinds.Previous(repo=None, flags=previous),
+            flags=flags,
+        )
+    text = f"{info.value.message} {info.value.detail}"
+    assert "--permission-profile" in text
+    assert "no built-in or configured permission profile" in text
+    assert layer in text
+
+
+@pytest.mark.parametrize("value", ["", "-x", "p q", "p.txt", "P" * 65, "p\n", "rév", "p\\q"])
+def test_permission_profile_name_grammar_is_enforced(cfg_dir: Path, value: str) -> None:
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", flags={"permission_profile": value})
+    text = f"{info.value.message} {info.value.detail}"
+    assert "--permission-profile" in text
+    assert "permission-profile name" in text
+
+
+@pytest.mark.parametrize(
+    ("kind", "flags", "isolated"),
+    [
+        ("implement", {}, False),
+        ("rank", {}, True),  # sandbox preferred, not third-party-reading
+        ("review", {}, True),
+        ("respond", {}, True),
+        ("implement", {"sandbox": "preferred"}, True),
+        ("implement", {"reads_third_party": True}, True),
+        ("review", {"sandbox": "off"}, True),  # still third-party-reading
+        ("rank", {"sandbox": "off"}, False),
+    ],
+)
+def test_isolated_runs(cfg_dir: Path, kind: str, flags: dict[str, Any], isolated: bool) -> None:
+    assert resolve(load(cfg_dir), kind, flags=flags).isolated() is isolated
 
 
 # --env-allow / --env-allowlist-only

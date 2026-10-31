@@ -216,6 +216,54 @@ def test_new_permission_profile_and_repo_override(cfg_dir: Path) -> None:
     assert cfg.me.name == "someone"
 
 
+# Permission-profile references (interface.md, Config)
+
+
+def test_kind_referencing_a_configured_profile_is_valid(cfg_dir: Path) -> None:
+    write(
+        cfg_dir / "config.yaml",
+        """
+        permission_profiles: {mine: {permissions: {allow: [Read]}}}
+        kinds: {implement: {permission_profile: mine}, triage: {permission_profile: mine}}
+        repos: {example.com/x: {kinds: {review: {permission_profile: mine}}}}
+        """,
+    )
+    cfg = load(cfg_dir)
+    assert cfg.kinds["implement"].permission_profile == "mine"
+    assert cfg.kinds["triage"].permission_profile == "mine"
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ("kinds: {implement: {permission_profile: missing}}\n", "kinds.implement"),
+        ("kinds: {triage: {permission_profile: missing}}\n", "kinds.triage"),
+        (
+            "repos: {example.com/x: {kinds: {review: {permission_profile: missing}}}}\n",
+            "repos.example.com/x.kinds.review",
+        ),
+    ],
+)
+def test_unknown_permission_profile_reference_is_invalid(
+    cfg_dir: Path, text: str, key: str
+) -> None:
+    path = write(cfg_dir / "config.yaml", text)
+    error = invalid(cfg_dir)
+    detail = str(error.detail)
+    assert f"{key}.permission_profile: names no built-in or configured permission profile" in (
+        detail
+    )
+    assert str(path) in detail
+
+
+def test_unknown_profile_reference_names_the_drop_in_that_set_it(cfg_dir: Path) -> None:
+    write(cfg_dir / "config.yaml", "kinds: {implement: {timeout: 5m}}\n")
+    dropin = write(
+        cfg_dir / "config.d" / "10.yaml", "kinds: {implement: {permission_profile: nope}}\n"
+    )
+    assert str(dropin) in str(invalid(cfg_dir).detail)
+
+
 # Environment overrides
 
 ENV_CASES: list[tuple[str, str, str, Any]] = [

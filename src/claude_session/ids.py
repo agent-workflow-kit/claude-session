@@ -25,6 +25,7 @@ MAX_ALLOCATION_ATTEMPTS = 16
 SESSION_ID = re.compile(r"cs-[a-z2-7]{8}")
 KIND_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 PERMISSION_PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+PROFILE_FILE_SUFFIXES = (".json", ".yaml", ".yml")
 SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}")
 ARTIFACT_NAME = re.compile(r"[A-Za-z0-9._-]{1,128}")
 LABEL_KEY = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
@@ -131,8 +132,15 @@ def is_kind_name(name: str) -> bool:
 
 
 def is_permission_profile_name(name: str) -> bool:
-    # TODO(#22): enforce on --permission-profile names.
+    """Config profile names (``permission_profiles`` keys, kind ``permission_profile`` and
+    ``--permission-profile`` values that are not files)."""
     return PERMISSION_PROFILE_NAME.fullmatch(name) is not None
+
+
+def is_permission_profile_file(value: object) -> bool:
+    """Whether a ``--permission-profile`` value names a file rather than a config profile: it
+    contains ``/`` or ends in ``.json``, ``.yaml`` or ``.yml`` (interface.md, Launch flags)."""
+    return isinstance(value, str) and ("/" in value or value.endswith(PROFILE_FILE_SUFFIXES))
 
 
 def is_env_name(name: str) -> bool:

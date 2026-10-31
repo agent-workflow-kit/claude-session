@@ -63,8 +63,6 @@ _IMPLIED: tuple[tuple[str, Any, str | None], ...] = (
     ("env.inherit", False, "env_allowlist_only"),
     ("mcp", "none", None),
 )
-# `--permission-profile` values naming a file (interface.md, Launch flags).
-_PROFILE_FILE_SUFFIXES = (".json", ".yaml", ".yml")
 # Variables that would point git at another repository or config than the one at ``cwd``.
 _GIT_ENV_DROP = frozenset(
     {
@@ -124,8 +122,11 @@ class Resolution:
       for ``--env-allowlist-only ''``. When set it replaces ``profile.env.allow`` in the
       effective allowlist (``env_allowlist()``); ``profile.env.inherit`` is then false.
     - ``permission_profile_file``: the raw ``--permission-profile`` value when it names a file
-      (contains ``/`` or ends in ``.json``, ``.yaml`` or ``.yml``); None otherwise.
-      ``profile.permission_profile`` then keeps the kind's profile name.
+      (contains ``/`` or ends in ``.json``, ``.yaml`` or ``.yml``); None otherwise. The file
+      replaces the named profile entirely (``permission_profiles.select``);
+      ``profile.permission_profile`` keeps the kind's profile name. With origin
+      ``previous_run`` it is the previous run's snapshot (the stored flag value is the snapshot
+      path, never the original file).
 
     So ``profile.env.allow`` only ever holds names from the built-in, config and per-repo
     layers. ``origins`` has an entry ``env_allow``, ``env_allowlist_only`` or
@@ -143,8 +144,12 @@ class Resolution:
     # variable; only profile.env.allow (the kind's config env.allow) can.
     env_allow: tuple[str, ...] = ()
     env_allowlist_only: tuple[str, ...] | None = None
-    # TODO(#22): resolve, read and snapshot the permission profile file.
     permission_profile_file: str | None = None
+
+    def isolated(self) -> bool:
+        """Whether the run is isolated: third-party-reading or its sandbox is not ``off``
+        (design.md, Generated settings), whether or not the sandbox actually starts."""
+        return self.profile.reads_third_party or self.profile.sandbox != "off"
 
     def timeout(self, mode: Mode) -> float | None:
         """The run's wall-clock bound in ``mode`` (seconds; None: no bound)."""
@@ -209,6 +214,7 @@ def resolve(
     explicit = _explicit(previous.flags if previous else {}, flags or {})
     extra: dict[str, Any] = {}
     profile = _apply_flags(profile, explicit, origins, mode, extra, warnings)
+    _check_profile_name(cfg, profile, origins)
     return Resolution(
         kind=name,
         builtin=name in BUILTIN_KINDS,
@@ -371,7 +377,7 @@ def _apply_flags(
             keep(key, tuple(_env_names(value, key, origin, allow_empty=only)), origin)
             if only:
                 put("env.inherit", False, origin)
-        elif key == "permission_profile" and _is_profile_file(value):
+        elif key == "permission_profile" and ids.is_permission_profile_file(value):
             keep("permission_profile_file", value, origin)
         else:
             put(key, value, origin)
@@ -403,9 +409,19 @@ def _apply_flags(
     return config.validate_kind(data, where)
 
 
-def _is_profile_file(value: Any) -> bool:
-    """Whether a ``--permission-profile`` value names a file rather than a config profile."""
-    return isinstance(value, str) and ("/" in value or value.endswith(_PROFILE_FILE_SUFFIXES))
+def _check_profile_name(
+    cfg: config.Config, profile: config.Kind, origins: Mapping[str, Origin]
+) -> None:
+    """A ``--permission-profile`` name (given now or carried) must name a built-in or configured
+    profile; the grammar is checked with the profile (``config.ProfileName``). Names from the
+    kind layers were checked by ``config.load``."""
+    origin = origins["permission_profile"]
+    if origin in _LAYER_NAMES and profile.permission_profile not in cfg.permission_profiles:
+        detail = (
+            "permission_profile: names no built-in or configured permission profile"
+            f" (in --permission-profile, {_LAYER_NAMES[origin]})"
+        )
+        raise UsageError("invalid flag value", detail=detail)
 
 
 def _flag_for(field_name: str) -> str | None:
