@@ -658,14 +658,21 @@ def _apply_own_row(store: Store, run: HookRun, hook: Hook) -> None:
 
 
 def apply_hook(
-    store: Store, csession_id: str, hook: Hook, drain: outbox.Drain | None = None
+    store: Store,
+    csession_id: str,
+    hook: Hook,
+    drain: outbox.Drain | None = None,
+    *,
+    unchecked_requests: bool = False,
 ) -> Applied:
     """In one transaction: load the session's current run, record SessionStart and SessionEnd
     facts, apply the table and append the event, then record the drained outbox requests
     (``drain``, prepared before the transaction) and apply an ingested report, and decide
-    the Stop backstop on whether the run then has a report. A run that is not adopted,
-    already ended or not in a live state is left alone (its claimed requests stay for the
-    next drain)."""
+    the Stop backstop on whether the run then has a report. ``unchecked_requests``: the
+    drain failed with claimed requests it could not check (``outbox.DrainSetupError``), so a
+    report may be pending and the backstop is not taken. A run that is not adopted, already
+    ended or not in a live state is left alone (its claimed requests stay for the next
+    drain)."""
     with store.transaction():
         run = store.hook_run(csession_id)
         if run is None:
@@ -695,6 +702,7 @@ def apply_hook(
             and run.mode == "headless"
             and run.report_status is None
             and not run.backstop_used
+            and not unchecked_requests
         )
         try:
             with store.savepoint("hook"):
@@ -817,16 +825,23 @@ def main(
     log = _Log(state_dir)
     with Store.open(db_path(state_dir), migrate=False, busy_timeout=BUSY_TIMEOUT) as store:
         drain = None
+        unchecked = False
         if cause in DRAIN_CAUSES:
             try:
                 drain = prepare_drain(store, csession_id, log)
+            except outbox.DrainSetupError as exc:
+                # Claimed requests wait, unchecked, for a usable hookconf.json or
+                # secret-index: logged with the reason and the exception type only.
+                unchecked = True
+                cause_name = type(exc.__cause__).__name__
+                log.failure(csession_id, f"{cause}: outbox drain: {exc.reason} ({cause_name})")
             except Exception as exc:
                 # The hook's own event must not depend on the outbox: a drain that cannot run
-                # (an unusable private directory, hookconf.json or secret-index) is logged with the
-                # exception type only, and its claimed requests stay for the next drain.
+                # (an unusable private directory) is logged with the exception type only, and
+                # its claimed requests stay for the next drain.
                 log.failure(csession_id, f"{cause}: outbox drain: {type(exc).__name__}")
         try:
-            applied = apply_hook(store, csession_id, hook, drain)
+            applied = apply_hook(store, csession_id, hook, drain, unchecked_requests=unchecked)
         except BaseException:
             if drain is not None:
                 drain.finish(committed=False)  # claimed requests stay for the next drain

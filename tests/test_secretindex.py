@@ -239,6 +239,199 @@ def test_the_scan_agrees_with_a_plain_substring_search(seed: int) -> None:
         assert chunked(index, pieces) == expected, (values, pieces)
 
 
+def _near(rng: random.Random, value: str, alphabet: str) -> str:
+    """``value`` with one character changed (a near match: every q-gram but a few match)."""
+    at = rng.randrange(len(value))
+    other = [c for c in alphabet if c != value[at]]
+    return value[:at] + rng.choice(other) + value[at + 1 :]
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_the_scan_agrees_with_a_plain_substring_search_on_near_matches(seed: int) -> None:
+    """Data built from near matches, repeats and planted values (candidate-heavy: many windows
+    pass the anchor and the prefilter q-gram and fail the whole-window hash), lengths that
+    give every stride, random chunking down to single bytes."""
+    rng = random.Random(1000 + seed)
+    alphabet = ["ab", "abc", "abcdefgh"][seed % 3]
+    values = [
+        "".join(rng.choices(alphabet, k=rng.randint(8, 24))) for _ in range(rng.randint(1, 3))
+    ]
+    if seed % 4 == 0:
+        values.append(alphabet[0] * rng.randint(8, 40))  # self-periodic
+    index = index_of(*values)
+    for _ in range(15):
+        parts = []
+        for _ in range(rng.randint(1, 12)):
+            value = rng.choice(values)
+            kind = rng.random()
+            if kind < 0.6:
+                parts.append(_near(rng, value, alphabet))
+            elif kind < 0.7:
+                parts.append(value)
+            elif kind < 0.85:
+                parts.append(value[: rng.randint(1, len(value) - 1)])
+            else:
+                parts.append("".join(rng.choices(alphabet, k=rng.randint(0, 9))))
+        data = "".join(parts).encode()
+        expected = any(v.encode() in data for v in values)
+        size = rng.choice([1, 2, 3, 7, 16, 1000])
+        pieces = [data[i : i + size] for i in range(0, len(data), size)]
+        assert index.contains(data) == expected, (values, data)
+        assert chunked(index, pieces) == expected, (values, size, data)
+
+
+def test_a_self_periodic_value_is_found_after_near_matches() -> None:
+    index = index_of("a" * 2000, RUN_SECRET)
+    data = (b"a" * 1999 + b"b") * 20
+    assert not index.contains(data)
+    assert index.contains(data + b"a" * 2000)
+    assert chunked(index, [data[:1234], data[1234:] + b"a" * 1000, b"a" * 1000])
+
+
+# Scan cost: candidate windows (design.md, contains_secret budget). Counted, not timed: the
+# bytes given to the whole-window hash.
+
+
+def _window_hash_bytes(
+    monkeypatch: pytest.MonkeyPatch, index: SecretIndex, data: bytes, chunk: int = 4096
+) -> int:
+    hashed = [0]
+    original = secretindex._value_hash
+
+    def counting(key: bytes, window: bytes | memoryview) -> bytes:
+        hashed[0] += len(window)
+        return original(key, window)
+
+    monkeypatch.setattr(secretindex, "_value_hash", counting)
+    assert not chunked(index, [data[i : i + chunk] for i in range(0, len(data), chunk)])
+    return hashed[0]
+
+
+def _pem(label: str, rng: random.Random, size: int) -> str:
+    body = base64.b64encode(rng.randbytes(size)).decode()
+    lines = "\n".join(body[i : i + 64] for i in range(0, len(body), 64))
+    return f"-----BEGIN {label}-----\n{lines}\n-----END {label}-----\n"
+
+
+@pytest.mark.parametrize("unit", [b"CERTIFIC", b"-----BEGIN CERTIFICATE-----\n", b"-----"])
+def test_a_value_with_repeated_q_grams_costs_no_window_hashes_on_matching_data(
+    monkeypatch: pytest.MonkeyPatch, unit: bytes
+) -> None:
+    """A PEM bundle repeats its header q-grams; data made of them used to name the same
+    windows over and over, each hashed whole."""
+    rng = random.Random(5)
+    bundle = _pem("PRIVATE KEY", rng, 1218) + "".join(
+        _pem("CERTIFICATE", rng, 900) for _ in range(6)
+    )
+    index = index_of(bundle, API_KEY, RUN_SECRET)
+    data = unit * (256 * 1024 // len(unit))
+    assert _window_hash_bytes(monkeypatch, index, data) <= len(data)
+
+
+@pytest.mark.parametrize("where", ["middle", "end"])
+def test_near_matches_at_stride_1_hash_each_window_at_most_once(
+    monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """Data made of copies of a value with one byte changed: each copy is one candidate (its
+    anchor), never one per sampled q-gram, and the last-q-gram prefilter drops a copy whose
+    end differs."""
+    index = index_of("exactly8", API_KEY, RUN_SECRET)
+    assert index.stride == 1
+    at = len(API_KEY) // 2 if where == "middle" else len(API_KEY) - 1
+    near = (API_KEY[:at] + "#" + API_KEY[at + 1 :]).encode()
+    data = near * (256 * 1024 // len(near))
+    hashed = _window_hash_bytes(monkeypatch, index, data)
+    if where == "end":
+        assert hashed == 0
+    else:
+        assert hashed <= len(data)
+
+
+def test_each_candidate_window_is_named_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every (start, value) window reaches the confirmation at most once, whatever the value
+    repeats and however the data is chunked."""
+    seen: list[tuple[int, int]] = []
+    original = secretindex.Scan._confirm
+
+    def recording(self: secretindex.Scan, buf: bytes, at: int, number: int, offset: int) -> bool:
+        seen.append((self._base + at, number))
+        return original(self, buf, at, number, offset)
+
+    monkeypatch.setattr(secretindex.Scan, "_confirm", recording)
+    index = index_of("abababababababab" + "c", "abcabcabcabc", RUN_SECRET)
+    data = b"ab" * 3000 + b"x" + b"abcabcabcabx" * 300
+    assert not chunked(index, [data[i : i + 37] for i in range(0, len(data), 37)])
+    assert seen and len(seen) == len(set(seen))
+
+
+# The caller's deadline: ``check`` is called at a bounded interval of work
+
+
+class Stop(Exception):
+    pass
+
+
+def _counting_check(limit: int | None = None) -> tuple[list[int], Callable[[], None]]:
+    calls = [0]
+
+    def check() -> None:
+        calls[0] += 1
+        if limit is not None and calls[0] >= limit:
+            raise Stop
+
+    return calls, check
+
+
+def test_check_is_called_once_per_chunk() -> None:
+    calls, check = _counting_check()
+    scan = index_of(API_KEY).scan(check)
+    for _ in range(5):
+        scan.update(b"x" * 100)
+    assert calls[0] == 5
+
+
+def test_check_is_called_inside_one_huge_chunk() -> None:
+    """One chunk of 1 MiB at stride 8 is 131072 samples: check runs every CHECK_EVERY."""
+    calls, check = _counting_check()
+    index = index_of(*REALISTIC)
+    assert index.stride == 8
+    index.scan(check).update(bytes(1024 * 1024))
+    assert calls[0] >= (1024 * 1024 // 8) // secretindex.CHECK_EVERY
+
+
+def test_check_is_called_while_confirming_candidates() -> None:
+    """A self-periodic value on near-matching data: every sample names candidates that pass
+    the prefilter; the confirmations themselves count as work."""
+    calls, check = _counting_check()
+    index = index_of("a" * 2000, RUN_SECRET)
+    data = (b"a" * 1999 + b"b") * 32
+    samples = len(data) // index.stride
+    assert not index.scan(check).update(data)
+    assert calls[0] > 2 * (samples // secretindex.CHECK_EVERY + 1)
+
+
+def test_check_is_called_while_draining_pending_windows() -> None:
+    """Candidate windows waiting for their end are revisited on every update: each one
+    counts as work, so tiny chunks after a long run of candidates still reach check."""
+    calls, check = _counting_check()
+    index = index_of("a" * 2000, RUN_SECRET)
+    scan = index.scan(check)
+    assert not scan.update(b"a" * 1000)  # about 1000 windows wait for their end
+    calls[0] = 0
+    updates = 500
+    for _ in range(updates):
+        assert not scan.update(b"a")
+    pending_work = updates * 1000
+    assert calls[0] >= updates + pending_work // secretindex.CHECK_EVERY
+
+
+def test_an_exception_from_check_ends_the_scan() -> None:
+    _, check = _counting_check(limit=3)
+    scan = index_of("exactly8").scan(check)
+    with pytest.raises(Stop):
+        scan.update(bytes(4 * secretindex.CHECK_EVERY))
+
+
 # Documented residual risk: only literal values are caught
 
 
@@ -318,6 +511,18 @@ def test_parse_refuses_an_index_missing_a_q_gram() -> None:
     doubled = data[:values_end] + (3).to_bytes(4, "little") + first + first + rest
     with pytest.raises(SecretIndexError):
         secretindex.parse(doubled)
+
+
+def test_parse_refuses_q_grams_out_of_order() -> None:
+    """The q-grams are listed by value, then by offset (build's order)."""
+    data = secretindex.build(["abcdefghij"])
+    header, _ = _layout(data)
+    values_end = header + 4 + secretindex.VALUE_ENTRY
+    entries = data[values_end + 4 :]
+    size = secretindex.GRAM_ENTRY
+    swapped = entries[size : 2 * size] + entries[:size] + entries[2 * size :]
+    with pytest.raises(SecretIndexError, match="q-gram entry"):
+        secretindex.parse(data[: values_end + 4] + swapped)
 
 
 def run_dir(tmp_path: Path) -> Path:
@@ -401,10 +606,31 @@ def test_an_oversized_index_is_refused(tmp_path: Path, monkeypatch: pytest.Monke
         os.close(fd)
 
 
-def test_build_refuses_an_index_over_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(secretindex, "INDEX_MAX_BYTES", 100)
-    with pytest.raises(ValueError, match="too large"):
-        secretindex.build([API_KEY])
+def test_build_refuses_values_over_the_total_limit() -> None:
+    """The values may total VALUES_MAX_BYTES (as environment bytes); more is refused with an
+    error naming the limit."""
+    limit = secretindex.VALUES_MAX_BYTES
+    half = limit // 2
+    values = ["a" * half, "b" * (limit - half)]
+    assert len(secretindex.build(values)) <= secretindex.INDEX_MAX_BYTES
+    with pytest.raises(ValueError, match=f"total {limit + 1} bytes, over the limit of {limit}"):
+        secretindex.build(["a" * half, "b" * (limit - half + 1)])
+
+
+@pytest.mark.parametrize("shape", ["one-value", "many-values"])
+def test_the_largest_index_parses_well_within_the_drain_budget(shape: str) -> None:
+    """At the limit parsing takes about 0.2 s on a desktop core; the bound here is generous
+    for CI."""
+    limit = secretindex.VALUES_MAX_BYTES
+    if shape == "one-value":
+        values = ["".join(random.Random(3).choices("0123456789abcdef", k=limit))]
+    else:
+        values = [f"{n:08d}" + "x" * 24 for n in range(limit // 32)]
+    data = secretindex.build(values)
+    assert len(data) <= secretindex.INDEX_MAX_BYTES
+    start = time.perf_counter()
+    secretindex.parse(data)
+    assert time.perf_counter() - start < secretindex.SCAN_BUDGET / 4
 
 
 # Budget (design.md: a full-size artifact well within the PostToolUse hook budget)
@@ -431,9 +657,10 @@ def test_a_10_mib_artifact_is_scanned_within_the_budget() -> None:
 
 
 def test_the_worst_stride_stays_within_the_budget() -> None:
-    """An 8-character value forces stride 1 (eight times the hashes); measured on 2 MiB and
-    extrapolated linearly (the scan is linear in the bytes)."""
+    """An 8-character value forces stride 1 (eight times the hashes). Measured on 1 MiB with a
+    generous bound (a tenth of the input against half the budget, for slow CI machines); the
+    10 MiB figure is design.md's measurement, and the drain's deadline, not this timing, is
+    what bounds a scan (test_ingest)."""
     index = index_of("exactly8", *REALISTIC)
     assert index.stride == 1
-    part = ARTIFACT_BYTES // 5
-    assert _scan_seconds(index, os.urandom(part)) * 5 < secretindex.SCAN_BUDGET
+    assert _scan_seconds(index, os.urandom(ARTIFACT_BYTES // 10)) < secretindex.SCAN_BUDGET / 2
