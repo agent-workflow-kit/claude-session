@@ -196,7 +196,15 @@ def read_file(
     raw = _read_bytes(path)
     data = _parse(raw, path, json_file=value.endswith(".json"))
     validate(data, isolated=isolated, source=path)
-    profile = Profile(name=None, content=data, snapshot=_canonical(data))
+    try:
+        snapshot = _canonical(data)
+    except ValueError:  # e.g. a YAML integer over the int-to-str digit limit; not quoted
+        snapshot = None
+    if snapshot is None:
+        raise InvalidPermissionProfile(
+            "invalid permission profile", detail=f"{path}: value cannot be snapshotted"
+        )
+    profile = Profile(name=None, content=data, snapshot=snapshot)
     if expected_label is not None and profile.label != expected_label:
         raise InvalidPermissionProfile(
             "invalid permission profile",
@@ -364,17 +372,21 @@ def _no_constant(name: str) -> Any:
 
 
 def _encodable(node: Any) -> bool:
-    """Whether every string (key or value) in ``node`` encodes as UTF-8."""
-    if isinstance(node, str):
-        try:
-            node.encode("utf-8")
-        except UnicodeEncodeError:
-            return False
-        return True
-    if isinstance(node, dict):
-        return all(_encodable(key) and _encodable(value) for key, value in node.items())
-    if isinstance(node, list):
-        return all(_encodable(value) for value in node)
+    """Whether every string (key or value) in ``node`` encodes as UTF-8. Iterative: it runs
+    before the depth limit (``config.check_tree`` details quote keys), so it must not recurse."""
+    pending = [node]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                return False
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
     return True
 
 

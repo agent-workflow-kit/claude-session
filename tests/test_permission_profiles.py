@@ -438,6 +438,7 @@ def test_file_replaces_the_kind_profile_entirely(tmp_path: Path, cfg_dir: Path) 
         (b"permissions: !!python/object:os.system {}\n", "p.yaml", "tagged"),
         (b"[" * 70 + b"]" * 70, "p.yaml", "nested"),
         (b'{"permissions": {"x": ' + b"[" * 70 + b"]" * 70 + b"}}", "p.json", "nested"),
+        (b'{"permissions": {"x": ' + b"[" * 600 + b"]" * 600 + b"}}", "p.json", "nested"),
         (b"[" * 100000 + b"]" * 100000, "p.json", "invalid JSON"),
         (b'{"permissions": {"n": 1' + b"0" * 5000 + b"}}", "p.json", "invalid JSON"),
     ],
@@ -727,6 +728,13 @@ def test_lone_surrogates_in_json_fail(tmp_path: Path, raw: bytes) -> None:
     path.write_bytes(raw)
     error = refused(pp.read_file, str(path), isolated=False, session_writable=None)
     assert error.detail == f"{path}: invalid string"
+
+
+def test_unencodable_yaml_integer_fails(tmp_path: Path) -> None:
+    path = tmp_path / "p.yaml"
+    path.write_bytes(b"permissions: {x: 0x" + b"f" * 4000 + b"}\n")
+    error = refused(pp.read_file, str(path), isolated=False, session_writable=None)
+    assert error.detail == f"{path}: value cannot be snapshotted"
 
 
 def test_snapshot_bytes_are_frozen_at_read_time(tmp_path: Path) -> None:
