@@ -1,5 +1,5 @@
-"""Lifecycle hooks: ``post-state-change`` selection, execution and delivery (interface.md,
-Hooks; design.md, Lifecycle hooks and Data model).
+"""Lifecycle hooks: ``post-state-change`` selection, execution and delivery, and the
+``pre-launch`` runner (interface.md, Hooks; design.md, Lifecycle hooks and Data model).
 
 **Entries.** The configured entries of the *current* config (``hooks.post-state-change``) plus
 the per-invocation ``--hook post-state-change=<cmd>`` entries stored with the event's run
@@ -64,21 +64,30 @@ poll loop, so a slow hook delays later hooks, never supervision, and never the h
 path, which only appends events. Commands that change a run with no live wrapper deliver
 synchronously with ``deliver``.
 
-TODO(#31): ``pre-launch`` reuses ``Entry``, ``selected`` (without ``states``), ``hook_env``
-and the ``sh -c`` execution, with its own outcome rules.
-TODO(#20, #27): ``dryrun.hooks_json`` (feat/dry-run) has its own selector match; once both
-branches are merged it must call ``selected`` (without ``state``) so plan and run agree.
+**Pre-launch** (launch step 6, ``run_pre_launch``; ``launch.pre_launch`` builds the payload
+and records the result): the same ``Entry``, ``selected`` (without ``states``), ``hook_env``
+and ``sh -c`` execution, but synchronous and reading the output (``run_captured``: pipes,
+``PRE_LAUNCH_OUTPUT_MAX`` + 1 bytes kept per stream). Exit 0 continues, exit 13 escalates
+(later entries still run), any other exit, a timeout or an entry that could not run vetoes at
+once (fail closed). Stdout is an untrusted decision protocol, read strictly
+(``parse_decision``); the decision ids of all entries are capped at
+``DECISION_IDS_MAX_BYTES`` escaped, so the log and audit records carrying them stay small.
+Each entry that exited 13 is recorded by ``entry_hash`` (name, command, selectors), the input
+of a later ``--override-escalation``. ``dryrun.hooks_json`` selects with ``selected`` too, so
+the plan and a run never disagree.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import signal
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -151,6 +160,22 @@ def config_entries(cfg: Config) -> list[Entry]:
     ]
 
 
+def pre_launch_config_entries(cfg: Config) -> list[Entry]:
+    """The ``hooks.pre-launch`` entries of ``cfg``, in order (no ``async``, no ``states``)."""
+    return [
+        Entry(
+            cmd=hook.cmd,
+            timeout=hook.timeout,
+            origin="config",
+            index=n,
+            kinds=_tuple(hook.kinds),
+            exclude_kinds=_tuple(hook.exclude_kinds),
+            labels=_tuple(hook.labels),
+        )
+        for n, hook in enumerate(cfg.hooks.pre_launch, start=1)
+    ]
+
+
 def invocation_entries(invocation_json: str | None, hook: str = POST_STATE_CHANGE) -> list[Entry]:
     """The per-invocation ``--hook <hook>=<cmd>`` entries stored in ``invocation_json``, in
     order; ``--hook-timeout <hook>=<duration>`` (the last one given) sets their timeout. Stored
@@ -162,8 +187,17 @@ def invocation_entries(invocation_json: str | None, hook: str = POST_STATE_CHANG
         return []
     if not isinstance(invocation, dict):
         return []
+    return flag_entries(
+        _strings(invocation.get("hooks")), _strings(invocation.get("hook_timeouts")), hook
+    )
+
+
+def flag_entries(hooks: Sequence[str], hook_timeouts: Sequence[str], hook: str) -> list[Entry]:
+    """The ``--hook <hook>=<cmd>`` entries among ``hooks``, in order, with the timeout of the
+    last ``--hook-timeout <hook>=<duration>`` among ``hook_timeouts`` (default 30 s; one that
+    does not parse: the default)."""
     timeout = DEFAULT_TIMEOUT
-    for item in _strings(invocation.get("hook_timeouts")):
+    for item in hook_timeouts:
         name, sep, value = item.partition("=")
         if sep and name == hook:
             try:
@@ -171,7 +205,7 @@ def invocation_entries(invocation_json: str | None, hook: str = POST_STATE_CHANG
             except ValueError:
                 timeout = DEFAULT_TIMEOUT
     entries: list[Entry] = []
-    for item in _strings(invocation.get("hooks")):
+    for item in hooks:
         name, sep, cmd = item.partition("=")
         if sep and name == hook:
             entries.append(
@@ -311,6 +345,296 @@ def run_entry(
     if result.returncode != 0:
         return Ran("failed", f"exit {result.returncode}")
     return Ran("ok", "exit 0")
+
+
+# Pre-launch (launch step 6)
+
+PRE_LAUNCH = "pre-launch"
+# The exit code that escalates; 0 continues, any other code vetoes.
+ESCALATE_EXIT = 13
+# Bytes of a pre-launch hook's stdout read as its decision (one more is kept, so a longer
+# output is told apart and ignored), and of its stderr kept for the outcome message.
+PRE_LAUNCH_OUTPUT_MAX = 2048
+# The outcome message: control characters stripped, then at most this many characters.
+MESSAGE_MAX = 2048
+# All the decision ids one run's pre-launch hooks may add, measured as escaped ASCII JSON (the
+# form the log and audit records are written in, where one character can take up to 12
+# bytes). With at most ``PRE_LAUNCH_OUTPUT_MAX`` bytes of stdout per hook, this keeps a
+# record that carries them well inside the 4 MiB audit record limit however many hooks run.
+DECISION_IDS_MAX_BYTES = 256 * 1024
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
+_JSON_SPACE = " \t\n\r"
+
+
+def entry_hash(entry: Entry) -> str:
+    """The hash that names an entry in ``runs.escalated_hooks`` and ``overridden_hooks``: the
+    SHA-256 (hex) of its name (origin and position), command and selectors as canonical JSON.
+    Moving, editing or reselecting an entry changes it, so an override never covers a hook
+    configuration the human did not see escalate."""
+    data = {
+        "name": entry.name,
+        "cmd": entry.cmd,
+        "kinds": None if entry.kinds is None else list(entry.kinds),
+        "exclude_kinds": None if entry.exclude_kinds is None else list(entry.exclude_kinds),
+        "labels": None if entry.labels is None else list(entry.labels),
+    }
+    text = json.dumps(data, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    keys = [key for key, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+def parse_decision(stdout: str) -> tuple[list[str], str | None]:
+    """The ``decision_id``s of a pre-launch hook's stdout, and why the output was ignored
+    (None: it was not). Read strictly, as untrusted input: empty (or whitespace-only) output
+    carries no decision and is not an error; anything else must be one JSON object of at
+    most ``PRE_LAUNCH_OUTPUT_MAX`` bytes of valid UTF-8, without duplicate keys or ``NaN``
+    and ``Infinity``, whose ``decision_id``, when present, is a string or a list of strings
+    without unpaired surrogates. Other keys are ignored. Output that breaks any rule is
+    ignored as a whole (no decision id taken from it)."""
+    if stdout.strip(_JSON_SPACE) == "":
+        return [], None
+    if len(stdout.encode("utf-8", "surrogatepass")) > PRE_LAUNCH_OUTPUT_MAX:
+        return [], f"longer than {PRE_LAUNCH_OUTPUT_MAX} bytes"
+    if "\ufffd" in stdout:  # the gateway's replacement for bytes that are not UTF-8
+        return [], "not valid UTF-8"
+    try:
+        value = json.loads(stdout, parse_constant=_no_constant, object_pairs_hook=_unique_keys)
+    except (ValueError, RecursionError):
+        return [], "not JSON"
+    if not isinstance(value, dict):
+        return [], "not a JSON object"
+    if "decision_id" not in value:
+        return [], None
+    found = value["decision_id"]
+    if isinstance(found, str):
+        found = [found]
+    if not isinstance(found, list) or not all(isinstance(item, str) for item in found):
+        return [], "decision_id is not a string or a list of strings"
+    # json.loads joins an escaped surrogate pair into one character; what is left unpaired
+    # could not be written as UTF-8 and could pair up differently once re-escaped.
+    if any(_SURROGATE.search(item) for item in found):
+        return [], "decision_id holds an unpaired surrogate"
+    return list(found), None
+
+
+def escaped_size(value: str) -> int:
+    """The bytes ``value`` takes as an ASCII JSON string (quotes included)."""
+    return len(json.dumps(value, ensure_ascii=True))
+
+
+def outcome_message(stderr: str) -> str:
+    """A hook's stderr as the outcome message: control characters stripped, at most
+    ``MESSAGE_MAX`` characters."""
+    return _CONTROL.sub("", stderr)[:MESSAGE_MAX]
+
+
+@dataclass(frozen=True)
+class Captured:
+    """How one pre-launch entry ran: ``exited`` (with its exit code and output), ``timeout``
+    or ``failed`` (it could not be started or run); ``detail`` is fixed text and numbers,
+    never hook output."""
+
+    result: str
+    detail: str
+    returncode: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+
+
+def run_captured(
+    gateway: Gateway,
+    entry: Entry,
+    *,
+    sh: str | None,
+    env: Mapping[str, str],
+    cwd: str,
+    payload: str,
+    kill_grace: float,
+) -> Captured:
+    """Run a pre-launch ``entry`` once, reading its output (``run_entry`` discards it):
+    ``sh -c <cmd>`` in its own process group, the payload on stdin, at most
+    ``PRE_LAUNCH_OUTPUT_MAX`` + 1 bytes kept of each stream (the rest is read and dropped,
+    so the hook never blocks on a full pipe). On timeout the group gets SIGTERM, then
+    SIGKILL after ``kill_grace``. Any ``Exception`` from the runner is a ``failed`` result,
+    never raised; a ``BaseException`` (a signal ending the launch) propagates once the
+    gateway has ended the group."""
+    if sh is None:
+        return Captured("failed", "sh not found on the sanitized PATH")
+    try:
+        result = gateway.run(
+            ["sh", "-c", entry.cmd],
+            executable=sh,
+            env=env,
+            cwd=cwd,
+            stdin=payload,
+            timeout=entry.timeout,
+            new_process_group=True,
+            kill_grace=kill_grace,
+            output_limit=PRE_LAUNCH_OUTPUT_MAX + 1,
+        )
+    except GatewayTimeout:
+        return Captured("timeout", f"timed out after {entry.timeout:g} s; process group ended")
+    except OSError as exc:
+        return Captured("failed", f"could not start sh ({type(exc).__name__})")
+    except Exception as exc:  # e.g. a NUL in a --hook command: a defined veto, no traceback
+        return Captured("failed", f"could not run the hook ({type(exc).__name__})")
+    return Captured(
+        "exited",
+        f"exit {result.returncode}",
+        returncode=result.returncode,
+        stdout=result.stdout,
+        stderr=result.stderr,
+    )
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """What step 6 decided: ``outcome`` ``continue``, ``vetoed`` or ``escalated``, with the end
+    reason (``hook_veto``, ``hook_timeout``, ``hook_escalate``) and outcome message of a veto
+    or escalation; the hooks' ``decision_ids`` in order; ``escalated``, the hashes of every
+    entry that exited 13 (overridden or not: the next ``--override-escalation`` covers them
+    all); ``overridden``, those whose exit 13 counted as continue."""
+
+    outcome: str = "continue"
+    end_reason: str | None = None
+    message: str | None = None
+    decision_ids: tuple[str, ...] = ()
+    escalated: tuple[str, ...] = ()
+    overridden: tuple[str, ...] = ()
+
+
+def run_pre_launch(
+    gateway: Gateway,
+    entries: Sequence[Entry],
+    *,
+    payload: Callable[[], str],
+    sh: str | None,
+    env: Mapping[str, str],
+    cwd: str,
+    kill_grace: float,
+    overridable: Collection[str] = (),
+    log: logs.EventLog,
+    csession_id: str,
+    run: int,
+) -> Verdict:
+    """Launch step 6 (interface.md, Hooks: ``pre-launch`` outcome rules): the selected
+    ``entries`` run one after another, each with a fresh ``payload()``. Exit 0 continues;
+    exit 13 escalates (the remaining entries still run), unless the entry's hash is in
+    ``overridable`` (``--override-escalation``: the previous run's ``escalated_hooks``), when
+    it continues; any other exit, a timeout, or an entry that could not run vetoes at once
+    (fail closed). The first veto, or else the first escalation that was not overridden,
+    gives the outcome; its stderr is the message (a fixed description when it wrote none).
+    Each entry's stdout is read with ``parse_decision``; ids beyond
+    ``DECISION_IDS_MAX_BYTES`` in all are dropped and logged. Every veto, escalation,
+    timeout, failure and ignored output is logged, naming the entry by origin and position,
+    never by its command or output."""
+    fields: dict[str, Any] = {"csession_id": csession_id, "run": run}
+    decision_ids: list[str] = []
+    budget = DECISION_IDS_MAX_BYTES
+    escalated: list[str] = []
+    overridden: list[str] = []
+    escalation: tuple[str, str] | None = None  # the first escalation that stands: reason, text
+    for entry in entries:
+        what = f"{PRE_LAUNCH} {entry.name}"
+        ran = run_captured(
+            gateway, entry, sh=sh, env=env, cwd=cwd, payload=payload(), kill_grace=kill_grace
+        )
+        if ran.result == "timeout":
+            _log(log, "hook_timeout", level="warn", message=f"{what}: {ran.detail}", **fields)
+            return Verdict(
+                "vetoed",
+                "hook_timeout",
+                f"{what} {ran.detail}",
+                tuple(decision_ids),
+                tuple(escalated),
+                tuple(overridden),
+            )
+        if ran.result == "failed":
+            _log(log, "hook_failed", level="warn", message=f"{what}: {ran.detail}", **fields)
+            _log(log, "hook_veto", level="warn", message=f"{what}: {ran.detail}", **fields)
+            return Verdict(
+                "vetoed",
+                "hook_veto",
+                f"{what} {ran.detail}",
+                tuple(decision_ids),
+                tuple(escalated),
+                tuple(overridden),
+            )
+        found, problem = parse_decision(ran.stdout)
+        if problem is not None:
+            _log(
+                log,
+                "hook_output_ignored",
+                level="warn",
+                message=f"{what}: stdout ignored ({problem})",
+                **fields,
+            )
+        for item in found:
+            size = escaped_size(item) + 1  # and its separator
+            if size > budget:
+                _log(
+                    log,
+                    "hook_output_ignored",
+                    level="warn",
+                    message=f"{what}: decision ids beyond {DECISION_IDS_MAX_BYTES} bytes in"
+                    " all were dropped",
+                    **fields,
+                )
+                budget = 0
+                break
+            budget -= size
+            decision_ids.append(item)
+        text = outcome_message(ran.stderr) or None
+        if ran.returncode == 0:
+            continue
+        if ran.returncode == ESCALATE_EXIT:
+            digest = entry_hash(entry)
+            escalated.append(digest)
+            if digest in overridable:
+                overridden.append(digest)
+                _log(
+                    log,
+                    "hook_escalate",
+                    message=f"{what}: exit 13, overridden by --override-escalation",
+                    **fields,
+                )
+                continue
+            _log(log, "hook_escalate", level="warn", message=f"{what}: exit 13", **fields)
+            if escalation is None:
+                escalation = ("hook_escalate", text or f"{what} escalated the launch (exit 13)")
+            continue
+        _log(log, "hook_veto", level="warn", message=f"{what}: {ran.detail}", **fields)
+        return Verdict(
+            "vetoed",
+            "hook_veto",
+            text or f"{what} vetoed the launch ({ran.detail})",
+            tuple(decision_ids),
+            tuple(escalated),
+            tuple(overridden),
+        )
+    if escalation is not None:
+        return Verdict(
+            "escalated",
+            escalation[0],
+            escalation[1],
+            tuple(decision_ids),
+            tuple(escalated),
+            tuple(overridden),
+        )
+    return Verdict(
+        decision_ids=tuple(decision_ids), escalated=tuple(escalated), overridden=tuple(overridden)
+    )
 
 
 # Payload

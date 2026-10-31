@@ -7,6 +7,7 @@ One function per launch step, called in order by ``exec`` (``cli``):
   exit 2 on a usage error) and ``resolve_kind`` (the effective profile, the cwd, the repo);
 - step 4: ``allocate`` (session id, session and run rows, labels, the ``launch`` event);
 - step 5: ``validate`` (the launch validations, each an ordered helper below);
+- step 6: ``pre_launch`` (the ``pre-launch`` hooks; ``--override-escalation``);
 - step 7: ``prepare`` (session-directory files, secret index, hook configuration, settings).
   ``supervisor`` then spawns and supervises ``claude``; ``run`` strings steps 5 and 7 and the
   hand-over together.
@@ -36,7 +37,9 @@ runs ``run`` with its own effects (``Recording`` subclass comparing what ``start
 and ``staged=True`` (step 7 moves ``start``'s staged prompt and inputs into place).
 Resumes and forks (``resume``) build their request from the previous run (carry-over) and
 allocate with ``allocate_resume`` or ``allocate(fork=...)``; the rest is shared.
-TODO(#31): launch step 6, the ``pre-launch`` hooks, between ``validate`` and ``prepare``.
+Step 6, the ``pre-launch`` hooks (``pre_launch``), runs between ``validate`` and ``prepare``
+in ``run`` (so in the adopting ``exec`` too), before the fork taint re-check; a veto or
+escalation (``HookEnded``) ends the run through the same launch-phase path (exit 11 or 13).
 TODO(#40): ``claude --version`` against ``min_claude_version`` (``claude_too_old``) in
 ``validate``, after ``claude_bin`` is resolved.
 """
@@ -70,6 +73,7 @@ from . import (
     settings_builder,
     store,
     tmpdir,
+    toolhooks,
 )
 from .config import Config
 from .endmap import EXIT_CODES
@@ -188,6 +192,8 @@ class Request:
     outcome_file: str | None
     carried: Mapping[str, Any] = field(default_factory=dict)
     conversation: Conversation = field(default_factory=Conversation)
+    # --override-escalation (resume and start --resume only; checked at step 2).
+    override_escalation: bool = False
 
 
 def _actor(given: str | None, cfg: Config) -> str:
@@ -267,6 +273,7 @@ def read_request(args: argparse.Namespace, cfg: Config) -> Request:
         outcome_file=(
             None if args.outcome_file is None else outcomefile.absolute(args.outcome_file)
         ),
+        override_escalation=bool(getattr(args, "override_escalation", False)),
     )
 
 
@@ -431,6 +438,20 @@ class Allocated:
     # fork that never captured a Claude id): the source whose taint is re-checked right
     # before step 7 (``Store.recheck_fork_taint``).
     taint_source: str | None = None
+    # The ``launch_escalation_override`` record step 6 wrote (``result: ok``): a launch-phase
+    # end after it adds the ``result: error`` follow-up (``end_launch``).
+    override_audit: OverrideAudit | None = None
+
+
+@dataclass(frozen=True)
+class OverrideAudit:
+    """The fields of a written ``launch_escalation_override`` record, for its follow-up."""
+
+    path: str
+    actor: str
+    decision_ids: tuple[str, ...]
+    inputs: Mapping[str, Any]
+    secrets: tuple[str, ...] = field(repr=False)
 
 
 def _resolved_record(resolution: kinds.Resolution) -> dict[str, Any]:
@@ -1629,6 +1650,182 @@ def audit_sandbox_lowered(
     )
 
 
+# Step 6: pre-launch hooks
+
+
+class HookEnded(LaunchValidationError):
+    """A ``pre-launch`` hook ended the launch (step 6): ``outcome`` ``vetoed`` (exit 11; end
+    reason ``hook_veto`` or ``hook_timeout``) or ``escalated`` (exit 13; ``hook_escalate``).
+    The run ends ``not-started``; ``message`` is the hook's stderr (control characters
+    stripped, at most 2 KiB) or a fixed description."""
+
+    def __init__(self, message: str, *, outcome: str, end_reason: str) -> None:
+        super().__init__(message, end_reason=end_reason)
+        self.outcome = outcome
+
+
+def pre_launch_payload(
+    req: Request,
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    v: Validated,
+    record: Mapping[str, Any],
+    *,
+    now: str,
+) -> dict[str, Any]:
+    """The ``pre-launch`` payload (schemas/hooks/pre-launch.json) of the run about to launch,
+    as of ``now``. ``record`` is ``Store.pre_launch_record``. ``fork`` is true for a fork's
+    run 1; ``pending`` for a run ``start`` created (the adopting ``exec``). Names only, never
+    values, of the session's environment; never the prompt text."""
+    profile = resolution.profile
+    return {
+        "tool": toolhooks.TOOL,
+        "hook": toolhooks.PRE_LAUNCH,
+        "object_type": toolhooks.OBJECT_TYPE,
+        "object_id": alloc.csession_id,
+        "repo": resolution.repo,
+        "labels": list(record["labels"]),
+        "ts": now,
+        "run": alloc.run,
+        "pending": alloc.cause == "adopt",
+        "launch_kind": record["launch_kind"],
+        "run_kind": resolution.kind,
+        "previous_run_kind": record["previous_run_kind"],
+        "reads_third_party": profile.reads_third_party,
+        "implicit_done": profile.implicit_done,
+        "auto_exit": profile.auto_exit,
+        "tainted": record["tainted"],
+        "mode": req.mode,
+        "cwd": v.cwd,
+        "sandbox": profile.sandbox,
+        "permission_profile": v.profile.label,
+        "setting_sources": list(profile.setting_sources),
+        "mcp": profile.mcp,
+        "env_inherit": profile.env.inherit,
+        "env_names": sorted(v.session_env.env),
+        "plugin_dirs": list(v.plugin_dirs),
+        "input_files": [item.name for item in req.inputs],
+        "model": profile.model,
+        "resume": req.conversation.resume,
+        "fork": record["forked_from"] is not None and alloc.run == 1,
+        "forked_from": record["forked_from"],
+        "skill": req.skill,
+        "has_prompt": req.prompt is not None,
+        # TODO(#30): `req.allow_tainted is not None` once #30 adds Request.allow_tainted (at
+        # adoption it comes from the run row's invocation_json); until then never given.
+        "allow_tainted": False,
+        "override_escalation": req.override_escalation,
+        "actor": req.actor,
+        "decision_ids": list(req.decision_ids),
+    }
+
+
+def pre_launch(
+    st: store.Store,
+    cfg: Config,
+    req: Request,
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    v: Validated,
+    process: Process,
+    secrets: Sequence[str],
+) -> OverrideAudit | None:
+    """Launch step 6 (interface.md, Hooks): the selected ``pre-launch`` entries (the current
+    config's, then this invocation's ``--hook pre-launch=...``; ``toolhooks.selected`` on
+    the run kind and the session's labels) run in order (``toolhooks.run_pre_launch``). Their
+    decision ids and escalating entries are recorded on the run (``Store.record_pre_launch``)
+    whatever the outcome; a veto or escalation raises ``HookEnded``.
+
+    With ``--override-escalation`` an exit 13 of an entry recorded as escalating on the
+    previous run counts as continue; the launch that then goes on is audited
+    ``launch_escalation_override`` (``result: ok``, with the hooks' and ``--decision-id``
+    decision ids and the ``overridden_hooks``) before anything else happens, and that record
+    must be written (an ``audit.append`` error propagates: the launch is interrupted). One
+    the hooks still end is audited ``result: refused`` (best effort). Returns the ``ok``
+    record's fields (None without the flag)."""
+    sid, run = alloc.csession_id, alloc.run
+    record = st.pre_launch_record(sid, run)
+    entries = [
+        entry
+        for entry in [
+            *toolhooks.pre_launch_config_entries(cfg),
+            *toolhooks.flag_entries(req.hooks, req.hook_timeouts, toolhooks.PRE_LAUNCH),
+        ]
+        if toolhooks.selected(entry, run_kind=resolution.kind, labels=record["labels"])
+    ]
+    verdict = toolhooks.Verdict()
+    if entries:
+        from .dryrun import printable  # dryrun imports this module
+
+        env = toolhooks.hook_env(
+            process.environ, secret_env=cfg.secret_env, hook=toolhooks.PRE_LAUNCH, csession_id=sid
+        )
+
+        def payload() -> str:
+            now = store.format_ts(st.clock())  # per entry: when this one is delivered
+            data = pre_launch_payload(req, resolution, alloc, v, record, now=now)
+            return json.dumps(printable(data), ensure_ascii=False)
+
+        verdict = toolhooks.run_pre_launch(
+            process.gateway,
+            entries,
+            payload=payload,
+            sh=toolhooks.resolve_sh(env),
+            env=env,
+            cwd=process.state_root,
+            kill_grace=cfg.kill_grace,
+            overridable=frozenset(record["previous_escalated"])
+            if req.override_escalation
+            else frozenset(),
+            log=event_log(process, secrets),
+            csession_id=sid,
+            run=run,
+        )
+        st.record_pre_launch(
+            sid, run, decision_ids=verdict.decision_ids, escalated_hooks=verdict.escalated
+        )
+    audited: OverrideAudit | None = None
+    if req.override_escalation:
+        audited = OverrideAudit(
+            path=os.path.join(process.state_root, AUDIT_NAME),
+            actor=req.actor,
+            decision_ids=(*req.decision_ids, *verdict.decision_ids),
+            inputs={
+                "run_kind": resolution.kind,
+                "run": run,
+                "overridden_hooks": list(verdict.overridden),
+            },
+            secrets=tuple(secrets),
+        )
+    if verdict.outcome != "continue":
+        if audited is not None:
+            _audit_override(audited, sid, "refused", best_effort=True)
+        assert verdict.end_reason is not None and verdict.message is not None
+        raise HookEnded(verdict.message, outcome=verdict.outcome, end_reason=verdict.end_reason)
+    if audited is not None:
+        _audit_override(audited, sid, "ok", best_effort=False)
+    return audited
+
+
+def _audit_override(audited: OverrideAudit, target: str, result: str, *, best_effort: bool) -> None:
+    """Write a ``launch_escalation_override`` record; with ``best_effort`` a failure is
+    swallowed (a ``refused`` or ``error`` record: the launch is not taken either way)."""
+    try:
+        audit.append(
+            audited.path,
+            actor=audited.actor,
+            target=target,
+            action="launch_escalation_override",
+            result=result,
+            decision_ids=audited.decision_ids,
+            inputs=dict(audited.inputs),
+            secrets=audited.secrets,
+        )
+    except Exception:
+        if not best_effort:
+            raise
+
+
 # Step 7: prepare
 
 
@@ -1843,21 +2040,23 @@ def fail_launch(
     error: LaunchValidationError,
     writable: Sequence[str] | None = None,
 ) -> bool:
-    """End the run ``not-started`` with the error's end reason (exit 12) and its
-    ``failure_message``. Returns whether this call finalized the run. In the same
+    """End the run ``not-started`` with the error's end reason (exit 12; a ``HookEnded``:
+    outcome ``vetoed``, exit 11, or ``escalated``, exit 13) and its ``failure_message``.
+    Returns whether this call finalized the run. In the same
     transaction: the run's session-writable paths ``writable`` are stored unless the run has
     them already, and an ``UnsafeOutcomeFile`` drops the run's ``outcome_file``.
 
     The one final event it appends is delivered (``post-state-change``) by the caller's
     delivery: ``exec`` delivers it synchronously once the launch ended (``toolhooks``)."""
+    outcome = error.outcome if isinstance(error, HookEnded) else "not-started"
     return st.finalize_run(
         alloc.csession_id,
         alloc.run,
         store.Final(
             phase="launch",
-            outcome="not-started",
+            outcome=outcome,
             end_reason=error.end_reason,
-            exit_code=EXIT_CODES["not-started"],
+            exit_code=EXIT_CODES[outcome],
             state="not-started",
             cause=alloc.cause,
             message=failure_message(error),
@@ -1909,9 +2108,11 @@ def end_launch(
     session-writable set known: ``v``'s full set, else ``guard``'s), write its outcome file
     right after the compare-and-set, then, whatever happens, close
     the output descriptors, delete the secret index, remove the private tmpdir and log the
-    failure (``launch`` with the end reason; ``launch_interrupted`` with the exception type
-    for an ``exc``). A transaction an interrupted store write left open is rolled back
-    first."""
+    failure (``launch`` with the end reason and the run's decision ids;
+    ``launch_interrupted`` with the exception type for an ``exc``). A transaction an
+    interrupted store write left open is rolled back first. A launch whose escalation
+    override was audited (``alloc.override_audit``) gets the ``result: error`` follow-up
+    record (best effort)."""
     try:
         st.rollback_open_transaction()
         if fail_launch(st, alloc, error, _known_writable(v, guard)):
@@ -1931,10 +2132,19 @@ def end_launch(
                 st.add_run_warnings(alloc.csession_id, alloc.run, warnings)
             except Exception:  # best effort: the run is final either way
                 pass
+        if alloc.override_audit is not None:
+            _audit_override(alloc.override_audit, alloc.csession_id, "error", best_effort=True)
         log = event_log(process, () if prepared is None else sorted(prepared.secrets))
         fields: dict[str, Any] = {"csession_id": alloc.csession_id, "run": alloc.run}
         if exc is None:
-            log_best_effort(log, "launch", level="error", reason=error.end_reason, **fields)
+            log_best_effort(
+                log,
+                "launch",
+                level="error",
+                reason=error.end_reason,
+                decision_ids=_run_decision_ids(st, alloc),
+                **fields,
+            )
         else:
             log_best_effort(
                 log,
@@ -1944,6 +2154,17 @@ def end_launch(
                 message=type(exc).__name__,
                 **fields,
             )
+
+
+def _run_decision_ids(st: store.Store, alloc: Allocated) -> list[str] | None:
+    """The run's recorded decision ids, for its ``launch`` log record (None: unreadable)."""
+    try:
+        value = json.loads(st.run_record(alloc.csession_id, alloc.run)["decision_ids_json"] or "[]")
+    except Exception:  # best effort: the record is logged without them
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return None
+    return value
 
 
 def _known_writable(v: Validated | None, guard: WritableGuard | None) -> tuple[str, ...] | None:
@@ -2079,7 +2300,11 @@ def run(
                 # secret.
                 audit_sandbox_lowered(process, req, resolution, alloc, secrets)
                 st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
-                # TODO(#31): insert step 6 (pre-launch hooks) before this re-check.
+                # Step 6, before the fork taint re-check: a source tainted while the hooks
+                # run is still caught. --timeout does not count the hooks.
+                audited = pre_launch(st, cfg, req, resolution, alloc, v, process, secrets)
+                if audited is not None:
+                    alloc = dataclasses.replace(alloc, override_audit=audited)
                 recheck_fork_taint(st, alloc, resolution)
                 prepared = prepare(st, cfg, req, resolution, alloc, v, process)
                 st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)

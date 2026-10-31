@@ -1362,6 +1362,87 @@ class Store:
                 (json.dumps(merged, ensure_ascii=False), csession_id, run_no),
             )
 
+    # Pre-launch hooks (launch step 6; design.md, Lifecycle hooks)
+
+    def pre_launch_record(self, csession_id: str, run_no: int) -> dict[str, Any]:
+        """What step 6 reads of a run's session, in one snapshot: ``launch_kind``,
+        ``tainted``, ``forked_from``, the labels (``labels``, sorted ``key=value``), the kind
+        of the previous run (``previous_run_kind``: run ``run_no`` - 1, else for a fork's
+        run 1 the source's current run; None for a new session) and the previous run's
+        ``escalated_hooks`` (``previous_escalated``; entries that are not strings, or an
+        unreadable value, give none: nothing is overridden). ``InternalError`` when the
+        session does not exist."""
+        with self.transaction() as conn:
+            session = conn.execute(
+                "SELECT launch_kind, tainted, forked_from FROM sessions WHERE csession_id = ?",
+                (csession_id,),
+            ).fetchone()
+            if session is None:
+                raise InternalError(f"no session {csession_id}")
+            labels = [
+                f"{key}={value}"
+                for key, value in conn.execute(
+                    "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+                    (csession_id,),
+                )
+            ]
+            previous_kind, escalated = None, None
+            if run_no > 1:
+                row = conn.execute(
+                    "SELECT run_kind, escalated_hooks FROM runs "
+                    "WHERE csession_id = ? AND run_no = ?",
+                    (csession_id, run_no - 1),
+                ).fetchone()
+                if row is not None:
+                    previous_kind, escalated = row
+            elif session[2] is not None:
+                row = conn.execute(
+                    "SELECT r.run_kind FROM runs r JOIN sessions s "
+                    "ON s.csession_id = r.csession_id AND s.current_run = r.run_no "
+                    "WHERE s.csession_id = ?",
+                    (session[2],),
+                ).fetchone()
+                previous_kind = None if row is None else row[0]
+        return {
+            "launch_kind": session[0],
+            "tainted": bool(session[1]),
+            "forked_from": session[2],
+            "labels": labels,
+            "previous_run_kind": previous_kind,
+            "previous_escalated": _string_list_json(escalated),
+        }
+
+    def record_pre_launch(
+        self,
+        csession_id: str,
+        run_no: int,
+        *,
+        decision_ids: Sequence[str],
+        escalated_hooks: Sequence[str],
+    ) -> None:
+        """Record what step 6 returned, in one transaction: the hooks' ``decision_ids``
+        appended to the run's ``decision_ids_json`` (after the ``--decision-id`` values) and
+        the hashes of the entries that exited 13 as ``escalated_hooks`` (a JSON list; NULL
+        when none did)."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT decision_ids_json FROM runs WHERE csession_id = ? AND run_no = ?",
+                (csession_id, run_no),
+            ).fetchone()
+            if row is None:
+                raise InternalError(f"no run {run_no} of session {csession_id}")
+            merged = [*_string_list_json(row[0]), *decision_ids]
+            conn.execute(
+                "UPDATE runs SET decision_ids_json = ?, escalated_hooks = ? "
+                "WHERE csession_id = ? AND run_no = ?",
+                (
+                    json.dumps(merged, ensure_ascii=False),
+                    json.dumps(list(escalated_hooks)) if escalated_hooks else None,
+                    csession_id,
+                    run_no,
+                ),
+            )
+
     # Outcome file (interface.md, Outcome file; design.md, Data model)
 
     def unwritten_outcome_files(self, csession_id: str | None = None) -> list[tuple[str, int]]:
@@ -2334,6 +2415,18 @@ class HookRun:
     secret_sha256: str | None = None
     outbox_dev_ino: str | None = None
     artifacts_dev_ino: str | None = None
+
+
+def _string_list_json(value: str | None) -> list[str]:
+    """A stored JSON list of strings; [] when it is NULL, unreadable or holds anything
+    else (the conservative reading: nothing recorded)."""
+    try:
+        items = json.loads(value or "[]")
+    except ValueError:
+        return []
+    if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+        return []
+    return items
 
 
 def open_state(**kwargs: Any) -> Store:
