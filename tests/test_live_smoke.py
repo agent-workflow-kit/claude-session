@@ -13,6 +13,6 @@ from claude_session import gateway
 def test_claude_cli_reports_a_version() -> None:
     claude = shutil.which("claude")
     assert claude is not None, "claude is not on PATH"
-    proc = gateway.run([claude, "--version"], timeout=60)
+    proc = gateway.SystemGateway().run([claude, "--version"], timeout=60)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip()
