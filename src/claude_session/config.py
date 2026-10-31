@@ -53,15 +53,6 @@ MAX_RETENTION_DAYS = 36500
 
 VERSION = r"[0-9]+(\.[0-9]+)*"
 INVALID_REPO = "<invalid repo id>"
-# Names that are never config keys (interface.md, Environment variables); env.set refuses every
-# CSESSION_* name (CSESSION_PREFIX).
-RESERVED_ENV = (
-    "CSESSION_ID",
-    "CSESSION_DIR",
-    "CSESSION_KIND",
-    "CSESSION_HOOK",
-    "CSESSION_OBJECT_TYPE",
-)
 # No env.set name may start with it (interface.md, Environment variables).
 CSESSION_PREFIX = "CSESSION_"
 # env.allow entries: a name, or a PREFIX* glob whose prefix is a valid name start.
@@ -196,8 +187,9 @@ def _settable(name: str) -> str:
 def env_set_value_problem(value: str) -> str | None:
     """Why ``value`` is not a valid ``env.set`` value (None: valid). A value has no NUL, and
     every ``${`` in it starts one of the exact references ``${CSESSION_DIR}``, ``${CWD}``,
-    ``${HOME}``, ``${GIT_DIR}``; no ``${`` may remain once they are removed either. A ``$``
-    or ``}`` on its own is literal. The message never contains the value."""
+    ``${HOME}``, ``${GIT_DIR}``. A ``$``, ``{`` or ``}`` on its own is literal (``$${HOME}{``
+    is valid: expansion is single-pass, so no new reference forms). The message never contains
+    the value."""
     if "\x00" in value:
         return "must not contain a NUL character"
     start = value.find("${")
@@ -205,8 +197,6 @@ def env_set_value_problem(value: str) -> str | None:
         if not ENV_REFERENCE.match(value, start):
             return REFERENCE_PROBLEM
         start = value.find("${", start + 1)
-    if "${" in ENV_REFERENCE.sub("", value):
-        return REFERENCE_PROBLEM
     return None
 
 

@@ -376,6 +376,83 @@ def test_provider_flag_unlocked_from_secret_env_selects(cfg_dir: Path) -> None:
     assert env_of(cfg, "rank", environ)["AWS_REGION"] == "us-east-1"
 
 
+@pytest.mark.parametrize("kind", ["implement", "rank", "review"])
+def test_provider_flag_false_in_env_set_selects_nothing(cfg_dir: Path, kind: str) -> None:
+    # The flag is read as passed: env.set "0" overrides the caller's "1".
+    cfg = load(
+        cfg_dir,
+        f"""
+        kinds:
+          {kind}:
+            env:
+              set: {{CLAUDE_CODE_USE_BEDROCK: "0", CLAUDE_CODE_USE_VERTEX: "off"}}
+        """,
+    )
+    environ = {
+        **CALLER,
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "CLAUDE_CODE_USE_VERTEX": "1",
+        "AWS_REGION": "us-east-1",
+        "CLOUD_ML_REGION": "r",
+    }
+    result = build(cfg, kind, environ)
+    assert result.env["CLAUDE_CODE_USE_BEDROCK"] == "0"
+    assert result.env["CLAUDE_CODE_USE_VERTEX"] == "off"
+    assert "AWS_REGION" not in result.auth_names and "CLOUD_ML_REGION" not in result.auth_names
+    if kind != "implement":  # inherit mode passes them, but not as auth variables
+        assert "AWS_REGION" not in result.env and "CLOUD_ML_REGION" not in result.env
+
+
+@pytest.mark.parametrize("kind", ["implement", "rank", "review"])
+def test_provider_flag_true_in_env_set_selects(cfg_dir: Path, kind: str) -> None:
+    # The caller has no flag; env.set's " TRUE " (trimmed, lowercased) selects both providers.
+    cfg = load(
+        cfg_dir,
+        f"""
+        kinds:
+          {kind}:
+            env:
+              set: {{CLAUDE_CODE_USE_BEDROCK: " TRUE ", CLAUDE_CODE_USE_VERTEX: "yes"}}
+        """,
+    )
+    environ = {**CALLER, "AWS_REGION": "us-east-1", "CLOUD_ML_REGION": "r"}
+    result = build(cfg, kind, environ)
+    assert result.env["AWS_REGION"] == "us-east-1" and result.env["CLOUD_ML_REGION"] == "r"
+    assert {"AWS_REGION", "CLOUD_ML_REGION"} <= set(result.auth_names)
+
+
+def test_provider_flag_in_per_repo_env_set_is_read(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir,
+        """
+        repos:
+          github.com/o/r:
+            kinds:
+              review:
+                env:
+                  set: {CLAUDE_CODE_USE_BEDROCK: "1"}
+        """,
+    )
+    environ = {**CALLER, "AWS_REGION": "us-east-1"}
+    assert build(cfg, "review", environ, repo="github.com/o/r").env["AWS_REGION"] == "us-east-1"
+    assert "AWS_REGION" not in build(cfg, "review", environ).env
+
+
+def test_stripped_provider_flag_set_by_env_set_selects(cfg_dir: Path) -> None:
+    # secret_env strips the caller's flag, but env.set's value is what the session gets.
+    cfg = load(
+        cfg_dir,
+        """
+        secret_env: [CLAUDE_CODE_USE_BEDROCK]
+        kinds:
+          rank:
+            env: {set: {CLAUDE_CODE_USE_BEDROCK: "1"}}
+        """,
+    )
+    environ = {**CALLER, "AWS_REGION": "us-east-1"}
+    assert env_of(cfg, "rank", environ)["AWS_REGION"] == "us-east-1"
+
+
 # R10: auth_names come from the final environment.
 
 
@@ -702,7 +779,31 @@ def test_env_set_expansion_is_single_pass(cfg_dir: Path) -> None:
     assert env["X"] == "/w/${HOME}"
 
 
-@pytest.mark.parametrize("ref", ["${USER}", "${${HOME}}", "${HOME", "${}", "$${HOME}{"])
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("$${HOME}{", "$/home/user{"), ("${HOME}${", None), ("$}{${CWD}}", "$}{/work/repo}")],
+)
+def test_env_set_literal_dollar_and_braces_around_references(
+    cfg_dir: Path, value: str, expected: str | None
+) -> None:
+    # Every '${' must start an allowed reference; a lone '$', '{' or '}' is literal, and the
+    # single-pass expansion never forms a new reference from its result.
+    text = f"""
+        kinds:
+          implement:
+            env: {{inherit: true, allow: [], set: {{X: "{value}"}}, path_prepend: []}}
+        """
+    if expected is None:
+        with pytest.raises(UsageError):
+            load(cfg_dir, text)
+        with pytest.raises(UsageError):
+            build_unvalidated(load(cfg_dir), set={"X": value})
+        return
+    assert env_of(load(cfg_dir, text), "implement")["X"] == expected
+    assert build_unvalidated(load(cfg_dir), set={"X": value}).env["X"] == expected
+
+
+@pytest.mark.parametrize("ref", ["${USER}", "${${HOME}}", "${HOME", "${}"])
 def test_env_set_bad_reference_is_refused_at_load(cfg_dir: Path, ref: str) -> None:
     with pytest.raises(UsageError) as info:
         load(
@@ -718,7 +819,7 @@ def test_env_set_bad_reference_is_refused_at_load(cfg_dir: Path, ref: str) -> No
     assert SECRET not in detail and SECRET not in str(info.value)
 
 
-@pytest.mark.parametrize("ref", ["${USER}", "${${HOME}}", "${HOME", "$${HOME}{"])
+@pytest.mark.parametrize("ref", ["${USER}", "${${HOME}}", "${HOME"])
 def test_env_set_bad_reference_backstop(cfg_dir: Path, ref: str) -> None:
     with pytest.raises(UsageError) as info:
         build_unvalidated(load(cfg_dir), set={"TOKEN": SECRET + ref})

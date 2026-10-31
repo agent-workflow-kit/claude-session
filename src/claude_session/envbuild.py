@@ -12,8 +12,9 @@ caller's for ``exec``, the adopting process's for ``exec --session-id``); it nev
 2. ``claude_auth_env`` variables present in the environment (``AWS_*`` only when
    ``CLAUDE_CODE_USE_BEDROCK`` is true, the Google/Vertex names only when
    ``CLAUDE_CODE_USE_VERTEX`` is true; a flag is true when its value, trimmed and lowercased, is
-   ``1``, ``true``, ``yes`` or ``on``, and it is read as it will be passed: a flag that step 3
-   strips selects nothing).
+   ``1``, ``true``, ``yes`` or ``on``, and it is read as it will be passed: the expanded
+   ``env.set`` value when ``env.set`` sets it, else the environment's value unless step 3
+   strips it, in which case it selects nothing).
 3. ``secret_env`` variables removed unless the kind's ``env.allow`` (built-in, config and
    per-repo layers: ``profile.env.allow``) names them exactly. Names from ``--env-allow`` or
    ``--env-allowlist-only`` never unlock one. In allowlist-only mode the kind's ``env.allow`` is
@@ -21,10 +22,11 @@ caller's for ``exec``, the adopting process's for ``exec --session-id``); it nev
 4. Third-party-reading runs: token, tmux and ssh-agent variables removed; ``GH_CONFIG_DIR`` and
    ``GLAB_CONFIG_DIR`` point at ``$CSESSION_DIR/gh-empty``. Re-applied after step 5, so these
    win over ``env.set`` (``env.set`` may still set a ``secret_env`` name).
-5. ``env.set`` (``${CSESSION_DIR}``, ``${CWD}``, ``${HOME}``, ``${GIT_DIR}`` expanded once; any
-   other ``${`` is refused), then ``PATH`` = the executable directory, ``env.path_prepend``,
-   the kind's ``PATH``. Config validation already refuses invalid ``env.set``, ``env.allow``
-   and ``path_prepend`` entries; the checks here are a backstop.
+5. ``env.set`` (``${CSESSION_DIR}``, ``${CWD}``, ``${HOME}``, ``${GIT_DIR}`` expanded once,
+   before step 2 reads the provider flags; any other ``${`` is refused), then ``PATH`` = the
+   executable directory, ``env.path_prepend``, the kind's ``PATH``. Config validation
+   already refuses invalid ``env.set``, ``env.allow`` and ``path_prepend`` entries; the checks
+   here are a backstop.
 6. (#24) PATH sanitizing for isolated runs.
 7. (#23) git hardening for third-party-reading runs.
 8. Every ``CSESSION_*`` removed, then ``CSESSION_ID``, ``CSESSION_DIR``, ``CSESSION_KIND`` and,
@@ -146,16 +148,26 @@ def build(
         allowed = [*BASE_ALLOWLIST, *resolution.env_allowlist()]
         env = {name: value for name, value in environ.items() if _matches(name, allowed)}
 
-    # 3 (computed first: step 2 reads the provider flags as they will be passed).
+    # 3 and 5 (computed first: step 2 reads the provider flags as they will be passed).
     unlocking = set(profile.env.allow) if resolution.env_allowlist_only is None else set()
     stripped = [name for name in cfg.secret_env if name not in unlocking]
+    variables = {
+        "CSESSION_DIR": csession_dir,
+        "CWD": cwd,
+        "HOME": environ.get("HOME", ""),
+        "GIT_DIR": git_dir or "",
+    }
+    set_values: dict[str, str] = {}
+    for key, value in profile.env.set.items():
+        name = _check_set_name(key)  # before the value: an invalid name is never echoed
+        set_values[name] = _expand(name, value, variables)
 
     # 2. claude_auth_env.
     auth = [*AUTH_ENV, *cfg.claude_auth_env]
     auth_globs: list[str] = []
-    if _selected(BEDROCK_FLAG, environ, stripped):
+    if _selected(BEDROCK_FLAG, environ, stripped, set_values):
         auth_globs.extend(BEDROCK_ENV)
-    if _selected(VERTEX_FLAG, environ, stripped):
+    if _selected(VERTEX_FLAG, environ, stripped, set_values):
         auth_globs.extend(VERTEX_ENV)
     for name, value in environ.items():
         # Config extras are names only: compared exactly, never as globs.
@@ -171,16 +183,8 @@ def build(
     if profile.reads_third_party:
         _third_party(env, csession_dir)
 
-    # 5. env.set, path_prepend, the executable directory.
-    variables = {
-        "CSESSION_DIR": csession_dir,
-        "CWD": cwd,
-        "HOME": environ.get("HOME", ""),
-        "GIT_DIR": git_dir or "",
-    }
-    for key, value in profile.env.set.items():
-        name = _check_set_name(key)  # before the value: an invalid name is never echoed
-        env[name] = _expand(name, value, variables)
+    # 5. env.set (expanded above), path_prepend, the executable directory.
+    env.update(set_values)
     for entry in profile.env.path_prepend:
         _check_path_entry(entry, UsageError, "env.path_prepend")
     kind_path = env.get("PATH", "")
@@ -217,12 +221,22 @@ def _passable(name: str, value: str) -> bool:
     return bool(name) and "=" not in name and "\x00" not in name and "\x00" not in value
 
 
-def _selected(flag: str, environ: Mapping[str, str], stripped: Iterable[str]) -> bool:
-    """Whether a provider flag selects its provider: passed (not stripped by ``secret_env``)
-    and true (trimmed and lowercased, one of ``TRUE_VALUES``)."""
-    if flag in stripped:
+def _selected(
+    flag: str,
+    environ: Mapping[str, str],
+    stripped: Iterable[str],
+    set_values: Mapping[str, str],
+) -> bool:
+    """Whether a provider flag selects its provider, read as it will be passed: the expanded
+    ``env.set`` value when ``env.set`` sets it, else the environment's value unless
+    ``secret_env`` strips it; true when, trimmed and lowercased, it is one of ``TRUE_VALUES``."""
+    if flag in set_values:
+        value = set_values[flag]
+    elif flag in stripped:
         return False
-    return environ.get(flag, "").strip().lower() in TRUE_VALUES
+    else:
+        value = environ.get(flag, "")
+    return value.strip().lower() in TRUE_VALUES
 
 
 def _third_party(env: dict[str, str], csession_dir: str) -> None:
