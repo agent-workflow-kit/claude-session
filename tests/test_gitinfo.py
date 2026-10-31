@@ -399,3 +399,13 @@ def test_credential_warning_wording() -> None:
         "the repository git config may hold a credential in imap.pass; the session can read it"
         " (use a credential helper instead)"
     ]
+
+
+def test_a_resolved_git_runs_from_its_path_with_argv0_its_name(tmp_path: Path) -> None:
+    (tmp_path / "r" / ".git").mkdir(parents=True)
+    run = fake(0, ".git\n.git\n")
+    gitinfo.resolve(str(tmp_path / "r"), git="/opt/real/git", environ={}, gw=run, git_name="git")
+    gitinfo.credential_warnings("/w", git="/opt/real/git", environ={}, gw=run, git_name="git")
+    for call in run.calls:
+        assert call["argv"][0] == "git"
+        assert call["executable"] == "/opt/real/git"

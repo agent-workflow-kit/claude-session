@@ -155,9 +155,51 @@ def _report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _exec(args: argparse.Namespace) -> int:
+    """``exec`` of a new headless session: launch steps 2 to 7, then supervision (interface.md,
+    Launch order and exec). A launch-phase end exits 12 with the outcome object."""
+    if args.session_id is not None:
+        # TODO(#28): adoption of a pending run created by start.
+        raise InternalError("exec --session-id is not implemented yet", detail="not_implemented")
+    if args.dry_run:
+        # TODO(#27): the dry-run plan.
+        raise InternalError("exec --dry-run is not implemented yet", detail="not_implemented")
+    from . import launch, supervisor
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    with store.open_state() as st:
+        process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+        req = launch.read_request(args, cfg)
+        resolved = launch.resolve_kind(req, cfg, process)
+        alloc = launch.allocate(st, req, resolved, process)
+        ended = launch.run(
+            st, cfg, req, resolved, alloc, process, supervise=supervisor.run_headless
+        )
+        outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
+    _print_outcome(outcome, args.json)
+    return int(outcome["exit_code"]) if ended is None else ended.exit_code
+
+
+def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
+    """``--json``: the outcome object on stdout; otherwise a one-line summary on stderr."""
+    if json_mode:
+        print(json.dumps(outcome, ensure_ascii=False))
+        return
+    line = (
+        f"{outcome['csession_id']} run {outcome['run']}: {outcome['outcome']}"
+        f" ({outcome['end_reason']}), exit {outcome['exit_code']}"
+    )
+    if outcome["message"]:
+        line += f": {outcome['message']}"
+    print(f"{PROG}: {sanitize(line)}", file=sys.stderr)
+    for warning in outcome["warnings"]:
+        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+
+
 # Command name (as typed, nested commands joined by a space) -> handler.
 HANDLERS: dict[str, Handler] = {
-    "exec": _not_implemented,
+    "exec": _exec,
     "start": _not_implemented,
     "resume": _not_implemented,
     "stop": _not_implemented,

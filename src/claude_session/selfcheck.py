@@ -28,14 +28,14 @@ command that removes it.
 Prerequisite probes run through the #51 ``Gateway`` (a fake one in tests), by absolute path
 and with a fixed minimal environment.
 
-TODO(#15): exec calls ``tmpdir.check`` at the temporary-directory slot of launch step 5 and
-``self_check`` after the ``claude_args`` check (and both again at adoption) with the
-resolved ``bwrap`` and ``socat``, records ``sandbox_active`` on the run, adds the warnings to
-the run's warnings, passes ``tmpdir`` to ``settings_builder.Isolation`` and ``envbuild``, and
-maps a ``LaunchValidationError`` (with its ``hint``) to a not-started run.
-TODO(#24): ``bwrap`` and ``socat`` come from the PATH sanitizing's absolute tool resolution
-(outside session-writable paths); this module only checks that they are absolute,
-executable regular files.
+``exec`` (``launch.check_sandbox``) calls ``tmpdir.check`` at the temporary-directory slot of
+launch step 5 and ``self_check`` after the ``claude_args`` check with ``bwrap`` and ``socat``
+resolved by ``pathrules.resolve_tool`` (outside session-writable paths; this module only
+checks that they are absolute, executable regular files, and probes them by their realpath),
+records ``sandbox_active`` on the run, adds the warnings to the run's warnings, passes
+``tmpdir`` to ``settings_builder.Isolation`` and ``envbuild``, and maps a
+``LaunchValidationError`` (with its ``hint`` as the outcome message) to a not-started run.
+TODO(#28): adoption calls both again.
 TODO(#27): ``--dry-run`` calls ``tmpdir.check`` at the temporary-directory slot of launch
 step 5, then ``self_check(..., create=False)`` after the ``claude_args`` check, for
 ``would_fail``, ``sandbox_active`` and ``warnings``.

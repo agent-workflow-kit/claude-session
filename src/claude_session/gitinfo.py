@@ -5,13 +5,13 @@ Every git command runs through ``gateway`` with the absolute ``git`` resolved at
 hardening options of ``kinds.GIT_HARDENING`` and ``kinds.git_env`` (no inherited variable that
 selects another repository or extra config; ``GIT_CONFIG_NOSYSTEM=1``).
 
-TODO(#15): exec resolves the git directory at the session's first launch (``resolve``; its
-``FailedError`` ends the launch ``unsafe_cwd``: the cwd's git directories cannot be determined,
-so the run cannot protect them), stores
-``stored_value`` on the session, and at every resume and adoption calls ``check_unchanged``;
-``check_git_cwd`` for the run kind; ``credential_warnings`` on third-party-reading runs with a
-git directory (each warning also logged as ``config_warning``). kinds.git_origin_url moves here
-with the #51 gateway wiring.
+``exec`` (``launch.check_git``) resolves the git directory at the session's first launch
+(``resolve``; its ``FailedError`` ends the launch ``unsafe_cwd``), stores ``stored_value`` on
+the session, calls ``check_git_cwd`` for the run kind and ``credential_warnings`` on
+third-party-reading runs with a git directory. The origin lookup stays in
+``kinds.git_origin_url`` (``kinds`` resolves the repo before a launch has a git directory).
+TODO(#28): adoption calls ``check_unchanged`` against the stored value.
+TODO(#29): every resume calls ``check_unchanged`` against the stored value.
 """
 
 from __future__ import annotations
@@ -53,12 +53,17 @@ class GitDirs:
 
 
 def resolve(
-    cwd: str, *, git: str, environ: Mapping[str, str], gw: Gateway = _SYSTEM_GATEWAY
+    cwd: str,
+    *,
+    git: str,
+    environ: Mapping[str, str],
+    gw: Gateway = _SYSTEM_GATEWAY,
+    git_name: str | None = None,
 ) -> GitDirs | None:
     """The git directories of ``cwd`` (``git rev-parse --git-common-dir --git-dir``, made
     absolute against ``cwd`` and resolved), or None when ``cwd`` is not in a repository:
     git's stderr has a line starting ``fatal: not a git repository`` and no ``.git``
-    entry exists at ``cwd`` or any ancestor on the same file system (``_git_entry_above``).
+    entry exists at ``cwd`` or any ancestor on the same file system (``git_entry_above``).
     Raises ``FailedError`` when git fails for any other reason (for example a repository
     git refuses as of dubious ownership, a broken or unreadable ``.git``), when its output
     is not exactly two lines, or when a printed directory does not exist: "no git
@@ -66,14 +71,14 @@ def resolve(
     the first line of git's stderr, control characters replaced, at most
     ``STDERR_EXCERPT`` characters.
 
-    TODO(#15): the launch path maps ``FailedError`` to the end reason ``unsafe_cwd``."""
+    The launch path maps ``FailedError`` to the end reason ``unsafe_cwd``."""
     argv = [git, *kinds.GIT_HARDENING, "-C", cwd, "rev-parse", "--git-common-dir", "--git-dir"]
-    result = _run(gw, argv, environ)
+    result = _run(gw, argv, environ, git_name)
     if result.returncode != 0:
         not_a_repository = any(
             line.startswith(NOT_A_REPOSITORY) for line in result.stderr.splitlines()
         )
-        if not_a_repository and not _git_entry_above(cwd):
+        if not_a_repository and not git_entry_above(cwd):
             return None
         raise FailedError(
             "git rev-parse failed",
@@ -96,7 +101,7 @@ def stderr_excerpt(stderr: str) -> str:
     return _CONTROL.sub("?", first)[:STDERR_EXCERPT]
 
 
-def _git_entry_above(cwd: str) -> bool:
+def git_entry_above(cwd: str) -> bool:
     """Whether a ``.git`` entry (``lstat``: any type) exists at ``cwd`` or an ancestor on
     the same file system (git stops its discovery at a mount boundary). A ``cwd`` that
     cannot be examined counts as having one (fail closed)."""
@@ -152,7 +157,12 @@ def check_git_cwd(kind: str, current: GitDirs | None) -> None:
 
 
 def credential_warnings(
-    cwd: str, *, git: str, environ: Mapping[str, str], gw: Gateway = _SYSTEM_GATEWAY
+    cwd: str,
+    *,
+    git: str,
+    environ: Mapping[str, str],
+    gw: Gateway = _SYSTEM_GATEWAY,
+    git_name: str | None = None,
 ) -> list[str]:
     """Warnings for credentials in the repository config of ``cwd`` (local and worktree
     scopes, includes followed; read-only). A warning names the key (a subsection holding
@@ -170,7 +180,7 @@ def credential_warnings(
         "-z",
     ]
     try:
-        result = _run(gw, argv, environ)
+        result = _run(gw, argv, environ, git_name)
     except FailedError:
         return ["could not read the repository git config to check it for credentials"]
     if result.returncode != 0:
@@ -244,10 +254,15 @@ def _masked(key: str) -> str:
     return "".join(char if char.isprintable() else "?" for char in key)
 
 
-def _run(gw: Gateway, argv: list[str], environ: Mapping[str, str]) -> Result:
+def _run(gw: Gateway, argv: list[str], environ: Mapping[str, str], git_name: str | None) -> Result:
+    """Run git: ``argv[0]`` is the resolved git's realpath; with ``git_name`` that path is the
+    executable and ``argv[0]`` the bare name (``pathrules.resolve_tool``)."""
+    executable = None
+    if git_name is not None:
+        executable, argv = argv[0], [git_name, *argv[1:]]
     try:
         # git_env sets LC_ALL=C: "not a git repository" is matched in git's (untranslated)
         # stderr. The gateway gives git /dev/null as stdin and decodes its output as UTF-8.
-        return gw.run(argv, timeout=GIT_TIMEOUT, env=kinds.git_env(environ))
+        return gw.run(argv, timeout=GIT_TIMEOUT, env=kinds.git_env(environ), executable=executable)
     except (OSError, ValueError, GatewayTimeout) as exc:
         raise FailedError("git could not be run", detail=type(exc).__name__) from exc

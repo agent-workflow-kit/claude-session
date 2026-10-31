@@ -268,14 +268,16 @@ def _check_repo(value: str, where: str) -> None:
         raise UsageError(f"{where}: invalid repo id (expected host[:port]/path)")
 
 
-def git_origin_url(cwd: str, *, git: str, gw: Gateway) -> str | None:
+def git_origin_url(cwd: str, *, git: str, gw: Gateway, git_name: str | None = None) -> str | None:
     """The URL of the ``origin`` remote of the repository at ``cwd`` (hardened, read-only git),
-    or None when there is none or git fails. ``git`` is the absolute git resolved at launch.
-    The output is decoded by the gateway (UTF-8, invalid bytes replaced); only git's trailing
-    newline is removed."""
-    argv = [git, *GIT_HARDENING, "-C", os.fspath(cwd), "remote", "get-url", "origin"]
+    or None when there is none or git fails. ``git`` is the absolute git resolved at launch
+    (``pathrules.resolve_tool``: its realpath, run with ``argv[0]`` = ``git_name`` when
+    given). The output is decoded by the gateway (UTF-8, invalid bytes replaced); only git's
+    trailing newline is removed."""
+    argv = [git_name or git, *GIT_HARDENING, "-C", os.fspath(cwd), "remote", "get-url", "origin"]
+    executable = git if git_name else None
     try:
-        result = gw.run(argv, timeout=GIT_TIMEOUT, env=git_env(os.environ))
+        result = gw.run(argv, timeout=GIT_TIMEOUT, env=git_env(os.environ), executable=executable)
     except (OSError, ValueError, GatewayTimeout):
         return None
     if result.returncode != 0:

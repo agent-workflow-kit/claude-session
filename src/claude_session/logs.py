@@ -77,6 +77,7 @@ REASONS = frozenset(
         "fork_cwd_unsupported",
         "no_tty",
         "tmpdir_unsafe",
+        "session_dir_unsafe",
         "unsafe_claude_args",
         "unsafe_setting_sources",
         "claude_too_old",

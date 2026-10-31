@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sqlite3
@@ -1119,6 +1120,55 @@ def test_default_liveness_counts_a_pid_it_may_not_signal_as_alive() -> None:
 
 def test_default_holder_is_this_process() -> None:
     assert store.current_holder().pid == os.getpid()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procinfo through /proc")
+def test_default_liveness_compares_the_procinfo_start_time() -> None:
+    me = store.start_time(os.getpid())
+    assert me and ":" in me  # <boot_id>:<ticks>
+    assert store.pid_alive(os.getpid(), me)
+    assert not store.pid_alive(os.getpid(), me + "0")  # a reused PID: another start time
+    assert store.current_holder() == Holder(pid=os.getpid(), start=me)
+
+
+def test_default_liveness_counts_an_unanswerable_check_as_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_session.procinfo import ProcInfoError
+
+    class Broken:
+        def is_alive(self, pid: int, start: str) -> bool:
+            raise ProcInfoError("cannot tell")
+
+    monkeypatch.setattr(store, "_procinfo", Broken())
+    assert store.pid_alive(12345, "x:1")
+
+
+def test_the_holder_is_computed_only_when_a_lease_needs_it(
+    db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[int] = []
+    real = store.current_holder
+
+    def counting() -> Holder:
+        calls.append(1)
+        return real()
+
+    store.Store.open(db).close()  # created and migrated (the migrate lease needs the holder)
+    monkeypatch.setattr(store, "current_holder", counting)
+    with store.Store.open(db, migrate=False) as s:
+        assert calls == []  # the hook path opens a store and never takes a lease
+        assert s.take_lease("reconcile")
+        assert calls == [1]
+
+
+def test_a_migration_is_logged(db: str) -> None:
+    open_as(db, ME).close()
+    log = Path(db).parent / "log.jsonl"
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [r["event"] for r in records] == ["migration"]
+    open_as(db, ME).close()  # nothing to migrate: nothing logged
+    assert len(log.read_text().splitlines()) == 1
 
 
 # Concurrency: BEGIN IMMEDIATE with a busy timeout

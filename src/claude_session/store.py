@@ -252,12 +252,37 @@ def parse_ts(text: str) -> datetime:
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
 
 
+_procinfo: Any = None
+
+
+def system_procinfo() -> Any:
+    """The process's ``procinfo.ProcInfo`` over the real gateway, made on first use (imported
+    lazily: the hook path opens a store but never checks liveness)."""
+    global _procinfo
+    if _procinfo is None:
+        from .gateway import SystemGateway
+        from .procinfo import ProcInfo
+
+        _procinfo = ProcInfo(SystemGateway())
+    return _procinfo
+
+
+def start_time(pid: int) -> str:
+    """The procinfo start-time token of ``pid`` (``""``: gone, a zombie, or unknown). Stored
+    as data: changing the token format would make every live run look dead."""
+    from .gateway import GatewayTimeout
+    from .procinfo import ProcInfoError
+
+    try:
+        return system_procinfo().start_time(pid) or ""
+    except (ProcInfoError, OSError, ValueError, GatewayTimeout):
+        return ""
+
+
 def current_holder() -> Holder:
-    """This process as a lease holder (start ``""``: unknown, see ``Store.take_lease``)."""
-    # TODO(#6): wire procinfo.start_time/is_alive into current_holder() and the default
-    # liveness (a None start time becomes ""); keep liveness cheap, it runs inside
-    # BEGIN IMMEDIATE.
-    return Holder(pid=os.getpid(), start="")
+    """This process as a lease holder, with its procinfo start time (``""`` when unknown:
+    see ``Store.take_lease``)."""
+    return Holder(pid=os.getpid(), start=start_time(os.getpid()))
 
 
 def pid_exists(pid: int) -> bool:
@@ -274,10 +299,23 @@ def pid_exists(pid: int) -> bool:
 
 
 def pid_alive(pid: int, start: str) -> bool:
-    """Interim liveness check: whether ``pid`` exists. It ignores ``start``, so a reused PID
-    counts as alive and its lease is only taken over once it expires (safe, just slower)."""
-    del start
-    return pid_exists(pid)
+    """The default liveness check: whether the exact process ``pid`` with the procinfo
+    start-time token ``start`` still runs (not a zombie). An unknown start (``""``) falls back
+    to whether ``pid`` exists. When the platform cannot answer (procinfo error), the process
+    counts as alive: a live process must never be finalized or have its lease taken (a dead
+    one is then only noticed later, which is safe). Cheap on Linux (one ``/proc`` read):
+    it runs inside ``BEGIN IMMEDIATE``."""
+    if start == "":
+        return pid_exists(pid)
+    from .gateway import GatewayTimeout
+    from .procinfo import ProcInfoError
+
+    try:
+        return bool(system_procinfo().is_alive(pid, start))
+    except (ProcInfoError, OSError, GatewayTimeout):
+        return True
+    except ValueError:  # not a valid PID
+        return False
 
 
 # Schema
@@ -537,6 +575,19 @@ def _open_connection(path: str, *, migrate: bool, busy_timeout: float) -> sqlite
     return conn
 
 
+def _log_migration(db: str, version: Version) -> None:
+    """The ``migration`` record in ``log.jsonl`` next to ``state.db`` (best effort: a
+    migration that committed is never undone because its record could not be written)."""
+    try:
+        from .logs import EventLog
+
+        EventLog(os.path.join(os.path.dirname(db), "log.jsonl")).write(
+            "migration", message=f"state.db schema migrated to {format_version(version)}"
+        )
+    except (OSError, ValueError):
+        pass
+
+
 # Store
 
 
@@ -548,13 +599,14 @@ class Store:
         conn: sqlite3.Connection,
         *,
         path: str,
-        holder: Holder,
+        holder: Holder | None,
         liveness: Liveness,
         clock: Clock,
     ) -> None:
         self.conn = conn
         self.path = path
-        self.holder = Holder(pid=holder.pid, start=holder.start or "")
+        # Computed on first use (leases): the hook path never needs this process's start time.
+        self._holder = None if holder is None else Holder(pid=holder.pid, start=holder.start or "")
         # Lease ownership is (pid, start, token): two stores of one process never share one.
         self.token = uuid.uuid4().hex
         self.liveness = liveness
@@ -590,8 +642,7 @@ class Store:
         store = cls(
             conn,
             path=path,
-            holder=holder or current_holder(),
-            # TODO(#6): wire procinfo liveness (PID + start time) as the default.
+            holder=holder,
             liveness=liveness or pid_alive,
             clock=clock or utc_now,
         )
@@ -604,6 +655,13 @@ class Store:
             conn.close()
             raise
         return store
+
+    @property
+    def holder(self) -> Holder:
+        """This store's lease holder (default: this process, ``current_holder``)."""
+        if self._holder is None:
+            self._holder = current_holder()
+        return self._holder
 
     def close(self) -> None:
         self.conn.close()
@@ -754,7 +812,7 @@ class Store:
                         "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                         (format_version(migration.version),),
                     )
-                # TODO(#7): log a `migration` event.
+                _log_migration(path, migration.version)
                 if not self.renew_lease(MIGRATE_LEASE):
                     raise FailedError(
                         "lost the migrate lease while migrating state.db",
@@ -905,6 +963,236 @@ class Store:
             )
             if cursor.rowcount != 1:
                 raise InternalError(f"no run {run_no} of session {csession_id}")
+
+    # Launch and supervision (exec). Each method is one transaction.
+
+    def allocate(self, run: NewRun, *, new_id: Callable[[Callable[[str], bool]], str]) -> str:
+        """Launch step 4: allocate a session id (``new_id`` is ``ids.new_session_id``, given
+        ``session_id_used`` so the check and the insert share this transaction) and insert the
+        session (state ``starting``), its run 1 (phase ``launch``, the wrapper already set:
+        plain ``exec`` performs every step itself), its labels and the ``launch`` event. A
+        third-party-reading run taints the session here (interface.md, Taint). Returns the
+        session id."""
+        with self.transaction() as conn:
+            csession_id = new_id(self.session_id_used)
+            now = format_ts(self.clock())
+            conn.execute(
+                "INSERT INTO sessions (csession_id, created_at, launch_kind, csession_dir, "
+                "private_dir, tainted, tainted_at, tainted_by_run, current_run, state, "
+                "state_since, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'starting', ?, ?)",
+                (
+                    csession_id,
+                    now,
+                    run.kind,
+                    os.path.join(run.state_root, "sessions", csession_id),
+                    os.path.join(run.state_root, "private", csession_id),
+                    int(run.reads_third_party),
+                    now if run.reads_third_party else None,
+                    1 if run.reads_third_party else None,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO runs (csession_id, run_no, created_at, run_kind, reads_third_party, "
+                "mode, repo, model, skill, has_prompt, spec_json, resolved_json, config_hash, "
+                "invocation_json, decision_ids_json, warnings_json, hook_interpreter, "
+                "config_path, wrapper_pid, wrapper_start, outcome_file, phase) "
+                "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'launch')",
+                (
+                    csession_id,
+                    now,
+                    run.kind,
+                    int(run.reads_third_party),
+                    run.mode,
+                    run.repo,
+                    run.model,
+                    run.skill,
+                    int(run.has_prompt),
+                    json.dumps(run.spec, ensure_ascii=False, sort_keys=True),
+                    json.dumps(run.resolved, ensure_ascii=False, sort_keys=True),
+                    run.config_hash,
+                    json.dumps(run.invocation, ensure_ascii=False, sort_keys=True),
+                    json.dumps(list(run.decision_ids), ensure_ascii=False),
+                    json.dumps(list(run.warnings), ensure_ascii=False),
+                    run.hook_interpreter,
+                    run.config_path,
+                    run.wrapper_pid,
+                    run.wrapper_start,
+                    run.outcome_file,
+                ),
+            )
+            labels = sorted({f"kind={run.kind}", *run.labels})
+            for label in labels:
+                key, _, value = label.partition("=")
+                conn.execute(
+                    "INSERT OR IGNORE INTO labels (csession_id, key, value) VALUES (?, ?, ?)",
+                    (csession_id, key, value),
+                )
+            conn.execute(
+                "INSERT INTO events (csession_id, run_no, event_ts, from_state, to_state, "
+                "from_activity, to_activity, needs_input_reason, cause, final, labels_json) "
+                "VALUES (?, 1, ?, NULL, 'starting', NULL, NULL, NULL, 'launch', 0, ?)",
+                (csession_id, now, json.dumps(labels, ensure_ascii=False)),
+            )
+        return csession_id
+
+    def update_run(self, csession_id: str, run_no: int, **fields: Any) -> None:
+        """Set columns of a run row (only ``RUN_FIELDS``). ``InternalError`` when the run row
+        does not exist."""
+        unknown = sorted(set(fields) - RUN_FIELDS)
+        if unknown or not fields:
+            raise ValueError(f"not settable run fields: {unknown}")
+        columns = sorted(fields)
+        assignments = ", ".join(f"{name} = ?" for name in columns)
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                f"UPDATE runs SET {assignments} WHERE csession_id = ? AND run_no = ?",
+                (*(fields[name] for name in columns), csession_id, run_no),
+            )
+            if cursor.rowcount != 1:
+                raise InternalError(f"no run {run_no} of session {csession_id}")
+
+    def update_session(self, csession_id: str, **fields: Any) -> None:
+        """Set columns of a session row (only ``SESSION_FIELDS``)."""
+        unknown = sorted(set(fields) - SESSION_FIELDS)
+        if unknown or not fields:
+            raise ValueError(f"not settable session fields: {unknown}")
+        columns = sorted(fields)
+        assignments = ", ".join(f"{name} = ?" for name in columns)
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                f"UPDATE sessions SET {assignments} WHERE csession_id = ?",
+                (*(fields[name] for name in columns), csession_id),
+            )
+            if cursor.rowcount != 1:
+                raise InternalError(f"no session {csession_id}")
+
+    def add_run_warnings(self, csession_id: str, run_no: int, warnings: Sequence[str]) -> None:
+        """Append ``warnings`` to the run's ``warnings_json`` (duplicates kept once)."""
+        if not warnings:
+            return
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT warnings_json FROM runs WHERE csession_id = ? AND run_no = ?",
+                (csession_id, run_no),
+            ).fetchone()
+            if row is None:
+                raise InternalError(f"no run {run_no} of session {csession_id}")
+            current = json.loads(row[0] or "[]")
+            merged = list(dict.fromkeys([*current, *warnings]))
+            conn.execute(
+                "UPDATE runs SET warnings_json = ? WHERE csession_id = ? AND run_no = ?",
+                (json.dumps(merged, ensure_ascii=False), csession_id, run_no),
+            )
+
+    def set_implicit_report(self, csession_id: str, run_no: int, artifact: Frozen) -> bool:
+        """Store an implicit done (headless ``result`` accepted as done): status ``done``,
+        ``report_implicit`` 1, no summary or reason, the frozen ``result.md`` as artifact.
+        Only while the run has no report and is not final; returns whether it was stored."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET report_status = 'done', report_implicit = 1, "
+                "report_summary = NULL, report_reason = NULL, artifact_name = ?, "
+                "artifact_path = ?, artifact_sha256 = ?, artifact_size = ?, "
+                "artifact_ingest_seq = ?, reported_at = ? "
+                "WHERE csession_id = ? AND run_no = ? AND report_status IS NULL "
+                "AND ended_at IS NULL",
+                (
+                    artifact.name,
+                    artifact.path,
+                    artifact.sha256,
+                    artifact.size,
+                    artifact.ingest_seq,
+                    format_ts(self.clock()),
+                    csession_id,
+                    run_no,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def finalize_run(self, csession_id: str, run_no: int, final: Final) -> bool:
+        """The finalization compare-and-set (design.md, Data model): on ``ended_at IS NULL``,
+        record the outcome, set the session's final state (``exited`` when the run has a
+        report, else the outcome's state) and append the one final event. Returns whether
+        this call won (False: the run was already final, nothing changed)."""
+        with self.transaction() as conn:
+            now = format_ts(self.clock())
+            cursor = conn.execute(
+                "UPDATE runs SET ended_at = ?, phase = ?, outcome = ?, end_reason = ?, "
+                "exit_code = ?, cost_usd = ?, num_turns = ?, is_error = ?, "
+                "message = COALESCE(?, message) "
+                "WHERE csession_id = ? AND run_no = ? AND ended_at IS NULL",
+                (
+                    now,
+                    final.phase,
+                    final.outcome,
+                    final.end_reason,
+                    final.exit_code,
+                    final.cost_usd,
+                    final.num_turns,
+                    None if final.is_error is None else int(final.is_error),
+                    final.message,
+                    csession_id,
+                    run_no,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            row = conn.execute(
+                "SELECT s.state, s.activity, r.report_status FROM sessions s JOIN runs r "
+                "ON r.csession_id = s.csession_id AND r.run_no = ? WHERE s.csession_id = ?",
+                (run_no, csession_id),
+            ).fetchone()
+            if row is None:
+                raise InternalError(f"no run {run_no} of session {csession_id}")
+            before_state, before_activity, report_status = row
+            state = "exited" if report_status is not None else final.state
+            conn.execute(
+                "UPDATE sessions SET state = ?, activity = NULL, needs_input_reason = NULL, "
+                "state_since = CASE WHEN state IS ? THEN state_since ELSE ? END, updated_at = ? "
+                "WHERE csession_id = ? AND current_run = ?",
+                (state, state, now, now, csession_id, run_no),
+            )
+            labels = [
+                f"{key}={value}"
+                for key, value in conn.execute(
+                    "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+                    (csession_id,),
+                )
+            ]
+            conn.execute(
+                "INSERT INTO events (csession_id, run_no, event_ts, from_state, to_state, "
+                "from_activity, to_activity, needs_input_reason, cause, final, labels_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, 1, ?)",
+                (
+                    csession_id,
+                    run_no,
+                    now,
+                    before_state,
+                    state,
+                    before_activity,
+                    final.cause,
+                    json.dumps(labels, ensure_ascii=False),
+                ),
+            )
+        return True
+
+    def run_record(self, csession_id: str, run_no: int) -> dict[str, Any]:
+        """The run row joined with its session's ``forked_from``, ``claude_session_id`` and
+        ``state`` (for the outcome object). ``InternalError`` when it does not exist."""
+        cursor = self.conn.execute(
+            "SELECT r.*, s.forked_from AS session_forked_from, "
+            "s.claude_session_id AS session_claude_session_id, s.state AS session_state "
+            "FROM runs r JOIN sessions s ON s.csession_id = r.csession_id "
+            "WHERE r.csession_id = ? AND r.run_no = ?",
+            (csession_id, run_no),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise InternalError(f"no run {run_no} of session {csession_id}")
+        names = [column[0] for column in cursor.description]
+        return dict(zip(names, row, strict=True))
 
     # The hook path (hookevent). Call these inside one ``transaction()``; they read and write
     # only columns of schema 1.0, so a newer additive schema keeps working (design.md, Data
@@ -1124,6 +1412,68 @@ class Store:
             (run.csession_id, run.run_no),
         )
         return cursor.rowcount == 1
+
+
+# Run and session columns ``exec`` sets after allocation (``update_run``, ``update_session``).
+RUN_FIELDS = frozenset(
+    {
+        "cwd",
+        "permission_profile",
+        "permission_profile_snapshot",
+        "sandbox_active",
+        "started_at",
+        "child_pid",
+        "child_start",
+        "backstop_used",
+        "pending_cause",
+        "message",
+    }
+)
+SESSION_FIELDS = frozenset({"tmp_dir", "git_dir"})
+
+
+@dataclass(frozen=True)
+class NewRun:
+    """What launch step 4 records for a new session's run 1 (``Store.allocate``). JSON fields
+    hold no secret values and no prompt text (design.md, Data model)."""
+
+    state_root: str
+    kind: str
+    reads_third_party: bool
+    mode: str
+    repo: str | None
+    model: str | None
+    skill: str | None
+    has_prompt: bool
+    spec: dict[str, Any]
+    resolved: dict[str, Any]
+    config_hash: str | None
+    invocation: dict[str, Any]
+    hook_interpreter: str
+    config_path: str | None
+    wrapper_pid: int
+    wrapper_start: str
+    labels: tuple[str, ...] = ()
+    decision_ids: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    outcome_file: str | None = None
+
+
+@dataclass(frozen=True)
+class Final:
+    """A run's final record (``Store.finalize_run``). ``state`` is the outcome's final state;
+    the session's state becomes ``exited`` instead when the run has a report."""
+
+    phase: str
+    outcome: str
+    end_reason: str
+    exit_code: int
+    state: str
+    cause: str
+    cost_usd: float | None = None
+    num_turns: int | None = None
+    is_error: bool | None = None
+    message: str | None = None
 
 
 @dataclass(frozen=True)

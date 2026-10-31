@@ -13,7 +13,7 @@ Status: planned, 2026-10-29. Implements [interface.md](interface.md) (normative)
 
 ## Module map
 
-The plan splits six modules out of design.md's module list to keep files focused: `ids` (from `cli`/`store`), `endmap` (from `supervisor`), `pathrules` (from `settings_builder`), `lifecycle` (from `supervisor` and `reconcile`), `notes` (from `hookevent`) and `secretindex` (from `outbox`). Responsibilities are unchanged.
+The plan splits seven modules out of design.md's module list to keep files focused: `ids` (from `cli`/`store`), `endmap` and `launch` (from `supervisor`), `pathrules` (from `settings_builder`), `lifecycle` (from `supervisor` and `reconcile`), `notes` (from `hookevent`) and `secretindex` (from `outbox`). Responsibilities are unchanged.
 
 | Module | Stage | Responsibility |
 |---|---|---|
@@ -32,6 +32,7 @@ The plan splits six modules out of design.md's module list to keep files focused
 | `outbox.py` | 1 | `report` write side and ingestion |
 | `endmap.py` | 1, 2 | headless and interactive outcome mapping |
 | `supervisor.py` | 1, 2 | `exec`/`resume` process supervision |
+| `launch.py` | 1, 3 | launch steps 2 to 7 of a run, one function per step (validations, allocation, session files, settings) |
 | `toolhooks.py` | 2, 4 | `pre-launch` and `post-state-change` execution and delivery |
 | `secretindex.py` | 3 | `contains_secret` keyed q-gram index: build, read, streamed scan (stdlib only: on the hook path) |
 | `pathrules.py` | 3 | path rules, session-writable paths, PATH sanitizing |

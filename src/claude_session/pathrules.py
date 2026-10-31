@@ -21,16 +21,17 @@ The checks raise ``errors.LaunchValidationError`` with the end reason interface.
 session-writable path is a ``UsageError`` (exit 2). Messages name paths, never profile
 values other than the offending path.
 
-TODO(#15): exec builds ``Host`` and ``PathRules`` at launch step 5 and calls, for isolated
-runs, ``check_host`` first (the write checks assume a valid ``$HOME``), ``check_cwd`` (before
-``permission_profiles.expand``), ``resolve_dirs`` and ``resolve_write_dirs``, builds
+``exec`` (``launch.validate``) builds ``Host`` and ``PathRules`` at launch step 5 after the
+session directories exist and calls, for isolated runs, ``check_host`` first (the write
+checks assume a valid ``$HOME``), ``check_cwd`` (before ``permission_profiles.expand``),
+``resolve_dirs`` and ``resolve_write_dirs`` (creating ``create``), builds
 ``session_writable``, then ``check_read_dirs``, ``check_write_dirs`` and ``check_profile``
 (with it), ``check_plugin_dirs``, ``check_generated`` (every generated allowRead entry, the
 git directory included), ``check_claude_args``, and passes ``session_writable`` to
 ``permission_profiles.select``, ``envbuild.build``, ``resolve_tool`` (``claude_bin``,
 ``bwrap``, ``socat``, ``git`` on the sanitized PATH) and
 ``settings_builder.check_interpreter``; trusted runs call ``check_profile`` (refused paths
-only). #28 repeats them at adoption.
+only). TODO(#28): adoption repeats them.
 """
 
 from __future__ import annotations
@@ -995,7 +996,7 @@ def resolve_write_dirs(resolved: Sequence[str], *, session_dir: str) -> WriteDir
     ``check_write_dirs`` then refuses an entry strictly below ``outbox/``, ``artifacts/`` or
     ``work/`` (``user_entry_problem``).
 
-    TODO(#15): exec creates ``create`` (private-directory helpers) before launch."""
+    ``exec`` creates ``create`` before launch (``SessionDirs.ensure_session_subdir``)."""
     session = os.path.realpath(session_dir)
     own = [os.path.join(session, name) for name in OWN_WRITABLE]
     dirs: list[str] = []
@@ -1128,8 +1129,8 @@ def resolve_tool(
     exec time) with ``argv[0]`` set to the bare tool name (``ResolvedTool.name``). Raises
     ``LaunchValidationError`` (``unsafe_path``).
 
-    TODO(#15): the launch path execs ``path`` (through ``gateway``) with ``argv[0]`` =
-    ``name``."""
+    The launch path runs ``path`` through the gateway's ``executable`` with ``argv[0]`` =
+    ``name`` (``launch.check_tools``, ``supervisor.spawn``)."""
     if not name or "\x00" in name:
         raise LaunchValidationError("empty or invalid executable name", end_reason="unsafe_path")
     if "/" in name:

@@ -9,7 +9,11 @@ Rules every call follows:
 
 - ``argv`` is a sequence of strings (a bare ``str`` or ``bytes`` is refused with ``TypeError``)
   whose first entry is an absolute path, resolved by the caller outside every session-writable
-  path (interface.md, Path rules); a bare name is refused with ``ValueError``. Never
+  path (interface.md, Path rules); a bare name is refused with ``ValueError``. With
+  ``executable`` (an absolute path: the realpath of a tool resolved by
+  ``pathrules.resolve_tool``) the program run is ``executable`` and ``argv[0]`` is only the
+  name the program sees (the bare tool name, so launchers that dispatch on ``argv[0]``, such
+  as volta, mise or snap shims, keep working); it must then be a non-empty string. Never
   ``shell=True``: lifecycle hooks are run as an explicit absolute ``/bin/sh -c <cmd>`` argv.
 - Environment: with no explicit ``env`` the child gets this process's environment, plus
   ``extra_env``, with empty and relative ``PATH`` entries dropped (``sanitize_path``; if none
@@ -165,6 +169,7 @@ class Gateway(Protocol):
         timeout: float | None = None,
         new_process_group: bool = False,
         kill_grace: float | None = None,
+        executable: str | None = None,
     ) -> Result:
         """Run to completion, capturing text output. ``new_process_group`` puts the child in
         its own process group, which a timeout ends as a whole; ``kill_grace`` (only with a
@@ -188,6 +193,7 @@ class Gateway(Protocol):
         stderr: int | Inherit | None = None,
         new_process_group: bool = False,
         die_with_parent: bool = False,
+        executable: str | None = None,
     ) -> Child:
         """Start without waiting. Streams are file descriptors, ``DEVNULL`` or ``INHERIT``;
         ``stdin`` defaults to ``DEVNULL`` (``None`` raises ``TypeError``: pass ``INHERIT``),
@@ -220,14 +226,20 @@ def check_argv(
     *,
     env: Mapping[str, str] | None,
     extra_env: Mapping[str, str] | None,
+    executable: str | None = None,
 ) -> None:
     """The call contract shared by the real gateway and its fakes. Error messages name only
-    ``argv[0]``: later arguments may carry secrets."""
+    ``argv[0]`` (and ``executable``): later arguments may carry secrets."""
     if isinstance(argv, str | bytes | bytearray):
         raise TypeError("gateway argv must be a sequence of strings, not a single string")
     if not argv:
         raise ValueError("gateway needs an argv, got an empty one")
-    if not isinstance(argv[0], str) or not os.path.isabs(argv[0]):
+    if executable is not None:
+        if not isinstance(executable, str) or not os.path.isabs(executable):
+            raise ValueError(f"gateway needs an absolute executable path, got {executable!r}")
+        if not isinstance(argv[0], str) or not argv[0] or "\x00" in argv[0]:
+            raise ValueError(f"gateway needs a non-empty argv[0], got {argv[0]!r}")
+    elif not isinstance(argv[0], str) or not os.path.isabs(argv[0]):
         raise ValueError(f"gateway needs an absolute executable path, got {argv[0]!r}")
     if env is not None and extra_env is not None:
         raise ValueError("pass either env or extra_env, not both")
@@ -563,13 +575,15 @@ class SystemGateway:
         timeout: float | None = None,
         new_process_group: bool = False,
         kill_grace: float | None = None,
+        executable: str | None = None,
     ) -> Result:
-        check_argv(argv, env=env, extra_env=extra_env)
+        check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(kill_grace, new_process_group=new_process_group)
         args = tuple(argv)
         data = None if stdin is None else stdin.encode("utf-8", "replace")
         with subprocess.Popen(
             args,
+            executable=executable,
             stdin=DEVNULL if stdin is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -599,14 +613,16 @@ class SystemGateway:
         stderr: int | Inherit | None = None,
         new_process_group: bool = False,
         die_with_parent: bool = False,
+        executable: str | None = None,
     ) -> Child:
-        check_argv(argv, env=env, extra_env=extra_env)
+        check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_spawn_stdin(stdin)
 
         def start(preexec: Callable[[], None] | None) -> subprocess.Popen[bytes]:
             try:
                 return subprocess.Popen(
                     tuple(argv),
+                    executable=executable,
                     stdin=_stream(stdin),
                     stdout=_stream(stdout),
                     stderr=_stream(stderr),

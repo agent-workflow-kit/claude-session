@@ -52,6 +52,7 @@ class Call:
     stdout: int | Inherit | None = None  # spawn only
     stderr: int | Inherit | None = None  # spawn only
     kill_grace: float | None = None  # run only
+    executable: str | None = None  # the program run when argv[0] is only its name
 
 
 @dataclass(frozen=True)
@@ -166,8 +167,9 @@ class FakeGateway:
         timeout: float | None = None,
         new_process_group: bool = False,
         kill_grace: float | None = None,
+        executable: str | None = None,
     ) -> Result:
-        check_argv(argv, env=env, extra_env=extra_env)
+        check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(kill_grace, new_process_group=new_process_group)
         args = tuple(argv)
         self.calls.append(
@@ -181,6 +183,7 @@ class FakeGateway:
                 timeout=timeout,
                 new_process_group=new_process_group,
                 kill_grace=kill_grace,
+                executable=executable,
             )
         )
         response = self._answer(args)
@@ -209,8 +212,9 @@ class FakeGateway:
         stderr: int | Inherit | None = None,
         new_process_group: bool = False,
         die_with_parent: bool = False,
+        executable: str | None = None,
     ) -> Child:
-        check_argv(argv, env=env, extra_env=extra_env)
+        check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_spawn_stdin(stdin)
         args = tuple(argv)
         self.calls.append(
@@ -225,6 +229,7 @@ class FakeGateway:
                 die_with_parent=die_with_parent,
                 stdout=stdout,
                 stderr=stderr,
+                executable=executable,
             )
         )
         if self._spawn_via is not None:
@@ -238,6 +243,7 @@ class FakeGateway:
                 stderr=stderr,
                 new_process_group=new_process_group,
                 die_with_parent=die_with_parent,
+                executable=executable,
             )
         response = self._answer(args)
         if response.error is not None:

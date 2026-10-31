@@ -1,0 +1,1033 @@
+"""The launch pipeline of a new session's run (interface.md, Launch order; design.md, Launch,
+adoption and pending runs, and Supervision).
+
+One function per launch step, called in order by ``exec`` (``cli``):
+
+- step 2, before anything is allocated: ``read_request`` (flags, prompt and input files,
+  exit 2 on a usage error) and ``resolve_kind`` (the effective profile, the cwd, the repo);
+- step 4: ``allocate`` (session id, session and run rows, labels, the ``launch`` event);
+- step 5: ``validate`` (the launch validations, each an ordered helper below);
+- step 7: ``prepare`` (session-directory files, secret index, hook configuration, settings).
+  ``supervisor`` then spawns and supervises ``claude``; ``run`` strings steps 5 and 7 and the
+  hand-over together.
+
+A ``LaunchValidationError`` in step 5 or 7 (an unsafe session directory included,
+``session_dir_unsafe``; a ``UsageError`` from the environment builder, which config
+validation normally catches first, becomes ``config_invalid``) ends the run ``not-started``
+with its end reason (``fail_launch``); the command exits 12 with the outcome object.
+
+The step-5 helpers take every input explicitly and return values; the side effects of step 5
+are confined to ``open_dirs`` (the session's directories), ``create_write_dirs`` and
+``check_sandbox`` (the private tmpdir), so a dry run can call the others as they are.
+
+TODO(#27): ``--dry-run`` runs ``read_request``, ``resolve_kind`` and the side-effect-free
+step-5 helpers (``self_check(create=False)``), never ``allocate`` or ``prepare``.
+TODO(#28): ``start`` stores the request and the resolved spec; adoption reruns ``validate``
+and ``prepare`` for the pending run.
+TODO(#29): resume and fork build their request from the previous run (carry-over).
+TODO(#31): launch step 6, the ``pre-launch`` hooks, between ``validate`` and ``prepare``.
+TODO(#40): ``claude --version`` against ``min_claude_version`` (``claude_too_old``) in
+``validate``, after ``claude_bin`` is resolved.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any
+
+from . import (
+    audit,
+    envbuild,
+    gitinfo,
+    hookevent,
+    ids,
+    kinds,
+    logs,
+    pathrules,
+    permission_profiles,
+    secretindex,
+    selfcheck,
+    sessiondir,
+    settings_builder,
+    store,
+    tmpdir,
+)
+from .config import Config
+from .endmap import EXIT_CODES
+from .errors import FailedError, LaunchValidationError, UsageError
+from .gateway import Gateway
+from .sessiondir import InputFile, SessionDirs
+
+LOG_NAME = "log.jsonl"
+AUDIT_NAME = "audit.jsonl"
+RUN = 1  # a new session's run (resume: TODO(#29))
+RESULT_FILE = "result.json"
+STDERR_FILE = "stderr.log"
+PROFILE_SNAPSHOT = "permission-profile.json"
+
+
+def NO_SANDBOX(_path: str) -> bool:  # noqa: N802 (a constant predicate)
+    """The session-writable check of a trusted run: nothing is session-writable."""
+    return False
+
+
+# Hints for launch failures that have a fixed remedy (interface.md, Error handling).
+HINTS = {
+    "claude_not_found": "install Claude Code, or set claude_bin in the config to its path",
+    "session_dir_unsafe": "remove or repair the named entry of the claude-session state "
+    "directory (it must be a real directory or file owned by you)",
+}
+
+
+# Inputs
+
+
+@dataclass(frozen=True)
+class Process:
+    """The facts of the running ``exec``: its environment, cwd, executable and interpreter,
+    the state root and the gateway. Everything the pipeline reads from the process."""
+
+    environ: Mapping[str, str] = field(repr=False)
+    caller_cwd: str
+    claude_session: str  # the absolute claude-session executable (argv[0], not resolved)
+    interpreter: str  # settings_builder.current_interpreter()
+    state_root: str  # realpath of the state directory
+    gateway: Gateway
+
+    @classmethod
+    def current(cls, gw: Gateway, state_root: str) -> Process:
+        return cls(
+            environ=dict(os.environ),
+            caller_cwd=os.path.realpath(os.getcwd()),
+            claude_session=os.path.abspath(sys.argv[0]),
+            interpreter=settings_builder.current_interpreter(),
+            state_root=os.path.realpath(state_root),
+            gateway=gw,
+        )
+
+    @property
+    def exe_dir(self) -> str:
+        return os.path.dirname(self.claude_session)
+
+
+@dataclass(frozen=True)
+class Request:
+    """What ``exec`` was asked to launch, read and usage-checked (launch step 2)."""
+
+    kind: str | None
+    mode: str
+    skill: str | None
+    prompt: bytes | None = field(repr=False)
+    inputs: tuple[InputFile, ...]
+    plugin_dirs: tuple[str, ...]
+    repo: str | None
+    cwd: str | None  # --cwd as given (resolved in resolve_kind)
+    labels: tuple[str, ...]
+    flags: dict[str, Any]  # kinds.FLAG_KEYS given now (None: not given)
+    actor: str
+    decision_ids: tuple[str, ...]
+    hooks: tuple[str, ...]
+    hook_timeouts: tuple[str, ...]
+    outcome_file: str | None
+
+
+def _actor(given: str | None, cfg: Config) -> str:
+    """``--actor``, else ``human:<me.name>`` with a TTY stdin, else ``auto:unknown``."""
+    if given is not None:
+        return given
+    try:
+        tty = sys.stdin is not None and sys.stdin.isatty()
+    except (OSError, ValueError):
+        tty = False
+    if tty:
+        name = cfg.me.name or os.environ.get("USER") or "unknown"
+        return f"human:{name}"
+    return "auto:unknown"
+
+
+def read_request(args: argparse.Namespace, cfg: Config) -> Request:
+    """Launch step 2 for ``exec``: the flags (already checked by ``cli``'s flag rules), the
+    prompt and the input files read into memory (each at most ``input_max_bytes``; a bad file
+    is a ``UsageError``, exit 2). Only headless runs are implemented."""
+    mode = args.mode or "interactive"
+    if mode != "headless":
+        # TODO(#17): interactive supervision (exec's default mode).
+        raise UsageError("interactive exec is not implemented yet; pass --mode headless")
+    cap = cfg.input_max_bytes
+    prompt = None
+    if args.prompt_file == "-":
+        prompt = sessiondir.read_stream_capped(sys.stdin.buffer, cap, flag="--prompt-file -")
+    elif args.prompt_file is not None:
+        prompt = sessiondir.read_source_file(args.prompt_file, cap, flag="--prompt-file")
+    inputs = sessiondir.load_inputs(args.input_file or [], cap)
+    flags = {key: getattr(args, key, None) for key in kinds.FLAG_KEYS}
+    return Request(
+        kind=args.kind,
+        mode=mode,
+        skill=args.skill,
+        prompt=prompt,
+        inputs=tuple(inputs),
+        plugin_dirs=tuple(args.plugin_dir or ()),
+        repo=args.repo,
+        cwd=args.cwd,
+        labels=tuple(args.label or ()),
+        flags=flags,
+        actor=_actor(args.actor, cfg),
+        decision_ids=tuple(args.decision_id or ()),
+        hooks=tuple(args.hook or ()),
+        hook_timeouts=tuple(args.hook_timeout or ()),
+        outcome_file=None if args.outcome_file is None else os.path.abspath(args.outcome_file),
+    )
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """The effective profile of the run (launch step 2) and the caller-side cwd it resolved
+    (None for ``cwd: session-dir``, which is ``$CSESSION_DIR/work/`` once allocated)."""
+
+    resolution: kinds.Resolution
+    caller_cwd: str | None
+
+
+def _path_entries(environ: Mapping[str, str], prepend: Sequence[str]) -> list[str]:
+    """Where the tools are looked up: ``env.path_prepend``, then the caller's ``PATH``,
+    sanitized (empty and relative entries dropped)."""
+    return pathrules.sanitize_path(":".join([*prepend, environ.get("PATH", "")]))
+
+
+def _caller_cwd(given: str | None, process: Process) -> str:
+    """``--cwd`` (made absolute against the caller's cwd) or the caller's cwd, resolved; it
+    must be an existing directory (exit 2 otherwise)."""
+    path = os.path.realpath(os.path.join(process.caller_cwd, given or "."))
+    if not os.path.isdir(path):
+        raise UsageError(f"--cwd is not an existing directory: {given!r}")
+    return path
+
+
+def resolve_kind(req: Request, cfg: Config, process: Process) -> Resolved:
+    """Launch step 2: the effective profile (``kinds.resolve``), its cwd and the repo derived
+    from the ``origin`` remote, looked up with git resolved on the sanitized PATH and run by
+    name from its realpath (looked up with the kind's configured ``env.path_prepend``: the
+    repo, and so a per-repo override, is not known yet; step 5 resolves git again). A usage
+    error exits 2 before allocation."""
+    session_dir_cwd = req.cwd == "session-dir"
+    configured = cfg.kinds.get(req.kind or cfg.default_kind)
+    prepend = configured.env.path_prepend if configured is not None else []
+    try:
+        git = pathrules.resolve_tool("git", _path_entries(process.environ, prepend), NO_SANDBOX)
+    except LaunchValidationError:
+        git = None
+
+    def origin(cwd: str) -> str | None:
+        if git is None:
+            return None
+        return kinds.git_origin_url(cwd, git=git.path, git_name=git.name, gw=process.gateway)
+
+    probe_cwd = None if session_dir_cwd else _caller_cwd(req.cwd, process)
+    resolution = kinds.resolve(
+        cfg,
+        req.kind,
+        mode="headless",
+        repo=req.repo,
+        cwd=probe_cwd,
+        flags=req.flags,
+        origin_url=origin,
+    )
+    caller_cwd = None
+    if not session_dir_cwd and (resolution.profile.cwd == "caller" or req.cwd is not None):
+        caller_cwd = probe_cwd  # --cwd given for a session-dir kind: the caller's choice wins
+    return Resolved(resolution=resolution, caller_cwd=caller_cwd)
+
+
+# Step 4: allocation
+
+
+@dataclass(frozen=True)
+class Allocated:
+    csession_id: str
+    run: int
+    session_dir: str
+    private_dir: str
+    warnings: tuple[str, ...]
+
+
+def _resolved_record(resolution: kinds.Resolution) -> dict[str, Any]:
+    """``resolved_json``: every resolved setting with its origin. ``env.set`` is stored as
+    its names only (its values are literal configuration but may be credentials)."""
+    profile = resolution.profile.model_dump()
+    env = profile.pop("env")
+    profile["env"] = {**env, "set": sorted(env["set"])}
+    return {
+        "kind": resolution.kind,
+        "fallback": resolution.fallback,
+        "repo": resolution.repo,
+        "profile": profile,
+        "origins": dict(resolution.origins),
+        "env_allow": list(resolution.env_allow),
+        "env_allowlist_only": (
+            None if resolution.env_allowlist_only is None else list(resolution.env_allowlist_only)
+        ),
+        "permission_profile_file": resolution.permission_profile_file,
+    }
+
+
+def allocate(st: store.Store, req: Request, resolved: Resolved, process: Process) -> Allocated:
+    """Launch step 4: the session id (checked against every live, forgotten and deleted id in
+    the inserting transaction) and the session and run rows, with this process as the run's
+    wrapper (plain ``exec`` performs every step), its labels and the ``launch`` event."""
+    resolution = resolved.resolution
+    spec = {key: value for key, value in req.flags.items() if value is not None}
+    if req.plugin_dirs:
+        spec["plugin_dir"] = list(req.plugin_dirs)
+    invocation = {
+        "hooks": list(req.hooks),
+        "hook_timeouts": list(req.hook_timeouts),
+        "actor": req.actor,
+        "decision_ids": list(req.decision_ids),
+        "outcome_file": req.outcome_file,
+        "input_files": [item.name for item in req.inputs],
+    }
+    warnings = tuple(resolution.warnings)
+    new = store.NewRun(
+        state_root=process.state_root,
+        kind=resolution.kind,
+        reads_third_party=resolution.profile.reads_third_party,
+        mode=req.mode,
+        repo=resolution.repo,
+        model=resolution.profile.model,
+        skill=req.skill,
+        has_prompt=req.prompt is not None,
+        spec=spec,
+        resolved=_resolved_record(resolution),
+        # TODO(#28): start freezes the config hash and the absolute config path.
+        config_hash=None,
+        invocation=invocation,
+        hook_interpreter=process.interpreter,
+        config_path=None,
+        wrapper_pid=os.getpid(),
+        wrapper_start=store.start_time(os.getpid()),
+        labels=req.labels,
+        decision_ids=req.decision_ids,
+        warnings=warnings,
+        outcome_file=req.outcome_file,
+    )
+    csession_id = st.allocate(new, new_id=ids.new_session_id)
+    return Allocated(
+        csession_id=csession_id,
+        run=RUN,
+        session_dir=sessiondir.session_dir(process.state_root, csession_id),
+        private_dir=sessiondir.private_dir(process.state_root, csession_id),
+        warnings=warnings,
+    )
+
+
+# Step 5: launch validations
+
+
+@dataclass
+class Validated:
+    """Everything step 5 resolved and checked, for step 7 and the supervisor."""
+
+    dirs: SessionDirs
+    layout: sessiondir.RunLayout
+    cwd: str
+    git_dirs: gitinfo.GitDirs | None
+    profile: permission_profiles.Profile
+    expanded: dict[str, Any]
+    read_dirs: tuple[str, ...]
+    write_dirs: tuple[str, ...]
+    plugin_dirs: tuple[str, ...]
+    claude: pathrules.ResolvedTool
+    git: pathrules.ResolvedTool | None
+    bwrap: pathrules.ResolvedTool | None
+    socat: pathrules.ResolvedTool | None
+    session_env: envbuild.SessionEnv
+    isolation: settings_builder.Isolation | None
+    sandbox_active: bool
+    tmpdir: str | None
+    warnings: list[str] = field(default_factory=list)
+
+
+def open_dirs(
+    alloc: Allocated, process: Process, *, isolated: bool
+) -> tuple[SessionDirs, sessiondir.RunLayout]:
+    """The session and private directories, and the run's agent-writable directories
+    (``prepare_run``), created now: a ``cwd: session-dir`` run's cwd and the ``write_dirs``
+    inside ``$CSESSION_DIR`` must exist for the path rules. An unsafe entry raises
+    ``SessionDirUnsafe`` (``session_dir_unsafe``)."""
+    dirs = SessionDirs.open(process.state_root, alloc.csession_id)
+    try:
+        layout = dirs.prepare_run(alloc.run, isolated=isolated)
+    except BaseException:
+        dirs.close()
+        raise
+    return dirs, layout
+
+
+def host_rules(
+    process: Process, resolution: kinds.Resolution, alloc: Allocated, cwd: str, tmp: str | None
+) -> pathrules.PathRules:
+    """The ``Host`` facts and the run's ``PathRules`` (after ``open_dirs``: the exceptions for
+    the run's own directories apply only to real directories that exist); for isolated runs
+    ``check_host`` first: the write checks assume a valid ``$HOME``. The private tmpdir does
+    not exist yet (the self-check creates it at the end of step 5), so an entry inside it is
+    refused here (conservative: nothing a profile needs lives there)."""
+    host = pathrules.Host.from_environ(
+        process.environ,
+        state_root=process.state_root,
+        path_prepend=resolution.profile.env.path_prepend,
+    )
+    rules = pathrules.PathRules(
+        host, session_dir=alloc.session_dir, cwd=cwd, caller_cwd=process.caller_cwd, tmpdir=tmp
+    )
+    if resolution.isolated():
+        rules.check_host()
+    return rules
+
+
+def check_cwd(rules: pathrules.PathRules, resolution: kinds.Resolution) -> None:
+    """The cwd must be a directory; isolated runs also write it into rules and may write in
+    it, so it passes the cwd rules (``unsafe_cwd``), checked before the profile is expanded so
+    a bad cwd fails ``unsafe_cwd`` whatever the profile."""
+    if not os.path.isdir(rules.cwd):
+        raise LaunchValidationError(
+            f"cwd is not a directory: {rules.cwd!r}", end_reason="unsafe_cwd"
+        )
+    if resolution.isolated():
+        settings_builder.check_cwd(rules.cwd)
+        rules.check_cwd()
+
+
+def base_writable(
+    resolution: kinds.Resolution, alloc: Allocated, cwd: str, home: str, tmp: str | None
+) -> Callable[[str], bool]:
+    """The session-writable paths known before the profile and ``write_dirs`` are (the cwd,
+    ``$CSESSION_DIR`` and its writable directories, the tmpdir): used to resolve git and read
+    the profile file; every tool is resolved again with the full set (``check_tools``)."""
+    if not resolution.isolated():
+        return NO_SANDBOX
+    return pathrules.session_writable(session_dir=alloc.session_dir, cwd=cwd, home=home, tmpdir=tmp)
+
+
+def check_git(
+    resolution: kinds.Resolution,
+    cwd: str,
+    git: pathrules.ResolvedTool | None,
+    process: Process,
+) -> tuple[gitinfo.GitDirs | None, list[str]]:
+    """The cwd's git directories (``unsafe_cwd`` when git cannot determine them; no git found
+    counts as none only when no ``.git`` entry is above the cwd), ``no_git_cwd`` for a kind
+    that needs one, and the repository-config credential warnings of third-party-reading
+    runs."""
+    if git is None:
+        if gitinfo.git_entry_above(cwd):
+            raise LaunchValidationError(
+                "git is needed to find the cwd's git directory but was not found",
+                end_reason="unsafe_cwd",
+            )
+        dirs = None
+    else:
+        try:
+            dirs = gitinfo.resolve(
+                cwd, git=git.path, git_name=git.name, environ=process.environ, gw=process.gateway
+            )
+        except LaunchValidationError:
+            raise
+        except FailedError as exc:
+            raise LaunchValidationError(
+                exc.message, detail=exc.detail, end_reason="unsafe_cwd"
+            ) from exc
+    gitinfo.check_git_cwd(resolution.kind, dirs)
+    warnings: list[str] = []
+    if resolution.profile.reads_third_party and dirs is not None and git is not None:
+        warnings = gitinfo.credential_warnings(
+            cwd, git=git.path, git_name=git.name, environ=process.environ, gw=process.gateway
+        )
+    return dirs, warnings
+
+
+def profile_variables(
+    alloc: Allocated, cwd: str, home: str, git_dirs: gitinfo.GitDirs | None
+) -> dict[str, str | None]:
+    return {
+        "CSESSION_DIR": alloc.session_dir,
+        "CWD": cwd,
+        "HOME": home,
+        "GIT_DIR": None if git_dirs is None else git_dirs.common_dir,
+    }
+
+
+def select_profile(
+    cfg: Config,
+    resolution: kinds.Resolution,
+    variables: Mapping[str, str | None],
+    writable: Callable[[str], bool],
+) -> tuple[permission_profiles.Profile, dict[str, Any]]:
+    """The run's permission profile (a file is read once, here) and its expansion."""
+    profile = permission_profiles.select(
+        cfg, resolution, session_writable=writable if resolution.isolated() else None
+    )
+    return profile, permission_profiles.expand(profile.content, variables)
+
+
+def resolve_run_dirs(
+    resolution: kinds.Resolution, variables: Mapping[str, str | None], home: str, alloc: Allocated
+) -> tuple[list[str], pathrules.WriteDirs]:
+    profile = resolution.profile
+    read = pathrules.resolve_dirs(profile.read_dirs, variables, home=home, key="read_dirs")
+    resolved = pathrules.resolve_dirs(profile.write_dirs, variables, home=home, key="write_dirs")
+    write = pathrules.resolve_write_dirs(resolved, session_dir=alloc.session_dir)
+    return read, write
+
+
+def create_write_dirs(dirs: SessionDirs, write: pathrules.WriteDirs) -> None:
+    """Create the ``write_dirs`` inside ``$CSESSION_DIR`` before launch (no-follow, 0700)."""
+    for path in write.create:
+        dirs.ensure_session_subdir(path)
+
+
+def full_writable(
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    cwd: str,
+    home: str,
+    tmp: str | None,
+    write: pathrules.WriteDirs,
+    expanded: Mapping[str, Any],
+) -> pathrules.SessionWritable | None:
+    """The run's session-writable paths (isolated runs; None for trusted ones)."""
+    if not resolution.isolated():
+        return None
+    return pathrules.session_writable(
+        session_dir=alloc.session_dir,
+        cwd=cwd,
+        home=home,
+        tmpdir=tmp,
+        write_dirs=write.dirs,
+        profile=expanded,
+    )
+
+
+def check_paths(
+    rules: pathrules.PathRules,
+    writable: pathrules.SessionWritable | None,
+    read: Sequence[str],
+    write: pathrules.WriteDirs,
+    expanded: Mapping[str, Any],
+) -> None:
+    """``read_dirs``, ``write_dirs`` and the expanded profile's paths."""
+    if writable is None:
+        rules.check_profile(expanded, isolated=False)
+        return
+    rules.check_read_dirs(read, writable)
+    rules.check_write_dirs(write.dirs, writable)
+    rules.check_profile(expanded, isolated=True, writable=writable)
+
+
+def check_plugins(
+    rules: pathrules.PathRules,
+    plugin_dirs: Sequence[str],
+    writable: pathrules.SessionWritable | None,
+    caller_cwd: str,
+) -> tuple[str, ...]:
+    """The ``--plugin-dir`` entries, resolved; each must exist (``plugin_dir_missing``) and,
+    for isolated runs, pass the plugin-directory rules (``unsafe_plugin_dir``)."""
+    resolved = tuple(
+        dict.fromkeys(os.path.realpath(os.path.join(caller_cwd, d)) for d in plugin_dirs)
+    )
+    if writable is not None:
+        rules.check_plugin_dirs(resolved, writable)
+        return resolved
+    for entry in resolved:
+        if not os.path.isdir(entry):
+            raise LaunchValidationError(
+                f"plugin directory does not exist: {entry!r}", end_reason="plugin_dir_missing"
+            )
+    return resolved
+
+
+@dataclass(frozen=True)
+class Tools:
+    claude: pathrules.ResolvedTool
+    git: pathrules.ResolvedTool | None
+    bwrap: pathrules.ResolvedTool | None
+    socat: pathrules.ResolvedTool | None
+
+
+def check_tools(
+    cfg: Config,
+    resolution: kinds.Resolution,
+    process: Process,
+    writable: Callable[[str], bool],
+    git_before: pathrules.ResolvedTool | None,
+) -> Tools:
+    """``claude_bin``, ``git``, ``bwrap`` and ``socat`` resolved on the sanitized PATH, outside
+    the session-writable paths (``unsafe_path``); each runs from its realpath with ``argv[0]``
+    its name. ``claude_not_found`` when there is no ``claude_bin``. git must be the one the
+    git directory was resolved with (it was looked up before the full set was known)."""
+    entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
+    claude = pathrules.resolve_tool(cfg.claude_bin, entries, writable)
+    if claude is None:
+        raise LaunchValidationError(
+            f"claude not found: {cfg.claude_bin!r}",
+            end_reason="claude_not_found",
+            hint=HINTS["claude_not_found"],
+        )
+    git = pathrules.resolve_tool("git", entries, writable)
+    if git != git_before:
+        raise LaunchValidationError(
+            "git resolved differently once every session-writable path was known",
+            end_reason="unsafe_path",
+        )
+    bwrap = socat = None
+    if resolution.profile.sandbox != "off":
+        bwrap = pathrules.resolve_tool("bwrap", entries, writable)
+        socat = pathrules.resolve_tool("socat", entries, writable)
+    return Tools(claude=claude, git=git, bwrap=bwrap, socat=socat)
+
+
+def build_env(
+    resolution: kinds.Resolution,
+    cfg: Config,
+    process: Process,
+    alloc: Allocated,
+    cwd: str,
+    git_dirs: gitinfo.GitDirs | None,
+    tmp: str | None,
+    writable: pathrules.SessionWritable | None,
+) -> envbuild.SessionEnv:
+    """The session environment (its ``PATH`` checked for isolated runs: ``unsafe_path``). An
+    invalid ``env.set`` or ``path_prepend`` entry that reached here (config validation refuses
+    them) ends the run ``config_invalid``."""
+    try:
+        return envbuild.build(
+            resolution,
+            cfg,
+            process.environ,
+            csession_id=alloc.csession_id,
+            csession_dir=alloc.session_dir,
+            cwd=cwd,
+            exe_dir=process.exe_dir,
+            git_dir=None if git_dirs is None else git_dirs.common_dir,
+            tmpdir=tmp,
+            session_writable=writable,
+        )
+    except UsageError as exc:
+        raise LaunchValidationError(
+            exc.message, detail=exc.detail, end_reason="config_invalid"
+        ) from exc
+
+
+def generated_entries(
+    resolution: kinds.Resolution,
+    tools: Tools,
+    git_dirs: gitinfo.GitDirs | None,
+    process: Process,
+) -> dict[str, tuple[str, ...]]:
+    """The read entries ``exec`` adds to an isolated run's ``allowRead`` on its own."""
+    git: tuple[str, ...] = () if git_dirs is None else (git_dirs.common_dir,)
+    if git_dirs is not None and git_dirs.worktree_git_dir is not None:
+        git = (*git, git_dirs.worktree_git_dir)
+    paths = [t.path for t in (tools.bwrap, tools.socat, tools.git, tools.claude) if t is not None]
+    return {
+        "system": settings_builder.system_read_dirs(),
+        "tools": settings_builder.tool_dirs(paths),
+        "python": settings_builder.python_read_dirs(executable_dir=process.exe_dir),
+        "path_prepend": tuple(
+            dict.fromkeys(os.path.realpath(p) for p in resolution.profile.env.path_prepend)
+        ),
+        "git": git,
+    }
+
+
+def check_sandbox(
+    resolution: kinds.Resolution, alloc: Allocated, tools: Tools, process: Process
+) -> selfcheck.SelfCheck:
+    """The temporary-directory check, ``claude_args`` and setting sources, then the sandbox
+    self-check, which creates the private tmpdir (``tmpdir_unsafe``, ``unsafe_claude_args``,
+    ``unsafe_setting_sources``, ``sandbox_unavailable``, ``socket_path_too_long``)."""
+    profile = resolution.profile
+    if profile.sandbox != "off":
+        tmpdir.check(alloc.csession_id)
+    pathrules.check_claude_args(profile.claude_args, isolated=resolution.isolated())
+    settings_builder.check_setting_sources(resolution)
+    return selfcheck.self_check(
+        profile.sandbox,
+        alloc.csession_id,
+        bwrap=None if tools.bwrap is None else tools.bwrap.path,
+        socat=None if tools.socat is None else tools.socat.path,
+        gw=process.gateway,
+        create=True,
+    )
+
+
+def check_hook_interpreter(process: Process, writable: pathrules.SessionWritable | None) -> None:
+    """Isolated runs: nothing the unsandboxed hook interpreter loads code from may be
+    session-writable, and the install has no hard-linked files (``unsafe_path``)."""
+    if writable is None:
+        return
+    settings_builder.check_interpreter(
+        process.interpreter, session_writable=writable, writable_paths=writable.paths
+    )
+
+
+def validate(
+    st: store.Store,
+    cfg: Config,
+    req: Request,
+    resolved: Resolved,
+    alloc: Allocated,
+    process: Process,
+) -> Validated:
+    """Launch step 5, in order: rule paths, the session directories, ``$HOME``, the cwd,
+    git and the git directory, the permission profile, ``read_dirs``/``write_dirs``, plugin
+    directories, the tools (``claude_bin``, ``git``, ``bwrap``, ``socat``), the session
+    environment (``PATH``), the generated read entries, the tmpdir, ``claude_args``, setting
+    sources, the sandbox self-check, the hook interpreter. Raises ``LaunchValidationError``.
+
+    The git directory is resolved before the profile is expanded (``${GIT_DIR}``), so it is
+    checked earlier than interface.md lists it; the end reasons are the same."""
+    resolution = resolved.resolution
+    isolated = resolution.isolated()
+    home = os.path.realpath(process.environ.get("HOME", "/"))
+    tmp = None if resolution.profile.sandbox == "off" else tmpdir.run_path(alloc.csession_id)
+    settings_builder.check_rule_paths(process.state_root, process.claude_session)
+    dirs, layout = open_dirs(alloc, process, isolated=isolated)
+    try:
+        cwd = os.path.realpath(
+            resolved.caller_cwd or os.path.join(alloc.session_dir, sessiondir.WORK)
+        )
+        rules = host_rules(process, resolution, alloc, cwd, tmp)
+        check_cwd(rules, resolution)
+        st.update_run(alloc.csession_id, alloc.run, cwd=cwd)
+        early = base_writable(resolution, alloc, cwd, home, tmp)
+        entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
+        git_tool = pathrules.resolve_tool("git", entries, early)
+        git_dirs, warnings = check_git(resolution, cwd, git_tool, process)
+        st.update_session(alloc.csession_id, git_dir=gitinfo.stored_value(git_dirs))
+        variables = profile_variables(alloc, cwd, home, git_dirs)
+        profile, expanded = select_profile(cfg, resolution, variables, early)
+        read, write = resolve_run_dirs(resolution, variables, home, alloc)
+        warnings += write.warnings
+        create_write_dirs(dirs, write)
+        writable = full_writable(resolution, alloc, cwd, home, tmp, write, expanded)
+        check_paths(rules, writable, read, write, expanded)
+        plugins = check_plugins(rules, req.plugin_dirs, writable, process.caller_cwd)
+        tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool)
+        session_env = build_env(resolution, cfg, process, alloc, cwd, git_dirs, tmp, writable)
+        generated = generated_entries(resolution, tools, git_dirs, process)
+        if isolated:
+            rules.check_generated(generated)
+        check = check_sandbox(resolution, alloc, tools, process)
+        if check.tmpdir is not None:
+            st.update_session(alloc.csession_id, tmp_dir=check.tmpdir)
+        warnings += check.warnings
+        check_hook_interpreter(process, writable)
+        isolation = None
+        if isolated:
+            isolation = settings_builder.Isolation(
+                home=home,
+                tmpdir=check.tmpdir,
+                git_dir=None if git_dirs is None else git_dirs.common_dir,
+                worktree_git_dir=None if git_dirs is None else git_dirs.worktree_git_dir,
+                read_dirs=tuple(read),
+                write_dirs=write.dirs,
+                system_dirs=generated["system"],
+                tool_dirs=generated["tools"],
+                python_dirs=generated["python"],
+                path_prepend=generated["path_prepend"],
+            )
+        warnings += settings_builder.isolation_warnings(resolution)
+        warnings += layout.warnings
+    except BaseException:
+        dirs.close()
+        raise
+    return Validated(
+        dirs=dirs,
+        layout=layout,
+        cwd=cwd,
+        git_dirs=git_dirs,
+        profile=profile,
+        expanded=expanded,
+        read_dirs=tuple(read),
+        write_dirs=write.dirs,
+        plugin_dirs=plugins,
+        claude=tools.claude,
+        git=tools.git,
+        bwrap=tools.bwrap,
+        socat=tools.socat,
+        session_env=session_env,
+        isolation=isolation,
+        sandbox_active=check.sandbox_active,
+        tmpdir=check.tmpdir,
+        warnings=list(dict.fromkeys(warnings)),
+    )
+
+
+# Audit and log
+
+
+def event_log(process: Process, secrets: Sequence[str] = ()) -> logs.EventLog:
+    return logs.EventLog(os.path.join(process.state_root, LOG_NAME), secrets=secrets)
+
+
+def log_best_effort(log: logs.EventLog, event: str, **fields: Any) -> str | None:
+    """Write a ``log.jsonl`` record; a failure is returned as a warning, never raised."""
+    try:
+        log.write(event, **fields)
+    except (OSError, ValueError) as exc:
+        return f"could not write log.jsonl ({type(exc).__name__})"
+    return None
+
+
+def audit_sandbox_lowered(
+    process: Process,
+    req: Request,
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    secrets: Sequence[str],
+) -> None:
+    """A third-party-reading run below the ``required`` sandbox baseline: the
+    ``sandbox_lowered`` audit record (raises when it cannot be written: the run must not
+    launch without it) and the matching log event."""
+    if not resolution.sandbox_lowered():
+        return
+    inputs = settings_builder.sandbox_lowered_inputs(resolution, run=alloc.run)
+    audit.append(
+        os.path.join(process.state_root, AUDIT_NAME),
+        actor=req.actor,
+        target=alloc.csession_id,
+        action="sandbox_lowered",
+        result="ok",
+        decision_ids=req.decision_ids,
+        inputs=inputs,
+        secrets=secrets,
+    )
+    log_best_effort(
+        event_log(process, secrets),
+        "sandbox_lowered",
+        level="warn",
+        csession_id=alloc.csession_id,
+        run=alloc.run,
+        message=f"sandbox {resolution.profile.sandbox} (baseline required)",
+    )
+
+
+# Step 7: prepare
+
+
+@dataclass
+class Prepared:
+    """What step 7 wrote and the supervisor needs: the ``claude`` argv (``argv[0]`` the
+    tool's name, run from ``executable``), the run's secret values (for log redaction) and
+    the run secret (refused in an implicit ``result.md``), and the descriptors for its stdout
+    and stderr (the supervisor closes them)."""
+
+    argv: list[str]
+    executable: str
+    secrets: frozenset[str] = field(repr=False)
+    run_secret: str = field(repr=False)
+    stdout_fd: int
+    stderr_fd: int
+    warnings: list[str]
+
+
+def secret_index(values: frozenset[str]) -> bytes:
+    """The run's ``contains_secret`` index. Values over ``secretindex.VALUES_MAX_BYTES`` in
+    total fail the launch: no end reason names this, and the values come from the configured
+    ``claude_auth_env`` and ``secret_env`` names, so it is ``config_invalid``."""
+    try:
+        return secretindex.build(values)
+    except ValueError as exc:
+        raise LaunchValidationError(
+            "the secret values (claude_auth_env, secret_env and the run secret) are too large"
+            " to index for contains_secret",
+            detail=f"over {secretindex.VALUES_MAX_BYTES} bytes",
+            end_reason="config_invalid",
+        ) from exc
+
+
+def prepare(
+    st: store.Store,
+    cfg: Config,
+    req: Request,
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    v: Validated,
+    process: Process,
+) -> Prepared:
+    """Launch step 7: the prompt and inputs, ``instructions.md``, ``run.json`` and a new
+    secret (its digest and the directory identities recorded), the secret index (before the
+    agent can file a report), the hook configuration, the profile snapshot, the generated
+    settings and the output files."""
+    dirs, run, sid = v.dirs, alloc.run, alloc.csession_id
+    # TODO(#29): drain (ingest or discard) the previous run's outbox before the secret rotates.
+    prompt_path = None if req.prompt is None else dirs.write_prompt(run, req.prompt)
+    names = dirs.write_inputs(run, req.inputs)
+    secret = dirs.write_run_files(
+        run,
+        claude_session_path=process.claude_session,
+        summary_max_bytes=cfg.summary_max_bytes,
+        artifact_max_bytes=cfg.artifact_max_bytes,
+        input_files=names,
+        respond=resolution.kind == "respond" and not resolution.fallback,
+    )
+    st.record_run_files(
+        sid,
+        run,
+        secret_sha256=secret.sha256,
+        outbox_dev_ino=v.layout.outbox.text,
+        artifacts_dev_ino=v.layout.artifacts.text,
+    )
+    values = envbuild.secret_values(v.session_env, process.environ, run_secret=secret.value)
+    dirs.write_private_run_file(run, secretindex.INDEX_NAME, secret_index(values))
+    dirs.write_private_run_file(
+        run,
+        hookevent.HOOKCONF_NAME,
+        hookevent.hookconf_bytes(
+            names,
+            summary_max_bytes=cfg.summary_max_bytes,
+            artifact_max_bytes=cfg.artifact_max_bytes,
+        ),
+    )
+    snapshot = None
+    if v.profile.is_file:
+        snapshot = dirs.write_private_run_file(run, PROFILE_SNAPSHOT, v.profile.snapshot_bytes())
+    paths = settings_builder.Paths(state_root=process.state_root, csession_id=sid, run=run)
+    tools = settings_builder.Tools(
+        interpreter=process.interpreter,
+        claude_session=process.claude_session,
+        claude=v.claude.path,
+    )
+    launch = settings_builder.Launch(
+        mode="headless",
+        cwd=v.cwd,
+        skill=req.skill,
+        prompt_path=prompt_path,
+        plugin_dirs=v.plugin_dirs,
+    )
+    generated = settings_builder.build(
+        resolution, v.expanded, paths, tools, launch, isolation=v.isolation
+    )
+    dirs.write_settings(run, settings_builder.settings_json(generated.settings))
+    fields: dict[str, Any] = {
+        "permission_profile": v.profile.label,
+        "permission_profile_snapshot": snapshot,
+        "sandbox_active": int(v.sandbox_active),
+    }
+    if not resolution.profile.backstop:
+        fields["backstop_used"] = 1  # the kind turns the Stop backstop off: never taken
+    st.update_run(sid, run, **fields)
+    warnings = [*v.warnings, *generated.warnings]
+    stdout_fd = dirs.create_run_output(run, RESULT_FILE)
+    try:
+        stderr_fd = dirs.create_run_output(run, STDERR_FILE)
+    except BaseException:
+        os.close(stdout_fd)
+        raise
+    return Prepared(
+        argv=[v.claude.name, *generated.argv[1:]],
+        executable=v.claude.path,
+        secrets=values,
+        run_secret=secret.value,
+        stdout_fd=stdout_fd,
+        stderr_fd=stderr_fd,
+        warnings=warnings,
+    )
+
+
+# Launch-phase end
+
+
+def fail_launch(st: store.Store, alloc: Allocated, error: LaunchValidationError) -> bool:
+    """End the run ``not-started`` with the error's end reason (exit 12); its hint (or the
+    fixed hint of the end reason) becomes the outcome message. Returns whether this call
+    finalized the run."""
+    hint = error.hint or HINTS.get(error.end_reason)
+    return st.finalize_run(
+        alloc.csession_id,
+        alloc.run,
+        store.Final(
+            phase="launch",
+            outcome="not-started",
+            end_reason=error.end_reason,
+            exit_code=EXIT_CODES["not-started"],
+            state="not-started",
+            cause="launch",
+            message=None if hint is None else hint[:2048],
+        ),
+    )
+
+
+# The launch as a whole (steps 5 to 7 and the hand-over to supervision)
+
+
+def _cleanup(alloc: Allocated, v: Validated | None) -> None:
+    """After a launch-phase end: the secret index and the private tmpdir are removed (best
+    effort; a leftover tmpdir is reconcile's, #33)."""
+    if v is None:
+        return
+    try:
+        run_fd = v.dirs.open_run_dir(alloc.run)
+        try:
+            os.unlink(secretindex.INDEX_NAME, dir_fd=run_fd)
+        finally:
+            os.close(run_fd)
+    except OSError:
+        pass
+    if v.tmpdir is not None:
+        try:
+            tmpdir.remove(alloc.csession_id)
+        except OSError:
+            pass
+
+
+def run(
+    st: store.Store,
+    cfg: Config,
+    req: Request,
+    resolved: Resolved,
+    alloc: Allocated,
+    process: Process,
+    *,
+    supervise: Callable[..., Any],
+) -> Any:
+    """Steps 5 and 7 of an allocated run, then ``supervise`` (``supervisor.run_headless``).
+    A launch validation failure (or an unsafe session directory) ends the run ``not-started``
+    and returns None (the outcome is in the store). Any other error before ``claude`` is
+    spawned ends it ``not-started`` with ``launch_interrupted`` (the wrapper must exit) and is
+    re-raised."""
+    resolution = resolved.resolution
+    v: Validated | None = None
+    try:
+        try:
+            v = validate(st, cfg, req, resolved, alloc, process)
+            secrets = sorted(envbuild.secret_values(v.session_env, process.environ))
+            audit_sandbox_lowered(process, req, resolution, alloc, secrets)
+            st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
+            prepared = prepare(st, cfg, req, resolution, alloc, v, process)
+        except LaunchValidationError as error:
+            fail_launch(st, alloc, error)
+            _cleanup(alloc, v)
+            return None
+        except BaseException:
+            fail_launch(
+                st,
+                alloc,
+                LaunchValidationError(
+                    "launch interrupted by an internal error", end_reason="launch_interrupted"
+                ),
+            )
+            _cleanup(alloc, v)
+            raise
+        st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
+        return supervise(
+            st, cfg, alloc, v, prepared, process, implicit_done=resolution.profile.implicit_done
+        )
+    finally:
+        if v is not None:
+            v.dirs.close()

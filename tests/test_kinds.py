@@ -1095,3 +1095,11 @@ def test_unknown_profile_name_given_now_has_no_reset_hint(cfg_dir: Path) -> None
     with pytest.raises(UsageError) as info:
         resolve(load(cfg_dir), "implement", flags={"permission_profile": "gone"})
     assert "--reset" not in str(info.value.detail)
+
+
+def test_git_origin_url_runs_a_resolved_git_by_name() -> None:
+    gw = FakeGateway()
+    gw.on(["git"], stdout="https://example.com/a/b\n")
+    assert kinds.git_origin_url("/w", git="/opt/real/git", git_name="git", gw=gw)
+    (call,) = gw.calls
+    assert call.argv[0] == "git" and call.executable == "/opt/real/git"

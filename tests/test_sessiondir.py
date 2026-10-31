@@ -1096,3 +1096,84 @@ def test_leftover_warnings_never_name_entries_inside_the_tree(
 
 def test_trusted_prepare_has_no_warnings(dirs: SessionDirs) -> None:
     assert dirs.prepare_run(1).warnings == ()
+
+
+# Launch helpers (#15)
+
+
+def test_an_unsafe_entry_is_a_session_dir_unsafe_launch_error(root: Path) -> None:
+    from claude_session.sessiondir import SessionDirUnsafe
+
+    elsewhere = root.parent / "elsewhere"
+    elsewhere.mkdir()
+    (root / "sessions").symlink_to(elsewhere)
+    with pytest.raises(SessionDirUnsafe) as info:
+        SessionDirs.open(str(root), SID)
+    assert info.value.end_reason == "session_dir_unsafe"
+    assert info.value.exit_code == 12
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_write_private_run_file(root: Path, dirs: SessionDirs) -> None:
+    with pytest.raises(ValueError):
+        dirs.write_private_run_file(1, "hookconf.json", b"{}")  # prepare_run first
+    dirs.prepare_run(1)
+    path = Path(dirs.write_private_run_file(1, "hookconf.json", b"{}"))
+    assert path == pdir(root) / "runs" / "1" / "hookconf.json"
+    assert path.read_bytes() == b"{}" and mode(path) == 0o600
+    for bad in ("", "a/b", ".", ".."):
+        with pytest.raises(ValueError):
+            dirs.write_private_run_file(1, bad, b"")
+
+
+def test_a_planted_symlink_is_replaced_never_written_through(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1)
+    victim = root.parent / "victim"
+    victim.write_text("keep")
+    (pdir(root) / "runs" / "1" / "secret-index").symlink_to(victim)
+    dirs.write_private_run_file(1, "secret-index", b"new")
+    assert victim.read_text() == "keep"
+    assert not (pdir(root) / "runs" / "1" / "secret-index").is_symlink()
+
+
+def test_create_run_output_is_exclusive_and_private(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1)
+    old = os.umask(0)
+    try:
+        fd = dirs.create_run_output(1, "result.json")
+    finally:
+        os.umask(old)
+    os.write(fd, b"x")
+    os.close(fd)
+    path = pdir(root) / "runs" / "1" / "result.json"
+    assert path.read_bytes() == b"x" and mode(path) == 0o600
+    from claude_session.sessiondir import SessionDirUnsafe
+
+    with pytest.raises(SessionDirUnsafe):
+        dirs.create_run_output(1, "result.json")  # never reused
+    (pdir(root) / "runs" / "1" / "stderr.log").symlink_to(root.parent / "elsewhere-log")
+    with pytest.raises(SessionDirUnsafe):
+        dirs.create_run_output(1, "stderr.log")
+    assert not (root.parent / "elsewhere-log").exists()
+
+
+def test_ensure_session_subdir(root: Path, dirs: SessionDirs) -> None:
+    dirs.prepare_run(1)
+    target = sdir(root) / "work" / "a" / "b"
+    dirs.ensure_session_subdir(str(target))
+    assert target.is_dir() and mode(target) == 0o700
+    for bad in (sdir(root) / "inputs" / "x", sdir(root) / "work" / ".." / "secret", root):
+        with pytest.raises(ValueError):
+            dirs.ensure_session_subdir(str(bad))
+
+
+def test_ensure_session_subdir_refuses_a_symlinked_component(root: Path, dirs: SessionDirs) -> None:
+    from claude_session.sessiondir import SessionDirUnsafe
+
+    dirs.prepare_run(1)
+    outside = root.parent / "outside"
+    outside.mkdir()
+    (sdir(root) / "work" / "lnk").symlink_to(outside)
+    with pytest.raises(SessionDirUnsafe):
+        dirs.ensure_session_subdir(str(sdir(root) / "work" / "lnk" / "deeper"))
+    assert list(outside.iterdir()) == []

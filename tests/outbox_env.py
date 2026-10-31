@@ -190,7 +190,9 @@ class Run(Env):
         path = self.root / "log.jsonl"
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text().splitlines()]
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        # The store logs its own migration when it creates the database (not a drain record).
+        return [r for r in records if r["event"] != "migration"]
 
 
 def rejection(output: str) -> str:

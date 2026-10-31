@@ -178,6 +178,7 @@
             "fork_cwd_unsupported",
             "no_tty",
             "tmpdir_unsafe",
+            "session_dir_unsafe",
             "unsafe_claude_args",
             "unsafe_setting_sources",
             "claude_too_old"
@@ -192,7 +193,7 @@
           "pattern": "^signal_[a-z0-9]+$"
         }
       ],
-      "description": "Session phase: normal, auto_exit, user_exit, forwarded_term, forwarded_hup, forwarded_int, stopped, timeout, max_turns, api_error, no_result, no_report, result_rejected, no_session_start, wrapper_lost, lost, internal_error, exit_<code>, signal_<name> (claude killed by a signal exec did not send, e.g. signal_kill; forwarded_* are signals exec received and forwarded). Launch phase: hook_veto, hook_escalate, hook_timeout, canceled, never_adopted, launch_interrupted, config_invalid, claude_not_found, sandbox_unavailable, socket_path_too_long, invalid_permission_profile, unsafe_cwd, unsafe_path, unsafe_plugin_dir, unsafe_read_dir, plugin_dir_missing, git_dir_changed, no_git_cwd, fork_cwd_unsupported, no_tty, tmpdir_unsafe, unsafe_claude_args, unsafe_setting_sources, claude_too_old. null while the run is live. normal: clean exit; user_exit: the user quit an interactive session (last process-ending SessionEnd prompt_input_exit). See interface.md, Outcome mapping."
+      "description": "Session phase: normal, auto_exit, user_exit, forwarded_term, forwarded_hup, forwarded_int, stopped, timeout, max_turns, api_error, no_result, no_report, result_rejected, no_session_start, wrapper_lost, lost, internal_error, exit_<code>, signal_<name> (claude killed by a signal exec did not send, e.g. signal_kill; forwarded_* are signals exec received and forwarded). Launch phase: hook_veto, hook_escalate, hook_timeout, canceled, never_adopted, launch_interrupted, config_invalid, claude_not_found, sandbox_unavailable, socket_path_too_long, invalid_permission_profile, unsafe_cwd, unsafe_path, unsafe_plugin_dir, unsafe_read_dir, plugin_dir_missing, git_dir_changed, no_git_cwd, fork_cwd_unsupported, no_tty, tmpdir_unsafe, session_dir_unsafe, unsafe_claude_args, unsafe_setting_sources, claude_too_old. null while the run is live. normal: clean exit; user_exit: the user quit an interactive session (last process-ending SessionEnd prompt_input_exit). See interface.md, Outcome mapping."
     },
     "launch_end_reason": {
       "type": "string",
@@ -218,6 +219,7 @@
         "fork_cwd_unsupported",
         "no_tty",
         "tmpdir_unsafe",
+        "session_dir_unsafe",
         "unsafe_claude_args",
         "unsafe_setting_sources",
         "claude_too_old"
@@ -240,6 +242,7 @@
         "no_git_cwd",
         "fork_cwd_unsupported",
         "tmpdir_unsafe",
+        "session_dir_unsafe",
         "unsafe_claude_args",
         "unsafe_setting_sources",
         "claude_too_old"
@@ -263,6 +266,7 @@
         "fork_cwd_unsupported",
         "no_tty",
         "tmpdir_unsafe",
+        "session_dir_unsafe",
         "unsafe_claude_args",
         "unsafe_setting_sources",
         "claude_too_old"
@@ -806,6 +810,7 @@
                   "fork_cwd_unsupported",
                   "no_tty",
                   "tmpdir_unsafe",
+                  "session_dir_unsafe",
                   "unsafe_claude_args",
                   "unsafe_setting_sources",
                   "claude_too_old"
@@ -894,6 +899,7 @@
                   "fork_cwd_unsupported",
                   "no_tty",
                   "tmpdir_unsafe",
+                  "session_dir_unsafe",
                   "unsafe_claude_args",
                   "unsafe_setting_sources",
                   "claude_too_old"
@@ -952,6 +958,7 @@
                     "fork_cwd_unsupported",
                     "no_tty",
                     "tmpdir_unsafe",
+                    "session_dir_unsafe",
                     "unsafe_claude_args",
                     "unsafe_setting_sources",
                     "claude_too_old"
