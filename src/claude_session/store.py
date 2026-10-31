@@ -895,7 +895,7 @@ class Store:
         missing."""
         row = self.conn.execute(
             "SELECT s.csession_id, r.run_no, s.state, s.activity, s.needs_input_reason, "
-            "r.mode, r.session_started_at, r.report_status, r.reported_at, r.backstop_used, "
+            "r.mode, r.session_started_at, r.report_status, r.backstop_used, "
             "r.ended_at IS NULL AND r.wrapper_pid IS NOT NULL, s.csession_dir, s.private_dir, "
             "s.forgotten_at IS NOT NULL "
             "FROM sessions s JOIN runs r "
@@ -914,12 +914,11 @@ class Store:
             mode=row[5],
             session_started_at=row[6],
             report_status=row[7],
-            reported_at=row[8],
-            backstop_used=bool(row[9]),
-            adopted_and_open=bool(row[10]),
-            csession_dir=row[11],
-            private_dir=row[12],
-            forgotten=bool(row[13]),
+            backstop_used=bool(row[8]),
+            adopted_and_open=bool(row[9]),
+            csession_dir=row[10],
+            private_dir=row[11],
+            forgotten=bool(row[12]),
         )
 
     def prompt_submitted_after_report(self, run: HookRun) -> bool:
@@ -1048,7 +1047,6 @@ class HookRun:
     mode: str | None
     session_started_at: str | None
     report_status: str | None
-    reported_at: str | None
     backstop_used: bool
     # Adopted (wrapper set: claude can have been spawned) and not ended.
     adopted_and_open: bool
