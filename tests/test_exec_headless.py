@@ -783,7 +783,12 @@ def test_no_implicit_done_while_a_report_waits_unprocessed(
 
 
 def csession_tmpdir(sid: str) -> Path:
-    return Path(f"/tmp/csession-{os.geteuid()}") / sid
+    """The run's private tmpdir as the code under test computes it: under this test's
+    ``pathrules.TMP_ROOT`` (``private_tmp_root``), which ``run_exec`` passes on to the
+    subprocess, never the real ``/tmp``."""
+    from claude_session import tmpdir
+
+    return Path(tmpdir.run_path(sid))
 
 
 def script(path: Path, text: str) -> Path:
