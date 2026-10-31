@@ -76,6 +76,24 @@ def test_spawn_via_starts_the_real_program_and_records_it() -> None:
     assert fake.calls[0].kind == "spawn"
 
 
+def test_a_gated_spawn_is_recorded_and_its_release_seen() -> None:
+    fake = FakeGateway()
+    fake.on(["/opt/claude"], timeout=True)
+    child = fake.spawn(["/opt/claude"], gated=True)
+    assert fake.calls[0].gated
+    assert isinstance(child, FakeChild) and not child.released
+    child.release()
+    assert child.released
+
+
+def test_spawn_via_passes_the_gate_through() -> None:
+    fake = FakeGateway(spawn_via=SystemGateway())
+    child = fake.spawn([sys.executable, "-I", "-c", "raise SystemExit(7)"], gated=True)
+    assert child.wait(timeout=0.2) is None  # waits at its gate
+    child.release()
+    assert child.wait(timeout=30) == 7
+
+
 @pytest.mark.parametrize("argv", ["/usr/bin/git", b"/usr/bin/git"])
 def test_refuses_str_or_bytes_argv(argv: object) -> None:
     fake = FakeGateway()

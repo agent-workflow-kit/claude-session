@@ -1305,6 +1305,16 @@ class Store:
             )
         return cursor.rowcount == 1
 
+    def run_state(self, csession_id: str, run_no: int) -> str:
+        """The run's own state: the session's while it is the current run, else its latest
+        event's (``starting`` before any): a superseded run never shows a later run's."""
+        row = self.conn.execute(
+            "SELECT state, current_run FROM sessions WHERE csession_id = ?", (csession_id,)
+        ).fetchone()
+        if row is not None and row[1] == run_no:
+            return str(row[0])
+        return _run_latest_state(self.conn, csession_id, run_no)[0]
+
     def latest_event(self, csession_id: str, run_no: int) -> dict[str, Any] | None:
         """The run's latest event (see ``latest_events``); None when it has none."""
         latest = self.latest_events(csession_id, run_no, 1)
@@ -1482,13 +1492,16 @@ class Store:
             return False
         self._record_with_final(conn, csession_id, run_no, final)
         row = conn.execute(
-            "SELECT s.state, s.activity, r.report_status FROM sessions s JOIN runs r "
-            "ON r.csession_id = s.csession_id AND r.run_no = ? WHERE s.csession_id = ?",
+            "SELECT s.state, s.activity, r.report_status, s.current_run FROM sessions s "
+            "JOIN runs r ON r.csession_id = s.csession_id AND r.run_no = ? "
+            "WHERE s.csession_id = ?",
             (run_no, csession_id),
         ).fetchone()
         if row is None:
             raise InternalError(f"no run {run_no} of session {csession_id}")
-        before_state, before_activity, report_status = row
+        before_state, before_activity, report_status, current_run = row
+        if current_run != run_no:  # a superseded run: its own state, never a later run's
+            before_state, before_activity = _run_latest_state(conn, csession_id, run_no)
         state = "exited" if report_status is not None else final.state
         conn.execute(
             "UPDATE sessions SET state = ?, activity = NULL, needs_input_reason = NULL, "
@@ -1802,6 +1815,14 @@ class Store:
             "SELECT DISTINCT csession_id FROM runs WHERE ended_at IS NULL ORDER BY csession_id"
         ).fetchall()
         return [str(sid) for (sid,) in rows]
+
+    def final_runs(self) -> list[tuple[str, int]]:
+        """``(csession_id, run_no)`` of every final run, by session id and run."""
+        rows = self.conn.execute(
+            "SELECT csession_id, run_no FROM runs WHERE ended_at IS NOT NULL "
+            "ORDER BY csession_id, run_no"
+        ).fetchall()
+        return [(str(sid), int(run_no)) for sid, run_no in rows]
 
     def sessions_with_undelivered(self) -> list[str]:
         """Every session with an event whose ``delivered_at`` is unset."""
@@ -2339,3 +2360,14 @@ class HookRun:
 def open_state(**kwargs: Any) -> Store:
     """Open ``state.db`` in the default state directory (see ``Store.open``)."""
     return Store.open(db_path(state_dir()), **kwargs)
+
+
+def _run_latest_state(conn: sqlite3.Connection, csession_id: str, run_no: int) -> tuple[str, Any]:
+    """The state and activity of the run's latest event; ``starting`` (no activity) before
+    any event."""
+    row = conn.execute(
+        "SELECT to_state, to_activity FROM events WHERE csession_id = ? AND run_no = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (csession_id, run_no),
+    ).fetchone()
+    return ("starting", None) if row is None else (str(row[0]), row[1])
