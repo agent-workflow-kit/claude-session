@@ -332,9 +332,10 @@ def pid_alive(pid: int, start: str) -> bool:
 
 def pid_known_alive(pid: int, start: str) -> bool:
     """Whether the exact process ``pid`` with the start-time token ``start`` is known to run:
-    for showing the processes of a run that has ended. Unlike ``pid_alive``, an unknown start
-    (``""``) or a check the platform cannot answer counts as gone: nothing is decided by it,
-    and a reused PID must not show an ended run's wrapper as alive."""
+    for showing the processes of a run that has ended, and for ``verify-secret``'s liveness
+    gate. Unlike ``pid_alive``, an unknown start (``""``) or a check the platform cannot answer
+    counts as gone, and must keep doing so (fail closed): a reused PID must not show an ended
+    run's wrapper as alive, and must not let a secret match."""
     if start == "" or not 0 < pid <= MAX_PID:
         return False
     from .gateway import GatewayTimeout
@@ -639,7 +640,8 @@ class Store:
         # Lease ownership is (pid, start, token): two stores of one process never share one.
         self.token = uuid.uuid4().hex
         self.liveness = liveness
-        # For display only (an ended run's processes): "cannot tell" counts as gone.
+        # Display of an ended run's processes, and the verify-secret liveness gate: "cannot
+        # tell" counts as gone (fail closed; it must stay so).
         self.known_liveness = known_liveness
         self.clock = clock
 
@@ -1113,7 +1115,8 @@ class Store:
         if dry_run:
             with self._read_snapshot() as conn:
                 return self._label_change(conn, csession_id, unique, add=add)
-        with self.transaction() as conn:
+        # Stored text is only read and compared: decode it leniently, as the dry run does.
+        with self._lenient_decoding(), self.transaction() as conn:
             change = self._label_change(conn, csession_id, unique, add=add)
             if change is None:
                 return None
@@ -1167,10 +1170,11 @@ class Store:
     # verify-secret (interface.md, Internal commands)
 
     def secret_run(self, csession_id: str) -> SecretRun | None:
-        """The current run's stored secret digest and wrapper, only when the session is not
-        forgotten and the run is adopted (wrapper set) and has not ended; otherwise None."""
+        """The current run's stored secret digest, wrapper and child, only when the session is
+        not forgotten and the run is adopted (wrapper set) and has not ended; otherwise None.
+        A stored value of an unexpected type reads as None."""
         row = self.conn.execute(
-            "SELECT r.secret_sha256, r.wrapper_pid, r.wrapper_start "
+            "SELECT r.secret_sha256, r.wrapper_pid, r.wrapper_start, r.child_pid, r.child_start "
             "FROM sessions s JOIN runs r "
             "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
             "WHERE s.csession_id = ? AND s.forgotten_at IS NULL AND r.ended_at IS NULL "
@@ -1179,10 +1183,14 @@ class Store:
         ).fetchone()
         if row is None:
             return None
-        digest, pid, start = row
-        if not (isinstance(digest, str) and isinstance(pid, int) and isinstance(start, str)):
-            return None
-        return SecretRun(secret_sha256=digest, wrapper_pid=pid, wrapper_start=start)
+        digest, wrapper_pid, wrapper_start, child_pid, child_start = row
+        return SecretRun(
+            secret_sha256=digest if isinstance(digest, str) else None,
+            wrapper_pid=wrapper_pid if isinstance(wrapper_pid, int) else None,
+            wrapper_start=wrapper_start if isinstance(wrapper_start, str) else None,
+            child_pid=child_pid if isinstance(child_pid, int) else None,
+            child_start=child_start if isinstance(child_start, str) else None,
+        )
 
     # Runs
 
@@ -1767,9 +1775,11 @@ class LabelChange:
 class SecretRun:
     """``Store.secret_run``: what ``verify-secret`` checks a presented secret against."""
 
-    secret_sha256: str
-    wrapper_pid: int
-    wrapper_start: str
+    secret_sha256: str | None
+    wrapper_pid: int | None
+    wrapper_start: str | None
+    child_pid: int | None
+    child_start: str | None
 
 
 @dataclass(frozen=True)

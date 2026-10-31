@@ -27,6 +27,7 @@ OTHER = "cs-wxyz7777"
 SECRET = "0123456789abcdef" * 4
 SECRET_SHA = hashlib.sha256(SECRET.encode("ascii")).hexdigest()
 WRAPPER: tuple[int, str] = (4242, "boot:1")
+CHILD: tuple[int, str] = (4343, "boot:2")
 T0 = datetime(2026, 10, 30, 12, 0, 0, tzinfo=UTC)
 
 
@@ -86,6 +87,12 @@ class Stdin:
 
     def __init__(self, data: bytes) -> None:
         self.buffer = io.BytesIO(data)
+
+
+def with_child(s: Store, child: tuple[int, str] | None = CHILD, sid: str = SID) -> None:
+    """Record the run's child (``None``: no child recorded)."""
+    pid, start = child if child is not None else (None, None)
+    sql(s, "UPDATE runs SET child_pid = ?, child_start = ? WHERE csession_id = ?", pid, start, sid)
 
 
 def verify(
@@ -197,8 +204,7 @@ def test_stdin_is_read_with_a_bound(st: Store, monkeypatch: pytest.MonkeyPatch) 
     "text",
     [
         "abcd2345",  # cs- is required
-        "CS-ABCD2345",  # the full id as stored
-        "cs-ABCD2345",
+        "ABCD2345",
         "cs-abcd",  # no prefix matching
         "cs-abcd234",
         "cs-abcd23455",
@@ -208,11 +214,26 @@ def test_stdin_is_read_with_a_bound(st: Store, monkeypatch: pytest.MonkeyPatch) 
         "cs-abcd2345\n",
         "cs-abcd%",
         "-",
+        "cs-abcd2345".replace("c", "\u0441"),  # Cyrillic look-alikes
+        "cs-\u212aabc2345",
     ],
 )
 def test_only_the_exact_full_id_matches(st: Store, run_verify: Any, text: str) -> None:
     adopted(st)
     assert_no_match(run_verify(SECRET.encode(), "--json", "--", text))
+
+
+@pytest.mark.parametrize("text", ["CS-ABCD2345", "cs-ABCD2345", "Cs-AbCd2345"])
+def test_the_full_id_is_case_insensitive(st: Store, run_verify: Any, text: str) -> None:
+    adopted(st)
+    assert run_verify(SECRET.encode(), text, "--json")[0] == 0
+
+
+def test_a_non_ascii_look_alike_is_not_folded(st: Store, run_verify: Any) -> None:
+    """``"\u212a".lower()`` is ``"k"``: only ASCII is folded."""
+    adopted(st, "cs-abck2345")
+    assert_no_match(run_verify(SECRET.encode(), "cs-abc\u212a2345", "--json"))
+    assert run_verify(SECRET.encode(), "CS-ABCK2345", "--json")[0] == 0
 
 
 def test_an_unknown_session_answers_like_a_wrong_secret(st: Store, run_verify: Any) -> None:
@@ -267,6 +288,50 @@ def test_a_reused_wrapper_pid_never_matches(
     adopted(st)
     alive.clear()
     alive.add((WRAPPER[0], "boot:999"))
+    assert_no_match(run_verify(SECRET.encode(), SID, "--json"))
+
+
+def test_a_run_whose_child_alone_is_alive_matches(
+    st: Store, run_verify: Any, alive: set[tuple[int, str]]
+) -> None:
+    """An orphaned child (wrapper dead, child alive) keeps the run live (interface.md,
+    Liveness)."""
+    adopted(st)
+    with_child(st)
+    alive.clear()
+    alive.add(CHILD)
+    assert run_verify(SECRET.encode(), SID, "--json")[0] == 0
+
+
+def test_a_run_whose_wrapper_and_child_are_dead_never_matches(
+    st: Store, run_verify: Any, alive: set[tuple[int, str]]
+) -> None:
+    adopted(st)
+    with_child(st)
+    alive.clear()
+    assert_no_match(run_verify(SECRET.encode(), SID, "--json"))
+
+
+def test_a_wrapper_without_a_start_token_with_a_live_child_matches(
+    st: Store, run_verify: Any, alive: set[tuple[int, str]]
+) -> None:
+    adopted(st)
+    with_child(st)
+    sql(st, "UPDATE runs SET wrapper_start = ''")
+    alive.clear()
+    alive.update({(WRAPPER[0], ""), CHILD})
+    assert run_verify(SECRET.encode(), SID, "--json")[0] == 0
+    alive.discard(CHILD)  # an empty start token never counts as alive
+    assert_no_match(run_verify(SECRET.encode(), SID, "--json"))
+
+
+def test_a_run_whose_liveness_cannot_be_told_never_matches(
+    st: Store, run_verify: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adopted(st)
+    with_child(st)
+    monkeypatch.setattr(store, "pid_alive", lambda pid, start: True)
+    monkeypatch.setattr(store, "pid_known_alive", lambda pid, start: False)
     assert_no_match(run_verify(SECRET.encode(), SID, "--json"))
 
 
@@ -341,6 +406,86 @@ def test_the_compare_runs_for_every_answer(
         assert all(len(side) == 64 for side in calls[0])
 
 
+class RecordingProcInfo:
+    """A ``procinfo.ProcInfo`` stand-in that records every liveness probe."""
+
+    def __init__(self, alive: set[tuple[int, str]]) -> None:
+        self.alive = alive
+        self.calls: list[tuple[int, str]] = []
+
+    def is_alive(self, pid: int, start: str) -> bool:
+        self.calls.append((pid, start))
+        return (pid, start) in self.alive
+
+
+def test_every_answer_does_the_same_work(run_verify: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unknown, forgotten, pending and ended runs, a malformed id, no recorded digest, dead
+    processes, a wrong and the right secret: each does one lookup, one compare and the same
+    two liveness probes through the real ``pid_known_alive`` and procinfo path, so timing does
+    not tell whether a session exists or what state its run is in."""
+    fake = RecordingProcInfo({WRAPPER})
+    lookups = {"procinfo": 0, "secret_run": 0, "compare": 0}
+
+    def procinfo() -> RecordingProcInfo:
+        lookups["procinfo"] += 1
+        return fake
+
+    real_secret_run = Store.secret_run
+    real_compare = secretcheck.hmac.compare_digest
+
+    def secret_run(self: Store, csession_id: str) -> Any:
+        lookups["secret_run"] += 1
+        return real_secret_run(self, csession_id)
+
+    def compare(a: Any, b: Any) -> bool:
+        lookups["compare"] += 1
+        return real_compare(a, b)
+
+    with store.open_state(clock=lambda: T0) as s:
+        adopted(s)  # live, wrapper only
+        adopted(s, "cs-aaaa2222")  # forgotten
+        sql(s, "UPDATE sessions SET forgotten_at = created_at WHERE csession_id = 'cs-aaaa2222'")
+        adopted(s, "cs-bbbb2222")  # pending
+        sql(
+            s,
+            "UPDATE runs SET wrapper_pid = NULL, wrapper_start = NULL "
+            "WHERE csession_id = 'cs-bbbb2222'",
+        )
+        adopted(s, "cs-cccc2222")  # ended
+        sql(s, "UPDATE runs SET ended_at = created_at WHERE csession_id = 'cs-cccc2222'")
+        adopted(s, "cs-dddd2222", digest=None)  # no recorded secret
+        adopted(s, "cs-eeee2222")  # wrapper and child dead
+        with_child(s, (4444, "boot:4"), sid="cs-eeee2222")
+        sql(s, "UPDATE runs SET wrapper_pid = 4545 WHERE csession_id = 'cs-eeee2222'")
+        adopted(s, "cs-ffff2222")  # live child, wrapper without a start token
+        with_child(s, CHILD, sid="cs-ffff2222")
+        sql(s, "UPDATE runs SET wrapper_start = '' WHERE csession_id = 'cs-ffff2222'")
+    fake.alive.add(CHILD)
+    monkeypatch.setattr(store, "system_procinfo", procinfo)
+    monkeypatch.setattr(Store, "secret_run", secret_run)
+    monkeypatch.setattr(secretcheck.hmac, "compare_digest", compare)
+    cases = [
+        (OTHER, SECRET, 11),  # unknown
+        ("cs-aaaa2222", SECRET, 11),
+        ("cs-bbbb2222", SECRET, 11),
+        ("cs-cccc2222", SECRET, 11),
+        ("cs-dddd2222", SECRET, 11),
+        ("cs-eeee2222", SECRET, 11),
+        ("x", SECRET, 11),  # malformed id
+        (SID, "f" * 64, 11),  # live, wrong secret
+        (SID, SECRET, 0),  # live, right secret
+        ("cs-ffff2222", SECRET, 0),  # live through the child
+    ]
+    for sid, secret, code in cases:
+        fake.calls.clear()
+        for key in lookups:
+            lookups[key] = 0
+        assert run_verify(secret.encode(), sid, "--json")[0] == code, sid
+        assert lookups == {"procinfo": 2, "secret_run": 1, "compare": 1}, sid
+        assert len(fake.calls) == 2, sid
+        assert all(start != "" for _, start in fake.calls), sid
+
+
 def test_the_secret_is_never_printed(st: Store, run_verify: Any) -> None:
     adopted(st)
     near = SECRET[:-1] + "0"
@@ -358,12 +503,80 @@ def test_the_secret_is_never_printed(st: Store, run_verify: Any) -> None:
 # argv
 
 
-@pytest.mark.parametrize("flag", ["--dry-run", "--secret=x", "--run=1"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--dry-run",
+        "--secret=x",
+        "--run=1",
+        # Global flags do not apply to internal commands (interface.md, Global flags).
+        "--yes",
+        "--quiet",
+        "--verbose",
+        "--version",
+        "--config=/dev/null",
+    ],
+)
 def test_unknown_flags_are_usage_errors(flag: str, run_verify: Any) -> None:
     code, out, err = run_verify(SECRET.encode(), SID, "--json", flag)
     assert code == 2
     assert json.loads(out)["error"]["code"] == "usage"
     assert SECRET not in out + err
+
+
+def test_config_with_a_value_is_a_usage_error(run_verify: Any) -> None:
+    code, out, _ = run_verify(SECRET.encode(), SID, "--json", "--config", "/dev/null")
+    assert code == 2
+    assert json.loads(out)["error"]["code"] == "usage"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [SID, SECRET],
+        [SID, "--json", SECRET],
+        [SID, "--" + SECRET],
+        [SID, "--json=" + SECRET],
+        [SID, "--json", "--", SECRET],
+        [SID, "-" + SECRET],
+    ],
+)
+@pytest.mark.parametrize("json_flag", [True, False])
+def test_a_secret_on_argv_is_never_echoed(
+    run_verify: Any, argv: list[str], json_flag: bool
+) -> None:
+    if not json_flag:
+        argv = [arg for arg in argv if arg != "--json"]
+    code, out, err = run_verify(b"", *argv)
+    assert code == 2
+    assert SECRET not in out + err
+    if "--json" in argv:
+        assert json.loads(out)["error"]["code"] == "usage"
+
+
+def test_a_terminal_on_stdin_is_a_usage_error_without_reading(
+    st: Store, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    adopted(st)
+
+    class Terminal(io.BytesIO):
+        def isatty(self) -> bool:
+            return True
+
+        def read(self, size: int | None = -1) -> bytes:
+            raise AssertionError("read from a terminal")
+
+    class TerminalStdin:
+        buffer = Terminal()
+
+    monkeypatch.setattr(sys, "stdin", TerminalStdin())
+    for argv in ([SID, "--json"], [OTHER, "--json"], ["x", "--json"]):
+        code = main(["verify-secret", *argv])
+        out = capsys.readouterr().out
+        assert code == 2
+        error = json.loads(out)["error"]
+        assert error["code"] == "usage"
+        assert "terminal" in error["message"]
 
 
 def test_the_id_is_required(run_verify: Any) -> None:
@@ -380,6 +593,9 @@ def test_a_read_error_is_an_error_without_the_secret(
     adopted(st)
 
     class Broken:
+        def isatty(self) -> bool:
+            return False
+
         def read(self, size: int = -1) -> bytes:
             raise OSError(5, "Input/output error")
 

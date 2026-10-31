@@ -82,6 +82,11 @@ SESSION_ID_ARGS: dict[str, str | None] = {
 KIND_ARGS = ("kind", "launch_kind", "run_kind")
 # interface.md, Exit codes: a verify-secret mismatch (any reason).
 VERIFY_SECRET_MISMATCH = 11
+# Every verify-secret usage error: the arguments are never named (one may be a secret).
+VERIFY_SECRET_USAGE = (
+    "unexpected arguments (verify-secret takes only <full id> and --json; "
+    "the secret is read from stdin)"
+)
 # argparse takes a token like this as an option value, not as an option.
 NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
 
@@ -91,10 +96,13 @@ class _Parser(argparse.ArgumentParser):
 
     # Leaf command name -> its parser (set on the top-level parser only).
     leaves: dict[str, _Parser]
+    # When set, replaces every usage error message: for a command whose argv must never be
+    # echoed (verify-secret: a secret given there by mistake).
+    fixed_error: str | None = None
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
-        raise UsageError(message)
+        raise UsageError(self.fixed_error or message)
 
 
 class _VersionAction(argparse.Action):
@@ -204,15 +212,25 @@ def _label(args: argparse.Namespace) -> int:
 
 def _verify_secret(args: argparse.Namespace) -> int:
     """``verify-secret <full id>`` (interface.md, Internal commands): exit 0 on a match, 11
-    otherwise. The secret is read from stdin before the lookup, whatever the id."""
+    otherwise. The secret is read from stdin before the lookup, whatever the id; a terminal
+    on stdin is refused unread (the secret would be echoed), whatever the id."""
     from . import secretcheck
 
+    if _is_terminal(sys.stdin.buffer):
+        raise UsageError("verify-secret reads the secret from a pipe; stdin is a terminal")
     presented = secretcheck.read_secret(sys.stdin.buffer)
     with store.open_state() as st:
         match = secretcheck.matches(st, args.id, presented)
     if args.json:
         print(json.dumps({"match": match}))
     return 0 if match else VERIFY_SECRET_MISMATCH
+
+
+def _is_terminal(stream: Any) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (OSError, ValueError):
+        return False
 
 
 def _report(args: argparse.Namespace) -> int:
@@ -344,11 +362,16 @@ def _command(
     handler: str,
     help_text: str | None,
 ) -> _Parser:
-    """Add a leaf command; ``help_text=None`` keeps it out of ``--help`` (internal commands)."""
-    kwargs: dict[str, Any] = {"parents": [_global_flags()], "allow_abbrev": False}
+    """Add a leaf command; ``help_text=None`` keeps it out of ``--help`` and leaves out the
+    global flags (internal commands take only their documented argv)."""
+    kwargs: dict[str, Any] = {"allow_abbrev": False}
+    if help_text is not None:
+        kwargs["parents"] = [_global_flags()]
     if help_text is not None:
         kwargs["help"] = help_text
     parser = subparsers.add_parser(name, **kwargs)
+    if help_text is None:  # the global flags' values, for the code paths that read them
+        parser.set_defaults(json=False, config=None, verbose=False, quiet=False, yes=False)
     parser.set_defaults(handler=handler)
     leaves[handler] = parser
     return parser
@@ -504,6 +527,8 @@ def build_parser() -> _Parser:
     # Internal: run by agent-spawn, not listed in --help.
     p = _command(commands, leaves, "verify-secret", "verify-secret", None)
     p.add_argument("id")
+    p.add_argument("--json", action="store_true")
+    p.fixed_error = VERIFY_SECRET_USAGE
     return parser
 
 
@@ -511,8 +536,13 @@ def parse(parser: _Parser, argv: Sequence[str]) -> argparse.Namespace:
     """Parse ``argv``; leftover arguments are reported with the chosen command's usage."""
     args, extras = parser.parse_known_args(argv)
     if extras and args.handler in ("label add", "label remove"):
-        # Pairs given after an option (`label add <id> a=b --dry-run c=d`).
-        if not any(extra.startswith("-") for extra in extras):
+        # Pairs given after an option (`label add <id> a=b --dry-run c=d`), or after `--`
+        # there (`... --dry-run -- c=d`): those are pairs whatever they look like, and the
+        # label grammar refuses one that starts with `-`.
+        if extras[0] == "--":
+            args.pairs.extend(extras[1:])
+            extras = []
+        elif not any(extra.startswith("-") for extra in extras):
             args.pairs.extend(extras)
             extras = []
     if extras:

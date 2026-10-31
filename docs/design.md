@@ -600,7 +600,7 @@ The launch steps, the refusals, the flags each entry point accepts and their sto
 
 **Liveness and finalization.** `status`, `list`, `wait` (each poll), `resume`, `start --resume`, `stop` and `forget` run the single-session check of the `liveness` module (wrapper and child PID + start time; `lost_grace` for pending runs) and apply the transition. They and `reconcile` finalize a run only when its wrapper is dead (process gone or a zombie); while the wrapper lives they never finalize, because `exec` owns the end mapping. Finalization is the compare-and-set on `ended_at IS NULL` (section [Data model](#data-model-statedb-sqlite-wal)), so exactly one final event and one final `post-state-change` exist. They also deliver the dead wrapper's undelivered events. `wait` on a pending run therefore ends `not-started` (`never_adopted`) after `lost_grace`, exiting 12; a session forgotten mid-wait exits 10 with the error envelope; `wait --run n` on a final run returns at once. An orphaned child (wrapper dead, child alive) is never signaled by liveness checks or `reconcile`; `stop` is the remedy (on Linux a headless child is already ended by `PR_SET_PDEATHSIG`). The liveness check and `reconcile` also backfill the outcome file of final runs whose `outcome_file_written_at` is unset.
 
-`verify-secret` matches only when the current run is adopted (wrapper set) and live.
+`verify-secret` matches only when the current run is adopted (wrapper set) and live: not ended, and its wrapper or its recorded child confirmed alive (PID plus start token); when liveness cannot be determined it does not match. Every non-match path does the same work (lookup, hash, compare, liveness probe), so timing does not reveal whether a session exists or its state.
 
 ### Lifecycle hooks
 

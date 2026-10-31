@@ -174,6 +174,41 @@ def test_pairs_after_an_option_are_taken(st: Store, capsys: pytest.CaptureFixtur
     assert obj["added"] == ["a=1", "b=2"]
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["label", "add", "--json", SID, "a=1", "--dry-run", "--", "b=2"],
+        ["label", "add", SID, "a=1", "--json", "--dry-run", "--", "b=2"],
+        ["label", "add", "--dry-run", "--json", SID, "--", "a=1", "b=2"],
+    ],
+)
+def test_pairs_after_double_dash_are_taken(
+    st: Store, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    allocate(st)
+    code, obj, _ = run_json(argv, capsys)
+    assert code == 0
+    assert obj["added"] == ["a=1", "b=2"]
+    assert obj["dry_run"] is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["label", "add", "--json", SID, "a=1", "--dry-run", "--", "-x=y"],
+        ["label", "add", "--json", SID, "a=1", "--", "--dry-run"],
+    ],
+)
+def test_option_like_pairs_after_double_dash_are_usage_errors(
+    st: Store, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    allocate(st)
+    code, obj, _ = run_json(argv, capsys)
+    assert code == 2
+    assert obj["error"]["code"] == "usage"
+    assert labels_in_db(st) == ["kind=implement", "team=core"]
+
+
 # label remove
 
 
@@ -325,6 +360,28 @@ def test_human_output(st: Store, capsys: pytest.CaptureFixture[str]) -> None:
         f"{SID}: removed kind=implement, team=core, x=1",
         "labels: (none)",
     ]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_a_stored_label_that_is_not_utf8_does_not_break_a_change(
+    st: Store, capsys: pytest.CaptureFixture[str], dry_run: bool
+) -> None:
+    """Stored text is decoded leniently (as by ``status`` and ``list``); the bad row is kept."""
+    allocate(st)
+    with st.transaction() as conn:
+        conn.execute(
+            "INSERT INTO labels (csession_id, key, value) VALUES (?, 'bad', CAST(x'fffe' AS TEXT))",
+            (SID,),
+        )
+    flags = ["--dry-run"] if dry_run else []
+    code, obj, _ = run_json(["label", "add", SID, "x=1", "--json", *flags], capsys)
+    assert code == 0
+    assert obj["added"] == ["x=1"]
+    code, obj, _ = run_json(["label", "remove", SID, "team=core", "--json", *flags], capsys)
+    assert code == 0
+    assert obj["removed"] == ["team=core"]
+    (count,) = st.conn.execute("SELECT count(*) FROM labels WHERE key = 'bad'").fetchone()
+    assert count == 1
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
