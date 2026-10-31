@@ -269,8 +269,10 @@ def test_label_pairs_after_an_option_are_collected() -> None:
     assert (args.pairs, args.dry_run) == (["a=b", "c=d"], True)
 
 
-@pytest.mark.parametrize("name", sorted(FULL_INVOCATIONS))
+@pytest.mark.parametrize("name", sorted(set(FULL_INVOCATIONS) - {"verify-secret"}))
 def test_yes_is_accepted_as_a_no_op(name: str) -> None:
+    """Every command but the internal ones (verify-secret refuses global flags; see
+    test_verify_secret)."""
     without = vars(parse(FULL_INVOCATIONS[name]))
     with_yes = vars(parse([*FULL_INVOCATIONS[name], "--yes"]))
     assert with_yes.pop("yes") is True
