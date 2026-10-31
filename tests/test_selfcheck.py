@@ -53,6 +53,7 @@ class FakeRunner(FakeGateway):
         kill_grace: float | None = None,
         executable: str | None = None,
         kill_group_on_exit: bool = False,
+        output_limit: int | None = None,
     ) -> Result:
         self.probes.append({"argv": list(argv), "timeout": timeout, "env": env, "stdin": stdin})
         answer: int | BaseException | None = self.by_tool.get(Path(argv[0]).name)

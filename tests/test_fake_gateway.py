@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import signal
 import sys
+from typing import Any
 
 import pytest
 
@@ -111,6 +112,25 @@ def test_kill_grace_contract_matches_the_real_gateway() -> None:
         fake.run(["/bin/sh"], kill_grace=1)
     with pytest.raises(ValueError):
         fake.run(["/bin/sh"], new_process_group=True, kill_grace=-1)
+
+
+def test_output_limit_is_recorded_and_applied_like_the_real_gateway() -> None:
+    fake = FakeGateway()
+    fake.on(["/bin/sh"], stdout="abcdef", stderr="é" * 4)
+    result = fake.run(["/bin/sh"], output_limit=3)
+    assert fake.calls[0].output_limit == 3
+    # Bytes, as the real gateway counts them: a split character is replaced.
+    assert (result.stdout, result.stderr) == ("abc", "é\ufffd")
+    empty = fake.run(["/bin/sh"], output_limit=0)
+    assert (empty.stdout, empty.stderr) == ("", "")
+
+
+@pytest.mark.parametrize(
+    ("limit", "error"), [(-1, ValueError), (True, TypeError), (1.5, TypeError)]
+)
+def test_output_limit_contract_matches_the_real_gateway(limit: Any, error: type) -> None:
+    with pytest.raises(error, match="output_limit"):
+        FakeGateway().run(["/bin/sh"], output_limit=limit)
 
 
 def test_a_response_list_is_consumed_in_order_and_the_last_repeats() -> None:

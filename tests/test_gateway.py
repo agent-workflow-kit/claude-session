@@ -265,6 +265,50 @@ def test_run_handles_large_output_on_both_streams_with_input(gw: SystemGateway) 
     assert proc.stderr == "e" * size
 
 
+def test_run_output_limit_keeps_a_prefix_and_drains_the_rest(gw: SystemGateway) -> None:
+    size = 3 * 1024 * 1024  # far above a pipe buffer: a child left unread would block
+    proc = gw.run(
+        py(
+            f"""
+            import sys
+            sys.stdout.write("o" * {size})
+            sys.stderr.write("é" * {size})
+            sys.stdout.write("tail")
+            """
+        ),
+        timeout=60,
+        output_limit=5,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout == "ooooo"
+    assert proc.stderr == "éé\ufffd"  # 5 bytes: two whole characters, then half of one
+
+
+def test_run_output_limit_zero_discards_everything(gw: SystemGateway) -> None:
+    proc = gw.run(py("print('out'); import sys; print('err', file=sys.stderr)"), output_limit=0)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+
+
+def test_run_output_limit_does_not_split_a_short_output(gw: SystemGateway) -> None:
+    proc = gw.run(py("print('2.1.312 (Claude Code)')"), output_limit=4096)
+    assert proc.stdout == "2.1.312 (Claude Code)\n"
+
+
+@pytest.mark.parametrize("limit", [-1, True, 1.5])
+def test_run_output_limit_must_be_a_non_negative_int(gw: SystemGateway, limit: Any) -> None:
+    with pytest.raises((ValueError, TypeError)):
+        gw.run([PY, "-c", "pass"], output_limit=limit)
+
+
+def test_run_output_limit_type_is_checked_before_the_child_starts(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    marker = tmp_path / "ran"
+    with pytest.raises(TypeError, match="output_limit"):
+        gw.run(py(f"open({str(marker)!r}, 'w')"), output_limit=True)  # type: ignore[arg-type]
+    assert not marker.exists()
+
+
 def test_run_timeout_raises_gateway_timeout_and_reaps_the_child(
     gw: SystemGateway, tmp_path: Path
 ) -> None:
@@ -1081,6 +1125,58 @@ def test_kill_group_on_exit_ends_descendants_left_by_a_leader_that_exited(
     assert result.returncode == 0
     member = _read_pid(pidfile, grandchildren)
     assert _wait_dead(member, 5 if kill_group else 0.5) is kill_group
+
+
+@linux_only
+def test_kill_group_on_exit_returns_when_a_descendant_holds_the_output_open(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    """A member left holding stdout cannot delay the result: once the leader exited the
+    group is SIGKILLed and what was printed is returned."""
+    pidfile = tmp_path / "pid"
+    script = f"echo '2.1.400 (Claude Code)'; /bin/sleep 40 & echo $! > {pidfile}; exit 0"
+    start = time.monotonic()
+    result = gw.run(
+        ["/bin/sh", "-c", script],
+        new_process_group=True,
+        timeout=20,
+        kill_group_on_exit=True,
+    )
+    assert time.monotonic() - start < 5
+    assert (result.returncode, result.stdout) == (0, "2.1.400 (Claude Code)\n")
+    assert _wait_dead(_read_pid(pidfile, grandchildren), 5)
+
+
+@linux_only
+def test_kill_group_on_exit_returns_when_an_escaped_descendant_holds_the_output_open(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    """A descendant that left the group (``setsid``) is not signaled, but it no longer
+    blocks the result either."""
+    pidfile = tmp_path / "pid"
+    code = f"""
+        import os, sys, time
+        print("2.1.400 (Claude Code)", flush=True)
+        if os.fork() == 0:
+            os.setsid()
+            open({str(pidfile)!r}, "w").write(str(os.getpid()))
+            time.sleep(40)
+            os._exit(0)
+        """
+    start = time.monotonic()
+    result = gw.run(py(code), new_process_group=True, timeout=20, kill_group_on_exit=True)
+    assert time.monotonic() - start < 5
+    assert (result.returncode, result.stdout) == (0, "2.1.400 (Claude Code)\n")
+    _read_pid(pidfile, grandchildren)  # SIGKILLed by the fixture
+
+
+def test_without_kill_group_on_exit_run_still_reads_to_the_end_of_the_output(
+    gw: SystemGateway,
+) -> None:
+    """Other callers keep reading until every writer closed the output."""
+    script = "/bin/sh -c 'sleep 0.5; echo late' & echo early; exit 0"
+    result = gw.run(["/bin/sh", "-c", script], new_process_group=True, timeout=20)
+    assert result.stdout.split() == ["early", "late"]
 
 
 def test_kill_group_on_exit_needs_a_process_group(gw: SystemGateway) -> None:

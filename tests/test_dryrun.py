@@ -54,6 +54,7 @@ SECRET = "do-not-print-this-value-0123456789"
 # The probe's session-writable paths: none (unit tests of the probe itself).
 NOTHING = pathrules.SessionWritable([])
 PATH_ONLY = {"PATH": "/usr/bin"}
+CURRENT_VERSION = "2.1.312 (Claude Code)"
 
 
 @pytest.fixture(scope="module")
@@ -98,6 +99,8 @@ class GitGateway(FakeGateway):
     def __init__(self, git_dirs: tuple[str, str] | None) -> None:
         super().__init__()
         self.git_dirs = git_dirs
+        # The launch's version check (a test can override it with a later rule).
+        self.on(["claude", "--version"], stdout=f"{CURRENT_VERSION}\n")
 
     def _answer(self, argv: tuple[str, ...]) -> Response:
         if argv[0] != "git":
@@ -354,7 +357,9 @@ def test_required_env_names_are_auth_allow_and_set_names(tmp_path: Path) -> None
     [
         ("2.1.312 (Claude Code)", (2, 1, 312)),
         ("2.1.312", (2, 1, 312)),
-        ("  10.0\n", (10, 0)),
+        ("10.0\n", (10, 0)),
+        ("  10.0", None),
+        ("2.1.3\t12", (2, 1, 3)),
         ("v2.1.312", None),
         ("2.1.312beta", None),
         ("", None),
@@ -388,10 +393,9 @@ def test_version_probe_runs_the_realpath_with_the_tool_name() -> None:
     gw = FakeGateway()
     gw.on(["claude", "--version"], stdout="2.1.314 (Claude Code)\nmore\n")
     tool = pathrules.ResolvedTool("/opt/claude/bin/claude-real", "claude")
-    assert (
-        claude_version.probe(tool, {"PATH": "/usr/bin"}, gw, writable=NOTHING)
-        == "2.1.314 (Claude Code)"
-    )
+    assert claude_version.run(
+        tool, {"PATH": "/usr/bin"}, gw, writable=NOTHING
+    ) == claude_version.Version("2.1.314 (Claude Code)", "2.1.314 (Claude Code)")
     assert gw.calls[0].executable == "/opt/claude/bin/claude-real"
 
 
@@ -405,24 +409,24 @@ def test_version_probe_runs_the_realpath_with_the_tool_name() -> None:
         {"timeout": True},
     ],
 )
-def test_version_probe_failures_are_none(answer: dict[str, Any]) -> None:
+def test_version_probe_failures_are_not_run(answer: dict[str, Any]) -> None:
     gw = FakeGateway()
     gw.on(["claude", "--version"], **answer)
-    assert (
-        claude_version.probe(
+    with pytest.raises(claude_version.NotRun):
+        claude_version.run(
             pathrules.ResolvedTool("/x/claude", "claude"), PATH_ONLY, gw, writable=NOTHING
         )
-        is None
-    )
 
 
 def test_version_probe_strips_control_characters_and_caps_length() -> None:
     gw = FakeGateway()
     gw.on(["claude"], stdout="\x1b[31m2.1.314" + "x" * 500 + "\n")
-    text = claude_version.probe(
+    version = claude_version.run(
         pathrules.ResolvedTool("/x/claude", "claude"), PATH_ONLY, gw, writable=NOTHING
     )
-    assert text is not None and "\x1b" not in text and len(text) == claude_version.MAX_TEXT
+    assert version.line.startswith("\x1b[31m2.1.314")
+    text = version.text
+    assert "\x1b" not in text and len(text) == claude_version.MAX_TEXT
 
 
 # The read-only session-directory check
@@ -706,9 +710,7 @@ def test_version_probe_gets_a_minimal_environment_in_its_own_group() -> None:
         "ANTHROPIC_API_KEY": SECRET,
         "MY_SECRET": SECRET,
     }
-    claude_version.probe(
-        pathrules.ResolvedTool("/x/claude", "claude"), environ, gw, writable=NOTHING
-    )
+    claude_version.run(pathrules.ResolvedTool("/x/claude", "claude"), environ, gw, writable=NOTHING)
     (call,) = gw.calls
     assert call.env == {"PATH": "/usr/bin", "HOME": "/home/x", "LANG": "C.UTF-8", "LC_ALL": "C"}
     assert call.cwd == "/"
@@ -728,7 +730,7 @@ def test_version_probe_path_drops_relative_and_session_writable_entries(tmp_path
     gw.on(["claude", "--version"], stdout="2.1.314 (Claude Code)\n")
     environ = {"PATH": f"rel:{unsafe / 'bin'}::{link}:{safe}"}
     writable = pathrules.SessionWritable([str(unsafe)])
-    claude_version.probe(
+    claude_version.run(
         pathrules.ResolvedTool("/x/claude", "claude"), environ, gw, writable=writable
     )
     (call,) = gw.calls
@@ -739,7 +741,8 @@ def test_version_probe_with_no_safe_path_entry_runs_nothing(tmp_path: Path) -> N
     gw = FakeGateway()
     writable = pathrules.SessionWritable([str(tmp_path)])
     found = pathrules.ResolvedTool("/x/claude", "claude")
-    assert claude_version.probe(found, {"PATH": str(tmp_path)}, gw, writable=writable) is None
+    with pytest.raises(claude_version.NotRun):
+        claude_version.run(found, {"PATH": str(tmp_path)}, gw, writable=writable)
     assert gw.calls == []
 
 
@@ -760,9 +763,8 @@ def test_a_hanging_version_probe_leaves_no_process(tmp_path: Path) -> None:
     claude.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {pid_file}\nwait\n")
     environ = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
     found = pathrules.ResolvedTool(str(claude), "claude")
-    assert (
-        claude_version.probe(found, environ, SystemGateway(), writable=NOTHING, timeout=0.5) is None
-    )
+    with pytest.raises(claude_version.NotRun):
+        claude_version.run(found, environ, SystemGateway(), writable=NOTHING, timeout=0.5)
     pid = int(pid_file.read_text())
     deadline = time.monotonic() + 10
     while not _gone(pid) and time.monotonic() < deadline:

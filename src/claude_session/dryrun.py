@@ -8,7 +8,9 @@ and ``resolve_kind`` (step 2), then the step-5 checks in their documented order
 nothing: ``tmpdir.check`` and ``self_check(create=False)``), then ``launch.generate`` (the
 settings and argv step 7 would write). It never allocates, opens no session directory, runs
 no hook and writes no audit or log record. The processes it starts are the read-only probes
-of a launch: ``git`` (repo id and git directory) and the sandbox prerequisite probes. When
+of a launch: ``git`` (repo id and git directory), ``claude --version`` (the launch's version
+check, never of a ``claude`` under the paths a session could write, also for trusted kinds:
+``launch.Effects.claude_version``) and the sandbox prerequisite probes. When
 the checks pass, the sandbox state comes from them (no second probe); when one fails, the
 prerequisites are probed with ``bwrap`` and ``socat`` resolved against the session-writable
 paths known without a session (``unchecked_writable``: with the permission profile's write
@@ -23,7 +25,8 @@ are shown with the placeholder id ``PLACEHOLDER_ID``, and its own ``work/``, ``o
 
 ``kinds`` resolves every kind (or one) without a session and without the session-writable
 checks of a launch (it has no session); it probes ``claude --version`` (minimal environment
-whose ``PATH`` holds no session-writable entry, ``claude_version.probe``) and the sandbox
+whose ``PATH`` holds no session-writable entry: ``claude_version.check_interpreter``,
+then ``claude_version.run``) and the sandbox
 prerequisites, never running a binary under a path a session could write without a session
 context (``launch.step2_writable``) or under a kind's ``write_dirs`` and permission profile
 write paths (``unchecked_writable``; without ``--repo``, also every per-repo override's:
@@ -430,17 +433,28 @@ def kinds_report(
     lookup = _claude_lookup(cfg, process, default, every)
     claude = lookup.tool
     version = None
+    not_run = None
     if claude is not None and every is not None:
-        version = claude_version.probe(
-            claude, process.environ, process.gateway, writable=every.union
-        )
+        try:
+            claude_version.check_interpreter(
+                claude, claude_version.probe_path(process.environ, every.union), every.union
+            )
+            version = claude_version.run(
+                claude, process.environ, process.gateway, writable=every.union
+            )
+        except LaunchValidationError as error:
+            not_run = error.message
+        except claude_version.NotRun as error:
+            not_run = error.reason
     warnings: list[str] = []
     if lookup.refused is not None:
         warnings.append(f"claude: {lookup.refused}")
     elif claude is None:
         warnings.append(f"claude not found: {cfg.claude_bin!r}")
     elif version is None:
-        warnings.append(f"could not run {claude.path} --version")
+        warnings.append(
+            f"could not run {claude.path} --version" + ("" if not_run is None else f": {not_run}")
+        )
     profiles = []
     for resolution, writable in zip(resolutions, sets, strict=True):
         warnings += resolution.warnings
@@ -459,8 +473,12 @@ def kinds_report(
         "default_kind": cfg.default_kind,
         "repo": repo,
         "claude_bin_resolved": None if claude is None else claude.path,
-        "claude_version": version,
-        "claude_version_ok": claude_version.at_least(version, cfg.min_claude_version),
+        "claude_version": None if version is None else version.text,
+        "claude_version_ok": (
+            None
+            if version is None
+            else claude_version.at_least(version.line, cfg.min_claude_version)
+        ),
         "state_dir_warnings": state_dir_warnings(process.state_root, probes.platform),
         "min_claude_version": cfg.min_claude_version,
         "kinds": profiles,

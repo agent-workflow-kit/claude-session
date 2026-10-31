@@ -32,7 +32,11 @@ Rules every call follows:
   ``GatewayTimeout``).
 - The ``claude --version`` probe adds ``kill_group_on_exit=True``: its group also gets SIGKILL
   when ``claude`` exits normally (Linux: after the exit, before the leader is reaped, so the
-  group ID still names that group), so no descendant outlives the probe.
+  group ID still names that group), so no descendant outlives the probe. On Linux the leader's
+  exit is also polled while the output is read: once it has exited the group is SIGKILLed, what
+  is already buffered is read (at most ``_DRAIN_MAX`` seconds) and reading stops, so a
+  descendant that left the group (``setsid``) and holds the output open cannot delay the
+  result. Without ``kill_group_on_exit`` ``run`` reads until every writer closed the output.
 
 ``die_with_parent`` (``spawn``, Linux only, ignored elsewhere) sets ``PR_SET_PDEATHSIG(SIGTERM)``
 in the child between fork and exec (through ``ctypes``, resolved before the fork, in
@@ -102,6 +106,8 @@ _GRACE_POLL_MAX = 0.5
 _EXIT_POLL_FIRST = 0.001
 _EXIT_POLL_MAX = 0.05
 _READ_SIZE = 32768
+# The longest read of already buffered output once a ``kill_group_on_exit`` leader exited.
+_DRAIN_MAX = 0.1
 _PIPE_BUF = getattr(select, "PIPE_BUF", 512)  # a write this small never blocks once writable
 
 
@@ -174,20 +180,25 @@ class Gateway(Protocol):
         kill_grace: float | None = None,
         executable: str | None = None,
         kill_group_on_exit: bool = False,
+        output_limit: int | None = None,
     ) -> Result:
-        """Run to completion, capturing text output. ``new_process_group`` puts the child in
+        """Run to completion, capturing text output. ``output_limit`` (bytes, per stream) keeps
+        only that prefix of stdout and of stderr; the rest is read and discarded, so untrusted
+        output never grows memory and the child never blocks on a full pipe (a cut may split a
+        UTF-8 character, which is then replaced). ``new_process_group`` puts the child in
         its own process group, which a timeout ends as a whole; ``kill_grace`` (only with a
         group) is the longest SIGTERM-to-SIGKILL delay (see ``GatewayTimeout``).
         ``kill_group_on_exit`` (only with a group) also SIGKILLs the group when the leader
         exits normally, so no descendant outlives the run: on Linux it is sent once the
         leader has exited but before it is reaped (the unreaped leader keeps the group ID
-        from being reused), and only to that group; without ``os.waitid`` (macOS) the
-        leader is reaped first and the group is not signaled (best effort). An exception
-        while waiting (a signal handler raising, ``KeyboardInterrupt`` included) ends the child
-        the same way, then propagates (on Linux; best effort without ``os.waitid``, see
-        ``GatewayTimeout``); one raised during the grace still gets the group SIGKILL and the
-        leader reaped first. Raises ``GatewayTimeout``, and ``OSError`` when the
-        program cannot be started."""
+        from being reused), and only to that group, and reading the output then stops after
+        what is already buffered (a descendant that left the group cannot delay the result);
+        without ``os.waitid`` (macOS) the leader is reaped first and the group is not
+        signaled (best effort). An exception while waiting (a signal handler raising,
+        ``KeyboardInterrupt`` included) ends the child the same way, then propagates (on
+        Linux; best effort without ``os.waitid``, see ``GatewayTimeout``); one raised during
+        the grace still gets the group SIGKILL and the leader reaped first. Raises
+        ``GatewayTimeout``, and ``OSError`` when the program cannot be started."""
         ...
 
     def spawn(
@@ -273,6 +284,16 @@ def check_kill_grace(
         raise ValueError("kill_grace needs new_process_group (it applies to the group)")
     if kill_grace < 0:
         raise ValueError(f"kill_grace must not be negative, got {kill_grace}")
+
+
+def check_output_limit(output_limit: int | None) -> None:
+    """``run``'s ``output_limit`` contract, shared with the fakes: None or an int >= 0."""
+    if output_limit is None:
+        return
+    if isinstance(output_limit, bool) or not isinstance(output_limit, int):
+        raise TypeError("output_limit must be an int")
+    if output_limit < 0:
+        raise ValueError(f"output_limit must not be negative, got {output_limit}")
 
 
 def _child_env(
@@ -501,22 +522,60 @@ def _wait_exited(
     popen.wait()  # it has exited: returns at once
 
 
+def _leader_exited(popen: subprocess.Popen[bytes]) -> bool:
+    """Whether the child has exited (left unreaped: ``WNOWAIT``), or was reaped elsewhere."""
+    try:
+        return os.waitid(os.P_PID, popen.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None
+    except ChildProcessError:
+        return True
+
+
+def _keep(kept: list[bytes], chunk: bytes, output_limit: int | None) -> None:
+    """Append ``chunk`` to ``kept``, cut to what ``output_limit`` still allows."""
+    if output_limit is not None:
+        room = output_limit - sum(map(len, kept))
+        chunk = chunk[: max(room, 0)]
+    if chunk:
+        kept.append(chunk)
+
+
+def _drain(fds: Iterable[int], output: dict[int, list[bytes]], output_limit: int | None) -> None:
+    """Read what is already buffered on ``fds`` without blocking, until each is empty or at
+    EOF, for at most ``_DRAIN_MAX`` seconds in all (a writer outside the group may go on)."""
+    end = time.monotonic() + _DRAIN_MAX
+    for fd in fds:
+        os.set_blocking(fd, False)
+        while time.monotonic() < end:
+            try:
+                chunk = os.read(fd, _READ_SIZE)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            _keep(output[fd], chunk, output_limit)
+
+
 def _exchange(
     popen: subprocess.Popen[bytes],
     data: bytes | None,
     timeout: float | None,
+    output_limit: int | None = None,
     *,
     kill_group: bool = False,
 ) -> tuple[bytes, bytes]:
     """Like ``Popen.communicate``: write ``data`` to stdin, read stdout and stderr to EOF,
     wait for the exit; ``subprocess.TimeoutExpired`` after ``timeout`` seconds. Unlike it, the
-    child is never reaped before it has exited, even when interrupted (see the module docs)."""
+    child is never reaped before it has exited, even when interrupted (see the module docs).
+    With ``output_limit``, at most that many bytes of each stream are kept. With
+    ``kill_group`` (Linux), reading also ends once the leader has exited: its group is then
+    SIGKILLed and only what is already buffered is read (``_drain``)."""
     deadline = None if timeout is None else time.monotonic() + timeout
     assert popen.stdout is not None and popen.stderr is not None
     out_fd, err_fd = popen.stdout.fileno(), popen.stderr.fileno()
     readers = {out_fd: popen.stdout, err_fd: popen.stderr}
     output: dict[int, list[bytes]] = {fd: [] for fd in readers}
     pending = memoryview(data or b"")
+    poll_exit = kill_group and hasattr(os, "waitid")
     with selectors.DefaultSelector() as selector:
         for fd in readers:
             selector.register(fd, selectors.EVENT_READ)
@@ -532,7 +591,10 @@ def _exchange(
             if remaining is not None and remaining <= 0:
                 assert timeout is not None  # a deadline comes from a timeout
                 raise subprocess.TimeoutExpired(popen.args, timeout)
-            for key, _ in selector.select(remaining):
+            wait = remaining
+            if poll_exit:
+                wait = _EXIT_POLL_MAX if remaining is None else min(remaining, _EXIT_POLL_MAX)
+            for key, _ in selector.select(wait):
                 if key.fd == in_fd:
                     try:
                         pending = pending[os.write(key.fd, pending[:_PIPE_BUF]) :]
@@ -545,10 +607,23 @@ def _exchange(
                     continue
                 chunk = os.read(key.fd, _READ_SIZE)
                 if chunk:
-                    output[key.fd].append(chunk)
-                else:
-                    selector.unregister(key.fd)
-                    readers[key.fd].close()
+                    _keep(output[key.fd], chunk, output_limit)
+                    continue
+                selector.unregister(key.fd)
+                readers[key.fd].close()
+            if poll_exit and _leader_exited(popen):
+                # The rest of the group is SIGKILLed: only a descendant that left the group
+                # can still hold the output open, so read what is buffered and stop.
+                _signal_group(popen, signal.SIGKILL)
+                fds = [key.fd for key in selector.get_map().values()]
+                _drain([fd for fd in fds if fd != in_fd], output, output_limit)
+                for fd in fds:
+                    selector.unregister(fd)
+                    if fd == in_fd:
+                        assert stdin is not None
+                        stdin.close()
+                    else:
+                        readers[fd].close()
     _wait_exited(popen, deadline, timeout, kill_group=kill_group)
     return b"".join(output[out_fd]), b"".join(output[err_fd])
 
@@ -602,11 +677,13 @@ class SystemGateway:
         kill_grace: float | None = None,
         executable: str | None = None,
         kill_group_on_exit: bool = False,
+        output_limit: int | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(
             kill_grace, new_process_group=new_process_group, kill_group_on_exit=kill_group_on_exit
         )
+        check_output_limit(output_limit)
         args = tuple(argv)
         data = None if stdin is None else stdin.encode("utf-8", "replace")
         with subprocess.Popen(
@@ -620,7 +697,9 @@ class SystemGateway:
             process_group=0 if new_process_group else None,
         ) as popen:
             try:
-                out, err = _exchange(popen, data, timeout, kill_group=kill_group_on_exit)
+                out, err = _exchange(
+                    popen, data, timeout, output_limit, kill_group=kill_group_on_exit
+                )
             except subprocess.TimeoutExpired:
                 _end(popen, group=new_process_group, kill_grace=kill_grace)
                 raise GatewayTimeout(args, timeout) from None
