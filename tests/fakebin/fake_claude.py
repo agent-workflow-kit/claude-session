@@ -24,21 +24,30 @@ infinite numbers)::
       "report_command": "claude-session report",  # the agent's command prefix (shell text)
       "log": "<abs path>",
       "version": "2.1.312 (Claude Code)",
-      "extra_flags": {"--permission-mode": "value", "--foo": "bool"},  # more accepted options
+      "extra_flags": {"--allowedTools": "variadic", "--foo": "bool"},  # more accepted options
       "signals": {"TERM": {"exit": 143, "session_end": "other"}, "HUP": "ignore"},
       "raise_after_steps": "TERM",       # test knob: the fake signals itself after the steps
       "signal_on_error": "TERM",         # test knob: ... as it starts handling a step's error
       "steps": [ {"do": "<step>", ...}, ... ]
     }
 
-**argv** follows the real claude's grammar: ``--opt value`` and ``--opt=value``, ``--`` ends
-the options, ``-d``/``--debug`` takes an optional value (the next argument unless it starts
-with ``-``, so it eats a following bootstrap prompt, as the real one does) and ``--add-dir``
-takes one or more values up to the next option (likewise). Only the flags claude-session passes
-(and ``extra_flags``) are accepted. With ``-p`` and no prompt argument the prompt is read from
-stdin (unless stdin is a terminal); like the real claude it waits 3 s for stdin to have data
-or end, then reads it to the end; nothing at all exits 1. TERM, HUP and INT kill the fake
-during that wait (no handlers are in place yet).
+**argv** follows the real claude's grammar (commander.js; ``CLAUDE_OPTIONS``): ``--opt value``
+and ``--opt=value``, ``--`` ends the options, a value is the next argument whatever it is, an
+optional value (``-d``/``--debug [filter]``, ``-r``/``--resume [value]``, ...) is the next
+argument unless it looks like an option, and a variadic option (``--add-dir``,
+``--allowedTools``/``--allowed-tools``, ``--disallowedTools``, ``--mcp-config``, ``--betas``,
+``--tools``, ``--file``) takes one value and then every argument up to the next option or
+``--``. So, as with the real claude, ``--debug`` or ``--allowedTools X`` right before a prompt
+eats it unless ``--`` comes first (verified live on Claude Code 2.1.314 for ``--debug`` and
+``--allowedTools``; the other kinds are read from ``claude --help`` 2.1.314). Only the flags
+claude-session passes (and ``extra_flags``, each ``bool``, ``value``, ``optional`` or
+``variadic``, which must match Claude Code's grammar for an option it has) are accepted;
+``--resume`` without an id (Claude Code's picker) is not modelled and fails loudly. How
+commander takes values (a dash-led value after a required option, a lone ``-`` as a value) is
+commander's documented behaviour, *unverified* on claude itself. With ``-p`` and no prompt
+argument the prompt is read from stdin (unless stdin is a terminal); like the real claude it
+waits 3 s for stdin to have data or end, then reads it to the end; nothing at all exits 1.
+TERM, HUP and INT kill the fake during that wait (no handlers are in place yet).
 
 **Hook steps** fire every matching hook of one event and take, besides their own keys,
 ``payload`` (fields merged over the built payload, for hostile-input tests), ``omit`` (field
@@ -168,12 +177,106 @@ FAKE_ERROR = 99
 ARGV_ERROR = 1
 NO_INPUT = "Input must be provided either through stdin or as a prompt argument when using --print"
 
-# The flags claude-session passes (design.md, Generated settings: argv); anything else is an
-# argv bug in the code under test and is rejected, as the real claude rejects unknown options.
-VALUE_FLAGS = {
+BOOL, VALUE, OPTIONAL, VARIADIC = "bool", "value", "optional", "variadic"
+# Claude Code's options and how its argv parser (commander.js) reads each one, from
+# ``claude --help`` of 2.1.314 (``<v>`` value, ``[v]`` optional, ``<v...>`` variadic, none bool).
+# commander (its documented parsing, not checked on claude): a value (and a variadic's first
+# value) is the next argument whatever it is; an optional value is the next argument unless it
+# looks like an option (starts with "-" and is longer than "-"); a variadic then takes every
+# following argument up to one that looks like an option, ``--`` included; ``--opt=v`` gives
+# exactly one value. The two hidden options claude-session passes
+# (``--append-system-prompt-file``, ``--max-turns``) are from Claude Code's documentation, not
+# ``--help``.
+CLAUDE_OPTIONS: dict[str, str] = {
+    "--add-dir": VARIADIC,
+    "--agent": VALUE,
+    "--agents": VALUE,
+    "--allow-dangerously-skip-permissions": BOOL,
+    "--allowedTools": VARIADIC,
+    "--append-system-prompt": VALUE,
+    "--append-system-prompt-file": VALUE,
+    "--autocompact": VALUE,
+    "--ax-screen-reader": BOOL,
+    "--bg": BOOL,
+    "--bare": BOOL,
+    "--betas": VARIADIC,
+    "--brief": BOOL,
+    "--chrome": BOOL,
+    "--cloud": OPTIONAL,
+    "--continue": BOOL,
+    "--dangerously-skip-permissions": BOOL,
+    "--debug": OPTIONAL,
+    "--debug-file": VALUE,
+    "--desktop": BOOL,
+    "--disable-slash-commands": BOOL,
+    "--disallowedTools": VARIADIC,
+    "--effort": VALUE,
+    "--environment": VALUE,
+    "--exclude-dynamic-system-prompt-sections": BOOL,
+    "--fallback-model": VALUE,
+    "--file": VARIADIC,
+    "--fork-session": BOOL,
+    "--forward-subagent-text": BOOL,
+    "--from-pr": OPTIONAL,
+    "--help": BOOL,
+    "--ide": BOOL,
+    "--include-hook-events": BOOL,
+    "--include-partial-messages": BOOL,
+    "--input-format": VALUE,
+    "--json-schema": VALUE,
+    "--max-budget-usd": VALUE,
+    "--max-turns": VALUE,
+    "--mcp-config": VARIADIC,
+    "--model": VALUE,
+    "--name": VALUE,
+    "--no-chrome": BOOL,
+    "--no-session-persistence": BOOL,
+    "--output-format": VALUE,
+    "--permission-mode": VALUE,
+    "--permission-prompts": VALUE,
+    "--plugin-dir": VALUE,
+    "--plugin-url": VALUE,
+    "--print": BOOL,
+    "-p": BOOL,
+    "--prompt-suggestions": OPTIONAL,
+    "--remote-control": OPTIONAL,
+    "--remote-control-session-name-prefix": VALUE,
+    "--replay-user-messages": BOOL,
+    "--restricted": BOOL,
+    "--resume": OPTIONAL,
+    "--safe-mode": BOOL,
+    "--session-id": VALUE,
+    "--setting-sources": VALUE,
+    "--settings": VALUE,
+    "--strict-mcp-config": BOOL,
+    "--system-prompt": VALUE,
+    "--system-prompt-snapshot": VALUE,
+    "--teleport": OPTIONAL,
+    "--tmux": BOOL,
+    "--tools": VARIADIC,
+    "--verbose": BOOL,
+    "--worktree": OPTIONAL,
+}
+# Other spellings of one option (``-p`` stays its own key; ``-v`` is ``--version``).
+ALIASES = {
+    "-c": "--continue",
+    "-d": "--debug",
+    "-h": "--help",
+    "-n": "--name",
+    "-r": "--resume",
+    "-w": "--worktree",
+    "--allowed-tools": "--allowedTools",
+    "--background": "--bg",
+    "--disallowed-tools": "--disallowedTools",
+}
+# The options claude-session passes (design.md, Generated settings: argv): the only ones
+# accepted besides a scenario's ``extra_flags``; anything else is an argv bug in the code under
+# test and is rejected, as the real claude rejects unknown options.
+STRICT_FLAGS = {
     "--settings",
     "--setting-sources",
     "--model",
+    "--add-dir",
     "--plugin-dir",
     "--append-system-prompt-file",
     "--system-prompt-snapshot",
@@ -181,14 +284,16 @@ VALUE_FLAGS = {
     "--session-id",
     "--output-format",
     "--max-turns",
+    "--debug",
+    "-p",
+    "--print",
+    "--fork-session",
+    "--strict-mcp-config",
+    "--verbose",
 }
 REPEATABLE_FLAGS = {"--plugin-dir"}
-VARIADIC_FLAGS = {"--add-dir"}
-OPTIONAL_VALUE_FLAGS = {"--debug"}
-BOOL_FLAGS = {"-p", "--print", "--fork-session", "--strict-mcp-config", "--verbose"}
-ALIASES = {"-d": "--debug"}
 OUTPUT_FORMATS = {"text", "json", "stream-json"}
-EXTRA_FLAG_KINDS = {"value", "bool"}
+EXTRA_FLAG_KINDS = {BOOL, VALUE, OPTIONAL, VARIADIC}
 
 SOURCES = {"startup", "resume", "fork", "clear", "compact"}
 NOTIFICATION_MESSAGES = {
@@ -336,13 +441,18 @@ class Argv:
         return bool(self.flags.get("-p") or self.flags.get("--print"))
 
 
+def _looks_like_option(arg: str) -> bool:
+    """commander's test: ``-`` alone is a value, ``--`` and ``-x...`` are options."""
+    return len(arg) > 1 and arg.startswith("-")
+
+
 def parse_argv(args: list[str], extra: dict[str, str] | None = None) -> Argv:
-    """Parse claude's argv strictly: unknown options, a missing value, a repeated single-use
-    flag or more than one prompt are rejected, as are the combinations the spike found
-    invalid. ``extra`` maps more accepted options to ``value`` or ``bool``."""
-    extra = extra or {}
-    value_flags = VALUE_FLAGS | {k for k, v in extra.items() if v == "value"}
-    bool_flags = BOOL_FLAGS | {k for k, v in extra.items() if v == "bool"}
+    """Parse claude's argv strictly, with commander's value grammar (``CLAUDE_OPTIONS``):
+    unknown options, a missing value, a repeated single-use flag or more than one prompt are
+    rejected, as are the combinations the spike found invalid. ``extra`` maps more accepted
+    options to a kind (``bool``, ``value``, ``optional``, ``variadic``)."""
+    kinds = {name: CLAUDE_OPTIONS[name] for name in STRICT_FLAGS}
+    kinds |= {ALIASES.get(k, k): v for k, v in (extra or {}).items()}
     parsed = Argv()
     i = 0
     options_done = False
@@ -355,7 +465,7 @@ def parse_argv(args: list[str], extra: dict[str, str] | None = None) -> Argv:
     while i < len(args):
         arg = args[i]
         i += 1
-        if options_done or arg == "-" or not arg.startswith("-"):
+        if options_done or not _looks_like_option(arg):
             positional(arg)
             continue
         if arg == "--":
@@ -364,11 +474,12 @@ def parse_argv(args: list[str], extra: dict[str, str] | None = None) -> Argv:
         name, eq, inline = arg.partition("=") if arg.startswith("--") else (arg, "", "")
         has_inline = eq == "="
         name = ALIASES.get(name, name)
+        kind = kinds.get(name)
         if name in ("--version", "-v"):
             if has_inline:
                 raise ArgvError(f"option '{name}' does not take an argument")
             parsed.version = True
-        elif name in value_flags:
+        elif kind in (VALUE, VARIADIC):
             if has_inline:
                 value = inline
             elif i < len(args):
@@ -376,29 +487,27 @@ def parse_argv(args: list[str], extra: dict[str, str] | None = None) -> Argv:
                 i += 1
             else:
                 raise ArgvError(f"option '{name}' argument missing")
-            if name in REPEATABLE_FLAGS:
+            if kind == VARIADIC:
+                values = [value]
+                while not has_inline and i < len(args) and not _looks_like_option(args[i]):
+                    values.append(args[i])
+                    i += 1
+                parsed.flags.setdefault(name, []).extend(values)
+            elif name in REPEATABLE_FLAGS:
                 parsed.flags.setdefault(name, []).append(value)
             elif name in parsed.flags:
                 raise ArgvError(f"option '{name}' given more than once")
             else:
                 parsed.flags[name] = value
-        elif name in VARIADIC_FLAGS:
-            values = [inline] if has_inline else []
-            while not has_inline and i < len(args) and not args[i].startswith("-"):
-                values.append(args[i])
-                i += 1
-            if not values:
-                raise ArgvError(f"option '{name}' argument missing")
-            parsed.flags.setdefault(name, []).extend(values)
-        elif name in OPTIONAL_VALUE_FLAGS:
+        elif kind == OPTIONAL:
             if has_inline:
                 parsed.flags[name] = inline
-            elif i < len(args) and not args[i].startswith("-"):
+            elif i < len(args) and not _looks_like_option(args[i]):
                 parsed.flags[name] = args[i]
                 i += 1
             else:
                 parsed.flags[name] = True
-        elif name in bool_flags:
+        elif kind == BOOL:
             if has_inline:
                 raise ArgvError(f"option '{name}' does not take an argument")
             parsed.flags[name] = True
@@ -406,6 +515,8 @@ def parse_argv(args: list[str], extra: dict[str, str] | None = None) -> Argv:
             raise ArgvError(f"unknown option '{arg}'")
     if parsed.version:
         return parsed
+    if parsed.flags.get("--resume") is True:
+        raise FakeError("--resume without a session id opens Claude Code's picker; not modelled")
     _check_combinations(parsed)
     return parsed
 
@@ -581,7 +692,16 @@ def load_scenario(path: str) -> dict[str, Any]:
     if not isinstance(extra, dict) or not all(
         isinstance(k, str) and k.startswith("-") and v in EXTRA_FLAG_KINDS for k, v in extra.items()
     ):
-        raise FakeError("scenario extra_flags must map options to 'value' or 'bool'")
+        raise FakeError(
+            f"scenario extra_flags must map options to one of {sorted(EXTRA_FLAG_KINDS)}"
+        )
+    declared: dict[str, str] = extra
+    for name, kind in declared.items():
+        real = CLAUDE_OPTIONS.get(ALIASES.get(name, name))
+        if real is not None and real != kind:
+            raise FakeError(
+                f"scenario extra_flags declares {name} {kind}; Claude Code's grammar is {real}"
+            )
     for knob in ("raise_after_steps", "signal_on_error"):
         if scenario.get(knob, "TERM") not in SIGNALS:
             raise FakeError(f"scenario {knob} must be one of {sorted(SIGNALS)}")
@@ -1436,6 +1556,8 @@ def _main(args: list[str], made: list[Fake]) -> int:
             read_headless_prompt(argv)
     except ArgvError as exc:
         return _error(f"Error: {exc}", ARGV_ERROR)
+    except FakeError as exc:
+        return _error(str(exc), FAKE_ERROR)
     if argv.version:
         version = (scenario or {}).get("version") or os.environ.get(VERSION_ENV, DEFAULT_VERSION)
         write_out(sys.stdout, version + "\n")

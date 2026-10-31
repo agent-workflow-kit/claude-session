@@ -261,7 +261,6 @@ def test_the_documented_argv_is_accepted_and_logged(env: Env) -> None:
         (["-p", "--max-turns", "0", "x"], "invalid --max-turns"),
         (["--verbose=yes"], "does not take an argument"),
         (["--add-dir"], "argument missing"),
-        (["--add-dir", "--verbose"], "argument missing"),
         (["-p"], "Input must be provided"),
         (["--", "a", "b"], "too many arguments"),
     ],
@@ -377,6 +376,212 @@ def test_extra_flags_extend_the_accepted_argv(env: Env) -> None:
     assert env.run("--permission-mode", "plan").returncode == 1
 
 
+def issue12_argv(
+    env: Env,
+    *,
+    headless: bool = False,
+    claude_args: tuple[str, ...] = (),
+    resume_from: str | None = None,
+    fork: bool = False,
+    session_id: str | None = None,
+    prompt: str | None = None,
+) -> list[str]:
+    """The argv claude-session builds (#12, ``build_argv``; design.md, Generated settings:
+    argv) after the ``--settings`` ``Env.argv`` adds: ``... [claude_args] [--resume <id>
+    [--fork-session]] [--session-id <uuid>] [-- <bootstrap prompt>]``."""
+    args = ["--setting-sources", "user", "--strict-mcp-config", "--model", "m"]
+    args += ["--add-dir", str(env.tmp), "--plugin-dir", "/p", "--add-dir", "/p"]
+    args += ["--append-system-prompt-file", "/i.md", "--system-prompt-snapshot", "off"]
+    if headless:
+        args += [*HEADLESS, "--max-turns", "6"]
+    args += claude_args
+    if resume_from is not None:
+        args += ["--resume", resume_from]
+        if fork:
+            args.append("--fork-session")
+    if session_id is not None:
+        args += ["--session-id", session_id]
+    if prompt is not None:
+        args += ["--", prompt]
+    return args
+
+
+# Variadic and optional-value options from claude_args, right before the conversation flags.
+GREEDY_ARGS = ("--allowedTools", "Bash(git *)", "Edit", "--debug")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "session_id", "source"),
+    [
+        ({"session_id": SID, "prompt": "/plugin:skill go"}, SID, "startup"),
+        ({"headless": True, "session_id": SID, "prompt": "Do the task."}, SID, "startup"),
+        ({"resume_from": SID, "prompt": "--looks-like-an-option"}, SID, "resume"),
+        ({"headless": True, "resume_from": SID, "prompt": "Continue."}, SID, "resume"),
+        ({"resume_from": SID}, SID, "resume"),
+        (
+            {"resume_from": SID, "fork": True, "session_id": OTHER_SID, "prompt": "go\non"},
+            OTHER_SID,
+            "fork",
+        ),
+        (
+            {
+                "headless": True,
+                "resume_from": SID,
+                "fork": True,
+                "session_id": OTHER_SID,
+                "prompt": "Continue.",
+            },
+            OTHER_SID,
+            "fork",
+        ),
+    ],
+)
+def test_the_issue_12_argv_shapes_keep_the_prompt_after_end_of_options(
+    env: Env, kwargs: dict[str, Any], session_id: str, source: str
+) -> None:
+    """Every argv shape #12 builds (interactive/headless, fresh/resume/fork, with and without
+    a prompt) parses with greedy ``claude_args`` before it; the ``--`` is live-verified to
+    protect the prompt (#12 review, Claude Code 2.1.314)."""
+    env.setup([{"do": "session_start"}], extra_flags={"--allowedTools": "variadic"})
+    result = env.run(*issue12_argv(env, claude_args=GREEDY_ARGS, **kwargs))
+    assert result.returncode == 0, result.stderr
+    (start,) = env.records("start")
+    assert start["prompt"] == kwargs.get("prompt")
+    assert start["headless"] is kwargs.get("headless", False)
+    assert start["session_id"] == session_id
+    assert start["flags"]["--allowedTools"] == ["Bash(git *)", "Edit"]
+    assert start["flags"]["--debug"] is True
+    assert start["flags"]["--add-dir"] == [str(env.tmp), "/p"]
+    assert start["flags"].get("--resume") == kwargs.get("resume_from")
+    assert env.hook_calls()[0]["payload"]["source"] == source
+
+
+@pytest.mark.parametrize(
+    ("claude_args", "flag", "value"),
+    [
+        # Live (#12 review, Claude Code 2.1.314): both swallow a following prompt.
+        (["--debug"], "--debug", "go"),
+        (["--allowedTools", "Edit"], "--allowedTools", ["Edit", "go"]),
+        # From `claude --help` (2.1.314): the same grammar, not checked live.
+        (["--allowed-tools", "Edit"], "--allowedTools", ["Edit", "go"]),
+        (["-d"], "--debug", "go"),
+        (["--add-dir", "/a"], "--add-dir", ["/a", "go"]),
+        (["--mcp-config", "a.json"], "--mcp-config", ["a.json", "go"]),
+        (["--betas", "b1"], "--betas", ["b1", "go"]),
+        (["--worktree"], "--worktree", "go"),
+    ],
+)
+def test_a_greedy_claude_arg_swallows_a_prompt_without_end_of_options(
+    env: Env, claude_args: list[str], flag: str, value: object
+) -> None:
+    """A variadic or optional-value option right before the prompt takes it as a value; ``--``
+    keeps it a prompt. Verified live (#12 review, Claude Code 2.1.314): ``--debug`` and
+    ``--allowedTools X``. From ``claude --help`` 2.1.314 only: ``--allowed-tools``, ``-d``,
+    ``--add-dir``, ``--mcp-config``, ``--betas``, ``--worktree``."""
+    extra = {"--allowedTools": "variadic", "--mcp-config": "variadic", "--betas": "variadic"}
+    env.setup([], extra_flags={**extra, "--worktree": "optional"})
+    assert env.run(*claude_args, "go").returncode == 0
+    (start,) = env.records("start")
+    assert start["prompt"] is None
+    assert start["flags"][flag] == value
+    # With "--" (as #12 now builds it) the prompt is kept.
+    env.log.unlink()
+    assert env.run(*claude_args, "--", "go").returncode == 0
+    (start,) = env.records("start")
+    assert start["prompt"] == "go"
+    assert start["flags"][flag] == (value[:-1] if isinstance(value, list) else True)
+
+
+def test_a_swallowed_headless_prompt_leaves_print_mode_without_input(env: Env) -> None:
+    env.setup(
+        [{"do": "touch", "path": str(env.tmp / "ran")}], extra_flags={"--allowedTools": "variadic"}
+    )
+    result = env.run(*HEADLESS, "--allowedTools", "Edit", "Do the task.")
+    assert result.returncode == 1
+    assert "Input must be provided" in result.stderr
+    assert not (env.tmp / "ran").exists()
+
+
+@pytest.mark.parametrize(
+    ("args", "flags", "prompt"),
+    [
+        # commander: a required value is taken even when it starts with "-".
+        (["--add-dir", "--verbose"], {"--add-dir": ["--verbose"]}, None),
+        (["--add-dir", "--", "x"], {"--add-dir": ["--", "x"]}, None),
+        # A lone "-" is a value, not an option; "--" ends a variadic list.
+        (["--add-dir", "/a", "-", "--", "x"], {"--add-dir": ["/a", "-"]}, "x"),
+        (["--debug", "-"], {"--debug": "-"}, None),
+        (["--debug", "--", "x"], {"--debug": True}, "x"),
+        # "--opt=value" ends a variadic list at once.
+        (["--add-dir=/a", "x"], {"--add-dir": ["/a"]}, "x"),
+        (["-r", SID, "--", "x"], {"--resume": SID}, "x"),
+        (["--resume=" + SID], {"--resume": SID}, None),
+        (["--allowed-tools", "A", "--allowedTools", "B"], {"--allowedTools": ["A", "B"]}, None),
+    ],
+)
+def test_commander_value_grammar(
+    env: Env, args: list[str], flags: dict[str, Any], prompt: str | None
+) -> None:
+    """Edge cases of commander.js's documented parsing (not checked live on claude): a
+    required value may start with "-", a lone "-" is a value, "--" ends a variadic list and
+    ``--opt=value`` gives one value; option kinds from ``claude --help`` 2.1.314."""
+    env.setup([], extra_flags={"--allowed-tools": "variadic"})
+    result = env.run(*args)
+    assert result.returncode == 0, result.stderr
+    (start,) = env.records("start")
+    assert {k: start["flags"][k] for k in flags} == flags
+    assert start["prompt"] == prompt
+
+
+@pytest.mark.parametrize(
+    ("extra", "args", "flags", "prompt"),
+    [
+        ({"--foo": "optional"}, ["--foo", "x"], {"--foo": "x"}, None),
+        ({"--foo": "optional"}, ["--foo", "--", "x"], {"--foo": True}, "x"),
+        ({"--foo": "variadic"}, ["--foo", "a", "b", "--", "x"], {"--foo": ["a", "b"]}, "x"),
+        ({"--foo": "value"}, ["--foo", "-a", "x"], {"--foo": "-a"}, "x"),
+        ({"--foo": "bool"}, ["--foo", "x"], {"--foo": True}, "x"),
+    ],
+)
+def test_extra_flags_declare_any_kind(
+    env: Env, extra: dict[str, str], args: list[str], flags: dict[str, Any], prompt: str | None
+) -> None:
+    env.setup([], extra_flags=extra)
+    result = env.run(*args)
+    assert result.returncode == 0, result.stderr
+    (start,) = env.records("start")
+    assert {k: start["flags"][k] for k in flags} == flags
+    assert start["prompt"] == prompt
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"--allowedTools": "value"},
+        {"--allowed-tools": "bool"},
+        {"--debug": "value"},
+        {"--permission-mode": "optional"},
+        {"-r": "value"},
+    ],
+)
+def test_extra_flags_must_match_claudes_grammar(env: Env, extra: dict[str, str]) -> None:
+    """A scenario cannot declare a real option with another kind than ``claude --help``
+    2.1.314 gives it, so a test cannot pass on the fake and fail on claude."""
+    write_json(env.scenario, {"steps": [], "extra_flags": extra})
+    write_json(env.settings, {})
+    result = env.run("-p", "x")
+    assert result.returncode == FAKE_ERROR
+    assert "Claude Code's grammar" in result.stderr
+
+
+def test_resume_without_an_id_is_not_modelled(env: Env) -> None:
+    env.setup([{"do": "touch", "path": str(env.tmp / "ran")}])
+    result = env.run("--resume", "--", "x")
+    assert result.returncode == FAKE_ERROR
+    assert "--resume" in result.stderr
+    assert not (env.tmp / "ran").exists()
+
+
 @pytest.mark.parametrize(
     ("scenario", "message"),
     [
@@ -397,6 +602,7 @@ def test_extra_flags_extend_the_accepted_argv(env: Env) -> None:
         ({"steps": [{"do": "truncated_result", "chars": 3, "bytes": 3}]}, "exactly one"),
         ({"steps": [{"do": "parallel", "steps": [{"do": "stop"}]}]}, "parallel"),
         ({"steps": [], "extra_flags": {"--x": "maybe"}}, "extra_flags"),
+        ({"steps": [], "extra_flags": {"x": "bool"}}, "extra_flags"),
     ],
 )
 def test_a_broken_scenario_fails_loudly(env: Env, scenario: dict[str, Any], message: str) -> None:
