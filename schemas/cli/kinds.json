@@ -181,7 +181,7 @@
         },
         "path": {
           "type": "string",
-          "description": "Effective PATH the session would get."
+          "description": "The computed PATH claude would receive (an env.set PATH included): the one environment value shown; every other variable is named only."
         },
         "read_dirs": {
           "type": "array",

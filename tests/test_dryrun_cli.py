@@ -215,8 +215,12 @@ def test_start_dry_run_is_the_same_plan(tmp_path: Path, tools: Path, work: Path)
 def test_an_interactive_dry_run_uses_the_interactive_timeout(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
+    # start: an interactive exec without a terminal exits 2 (test_interactive_tty_checks).
     proc = cli(
-        ["exec", "--dry-run", "--json", "--timeout", "5m"], cwd=work, tools=tools, tmp_path=tmp_path
+        ["start", "--dry-run", "--json", "--timeout", "5m"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
     )
     plan = json.loads(proc.stdout)
     validate(plan, DRY_RUN)
@@ -434,12 +438,13 @@ def test_kinds_json(tmp_path: Path, tools: Path, work: Path) -> None:
 
 
 def test_kinds_reports_an_old_claude(tmp_path: Path, tools: Path, work: Path) -> None:
+    # The probe gets a minimal environment, so the fake's version comes from its scenario.
+    write_json(tmp_path / "scenario.json", {"steps": [], "version": "2.0.1 (Claude Code)"})
     proc = cli(
         ["kinds", "--json", "--kind", "review"],
         cwd=work,
         tools=tools,
         tmp_path=tmp_path,
-        env={"FAKE_CLAUDE_VERSION": "2.0.1 (Claude Code)"},
     )
     report = json.loads(proc.stdout)
     validate(report, KINDS)
@@ -497,3 +502,259 @@ def test_a_profile_file_is_shown_by_its_hash(tmp_path: Path, tools: Path, work: 
     assert plan["profile"]["permission_profile"] == plan["permission_profile"]
     assert plan["origins"]["permission_profile_file"] == "flag"
     assert "Read" in plan["settings"]["permissions"]["allow"]
+
+
+# Read-only probes never run a binary a launch would refuse (R1)
+
+
+def plant(directory: Path, marker: Path) -> None:
+    """``claude``, ``bwrap`` and ``socat`` that record that they ran."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in ("claude", "bwrap", "socat"):
+        path = directory / name
+        path.write_text(f"#!/bin/sh\necho {name} >> {marker}\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+
+
+def test_kinds_never_runs_a_binary_under_the_caller_cwd(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    marker = tmp_path / "ran"
+    plant(work / "bin", marker)
+    proc = cli(
+        ["kinds", "--json"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        env={"PATH": f"{work / 'bin'}:{tools}:/usr/bin:/bin", "ANTHROPIC_API_KEY": SECRET},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists()
+    report = json.loads(proc.stdout)
+    validate(report, KINDS)
+    assert report["claude_bin_resolved"] is None and report["claude_version_ok"] is None
+    assert any("session-writable" in w and "not run" in w for w in report["warnings"])
+    review = next(k for k in report["kinds"] if k["name"] == "review")
+    assert review["sandbox_available"] is False
+    assert any("not run" in p for p in review["sandbox_problems"])
+
+
+def test_a_failing_dry_run_never_runs_a_planted_sandbox_tool(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    marker = tmp_path / "ran"
+    plant(work / "bin", marker)
+    proc, plan = dry_run(
+        "respond",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        env={"PATH": f"{work / 'bin'}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 12 and plan["would_fail"] is not None
+    assert not marker.exists()
+    assert plan["sandbox"]["available"] is False
+    assert any("not run" in p for p in plan["sandbox"]["problems"])
+
+
+def logging_tools(directory: Path, log: Path) -> None:
+    for name in ("bwrap", "socat"):
+        path = directory / name
+        path.write_text(f"#!/bin/sh\necho {name} >> {log}\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+
+
+def test_a_passing_dry_run_probes_the_sandbox_once(tmp_path: Path, tools: Path, work: Path) -> None:
+    """The plan's sandbox state comes from the launch's self-check: no second probe."""
+    log = tmp_path / "probes"
+    logging_tools(tools, log)
+    proc, plan = dry_run("review", cwd=work, tools=tools, tmp_path=tmp_path)
+    assert proc.returncode == 0, plan["warnings"]
+    assert plan["sandbox"]["available"] is True
+    assert sorted(log.read_text(encoding="utf-8").split()) == ["bwrap", "socat"]
+
+
+# permission_profile when a later check fails (R2)
+
+
+def test_a_read_profile_file_is_kept_when_the_sandbox_check_fails(
+    tmp_path: Path, work: Path
+) -> None:
+    bare = tmp_path / "bare"
+    claude_bin(bare, write_json(tmp_path / "s.json", {"steps": []}))
+    profile = tmp_path / "profile.json"
+    profile.write_text('{"permissions": {"allow": ["Read"]}}', encoding="utf-8")
+    proc, plan = dry_run(
+        "review",
+        "--permission-profile",
+        str(profile),
+        cwd=work,
+        tools=bare,
+        tmp_path=tmp_path,
+        env={"PATH": str(bare)},
+    )
+    assert proc.returncode == 12 and plan["would_fail"] == "sandbox_unavailable"
+    assert plan["permission_profile"].startswith("file:")
+    assert plan["profile"]["permission_profile"] == plan["permission_profile"]
+    assert plan["origins"]["permission_profile"] == "flag"
+
+
+def test_a_read_profile_file_is_kept_when_there_is_no_git_cwd(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    profile = tmp_path / "profile.json"
+    profile.write_text('{"permissions": {"allow": ["Read"]}}', encoding="utf-8")
+    proc, plan = dry_run(
+        "respond", "--permission-profile", str(profile), cwd=work, tools=tools, tmp_path=tmp_path
+    )
+    assert proc.returncode == 12 and plan["would_fail"] == "no_git_cwd"
+    assert plan["permission_profile"].startswith("file:")
+    assert plan["profile"]["permission_profile"] == plan["permission_profile"]
+
+
+def test_an_unreadable_profile_file_names_no_builtin_profile(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    missing = str(tmp_path / "missing.json")
+    proc, plan = dry_run(
+        "review", "--permission-profile", missing, cwd=work, tools=tools, tmp_path=tmp_path
+    )
+    assert proc.returncode == 12 and plan["would_fail"] == "invalid_permission_profile"
+    assert plan["permission_profile"] is None
+    assert plan["profile"]["permission_profile"] == missing
+    assert plan["origins"]["permission_profile"] == "flag"
+
+
+# claude_argv (R6)
+
+
+def test_claude_argv_starts_with_the_bare_name(tmp_path: Path, tools: Path, work: Path) -> None:
+    proc, plan = dry_run("review", cwd=work, tools=tools, tmp_path=tmp_path)
+    assert proc.returncode == 0, plan["warnings"]
+    assert plan["claude_argv"][0] == "claude"
+
+
+# --outcome-file (R7)
+
+
+def test_a_dry_run_writes_only_a_usage_error_to_the_outcome_file(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    usage = tmp_path / "usage.json"
+    proc = cli(
+        ["exec", "--dry-run", "--json", "--mode", "headless", "--outcome-file", str(usage)],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+    )
+    assert proc.returncode == 2
+    envelope = json.loads(usage.read_text(encoding="utf-8"))
+    validate(envelope, ERROR)
+    assert envelope["error"]["code"] == "usage"
+    planned = tmp_path / "plan.json"
+    proc, plan = dry_run(
+        "review", "--outcome-file", str(planned), cwd=work, tools=tools, tmp_path=tmp_path
+    )
+    assert proc.returncode == 0, plan["warnings"]
+    assert not planned.exists()
+
+
+# Warnings before a failure (R8)
+
+
+def test_warnings_before_a_failure_are_kept(tmp_path: Path, work: Path) -> None:
+    git_repo(work)
+    subprocess.run(
+        ["git", "-C", str(work), "config", "imap.pass", "x"],
+        check=True,
+        timeout=30,
+        env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+    bare = tmp_path / "bare"
+    claude_bin(bare, write_json(tmp_path / "s.json", {"steps": []}))
+    git = subprocess.run(
+        ["sh", "-c", "command -v git"], capture_output=True, text=True, timeout=15, check=True
+    ).stdout.strip()
+    (bare / "git").symlink_to(git)
+    proc, plan = dry_run(
+        "respond", cwd=work, tools=bare, tmp_path=tmp_path, env={"PATH": str(bare)}
+    )
+    assert proc.returncode == 12 and plan["would_fail"] == "sandbox_unavailable"
+    warnings = plan["warnings"]
+    credential = next((i for i, w in enumerate(warnings) if "imap.pass" in w), None)
+    assert credential is not None, warnings
+    failure = next(i for i, w in enumerate(warnings) if w.startswith("a launch would fail"))
+    assert credential < failure
+
+
+# Environment values (R9): profile.path is the only one shown
+
+
+def test_kinds_prints_no_environment_value_but_the_path(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    config = f"kinds:\n  implement:\n    env:\n      set: {{SET_ME: {SET_VALUE}}}\n"
+    proc = cli(
+        ["kinds", "--json", "--kind", "implement"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=config,
+        env={"ANTHROPIC_API_KEY": SECRET, "OTHER": SECRET},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert SECRET not in proc.stdout and SET_VALUE not in proc.stdout
+    (profile,) = json.loads(proc.stdout)["kinds"]
+    assert str(tools) in profile["path"].split(":")
+
+
+# Interactive TTY checks (R10)
+
+
+def test_an_interactive_exec_dry_run_without_a_terminal_is_a_usage_error(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    proc = cli(["exec", "--dry-run", "--json"], cwd=work, tools=tools, tmp_path=tmp_path)
+    assert proc.returncode == 2
+    assert error_of(proc)["error"]["code"] == "usage"
+
+
+# A cwd that is not valid UTF-8 (R12)
+
+
+@pytest.fixture
+def odd_cwd(tmp_path: Path) -> Path:
+    path = tmp_path / os.fsdecode(b"odd\xff")
+    path.mkdir()
+    (path / "prompt.md").write_text("Do it.\n", encoding="utf-8")
+    return path
+
+
+def test_a_launch_in_a_non_utf8_cwd_fails_unsafe_cwd(
+    tmp_path: Path, tools: Path, odd_cwd: Path
+) -> None:
+    proc = cli(
+        ["exec", "--json", "--mode", "headless", "--prompt-file", "prompt.md"],
+        cwd=odd_cwd,
+        tools=tools,
+        tmp_path=tmp_path,
+    )
+    assert proc.returncode == 12, proc.stderr
+    outcome = json.loads(proc.stdout)
+    assert outcome["end_reason"] == "unsafe_cwd"
+
+
+def test_a_dry_run_in_a_non_utf8_cwd_would_fail_with_valid_json(
+    tmp_path: Path, tools: Path, odd_cwd: Path
+) -> None:
+    proc, plan = dry_run("implement", cwd=odd_cwd, tools=tools, tmp_path=tmp_path)
+    assert proc.returncode == 12 and plan["would_fail"] == "unsafe_cwd"
+    assert plan["cwd"].endswith("odd\\udcff")
+    human = cli(
+        ["exec", "--dry-run", "--mode", "headless", "--prompt-file", "prompt.md"],
+        cwd=odd_cwd,
+        tools=tools,
+        tmp_path=tmp_path,
+    )
+    assert human.returncode == 12, human.stderr
+    assert "a launch would fail (unsafe_cwd)" in human.stdout

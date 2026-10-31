@@ -8,7 +8,11 @@ and ``resolve_kind`` (step 2), then the step-5 checks in their documented order
 nothing: ``tmpdir.check`` and ``self_check(create=False)``), then ``launch.generate`` (the
 settings and argv step 7 would write). It never allocates, opens no session directory, runs
 no hook and writes no audit or log record. The processes it starts are the read-only probes
-of a launch: ``git`` (repo id and git directory) and the sandbox prerequisite probes.
+of a launch: ``git`` (repo id and git directory) and the sandbox prerequisite probes. When
+the checks pass, the sandbox state comes from them (no second probe); when one fails, the
+prerequisites are probed with ``bwrap`` and ``socat`` resolved against the session-writable
+paths known without a session (``unchecked_writable``), and a binary a launch would refuse
+is reported, never run.
 
 A new session has no id yet: its paths (session directory, private tmpdir, settings file)
 are shown with the placeholder id ``PLACEHOLDER_ID``, and its own ``work/``, ``outbox/`` and
@@ -16,8 +20,9 @@ are shown with the placeholder id ``PLACEHOLDER_ID``, and its own ``work/``, ``o
 (``pathrules.PathRules(planned=True)``).
 
 ``kinds`` resolves every kind (or one) without a session and without the session-writable
-checks of a launch (it has no session); it probes ``claude --version`` and the sandbox
-prerequisites.
+checks of a launch (it has no session); it probes ``claude --version`` (minimal environment,
+``claude_version.probe``) and the sandbox prerequisites, never running a binary under a path
+a session could write without a session context (``launch.step2_writable``).
 
 TODO(#28): ``start --resume --dry-run`` and ``exec --session-id <id> --dry-run`` (inspect
 the pending run without adopting it: ``would_refuse`` ``already_adopted``/``expired``,
@@ -30,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -50,6 +56,7 @@ from . import (
 from .config import Config
 from .errors import LaunchValidationError, UsageError
 from .gateway import Gateway
+from .permission_profiles import Profile
 
 # A new session's paths are shown with this id (valid grammar; ids are random, so a real
 # session with it is as unlikely as any other collision).
@@ -107,10 +114,17 @@ def required_env_names(
 def origins_json(resolution: kinds.Resolution, mode: kinds.Mode) -> dict[str, str]:
     """``origins``: ``env.set`` is reported as ``env.set_names`` (names only), and the
     top-level ``timeout`` has the origin of the mode's key (``timeout`` or
-    ``interactive_timeout``)."""
+    ``interactive_timeout``). ``env.allow`` has the origin of the last layer that changed the
+    effective list (``--env-allow`` after ``--env-allowlist-only``), and
+    ``permission_profile`` that of a ``--permission-profile`` file, which replaces it."""
     origins: dict[str, str] = {}
     for key, origin in resolution.origins.items():
         origins["env.set_names" if key == "env.set" else key] = origin
+    for flag in ("env_allowlist_only", "env_allow"):
+        if flag in resolution.origins:
+            origins["env.allow"] = resolution.origins[flag]
+    if "permission_profile_file" in resolution.origins:
+        origins["permission_profile"] = resolution.origins["permission_profile_file"]
     origins["timeout"] = resolution.origins[
         "timeout" if mode == "headless" else "interactive_timeout"
     ]
@@ -169,13 +183,37 @@ def _entries(process: launch.Process, resolution: kinds.Resolution) -> list[str]
     )
 
 
-def _tool(name: str, entries: Sequence[str]) -> pathrules.ResolvedTool | None:
-    """A tool on the sanitized ``PATH`` (no session: no session-writable check); None when
-    it is not found or its name is unusable."""
+@dataclass(frozen=True)
+class Lookup:
+    """A tool looked up on the sanitized ``PATH``: ``tool`` None when it is not found or
+    refused; ``refused`` names why a launch would refuse it (it is never run)."""
+
+    tool: pathrules.ResolvedTool | None
+    refused: str | None = None
+
+
+def _tool(name: str, entries: Sequence[str], writable: pathrules.SessionWritable) -> Lookup:
+    """``name`` resolved as a launch resolves it, against ``writable``."""
     try:
-        return pathrules.resolve_tool(name, entries, launch.NO_SANDBOX)
-    except LaunchValidationError:
-        return None
+        return Lookup(pathrules.resolve_tool(name, entries, writable))
+    except LaunchValidationError as error:
+        return Lookup(None, f"{error.message}: not run (a launch refuses it: unsafe_path)")
+
+
+def unchecked_writable(
+    process: launch.Process, resolved: launch.Resolved | None, resolution: kinds.Resolution
+) -> pathrules.SessionWritable:
+    """The session-writable paths known without a session (a dry run whose checks failed,
+    and ``kinds``): the step-2 set (the caller's cwd, ``<state>/sessions``, the tmp root;
+    ``launch.step2_writable``) plus the kind's ``write_dirs`` that resolve without one."""
+    cwd = process.caller_cwd if resolved is None else resolved.caller_cwd
+    home = os.path.realpath(process.environ.get("HOME", "/"))
+    write = [
+        entry
+        for entry in _expanded_dirs(resolution.profile.write_dirs, home, "write_dirs")
+        if os.path.isabs(entry) and not any(v in entry for v in _SESSION_VARIABLES)
+    ]
+    return pathrules.SessionWritable([*launch.step2_writable(process, cwd).paths, *write])
 
 
 class Prerequisites:
@@ -186,12 +224,23 @@ class Prerequisites:
         self.platform = selfcheck.detect_platform() if platform is None else platform
         self._seen: dict[tuple[str | None, str | None], Sandbox] = {}
 
-    def check(self, process: launch.Process, resolution: kinds.Resolution) -> Sandbox | None:
-        """None for sandbox ``off``; else whether the prerequisites are present here."""
+    def check(
+        self,
+        process: launch.Process,
+        resolution: kinds.Resolution,
+        writable: pathrules.SessionWritable,
+    ) -> Sandbox | None:
+        """None for sandbox ``off``; else whether the prerequisites are present here, with
+        ``bwrap`` and ``socat`` resolved against ``writable``: a refused one is reported as a
+        problem and nothing is probed."""
         if resolution.profile.sandbox == "off":
             return None
         entries = _entries(process, resolution)
-        bwrap, socat = _tool("bwrap", entries), _tool("socat", entries)
+        found = [_tool("bwrap", entries, writable), _tool("socat", entries, writable)]
+        refused = tuple(item.refused for item in found if item.refused is not None)
+        if refused:
+            return Sandbox(available=False, problems=refused)
+        bwrap, socat = (item.tool for item in found)
         key = (None if bwrap is None else bwrap.path, None if socat is None else socat.path)
         if key not in self._seen:
             found = selfcheck.check_prerequisites(
@@ -224,7 +273,11 @@ def _expanded_dirs(entries: Sequence[str], home: str, key: str) -> list[str]:
 
 
 def preview(
-    cfg: Config, resolution: kinds.Resolution, process: launch.Process, claude: str | None
+    cfg: Config,
+    resolution: kinds.Resolution,
+    process: launch.Process,
+    claude: str | None,
+    writable: pathrules.SessionWritable,
 ) -> Preview:
     """A kind's ``PATH``, directories and required names without a session: the
     environment is built with the placeholder session and no session-writable check; the
@@ -253,7 +306,7 @@ def preview(
     read = _expanded_dirs(profile.read_dirs, home, "read_dirs")
     if resolution.isolated():
         entries = _entries(process, resolution)
-        tools = [_tool(name, entries) for name in ("bwrap", "socat", "git")]
+        tools = [_tool(name, entries, writable).tool for name in ("bwrap", "socat", "git")]
         paths = [t.path for t in tools if t is not None] + ([claude] if claude else [])
         read = [
             *settings_builder.system_read_dirs(),
@@ -285,12 +338,16 @@ def kinds_report(
     is given (never derived: ``cwd=None``)."""
     probes = prerequisites or Prerequisites(process.gateway)
     default = kinds.resolve(cfg, None, mode="headless", repo=repo, cwd=None)
-    claude = _tool(cfg.claude_bin, _entries(process, default))
+    writable = launch.step2_writable(process, process.caller_cwd)
+    lookup = _tool(cfg.claude_bin, _entries(process, default), writable)
+    claude = lookup.tool
     version = (
         None if claude is None else claude_version.probe(claude, process.environ, process.gateway)
     )
     warnings: list[str] = []
-    if claude is None:
+    if lookup.refused is not None:
+        warnings.append(f"claude: {lookup.refused}")
+    elif claude is None:
         warnings.append(f"claude not found: {cfg.claude_bin!r}")
     elif version is None:
         warnings.append(f"could not run {claude.path} --version")
@@ -299,13 +356,15 @@ def kinds_report(
     for name in names:
         resolution = kinds.resolve(cfg, name, mode="headless", repo=repo, cwd=None)
         warnings += resolution.warnings
-        sandbox = probes.check(process, resolution)
+        kind_writable = unchecked_writable(process, None, resolution)
+        sandbox = probes.check(process, resolution, kind_writable)
+        claude_path = None if claude is None else claude.path
         profiles.append(
             profile_json(
                 resolution,
                 permission_profile=resolution.profile.permission_profile,
                 sandbox=sandbox,
-                preview=preview(cfg, resolution, process, None if claude is None else claude.path),
+                preview=preview(cfg, resolution, process, claude_path, kind_writable),
                 warnings=[*resolution.warnings, *_sandbox_warnings(resolution, sandbox)],
             )
         )
@@ -351,12 +410,37 @@ def state_dir_warnings(state_root: str, platform: str) -> list[str]:
 # Dry run of a new session
 
 
-def request(args: argparse.Namespace, cfg: Config) -> launch.Request:
-    """``launch.read_request`` for any mode.
+def _isatty(stream: Any) -> bool:
+    try:
+        return stream is not None and bool(stream.isatty())
+    except (OSError, ValueError):
+        return False
 
-    TODO(#17): call ``read_request`` as it is once it accepts interactive mode (and keep
-    its interactive TTY checks for ``exec``, never for ``start``)."""
+
+def check_interactive_tty(args: argparse.Namespace) -> None:
+    """The step-2 TTY checks of interactive mode (interface.md, Launch order): plain
+    ``exec`` needs a TTY on stdin and stdout, and ``--prompt-file -`` refuses a TTY stdin
+    (``exec`` and ``start``; ``start`` never checks the TTY for the run). Exit 2."""
+    if args.prompt_file == "-" and _isatty(sys.stdin):
+        raise UsageError("--prompt-file - with a terminal on stdin in interactive mode")
+    if getattr(args, "handler", None) == "exec" and not (
+        _isatty(sys.stdin) and _isatty(sys.stdout)
+    ):
+        raise UsageError(
+            "interactive exec needs a terminal on stdin and stdout",
+            detail="pass --mode headless, or use start for a program caller",
+        )
+
+
+def request(args: argparse.Namespace, cfg: Config) -> launch.Request:
+    """``launch.read_request`` for any mode: interactive mode gets its TTY checks here, then
+    is read as headless (the rest of step 2 is the same).
+
+    TODO(#17): once ``read_request`` accepts interactive mode (with these TTY checks),
+    call it as it is and drop ``check_interactive_tty`` here."""
     mode = args.mode or "interactive"
+    if mode == "interactive":
+        check_interactive_tty(args)
     headless = argparse.Namespace(**{**vars(args), "mode": "headless"})
     return replace(launch.read_request(headless, cfg), mode=mode)
 
@@ -421,6 +505,22 @@ class Outcome:
     would_fail: str | None = None
     message: str | None = None
     warnings: list[str] = field(default_factory=list)
+    profile: Profile | None = None  # the permission profile, once read
+
+
+class DryRunEffects(launch.Effects):
+    """The effects of a dry run: nothing is recorded or created; the permission profile
+    and the warnings are kept for a plan whose checks fail later."""
+
+    def __init__(self) -> None:
+        self.profile: Profile | None = None
+        self.warnings: list[str] = []
+
+    def record_profile(self, profile: Profile) -> None:
+        self.profile = profile
+
+    def warn(self, warnings: Sequence[str]) -> None:
+        self.warnings += warnings
 
 
 def run_checks(
@@ -433,10 +533,11 @@ def run_checks(
     """Launch step 5 and the step-7 generation, without side effects; the first
     ``LaunchValidationError`` becomes ``would_fail``."""
     found = Outcome()
+    effects = DryRunEffects()
     try:
         settings_builder.check_rule_paths(process.state_root, process.claude_session)
         sessiondir.check_dirs(process.state_root, alloc.csession_id)
-        found.checked = launch.checks(cfg, req, resolved, alloc, process, launch.Effects())
+        found.checked = launch.checks(cfg, req, resolved, alloc, process, effects)
         found.warnings += found.checked.warnings
         # The size check of step 7, with a run secret of the real length (never printed).
         values = envbuild.secret_values(
@@ -458,7 +559,12 @@ def run_checks(
         found.generated = None
         found.would_fail = error.end_reason
         found.message = launch.failure_message(error)
-        found.warnings.append(f"a launch would fail ({error.end_reason}): {found.message}")
+        # The warnings found before the failure, then the failure.
+        found.warnings = [
+            *effects.warnings,
+            f"a launch would fail ({error.end_reason}): {found.message}",
+        ]
+    found.profile = effects.profile
     return found
 
 
@@ -483,17 +589,27 @@ def new_session_plan(
         warnings=resolution.warnings,
     )
     found = run_checks(cfg, req, resolved, alloc, process)
-    probes = prerequisites or Prerequisites(process.gateway)
-    sandbox = probes.check(process, resolution)
-    if found.checked is not None and sandbox is not None and found.checked.sandbox_active:
-        sandbox = Sandbox(available=True)
+    writable = unchecked_writable(process, resolved, resolution)
+    sandbox: Sandbox | None
+    if found.checked is not None:
+        # The checks passed: their (verified) tools and self-check, no second probe.
+        sandbox = (
+            None
+            if resolution.profile.sandbox == "off"
+            else Sandbox(
+                available=found.checked.sandbox_active, problems=found.checked.sandbox_problems
+            )
+        )
+    else:
+        probes = prerequisites or Prerequisites(process.gateway)
+        sandbox = probes.check(process, resolution, writable)
     plan = plan_json(
         cfg,
         req,
         resolution,
         found,
         sandbox=sandbox,
-        preview=_plan_preview(cfg, resolution, process, found),
+        preview=_plan_preview(cfg, resolution, process, found, writable),
         cwd=found.checked.cwd if found.checked is not None else _cwd(resolved, alloc),
         allow_tainted=bool(getattr(args, "allow_tainted", False)),
         override_escalation=bool(getattr(args, "override_escalation", False)),
@@ -506,13 +622,17 @@ def _cwd(resolved: launch.Resolved, alloc: launch.Allocated) -> str:
 
 
 def _plan_preview(
-    cfg: Config, resolution: kinds.Resolution, process: launch.Process, found: Outcome
+    cfg: Config,
+    resolution: kinds.Resolution,
+    process: launch.Process,
+    found: Outcome,
+    writable: pathrules.SessionWritable,
 ) -> Preview:
     """The profile's ``PATH``, directories and required names: from the launch checks when
     they passed, else as ``kinds`` computes them."""
     checked = found.checked
     if checked is None:
-        return preview(cfg, resolution, process, None)
+        return preview(cfg, resolution, process, None, writable)
     read: list[str] = list(checked.read_dirs)
     if checked.isolation is not None:
         iso = checked.isolation
@@ -549,13 +669,17 @@ def plan_json(
     checked = found.checked if found.would_fail is None else None
     settings: dict[str, Any] = {} if generated is None else generated.settings
     filesystem: Mapping[str, Any] = settings.get("sandbox", {}).get("filesystem", {})
-    label = (
-        found.checked.profile.label
-        if found.checked is not None
-        else None
-        if resolution.permission_profile_file is not None
-        else profile.permission_profile
-    )
+    # The profile the launch checks read (also when a later check failed); a profile file
+    # that could not be read has no label, and the profile shows the flag's value.
+    recorded = found.checked.profile if found.checked is not None else found.profile
+    label: str | None
+    if recorded is not None:
+        label = recorded.label
+    elif resolution.permission_profile_file is not None:
+        label = None
+    else:
+        label = profile.permission_profile
+    shown_profile = label or resolution.permission_profile_file or profile.permission_profile
     # The launch checks give the isolation and sandbox warnings when they ran.
     extra = _sandbox_warnings(resolution, sandbox) if found.checked is None else []
     warnings = [*resolution.warnings, *found.warnings, *extra]
@@ -586,14 +710,19 @@ def plan_json(
         "config_hash_changed": None,
         "profile": profile_json(
             resolution,
-            permission_profile=label or profile.permission_profile,
+            permission_profile=shown_profile,
             sandbox=sandbox,
             preview=preview,
             warnings=[*resolution.warnings, *_sandbox_warnings(resolution, sandbox)],
         ),
         "origins": origins_json(resolution, mode),
         "settings": settings,
-        "claude_argv": [] if generated is None else list(generated.argv),
+        # argv[0] is the bare name a launch execs (launch.Prepared.argv).
+        "claude_argv": (
+            []
+            if generated is None or found.checked is None
+            else [found.checked.claude.name, *generated.argv[1:]]
+        ),
         "env_names": [] if checked is None else sorted(checked.session_env.env),
         "sandbox": {
             "mode": profile.sandbox,
@@ -611,6 +740,22 @@ def plan_json(
 def current_process(gw: Gateway) -> launch.Process:
     """The running process, with the state root the schema check created."""
     return launch.Process.current(gw, store.state_dir())
+
+
+def printable(value: Any) -> Any:
+    """``value`` with every string that is not valid UTF-8 (a non-UTF-8 path decoded with
+    surrogate escapes) shown with backslash escapes, so the JSON output is valid UTF-8."""
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return value.encode("utf-8", "backslashreplace").decode("utf-8")
+        return value
+    if isinstance(value, dict):
+        return {printable(key): printable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [printable(item) for item in value]
+    return value
 
 
 def exit_code(plan: Mapping[str, Any]) -> int:

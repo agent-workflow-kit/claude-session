@@ -115,11 +115,13 @@ class Prerequisites:
 @dataclass(frozen=True)
 class SelfCheck:
     """``tmpdir``: the private temporary directory (created unless a dry run; None for
-    ``off`` and for a dry run without a session id)."""
+    ``off`` and for a dry run without a session id). ``problems``: why a ``preferred``
+    sandbox is unavailable (``<problem>; <hint>``; a dry run reports it)."""
 
     sandbox_active: bool
     tmpdir: str | None
     warnings: tuple[str, ...] = ()
+    problems: tuple[str, ...] = ()
 
 
 def detect_platform(sys_platform: str | None = None, release: str | None = None) -> str:
@@ -205,7 +207,9 @@ def self_check(
         platform, bwrap=bwrap, socat=socat, gw=gw, sandbox_exec=sandbox_exec
     )
     warnings: list[str] = []
+    problems: tuple[str, ...] = ()
     if not prerequisites.available:
+        problems = (f"{prerequisites.problem}; {prerequisites.hint}",)
         if mode == "required":
             raise LaunchValidationError(
                 f"sandbox unavailable: {prerequisites.problem}",
@@ -226,7 +230,12 @@ def self_check(
                 f"leftover private temporary directory moved aside: {stale};"
                 f" remove it: rm -rf {stale}"
             )
-    return SelfCheck(sandbox_active=prerequisites.available, tmpdir=path, warnings=tuple(warnings))
+    return SelfCheck(
+        sandbox_active=prerequisites.available,
+        tmpdir=path,
+        warnings=tuple(warnings),
+        problems=problems,
+    )
 
 
 # Session ids have a fixed length (ids.SESSION_ID); a dry run of a new session checks this one.

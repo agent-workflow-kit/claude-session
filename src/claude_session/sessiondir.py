@@ -392,52 +392,58 @@ def check_dirs(state_root: str, csession_id: str) -> None:
     """What ``SessionDirs.open`` and ``prepare_run`` would find, read only (``--dry-run``,
     which creates nothing): the state root a directory of ours reached without a symlink,
     and each of ``sessions/``, ``private/``, the session's two directories and its
-    ``outbox/``, ``artifacts/``, ``work/`` and ``inputs/`` that exists a real directory of
-    ours (``lstat``: never followed). A missing entry is fine: the launch creates it.
-    Raises ``SessionDirUnsafe``."""
+    ``outbox/``, ``artifacts/``, ``work/`` and ``inputs/`` opened as the launch opens them
+    (``fsutil.inspect_private_dir_at``: no-follow, owner checked, through the parent's
+    descriptor), so a refusal raises the error and message a launch would. A missing entry
+    is fine (the launch creates it), and so is a mode the launch repairs to 0700; the
+    entries below a directory whose mode denies searching it cannot be inspected and are
+    not checked. Raises ``SessionDirUnsafe``."""
     if not ids.is_session_id(csession_id):
         raise ValueError(f"not a session id: {csession_id!r}")
     root = os.path.realpath(state_root)
     try:
         root_fd = fsutil.open_dir_nofollow(root)
-        try:
-            fsutil.check_private_dir_fd(root_fd, root)
-        finally:
-            os.close(root_fd)
     except OSError as exc:
         raise _failed(root, exc) from exc
-    found: list[str] = []
-    for top in (SESSIONS, PRIVATE):
-        path = os.path.join(root, top)
-        if not _checked_dir(path):
-            continue
-        session = os.path.join(path, csession_id)
-        if _checked_dir(session):
-            found.append(session)
-            if top == SESSIONS:
-                for name in (OUTBOX, ARTIFACTS, WORK, INPUTS):
-                    _checked_dir(os.path.join(session, name))
-    if len(found) == 2 and os.lstat(found[0]).st_dev != os.lstat(found[1]).st_dev:
-        raise SessionDirUnsafe(f"{found[0]} and {found[1]} are not on the same file system")
-
-
-def _checked_dir(path: str) -> bool:
-    """Whether ``path`` exists; when it does it must be a real directory of ours."""
+    opened = [root_fd]
     try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return False
+        try:
+            fsutil.check_private_dir_fd(root_fd, root)
+        except OSError as exc:
+            raise _failed(root, exc) from exc
+        found: list[tuple[str, int]] = []
+        for top in (SESSIONS, PRIVATE):
+            top_fd = _inspect_dir(root_fd, top, os.path.join(root, top), opened)
+            if top_fd is None:
+                continue
+            session = os.path.join(root, top, csession_id)
+            fd = _inspect_dir(top_fd, csession_id, session, opened)
+            if fd is None:
+                continue
+            found.append((session, fd))
+        if len(found) == 2:
+            _check_same_device(found[0][1], found[1][1], found[0][0], found[1][0])
+        # prepare_run's directories, after both session directories (the launch's order).
+        if found and found[0][0] == os.path.join(root, SESSIONS, csession_id):
+            session, fd = found[0]
+            for name in (OUTBOX, ARTIFACTS, WORK, INPUTS):
+                _inspect_dir(fd, name, os.path.join(session, name), opened)
+    finally:
+        for fd in opened:
+            os.close(fd)
+
+
+def _inspect_dir(dir_fd: int, name: str, path: str, opened: list[int]) -> int | None:
+    """``name`` in ``dir_fd`` checked as ``_ensure_dir`` would (``SessionDirUnsafe`` with
+    its message); its descriptor (added to ``opened``), or None when it is missing or its
+    entries cannot be inspected."""
+    try:
+        _exists, fd = fsutil.inspect_private_dir_at(dir_fd, name)
     except OSError as exc:
         raise _failed(path, exc) from exc
-    if not stat.S_ISDIR(info.st_mode):
-        raise SessionDirUnsafe(
-            f"unsafe or unusable session directory entry {path}: not a directory"
-        )
-    if info.st_uid != os.geteuid():
-        raise SessionDirUnsafe(
-            f"unsafe or unusable session directory entry {path}: owned by uid {info.st_uid}"
-        )
-    return True
+    if fd is not None:
+        opened.append(fd)
+    return fd
 
 
 class SessionDirs:

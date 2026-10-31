@@ -398,6 +398,7 @@ class Checked:
     tmpdir: str | None
     warnings: list[str] = field(default_factory=list)
     credential_warnings: tuple[str, ...] = ()
+    sandbox_problems: tuple[str, ...] = ()  # why a preferred sandbox is unavailable
 
 
 @dataclass
@@ -459,9 +460,10 @@ def host_rules(
 
 
 def check_cwd(rules: pathrules.PathRules, resolution: kinds.Resolution) -> None:
-    """The cwd must be a directory; isolated runs also write it into rules and may write in
-    it, so it passes the cwd rules (``unsafe_cwd``), checked before the profile is expanded so
-    a bad cwd fails ``unsafe_cwd`` whatever the profile. A dry run's ``work/`` that a launch
+    """The cwd must be a directory and valid UTF-8 (every run: it is recorded and printed);
+    isolated runs also write it into rules and may write in it, so it passes the cwd rules
+    (``unsafe_cwd``), checked before the profile is expanded so a bad cwd fails
+    ``unsafe_cwd`` whatever the profile. A dry run's ``work/`` that a launch
     would create (``rules.planned``) counts as a directory."""
     if not os.path.isdir(rules.cwd) and not rules.planned(rules.cwd):
         raise LaunchValidationError(
@@ -470,6 +472,8 @@ def check_cwd(rules: pathrules.PathRules, resolution: kinds.Resolution) -> None:
     if resolution.isolated():
         settings_builder.check_cwd(rules.cwd)
         rules.check_cwd()
+    else:
+        settings_builder.check_cwd_utf8(rules.cwd)
 
 
 def base_writable(
@@ -819,6 +823,10 @@ class Effects:
     - ``git_cwd``: where git looks for the cwd's git directory (a dry run's ``work/`` that
       does not exist yet: its nearest existing parent, which a new empty directory inherits
       the git directory from).
+    - ``record_profile``: the permission profile, once read (a dry run reports its label
+      also when a later check fails).
+    - ``warn``: each warning as ``checks`` finds it, in order (a dry run keeps them when a
+      later check fails); ``Checked.warnings`` holds the same list either way.
     """
 
     planned = True
@@ -833,6 +841,12 @@ class Effects:
         return current
 
     def record_git_dir(self, git_dirs: gitinfo.GitDirs | None) -> None:
+        pass
+
+    def record_profile(self, profile: permission_profiles.Profile) -> None:
+        pass
+
+    def warn(self, warnings: Sequence[str]) -> None:
         pass
 
     def create_write_dirs(self, write: pathrules.WriteDirs) -> None:
@@ -904,16 +918,19 @@ def checks(
     check_cwd(rules, resolution)
     effects.record_cwd(cwd)
     profile = select_profile(cfg, resolution, base_writable(resolution, alloc, cwd, home, tmp))
+    effects.record_profile(profile)
     before_git = git_writable(resolution, alloc, cwd, home, tmp, profile)
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
     git_tool = pathrules.resolve_tool("git", entries, before_git)
     git_dirs, credential = check_git(resolution, effects.git_cwd(cwd), git_tool, process)
     warnings = list(credential)
+    effects.warn(credential)
     effects.record_git_dir(git_dirs)
     variables = profile_variables(alloc, cwd, home, git_dirs)
     expanded = permission_profiles.expand(profile.content, variables)
     read, write = resolve_run_dirs(resolution, variables, home, alloc)
     warnings += write.warnings
+    effects.warn(write.warnings)
     effects.create_write_dirs(write)
     writable = full_writable(resolution, alloc, cwd, home, tmp, write, expanded)
     check_profile_file(resolution, writable)
@@ -928,6 +945,7 @@ def checks(
         rules.check_generated(generated)
     check = effects.sandbox(resolution, alloc, tools, process)
     warnings += check.warnings
+    effects.warn(check.warnings)
     isolation = None
     if isolated:
         isolation = settings_builder.Isolation(
@@ -942,7 +960,9 @@ def checks(
             python_dirs=generated["python"],
             path_prepend=generated["path_prepend"],
         )
-    warnings += settings_builder.isolation_warnings(resolution)
+    isolation_warnings = settings_builder.isolation_warnings(resolution)
+    warnings += isolation_warnings
+    effects.warn(isolation_warnings)
     return Checked(
         cwd=cwd,
         git_dirs=git_dirs,
@@ -961,6 +981,7 @@ def checks(
         tmpdir=check.tmpdir,
         warnings=warnings,
         credential_warnings=tuple(credential),
+        sandbox_problems=check.problems,
     )
 
 

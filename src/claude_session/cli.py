@@ -209,10 +209,11 @@ def _dry_run(args: argparse.Namespace) -> int:
 
     cfg = load_config(args)
     plan, message = dryrun.new_session_plan(args, cfg, dryrun.current_process(SystemGateway()))
+    plan = dryrun.printable(plan)  # valid UTF-8 output, also for a non-UTF-8 path
     if args.json:
         print(json.dumps(plan, ensure_ascii=False, allow_nan=False))
     else:
-        _print_plan(plan, message)
+        _print_plan(plan, dryrun.printable(message))
     return dryrun.exit_code(plan)
 
 
@@ -248,7 +249,7 @@ def _kinds(args: argparse.Namespace) -> int:
 
     cfg = load_config(args)
     process = dryrun.current_process(SystemGateway())
-    report = dryrun.kinds_report(cfg, process, kind=args.kind, repo=args.repo)
+    report = dryrun.printable(dryrun.kinds_report(cfg, process, kind=args.kind, repo=args.repo))
     if args.json:
         print(json.dumps(report, ensure_ascii=False, allow_nan=False))
         return 0

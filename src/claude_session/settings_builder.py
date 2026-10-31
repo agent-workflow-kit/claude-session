@@ -283,6 +283,18 @@ def check_cwd(cwd: str) -> None:
     _check_input("cwd", cwd, "unsafe_cwd", rule=True)
 
 
+def check_cwd_utf8(cwd: str) -> None:
+    """Every run: the cwd is recorded on the run and printed in JSON, so it must be valid
+    UTF-8 (the rule ``check_cwd`` applies, with its message). Raises
+    ``LaunchValidationError`` (``unsafe_cwd``)."""
+    try:
+        cwd.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise LaunchValidationError(
+            f"cwd is not valid UTF-8: {_shown(cwd)!r}", end_reason="unsafe_cwd"
+        ) from exc
+
+
 def check_interpreter(
     interpreter: str,
     *,

@@ -14,6 +14,10 @@ from .gateway import Gateway, GatewayTimeout
 from .pathrules import ResolvedTool
 
 PROBE_TIMEOUT = 10.0
+# SIGTERM-to-SIGKILL delay for the probe's process group on a timeout.
+KILL_GRACE = 2.0
+# The only variables the probe gets: nothing secret (auth, secret_env, env.set) reaches it.
+PROBE_NAMES = ("PATH", "HOME", "LANG", "LANGUAGE")
 # The longest version text kept (the first line of the output).
 MAX_TEXT = 200
 # A version at the start of the output: ``2.1.312 (Claude Code)``.
@@ -21,15 +25,36 @@ _LEADING = re.compile(r"([0-9]+(?:\.[0-9]+)*)(?:\s|$)")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
-def probe(claude: ResolvedTool, environ: Mapping[str, str], gw: Gateway) -> str | None:
+def probe_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """The probe's minimal environment: ``PATH``, ``HOME`` and the locale variables
+    (``LANG``, ``LANGUAGE``, ``LC_*``) of ``environ``."""
+    return {
+        name: value
+        for name, value in environ.items()
+        if name in PROBE_NAMES or name.startswith("LC_")
+    }
+
+
+def probe(
+    claude: ResolvedTool,
+    environ: Mapping[str, str],
+    gw: Gateway,
+    *,
+    timeout: float = PROBE_TIMEOUT,
+) -> str | None:
     """The first line of ``claude --version`` (stripped, control characters removed, at most
     ``MAX_TEXT`` characters), run from the resolved realpath with ``argv[0]`` the tool's
-    name; None when it cannot run, times out, exits non-zero or prints nothing."""
+    name, in ``/`` with the minimal environment (``probe_env``) and in its own process
+    group, which a timeout ends as a whole; None when it cannot run, times out, exits
+    non-zero or prints nothing. The caller never passes a binary a launch would refuse."""
     try:
         result = gw.run(
             [claude.name, "--version"],
-            env=dict(environ),
-            timeout=PROBE_TIMEOUT,
+            env=probe_env(environ),
+            cwd="/",
+            timeout=timeout,
+            new_process_group=True,
+            kill_grace=KILL_GRACE,
             executable=claude.path,
         )
     except (OSError, ValueError, GatewayTimeout):

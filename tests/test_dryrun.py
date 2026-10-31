@@ -1,12 +1,15 @@
 """The dry-run plan and the ``kinds`` report, in process (interface.md, Dry run and kinds):
-the plan serializer with the documented isolated settings (goldens), ``claude --version``
-parsing, the read-only session-directory check and the planned own directories of the path
-rules. The command line end to end is in test_dryrun_cli.py."""
+the dry-run pipeline on a laid-out host with the documented isolated settings (goldens),
+``claude --version`` parsing and probing, the read-only session-directory check, the
+interactive TTY checks and the planned own directories of the path rules. The command line
+end to end is in test_dryrun_cli.py."""
 
 from __future__ import annotations
 
 import json
 import os
+import stat
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,29 +23,29 @@ from claude_session import (
     kinds,
     launch,
     pathrules,
-    permission_profiles,
     sessiondir,
     settings_builder,
 )
-from claude_session.errors import LaunchValidationError
+from claude_session.errors import LaunchValidationError, UsageError
 from claude_session.sessiondir import SessionDirUnsafe
 
-from .fake_gateway import FakeGateway
+from .fake_gateway import FakeGateway, Response
 from .golden import assert_golden
 from .schemas import validate
 from .test_isolated_settings import (
+    CS_PATH,
     CSDIR,
     GIT_DIR,
     GOLDEN,
     HOME,
     ISOLATED_KINDS,
-    PATHS,
     PLUGIN,
-    TOOLS,
+    PYTHON,
+    PYTHON_DIRS,
+    REPO,
+    SID,
+    SYSTEM,
     WT_GIT_DIR,
-    cwd_of,
-    expanded_profile,
-    isolation,
 )
 
 DRY_RUN = "claude-session/cli/exec-dry-run.json"
@@ -85,102 +88,137 @@ def request(kind: str, **fields: Any) -> launch.Request:
     return launch.Request(**values)
 
 
-def synthetic_plan(cfg: config.Config, kind: str) -> dict[str, Any]:
-    """The plan of a headless run of ``kind`` from the fixed inputs of the settings goldens
-    (tests/golden_settings): what launch.checks and launch.generate give on that host."""
-    resolution = kinds.resolve(cfg, kind, mode="headless", origin_url=lambda _: None)
-    cwd = cwd_of(kind)
+class GitGateway(FakeGateway):
+    """A fake gateway whose ``git rev-parse`` prints ``git_dirs`` (None: not a repository);
+    every other git call (origin remote, repository config) prints nothing."""
+
+    def __init__(self, git_dirs: tuple[str, str] | None) -> None:
+        super().__init__()
+        self.git_dirs = git_dirs
+
+    def _answer(self, argv: tuple[str, ...]) -> Response:
+        if argv[0] != "git":
+            return super()._answer(argv)
+        if "rev-parse" in argv:
+            if self.git_dirs is None:
+                return Response(128, "", "fatal: not a git repository (or any parent)\n")
+            return Response(0, "\n".join(self.git_dirs) + "\n")
+        if "remote" in argv:
+            return Response(2)
+        return Response(0)
+
+
+def executable_at(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(0o755)
+    return path
+
+
+def real_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str) -> tuple[Any, Path]:
+    """The plan ``dryrun.new_session_plan`` gives for a headless run of ``kind`` on a host
+    laid out under ``<root>`` as the settings goldens' fixed inputs (tests/golden_settings)
+    are: ``<root>/home/user``, its state directory, the tools, the plugin directory, the
+    respond checkout ``<root>/work/repo`` and its git directories. The generated system and
+    Python read entries are those inputs too (they depend on the machine)."""
+    root = tmp_path / "root"
+    home = root / HOME.lstrip("/")
+    state = home / ".local" / "state" / "claude-session"
+    state.mkdir(parents=True, mode=0o700)
+    for name in ("bwrap", "socat"):
+        executable_at(root / "usr" / "bin" / name)
+    executable_at(root / "usr" / "local" / "bin" / "git")
+    real_claude = executable_at(root / "opt" / "claude" / "versions" / "2.1.314")
+    (root / "usr" / "local" / "bin" / "claude").symlink_to(real_claude)
+    for directory in (*SYSTEM, *PYTHON_DIRS, PLUGIN, "/opt/toolchain", REPO, WT_GIT_DIR):
+        (root / directory.lstrip("/")).mkdir(parents=True, exist_ok=True)
+    prefixed = lambda paths: tuple(f"{root}{p}" for p in paths)  # noqa: E731
+    monkeypatch.setattr(settings_builder, "system_read_dirs", lambda: prefixed(SYSTEM))
+    monkeypatch.setattr(settings_builder, "python_read_dirs", lambda **_: prefixed(PYTHON_DIRS))
+    toolchain = f"{root}/opt/toolchain"
+    cfg = load_cfg(
+        tmp_path,
+        "claude_bin: claude\nkinds:\n"
+        + "".join(f"  {k}:\n    read_dirs: ['{toolchain}']\n" for k in ISOLATED_KINDS),
+    )
     git = kind != "rank"
-    iso = isolation(
-        git_dir=GIT_DIR if git else None,
-        worktree_git_dir=WT_GIT_DIR if git else None,
-        read_dirs=("/opt/toolchain",),
-    )
-    expanded = expanded_profile(cfg, resolution, cwd, GIT_DIR if git else None)
-    profile = permission_profiles.select(cfg, resolution, session_writable=lambda _: False)
-    generated = settings_builder.build(
-        resolution,
-        expanded,
-        PATHS,
-        TOOLS,
-        settings_builder.Launch(
-            mode="headless", cwd=cwd, prompt_path=f"{CSDIR}/prompt.md", plugin_dirs=(PLUGIN,)
-        ),
-        isolation=iso,
-    )
-    env = {
-        "PATH": "/opt/claude-session/bin:/usr/bin:/bin",
-        "HOME": HOME,
+    gw = GitGateway((f"{root}{GIT_DIR}", f"{root}{WT_GIT_DIR}") if git else None)
+    for name in ("bwrap", "socat"):
+        gw.on([f"{root}/usr/bin/{name}"])
+    environ = {
+        "PATH": f"{root}/usr/bin:{root}/usr/local/bin",
+        "HOME": str(home),
         "ANTHROPIC_API_KEY": SECRET,
-        "CSESSION_ID": PATHS.csession_id,
-        "CSESSION_DIR": CSDIR,
-        "CSESSION_KIND": kind,
-        "TMPDIR": iso.tmpdir or "",
     }
-    session_env = envbuild.SessionEnv(env=env, auth_names=("ANTHROPIC_API_KEY",), secret_names=())
-    checked = launch.Checked(
-        cwd=cwd,
-        git_dirs=None,
-        profile=profile,
-        expanded=expanded,
-        read_dirs=iso.read_dirs,
-        write_dirs=(),
-        plugin_dirs=(PLUGIN,),
-        claude=pathrules.ResolvedTool(TOOLS.claude, "claude"),
-        git=None,
-        bwrap=None,
-        socat=None,
-        session_env=session_env,
-        isolation=iso,
-        sandbox_active=True,
-        tmpdir=iso.tmpdir,
-        warnings=list(settings_builder.isolation_warnings(resolution)),
+    proc = launch.Process(
+        environ=environ,
+        caller_cwd=f"{root}{REPO}",
+        claude_session=f"{root}{CS_PATH}",
+        interpreter=f"{root}{PYTHON}",
+        state_root=str(state),
+        gateway=gw,
     )
-    found = dryrun.Outcome(checked=checked, generated=generated, warnings=list(checked.warnings))
-    preview = dryrun.Preview(
-        path=env["PATH"],
-        read_dirs=tuple(
-            dict.fromkeys((*iso.system_dirs, *iso.tool_dirs, *iso.python_dirs, *iso.read_dirs))
-        ),
-        write_dirs=(),
-        required_env_names=dryrun.required_env_names(resolution, session_env),
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Review it.\n")
+    args = parsed(
+        "exec",
+        "--dry-run",
+        "--json",
+        "--kind",
+        kind,
+        "--mode",
+        "headless",
+        "--prompt-file",
+        str(prompt),
+        "--plugin-dir",
+        f"{root}{PLUGIN}",
+        "--actor",
+        "auto:test",
     )
-    return dryrun.plan_json(
-        cfg,
-        request(kind),
-        resolution,
-        found,
-        sandbox=dryrun.Sandbox(available=True),
-        preview=preview,
-        cwd=cwd,
-    )
+    plan, _ = dryrun.new_session_plan(args, cfg, proc)
+    return plan, root
+
+
+def normalized_plan(plan: Any, root: Path) -> Any:
+    """The host paths of ``real_plan`` mapped back to the goldens' fixed inputs: ``<root>``
+    removed and the per-test tmp root shown as ``/tmp/csession-1000``."""
+    text = json.dumps(plan)
+    text = text.replace(pathrules.tmp_parent(), "/tmp/csession-1000").replace(str(root), "")
+    return json.loads(text)
 
 
 # Goldens
 
 
 @pytest.mark.parametrize("kind", ISOLATED_KINDS)
-def test_dry_run_plan_golden(cfg: config.Config, kind: str) -> None:
-    """``exec --dry-run --json`` of each isolated built-in kind: valid against
-    exec-dry-run.json, and its settings are the documented ones (tests/golden_settings)."""
-    plan = synthetic_plan(cfg, kind)
-    assert_golden(plan, f"exec-dry-run-{kind}")
+def test_dry_run_plan_golden(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    """``exec --dry-run --json`` of each isolated built-in kind through the dry-run
+    pipeline: valid against exec-dry-run.json, and its settings are the documented ones
+    (tests/golden_settings, whose session id is ``cs-abcd2345``)."""
+    plan, root = real_plan(tmp_path, monkeypatch, kind)
+    assert plan["would_fail"] is None, plan["warnings"]
+    shown = normalized_plan(plan, root)
+    assert_golden(shown, f"exec-dry-run-{kind}")
     documented = json.loads((GOLDEN / f"settings-{kind}.json").read_text(encoding="utf-8"))
-    settings = dict(plan["settings"])
+    settings = json.loads(json.dumps(shown["settings"]).replace(dryrun.PLACEHOLDER_ID, SID))
     settings.pop("hooks")
     assert settings == documented
 
 
-def test_the_plan_never_holds_an_environment_value(cfg: config.Config) -> None:
-    plan = synthetic_plan(cfg, "review")
+def test_the_plan_never_holds_an_environment_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, _ = real_plan(tmp_path, monkeypatch, "review")
     text = json.dumps(plan)
     assert SECRET not in text
     assert "ANTHROPIC_API_KEY" in plan["env_names"]
     assert plan["profile"]["required_env_names"] == ["ANTHROPIC_API_KEY"]
 
 
-def test_the_sandbox_lists_come_from_the_generated_settings(cfg: config.Config) -> None:
-    plan = synthetic_plan(cfg, "review")
+def test_the_sandbox_lists_come_from_the_generated_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, _ = real_plan(tmp_path, monkeypatch, "review")
     filesystem = plan["settings"]["sandbox"]["filesystem"]
     assert plan["sandbox"]["allow_read"] == filesystem["allowRead"]
     assert plan["sandbox"]["allow_write"] == filesystem["allowWrite"]
@@ -639,3 +677,189 @@ def test_kinds_shows_session_variables_as_written(tmp_path: Path) -> None:
 )
 def test_state_dir_warnings(root: str, platform: str, warned: bool) -> None:
     assert bool(dryrun.state_dir_warnings(root, platform)) is warned
+
+
+# The claude --version probe's environment and process group (R1)
+
+
+def test_version_probe_gets_a_minimal_environment_in_its_own_group() -> None:
+    gw = FakeGateway()
+    gw.on(["claude", "--version"], stdout="2.1.314 (Claude Code)\n")
+    environ = {
+        "PATH": "/usr/bin",
+        "HOME": "/home/x",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C",
+        "ANTHROPIC_API_KEY": SECRET,
+        "MY_SECRET": SECRET,
+    }
+    claude_version.probe(pathrules.ResolvedTool("/x/claude", "claude"), environ, gw)
+    (call,) = gw.calls
+    assert call.env == {"PATH": "/usr/bin", "HOME": "/home/x", "LANG": "C.UTF-8", "LC_ALL": "C"}
+    assert call.cwd == "/"
+    assert call.new_process_group and call.kill_grace is not None
+
+
+def _gone(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as stat:
+            return stat.read().rpartition(")")[2].split()[0] == "Z"
+    except FileNotFoundError:
+        return True
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="needs /proc")
+def test_a_hanging_version_probe_leaves_no_process(tmp_path: Path) -> None:
+    from claude_session.gateway import SystemGateway
+
+    pid_file = tmp_path / "pid"
+    claude = tool(tmp_path / "bin", "claude")
+    claude.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {pid_file}\nwait\n")
+    environ = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    found = pathrules.ResolvedTool(str(claude), "claude")
+    assert claude_version.probe(found, environ, SystemGateway(), timeout=0.5) is None
+    pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 10
+    while not _gone(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert _gone(pid)
+
+
+# The session directories as a launch opens them (R4, R5)
+
+
+@pytest.mark.parametrize("top", ["sessions", "private"])
+@pytest.mark.parametrize("mode", [0o000, 0o600])
+def test_check_dirs_accepts_a_mode_the_launch_repairs(tmp_path: Path, top: str, mode: int) -> None:
+    root = state_root(tmp_path)
+    with sessiondir.SessionDirs.open(str(root), dryrun.PLACEHOLDER_ID) as dirs:
+        dirs.prepare_run(1)
+    (root / top).chmod(mode)
+    try:
+        sessiondir.check_dirs(str(root), dryrun.PLACEHOLDER_ID)
+        assert stat.S_IMODE((root / top).lstat().st_mode) == mode  # nothing repaired
+        # The launch repairs it and succeeds.
+        with sessiondir.SessionDirs.open(str(root), dryrun.PLACEHOLDER_ID) as dirs:
+            dirs.prepare_run(1)
+    finally:
+        (root / top).chmod(0o700)
+
+
+def launch_error(root: Path) -> str:
+    with pytest.raises(SessionDirUnsafe) as exc:
+        with sessiondir.SessionDirs.open(str(root), dryrun.PLACEHOLDER_ID) as dirs:
+            dirs.prepare_run(1)
+    return str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "sessions",
+        "private",
+        "sessions/cs-aaaaaaaa",
+        "private/cs-aaaaaaaa",
+        "sessions/cs-aaaaaaaa/work",
+        "sessions/cs-aaaaaaaa/inputs",
+    ],
+)
+@pytest.mark.parametrize("entry", ["symlink", "file"])
+def test_check_dirs_fails_with_the_launch_message(tmp_path: Path, where: str, entry: str) -> None:
+    root = state_root(tmp_path)
+    path = root / where
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if entry == "symlink":
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        path.symlink_to(target)
+    else:
+        path.write_text("x")
+    with pytest.raises(SessionDirUnsafe) as exc:
+        sessiondir.check_dirs(str(root), dryrun.PLACEHOLDER_ID)
+    assert str(exc.value) == launch_error(root)
+
+
+# Interactive TTY checks (R10)
+
+
+class Stream:
+    def __init__(self, tty: bool) -> None:
+        self.tty = tty
+
+    def isatty(self) -> bool:
+        return self.tty
+
+
+def parsed(*argv: str) -> Any:
+    from claude_session import cli
+
+    return cli.build_parser().parse_args(list(argv))
+
+
+@pytest.mark.parametrize(
+    ("argv", "stdin", "stdout", "refused"),
+    [
+        (["exec", "--dry-run"], False, False, True),
+        (["exec", "--dry-run"], True, False, True),
+        (["exec", "--dry-run"], True, True, False),
+        (["start", "--dry-run", "--json"], False, False, False),
+        (["exec", "--dry-run", "--prompt-file", "-"], True, True, True),
+        (["start", "--dry-run", "--json", "--prompt-file", "-"], True, False, True),
+    ],
+)
+def test_interactive_tty_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    cfg: config.Config,
+    argv: list[str],
+    stdin: bool,
+    stdout: bool,
+    refused: bool,
+) -> None:
+    monkeypatch.setattr("sys.stdin", Stream(stdin))
+    monkeypatch.setattr("sys.stdout", Stream(stdout))
+    args = parsed(*argv)
+    if refused:
+        with pytest.raises(UsageError):
+            dryrun.request(args, cfg)
+    else:
+        assert dryrun.request(args, cfg).mode == "interactive"
+
+
+def test_a_headless_dry_run_needs_no_terminal(
+    monkeypatch: pytest.MonkeyPatch, cfg: config.Config, tmp_path: Path
+) -> None:
+    prompt = tmp_path / "p.md"
+    prompt.write_text("x")
+    monkeypatch.setattr("sys.stdin", Stream(False))
+    args = parsed("exec", "--dry-run", "--mode", "headless", "--prompt-file", str(prompt))
+    assert dryrun.request(args, cfg).mode == "headless"
+
+
+# origins of env.allow (R11)
+
+
+@pytest.mark.parametrize(
+    ("flags", "origin"),
+    [
+        ({}, "builtin"),
+        ({"env_allow": ["EXTRA"]}, "flag"),
+        ({"env_allowlist_only": ["ONLY"]}, "flag"),
+    ],
+)
+def test_env_allow_origin_follows_the_flags(
+    cfg: config.Config, flags: dict[str, Any], origin: str
+) -> None:
+    resolution = kinds.resolve(
+        cfg, "implement", mode="headless", flags=flags or None, origin_url=lambda _: None
+    )
+    assert dryrun.origins_json(resolution, "headless")["env.allow"] == origin
+
+
+# JSON output (R12)
+
+
+def test_printable_escapes_strings_that_are_not_utf8() -> None:
+    odd = os.fsdecode(b"/x/odd\xff")
+    shown = dryrun.printable({"cwd": odd, "list": [odd, 1, None], "ok": "fine"})
+    assert shown == {"cwd": "/x/odd\\udcff", "list": ["/x/odd\\udcff", 1, None], "ok": "fine"}
+    json.dumps(shown, ensure_ascii=False).encode("utf-8")
