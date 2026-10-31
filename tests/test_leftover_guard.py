@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -105,27 +106,68 @@ def test_the_tracking_popen_is_restored_when_the_setup_fails(
     assert subprocess.Popen is real
 
 
-def test_the_watchdog_reports_a_hung_test_without_signalling_its_processes(
+_HUNG_TEST = (
+    "import subprocess, time\n\n"
+    "def test_slow():\n"
+    "    proc = subprocess.Popen(['/bin/sleep', '30'])\n"
+    "    time.sleep(1)\n"
+    "    assert proc.poll() {}\n"
+)
+
+
+def test_the_watchdog_only_reports_a_hung_test_without_a_pidfd(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The process the inner test started outlives the watchdog firing; teardown then ends it
-    # and fails the test.
+    # Without a pidfd the process the inner test started outlives the watchdog firing;
+    # teardown then ends it and fails the test.
     monkeypatch.setattr(conftest, "WATCHDOG_SECONDS", 0.2)
+    monkeypatch.setattr(conftest, "_pidfd", lambda pid: None)
     pytester.makeconftest("from tests.conftest import no_leftover_processes  # noqa: F401\n")
-    pytester.makepyfile(
-        "import subprocess, time\n\n"
-        "def test_slow():\n"
-        "    proc = subprocess.Popen(['/bin/sleep', '30'])\n"
-        "    time.sleep(1)\n"
-        "    assert proc.poll() is None\n",
-    )
+    pytester.makepyfile(_HUNG_TEST.format("is None"))
     result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
     result.assert_outcomes(passed=1, errors=1)
     result.stdout.fnmatch_lines(["*watchdog fired*"])
 
 
 @linux_only
-@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="needs a pidfd")
+@pytest.mark.skipif(not conftest.PIDFD, reason="needs a pidfd")
+def test_the_watchdog_kills_a_hung_test_s_processes_through_their_pidfds(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(conftest, "WATCHDOG_SECONDS", 0.2)
+    pytester.makeconftest("from tests.conftest import no_leftover_processes  # noqa: F401\n")
+    pytester.makepyfile(_HUNG_TEST.format(f"== -{int(signal.SIGKILL)}"))
+    result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(["*watchdog fired*"])
+
+
+def test_a_pidfd_is_available_on_x86_64_and_aarch64_linux() -> None:
+    expected = sys.platform.startswith("linux") and platform.machine() in ("x86_64", "aarch64")
+    assert conftest.PIDFD == expected
+
+
+@linux_only
+@pytest.mark.skipif(not conftest.PIDFD, reason="needs a pidfd")
+def test_signalling_a_reaped_process_through_its_pidfd_raises_process_lookup_error() -> None:
+    proc = subprocess.Popen(["/bin/true"])
+    fd = conftest._pidfd_open(proc.pid)  # pyright: ignore[reportPrivateUsage]
+    try:
+        proc.wait(timeout=5)
+        with pytest.raises(ProcessLookupError):
+            conftest._pidfd_send_signal(fd, signal.SIGKILL)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(not conftest.PIDFD, reason="needs a pidfd")
+def test_opening_a_pidfd_for_no_process_raises() -> None:
+    with pytest.raises(OSError):
+        conftest._pidfd_open(-1)  # pyright: ignore[reportPrivateUsage]
+
+
+@linux_only
+@pytest.mark.skipif(not conftest.PIDFD, reason="needs a pidfd")
 def test_a_group_leader_that_left_its_group_is_killed_through_its_pidfd() -> None:
     # The leader moves itself into this process's group: killpg on its PID reaches nobody,
     # its pidfd still ends it.
@@ -140,7 +182,8 @@ def test_a_group_leader_that_left_its_group_is_killed_through_its_pidfd() -> Non
             assert time.monotonic() < deadline
             time.sleep(0.05)
         assert stat is not None
-        record = _Started(leader, stat[2], True, os.pidfd_open(leader.pid))
+        pidfd = conftest._pidfd_open(leader.pid)  # pyright: ignore[reportPrivateUsage]
+        record = _Started(leader, stat[2], True, pidfd)
         try:
             record.kill()
             assert leader.wait(timeout=5) == -signal.SIGKILL

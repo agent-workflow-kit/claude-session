@@ -10,21 +10,31 @@ returned, each one still running is SIGKILLed while it is still the process star
   only while the leader is still our unreaped child with the same start ticks (an unreaped
   leader pins the group ID; Linux cannot signal a group through a pidfd).
 
-The check before ``killpg``, and before ``kill`` where there is no pidfd (macOS, older Linux),
-leaves a window: if the leader is reaped in it and its PID reused, the signal reaches the new
-process. Only a thread the test left running past teardown can reap it then, so the window is
-open only for such a test. Nothing else is ever signalled: the members of a group whose leader
-was already reaped are left to the tests that started them (see ``grandchildren`` in
-test_gateway.py), which record them by exact PID.
+Pidfds come from ``os.pidfd_open`` and ``signal.pidfd_send_signal`` where Python has them, and
+otherwise (Pythons built without them) straight from the syscalls through ``ctypes`` on x86_64
+and aarch64 Linux. Other machines and macOS have no pidfd.
 
-The watchdog signals nothing. Should a test run past ``WATCHDOG_SECONDS`` it writes the live
-tracked PIDs to stderr, and the test fails at teardown.
+The check before ``killpg``, and before ``kill`` where there is no pidfd, leaves a window: if
+the leader is reaped in it and its PID reused, the signal reaches the new process. Only a
+thread the test left running past teardown can reap it then, so the window is open only for
+such a test. Nothing else is ever signalled: the members of a group whose leader was already
+reaped are left to the tests that started them (see ``grandchildren`` in test_gateway.py), which
+record them by exact PID.
+
+Should a test run past ``WATCHDOG_SECONDS``, the watchdog writes the live tracked PIDs to
+stderr, SIGKILLs every tracked process that has a pidfd (exact: a pidfd never names a reused
+PID, so this cannot race the test's own wait), and the test fails at teardown. It sends no
+other signal: without pidfds it only reports, and a test hung on something else stays hung.
+This module is test-only; nothing under ``src/`` imports it.
 """
 
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -38,7 +48,7 @@ import pytest
 pytest_plugins = ["pytester"]  # test_leftover_guard.py runs the guard in a pytest of its own
 
 LINUX = sys.platform.startswith("linux")
-# A test still running after this long is reported as hung (nothing is signalled).
+# A test still running after this long is reported as hung and its pidfd processes killed.
 WATCHDOG_SECONDS = 60.0
 
 
@@ -65,11 +75,73 @@ def _unreaped_child(pid: int) -> bool:
     return True
 
 
-def _pidfd(pid: int) -> int | None:
-    if not hasattr(os, "pidfd_open"):
+# (SYS_pidfd_open, SYS_pidfd_send_signal) by platform.machine(), for Pythons without the
+# os/signal wrappers. Any other machine gets no pidfd.
+_PIDFD_SYSCALLS = {"x86_64": (434, 424), "aarch64": (434, 424)}
+
+
+def _libc_syscall() -> Any:
+    """libc's ``syscall``, or ``None`` when it is not needed or not available."""
+    if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+        return None
+    if not LINUX or platform.machine() not in _PIDFD_SYSCALLS:
         return None
     try:
+        fn = ctypes.CDLL(None, use_errno=True).syscall
+    except (OSError, AttributeError):
+        return None
+    fn.restype = ctypes.c_long
+    return fn
+
+
+_SYSCALL = _libc_syscall()
+# Whether exact pidfds are available here (natively or through the syscalls).
+PIDFD = (hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")) or (
+    _SYSCALL is not None
+)
+
+
+def _check(result: int) -> int:
+    if result < 0:
+        err = ctypes.get_errno() or errno.EIO  # never 0: set_errno(0) precedes every call
+        raise OSError(err, os.strerror(err))  # ESRCH arrives as ProcessLookupError
+    return result
+
+
+def _pidfd_open(pid: int) -> int:
+    if _SYSCALL is None:
         return os.pidfd_open(pid)
+    ctypes.set_errno(0)
+    return _check(
+        _SYSCALL(
+            ctypes.c_long(_PIDFD_SYSCALLS[platform.machine()][0]),
+            ctypes.c_int(pid),
+            ctypes.c_uint(0),
+        )
+    )
+
+
+def _pidfd_send_signal(fd: int, sig: int) -> None:
+    if _SYSCALL is None:
+        signal.pidfd_send_signal(fd, sig)
+        return
+    ctypes.set_errno(0)
+    _check(
+        _SYSCALL(
+            ctypes.c_long(_PIDFD_SYSCALLS[platform.machine()][1]),
+            ctypes.c_int(fd),
+            ctypes.c_int(sig),
+            ctypes.c_void_p(None),
+            ctypes.c_uint(0),
+        )
+    )
+
+
+def _pidfd(pid: int) -> int | None:
+    if not PIDFD:
+        return None
+    try:
+        return _pidfd_open(pid)
     except OSError:
         return None
 
@@ -98,9 +170,15 @@ class _Started:
                 os.killpg(pid, signal.SIGKILL)  # check-then-kill: see the module docstring
         with contextlib.suppress(ProcessLookupError, PermissionError):
             if self.pidfd is not None:
-                signal.pidfd_send_signal(self.pidfd, signal.SIGKILL)  # ESRCH once reaped
+                _pidfd_send_signal(self.pidfd, signal.SIGKILL)  # ESRCH once reaped
             elif self.is_ours():
                 os.kill(pid, signal.SIGKILL)  # no pidfd: check-then-kill
+
+    def kill_exact(self) -> None:
+        """SIGKILL through the pidfd only; without one, nothing is signalled."""
+        if self.pidfd is not None:
+            with contextlib.suppress(OSError):  # ESRCH once reaped
+                _pidfd_send_signal(self.pidfd, signal.SIGKILL)
 
     def close(self) -> None:
         if self.pidfd is not None:
@@ -129,11 +207,15 @@ def no_leftover_processes() -> Iterator[list[_Started]]:
     done, fired = threading.Event(), threading.Event()
 
     def watchdog() -> None:
-        # Report only: a signal from here could race the test's own wait (see the docstring).
+        # Signals only through pidfds: a check-then-kill from here could race the test's own
+        # wait (see the docstring). The pidfds stay open until this thread is joined.
         if not done.wait(WATCHDOG_SECONDS):
             fired.set()
-            live = [p.popen.pid for p in list(started) if p.is_ours()]  # never reaps
+            records = list(started)
+            live = [p.popen.pid for p in records if p.is_ours()]  # never reaps
             print(f"watchdog: test hung; live tracked PIDs: {live}", file=sys.__stderr__)
+            for record in records:
+                record.kill_exact()
 
     thread: threading.Thread | None = None
     try:
