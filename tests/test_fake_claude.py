@@ -126,7 +126,7 @@ def _dead(pid: int) -> bool:
         try:
             with open(f"/proc/{pid}/stat", "rb") as fh:
                 return fh.read().rpartition(b")")[2].split()[0] == b"Z"
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):  # reaped between open and read
             return True
     try:
         os.kill(pid, 0)

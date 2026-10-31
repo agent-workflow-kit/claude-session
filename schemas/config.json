@@ -298,7 +298,7 @@
       "default": [
         "startup"
       ],
-      "description": "SessionStart sources that get notes. 'other' is accepted for compatibility but currently never matches: hook-event treats a SessionStart with any source other than startup, resume, fork, clear or compact as an internal error."
+      "description": "SessionStart sources that get notes. 'other' matches a SessionStart whose source is none of startup, resume, fork, clear or compact."
     },
     "summary_max_bytes": {
       "type": "integer",

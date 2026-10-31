@@ -35,6 +35,7 @@ EVENTS = frozenset(
         "reconcile_change",
         "config_warning",
         "session_start_missing",
+        "session_start_source_unknown",
         "migration",
         "sandbox_lowered",
         "launch_interrupted",

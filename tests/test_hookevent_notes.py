@@ -262,6 +262,11 @@ def test_the_state_is_stored_before_the_command_runs(env: Env) -> None:
         ("compact", ("startup", "compact"), True),
         ("resume", ("resume", "fork"), True),
         ("startup", (), False),
+        ("reboot", ("other",), True),
+        ("reboot", ("startup", "resume", "fork", "clear", "compact"), False),
+        ("other", ("other",), True),
+        ("startup", ("other",), False),
+        ("clear", ("other",), False),
     ],
 )
 def test_only_the_configured_sources_get_notes(
