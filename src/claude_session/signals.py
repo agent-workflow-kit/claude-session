@@ -20,7 +20,9 @@ SIGTSTP and SIGCONT are never touched (default action: job control applies to th
 process group). The handlers are Python callables, never ``SIG_IGN``: an ignored signal would be
 inherited by ``claude`` across ``exec``, a caught one is reset to its default action there. A
 signal already ignored when ``exec`` starts (``nohup``, a shell's background job) stays ignored:
-no handler is installed for it, and ``claude`` inherits the ignore (interface.md, Signals).
+no handler is installed for it, and ``claude`` inherits an ignored SIGHUP or SIGINT; a headless
+``claude`` always starts with SIGTERM at its default action, because its parent-death signal
+needs it (``gateway``; interface.md, Signals).
 
 ``install`` sets the handlers in a record-only phase and applies the before-allocation rule
 (``RAISE``) to a signal recorded meanwhile only once every handler is in place.
@@ -104,7 +106,7 @@ class ExecSignals:
         try:
             for sig in HANDLED:
                 if signal.getsignal(sig) == signal.SIG_IGN:
-                    continue  # inherited ignored: claude inherits the ignore too
+                    continue  # inherited ignored: it stays ignored (see the module docstring)
                 self._previous[sig] = signal.signal(sig, self._handle)
         except ValueError:
             self.restore()

@@ -355,6 +355,55 @@ def test_a_launch_interrupted_that_reaches_exec_unhandled_still_ends_the_run(
     assert run_row_of(state)["ended_at"] is not None
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        LaunchValidationError("the cwd is not usable", end_reason="unsafe_cwd"),
+        RuntimeError("an internal error before the spawn"),
+    ],
+    ids=["validation", "internal"],
+)
+def test_a_failing_end_of_a_failed_launch_is_not_run_again(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    work: Path,
+    failure: Exception,
+) -> None:
+    """The inner handler's end_launch raising (a busy store, say) propagates as is: the outer
+    handler does not end the launch a second time."""
+
+    class EndFailed(Exception):
+        pass
+
+    def validate(*_args: Any, **_kwargs: Any) -> Any:
+        raise failure
+
+    ends: list[str] = []
+
+    def end_launch(*_args: Any, **_kwargs: Any) -> Any:
+        ends.append("end")
+        raise EndFailed
+
+    real_run = launch.run
+    raised: list[BaseException] = []
+
+    def run(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return real_run(*args, **kwargs)
+        except BaseException as exc:
+            raised.append(exc)
+            raise
+
+    monkeypatch.setattr(launch, "validate", validate)
+    monkeypatch.setattr(launch, "end_launch", end_launch)
+    monkeypatch.setattr(launch, "run", run)
+    code, outcome = exec_in_process(monkeypatch, capsys, tmp_path, work, STEPS)
+    assert ends == ["end"]
+    assert [type(exc) for exc in raised] == [EndFailed]
+    assert (code, outcome["error"]["code"]) == (1, "internal")
+
+
 # After the run (R1-13, R1-16)
 
 

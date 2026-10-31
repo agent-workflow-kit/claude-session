@@ -1265,6 +1265,7 @@ def run(
     resolution = resolved.resolution
     v: Validated | None = None
     prepared: Prepared | None = None
+    ending = False  # an inner handler is ending the launch: the outer one must not again
     try:
         # The outer handler also takes a signal that arrives while a launch failure is being
         # handled, before the inner handler's defer() (the phase is still RAISE there).
@@ -1285,15 +1286,18 @@ def run(
                 signals.defer()  # the supervisor raises a signal from here before the spawn
             except LaunchValidationError as error:
                 signals.defer()  # a signal during the cleanup is only recorded
+                ending = True
                 end_launch(st, alloc, v, prepared, process, error)
                 return None
             except Exception as exc:
                 signals.defer()
+                ending = True
                 end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc)
                 return None
         except BaseException as exc:
             signals.defer()  # a second signal during the cleanup is only recorded
-            end_launch(st, alloc, v, prepared, process, interrupted_by(st, alloc, exc), exc=exc)
+            if not ending:  # an inner end_launch that raised is not run again
+                end_launch(st, alloc, v, prepared, process, interrupted_by(st, alloc, exc), exc=exc)
             raise
         return supervise(
             st,
