@@ -281,6 +281,48 @@ def test_print_mode_reads_the_prompt_from_stdin(env: Env) -> None:
     assert env.records("start")[0]["prompt"] == "from stdin"
 
 
+def _spawn_with_open_stdin(env: Env, leaked: list[int]) -> subprocess.Popen[bytes]:
+    """The fake with ``-p``, no prompt and a stdin pipe that stays open and is never written."""
+    proc = subprocess.Popen(
+        env.argv("-p"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env={**os.environ, **env.env()},
+        cwd=str(env.cwd),
+    )
+    leaked.append(proc.pid)
+    return proc
+
+
+def test_print_mode_gives_up_on_a_silent_stdin(env: Env, leaked: list[int]) -> None:
+    env.setup([{"do": "touch", "path": str(env.tmp / "ran")}])
+    proc = _spawn_with_open_stdin(env, leaked)
+    assert proc.stdin is not None and proc.stderr is not None
+    try:
+        assert proc.wait(10) == 1  # the fake waits 3 s, like claude; stdin stays open
+    finally:
+        proc.stdin.close()
+    assert b"Input must be provided" in proc.stderr.read()
+    proc.stderr.close()
+    assert not (env.tmp / "ran").exists()
+
+
+def test_a_signal_while_waiting_for_stdin_ends_the_fake(env: Env, leaked: list[int]) -> None:
+    env.setup([])
+    proc = _spawn_with_open_stdin(env, leaked)
+    assert proc.stdin is not None and proc.stderr is not None
+    time.sleep(0.5)  # most likely inside the wait by now; earlier, it dies all the same
+    start = time.monotonic()
+    proc.send_signal(signal.SIGTERM)
+    try:
+        assert proc.wait(10) == -signal.SIGTERM
+    finally:
+        proc.stdin.close()
+        proc.stderr.close()
+    assert time.monotonic() - start < 2  # not the 3 s give-up
+
+
 def test_option_equals_value_and_end_of_options(env: Env) -> None:
     env.setup([])
     result = env.run("--model=m", "--add-dir=/a", "--debug=api", "--", "--looks-like-an-option")
@@ -1307,6 +1349,19 @@ def test_a_signal_after_the_last_step_takes_its_outcome(env: Env) -> None:
     assert "Traceback" not in result.stderr
     assert [c["payload"]["reason"] for c in env.hook_calls()] == ["other"]
     assert env.records("exit")[0]["code"] == 143
+
+
+def test_a_signal_while_handling_an_error_still_cleans_up(env: Env) -> None:
+    env.setup(
+        [{"do": "write_file", "path": "missing/dir/file.md", "content": "x"}],
+        signal_on_error="TERM",
+    )
+    result = env.run()
+    assert result.returncode == FAKE_ERROR
+    assert "internal error" not in result.stderr
+    assert [r["signal"] for r in env.records("signal")] == ["TERM"]
+    assert env.records("error")
+    assert env.records("exit")[0]["code"] == FAKE_ERROR
 
 
 @linux_only

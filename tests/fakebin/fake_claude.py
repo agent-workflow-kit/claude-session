@@ -27,6 +27,7 @@ infinite numbers)::
       "extra_flags": {"--permission-mode": "value", "--foo": "bool"},  # more accepted options
       "signals": {"TERM": {"exit": 143, "session_end": "other"}, "HUP": "ignore"},
       "raise_after_steps": "TERM",       # test knob: the fake signals itself after the steps
+      "signal_on_error": "TERM",         # test knob: ... as it starts handling a step's error
       "steps": [ {"do": "<step>", ...}, ... ]
     }
 
@@ -35,7 +36,9 @@ the options, ``-d``/``--debug`` takes an optional value (the next argument unles
 with ``-``, so it eats a following bootstrap prompt, as the real one does) and ``--add-dir``
 takes one or more values up to the next option (likewise). Only the flags claude-session passes
 (and ``extra_flags``) are accepted. With ``-p`` and no prompt argument the prompt is read from
-stdin (unless stdin is a terminal; the real claude waits 3 s for it); none at all exits 1.
+stdin (unless stdin is a terminal); like the real claude it waits 3 s for stdin to have data
+or end, then reads it to the end; nothing at all exits 1. TERM, HUP and INT kill the fake
+during that wait (no handlers are in place yet).
 
 **Hook steps** fire every matching hook of one event and take, besides their own keys,
 ``payload`` (fields merged over the built payload, for hostile-input tests), ``omit`` (field
@@ -156,6 +159,7 @@ DEFAULT_REPORT_COMMAND = "claude-session report"
 DEFAULT_PERMISSION_MODE = "default"
 DEFAULT_HOOK_TIMEOUT = 60.0
 HOOK_KILL_GRACE = 1.0
+STDIN_WAIT = 3.0  # how long ``-p`` without a prompt waits for stdin (design.md, Spike results)
 POLL_INTERVAL = 0.02
 READ_SIZE = 65536
 # Exit code for a broken scenario or a fake-internal error, distinct from anything claude uses.
@@ -206,6 +210,7 @@ SCENARIO_KEYS = {
     "extra_flags",
     "signals",
     "raise_after_steps",
+    "signal_on_error",
     "steps",
 }
 HOOK_STEP_KEYS = {"payload", "omit", "raw_payload", "on_block"}
@@ -440,9 +445,20 @@ def read_headless_prompt(parsed: Argv) -> None:
     if not parsed.headless or parsed.prompt is not None:
         return
     text = ""
-    with contextlib.suppress(OSError, ValueError):
-        if not sys.stdin.isatty():
-            text = sys.stdin.buffer.read().decode("utf-8", "replace")
+    # ``main`` blocks TERM/HUP/INT; an unbounded read with them blocked could never be ended.
+    # They take their default action (death) here, as no handler is in place yet.
+    for sig in SIGNUMS:
+        signal.signal(sig, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGNUMS)
+    try:
+        with contextlib.suppress(OSError, ValueError):
+            if not sys.stdin.isatty():
+                with selectors.DefaultSelector() as sel:
+                    sel.register(sys.stdin.fileno(), selectors.EVENT_READ)
+                    if sel.select(STDIN_WAIT):
+                        text = sys.stdin.buffer.read().decode("utf-8", "replace")
+    finally:
+        signal.pthread_sigmask(signal.SIG_BLOCK, SIGNUMS)
     if not text.strip():
         raise ArgvError(NO_INPUT)
     parsed.prompt = text
@@ -566,8 +582,9 @@ def load_scenario(path: str) -> dict[str, Any]:
         isinstance(k, str) and k.startswith("-") and v in EXTRA_FLAG_KINDS for k, v in extra.items()
     ):
         raise FakeError("scenario extra_flags must map options to 'value' or 'bool'")
-    if scenario.get("raise_after_steps", "TERM") not in SIGNALS:
-        raise FakeError(f"scenario raise_after_steps must be one of {sorted(SIGNALS)}")
+    for knob in ("raise_after_steps", "signal_on_error"):
+        if scenario.get(knob, "TERM") not in SIGNALS:
+            raise FakeError(f"scenario {knob} must be one of {sorted(SIGNALS)}")
     return scenario
 
 
@@ -1395,13 +1412,19 @@ def main(args: list[str]) -> int:
     # TERM/HUP/INT stay blocked until ``run`` has its handlers in place; a signal before then
     # is handled there (or dropped at exit for calls that never get that far).
     signal.pthread_sigmask(signal.SIG_BLOCK, SIGNUMS)
+    made: list[Fake] = []
     try:
-        return _main(args)
+        return _main(args, made)
     except (Exception, Signalled) as exc:  # a fake bug must never look like claude's exit 1
+        signal.pthread_sigmask(signal.SIG_BLOCK, SIGNUMS)
+        for fake in made:  # leave no child behind, whatever escaped ``run``
+            fake.handling_signal = True
+            with contextlib.suppress(Exception):
+                fake.kill_children()
         return _error(f"internal error: {exc!r}", FAKE_ERROR)
 
 
-def _main(args: list[str]) -> int:
+def _main(args: list[str], made: list[Fake]) -> int:
     scenario_path = os.environ.get(SCENARIO_ENV)
     try:
         scenario = load_scenario(scenario_path) if scenario_path else None
@@ -1424,6 +1447,7 @@ def _main(args: list[str]) -> int:
     except FakeError as exc:
         return _error(str(exc), FAKE_ERROR)
     fake = Fake(argv, scenario, hooks, scenario.get("log") or os.environ.get(LOG_ENV))
+    made.append(fake)
     return run(fake)
 
 
@@ -1462,8 +1486,15 @@ def run(fake: Fake) -> int:
             signal.pthread_sigmask(signal.SIG_BLOCK, SIGNUMS)
         code = 0 if code is None else code
     except Exception as exc:
-        fake.handling_signal = True  # before blocking: a pending signal is only logged
-        signal.pthread_sigmask(signal.SIG_BLOCK, SIGNUMS)
+        try:
+            knob = fake.scenario.get("signal_on_error")
+            if knob is not None:  # a signal landing before the next line, made deterministic
+                os.kill(os.getpid(), SIGNALS[knob])
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGNUMS)
+            fake.handling_signal = True  # before blocking: a pending signal is only logged
+            signal.pthread_sigmask(signal.SIG_BLOCK, SIGNUMS)
+        except Signalled:  # its handler already set ``handling_signal``; the error still wins
+            signal.pthread_sigmask(signal.SIG_BLOCK, SIGNUMS)
         fake.kill_children()
         fake.log("error", message=repr(exc))
         code = _error(str(exc) if isinstance(exc, FakeError) else repr(exc), FAKE_ERROR)
