@@ -748,7 +748,7 @@ def _gone(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8") as stat:
             return stat.read().rpartition(")")[2].split()[0] == "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # gone before open, or mid-read
         return True
 
 

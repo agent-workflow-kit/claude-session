@@ -265,6 +265,36 @@ def test_run_handles_large_output_on_both_streams_with_input(gw: SystemGateway) 
     assert proc.stderr == "e" * size
 
 
+def test_run_output_limit_keeps_a_prefix_and_drains_the_rest(gw: SystemGateway) -> None:
+    size = 3 * 1024 * 1024  # far above a pipe buffer: a child left unread would block
+    proc = gw.run(
+        py(
+            f"""
+            import sys
+            sys.stdout.write("o" * {size})
+            sys.stderr.write("é" * {size})
+            sys.stdout.write("tail")
+            """
+        ),
+        timeout=60,
+        output_limit=5,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout == "ooooo"
+    assert proc.stderr == "éé\ufffd"  # 5 bytes: two whole characters, then half of one
+
+
+def test_run_output_limit_zero_discards_everything(gw: SystemGateway) -> None:
+    proc = gw.run(py("print('out'); import sys; print('err', file=sys.stderr)"), output_limit=0)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
+
+
+@pytest.mark.parametrize("limit", [-1, True, 1.5])
+def test_run_output_limit_must_be_a_non_negative_int(gw: SystemGateway, limit: Any) -> None:
+    with pytest.raises((ValueError, TypeError)):
+        gw.run([PY, "-c", "pass"], output_limit=limit)
+
+
 def test_run_timeout_raises_gateway_timeout_and_reaps_the_child(
     gw: SystemGateway, tmp_path: Path
 ) -> None:
@@ -703,6 +733,101 @@ def test_run_with_empty_stdin_text_gives_eof(gw: SystemGateway) -> None:
 
 def test_run_survives_a_child_that_does_not_read_its_stdin(gw: SystemGateway) -> None:
     proc = gw.run(["/bin/true"], stdin="x" * (1024 * 1024), timeout=30)
+    assert proc.returncode == 0
+
+
+# --- discard_output, on_started, canceled and long timeouts ------------------------------
+
+
+@linux_only
+def test_discard_output_waits_only_for_the_child_not_a_descendant_holding_its_output(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    pidfile = tmp_path / "pid"
+    start = time.monotonic()
+    proc = gw.run(
+        ["/bin/sh", "-c", f"/bin/sleep 30 & echo $! > {pidfile}; echo out; exit 3"],
+        new_process_group=True,
+        timeout=10,
+        kill_grace=1,
+        discard_output=True,
+    )
+    assert time.monotonic() - start < 5
+    assert (proc.returncode, proc.stdout, proc.stderr) == (3, "", "")
+    pid = _read_pid(pidfile, grandchildren)  # ended by the fixture (exact recorded PID)
+    assert _alive(pid)
+
+
+def test_on_started_is_called_once_stdin_is_written_and_closed(gw: SystemGateway) -> None:
+    seen: list[str] = []
+    started = threading.Event()
+
+    def on_started() -> None:
+        seen.append("started")
+        started.set()
+
+    code = "import sys, time; sys.stdin.read(); time.sleep(0.3); print('done')"
+    result: list[Any] = []
+    thread = threading.Thread(
+        target=lambda: result.append(
+            gw.run(py(code), stdin="x" * 200000, timeout=30, on_started=on_started)
+        )
+    )
+    thread.start()
+    assert started.wait(10)
+    assert thread.is_alive()  # started before the child exited
+    thread.join(30)
+    assert seen == ["started"] and result[0].stdout == "done\n"
+
+
+def test_on_started_without_stdin_is_called_at_once(gw: SystemGateway) -> None:
+    seen: list[str] = []
+    gw.run(["/bin/true"], on_started=lambda: seen.append("started"))
+    assert seen == ["started"]
+
+
+def test_on_started_is_not_called_for_a_program_that_cannot_start(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    seen: list[str] = []
+    with pytest.raises(OSError):
+        gw.run([str(tmp_path / "missing")], stdin="x", on_started=lambda: seen.append("x"))
+    assert seen == []
+
+
+@linux_only
+def test_canceled_ends_the_group_and_raises(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    pidfile = tmp_path / "pid"
+    flag = threading.Event()
+    threading.Timer(0.5, flag.set).start()
+    start = time.monotonic()
+    with pytest.raises(gateway.GatewayCanceled):
+        gw.run(
+            ["/bin/sh", "-c", f"/bin/sleep 30 & echo $! > {pidfile}; wait"],
+            new_process_group=True,
+            timeout=60,
+            kill_grace=1,
+            discard_output=True,
+            canceled=flag.is_set,
+        )
+    assert time.monotonic() - start < 5
+    assert _wait_dead(_read_pid(pidfile, grandchildren), 5)
+
+
+def test_a_timeout_longer_than_one_wait_runs_normally(gw: SystemGateway) -> None:
+    # 30 days: one select/poll of that length overflows its millisecond argument.
+    month = 30 * 86400.0
+    assert month > gateway.MAX_WAIT
+    proc = gw.run(["/bin/sh", "-c", "echo ok"], stdin="x", timeout=month)
+    assert proc.stdout == "ok\n"
+    proc = gw.run(
+        ["/bin/sh", "-c", "exec >&- 2>&-; /bin/sleep 0.2"],
+        new_process_group=True,
+        timeout=month,
+        kill_grace=1,
+    )
     assert proc.returncode == 0
 
 

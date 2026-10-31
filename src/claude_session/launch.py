@@ -1838,7 +1838,8 @@ def fail_launch(
     transaction: the run's session-writable paths ``writable`` are stored unless the run has
     them already, and an ``UnsafeOutcomeFile`` drops the run's ``outcome_file``.
 
-    TODO(#20): the one final ``post-state-change`` of a launch-phase end."""
+    The one final event it appends is delivered (``post-state-change``) by the caller's
+    delivery: ``exec`` delivers it synchronously once the launch ended (``toolhooks``)."""
     return st.finalize_run(
         alloc.csession_id,
         alloc.run,

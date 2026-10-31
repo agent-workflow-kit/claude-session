@@ -16,6 +16,11 @@
   SIGINT is dropped here: ``claude`` gets it from the terminal and ``exec`` never re-forwards it,
   so Ctrl-C never counts as a kill.
 
+- ``DELIVER`` (after the child was reaped: finalization and the last ``post-state-change``
+  delivery, ``enter_delivery``): the handler records the signal and sets ``delivery_canceled``,
+  so the deliverer ends the running hooks' process groups, starts no further hook and leaves
+  the remaining events for the next delivering command (interface.md, Hooks: Delivery).
+
 SIGTSTP and SIGCONT are never touched (default action: job control applies to the foreground
 process group). The handlers are Python callables, never ``SIG_IGN``: an ignored signal would be
 inherited by ``claude`` across ``exec``, a caught one is reset to its default action there. A
@@ -35,6 +40,7 @@ from __future__ import annotations
 
 import enum
 import signal
+import threading
 from collections import deque
 from types import FrameType
 from typing import Any
@@ -56,6 +62,7 @@ class Phase(enum.Enum):
     RAISE = "raise"
     DEFER = "defer"
     SESSION = "session"
+    DELIVER = "deliver"
 
 
 class LaunchInterrupted(BaseException):  # noqa: N818 (like KeyboardInterrupt)
@@ -94,6 +101,8 @@ class ExecSignals:
         self.interactive = False
         self._pending: deque[int] = deque()
         self._previous: dict[int, Any] = {}
+        # Set by a signal in the ``DELIVER`` phase: post-state-change delivery stops.
+        self.delivery_canceled = threading.Event()
 
     # Installation
 
@@ -129,11 +138,18 @@ class ExecSignals:
             self.phase = Phase.DEFER  # a second signal during the cleanup is only recorded
             raise LaunchInterrupted(signum)
         self._pending.append(signum)  # an interactive SIGINT is dropped by take()
+        if self.phase is Phase.DELIVER:
+            self.delivery_canceled.set()
 
     # Phase changes
 
     def defer(self) -> None:
         self.phase = Phase.DEFER
+
+    def enter_delivery(self) -> None:
+        """The child is reaped (or never started): from now on a signal only records itself
+        and cancels the remaining ``post-state-change`` delivery (``delivery_canceled``)."""
+        self.phase = Phase.DELIVER
 
     def enter_launch(self) -> None:
         """Enter the launch phase (the run is allocated): a signal recorded meanwhile raises
