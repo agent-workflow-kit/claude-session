@@ -17,13 +17,14 @@ from claude_session import store
 # Modules hook-event must never import, whether or not they are installed.
 FORBIDDEN = ("pydantic", "yaml", "argparse", "claude_session.cli", "claude_session.config")
 # claude_session modules hook-event may load (design.md: stdlib, store, outbox's ingestion
-# side, gateway; plus the stdlib-only errors, logs and fsutil helpers).
+# side and its secretindex, gateway; plus the stdlib-only errors, logs and fsutil helpers).
 ALLOWED_PACKAGE_MODULES = {
     "claude_session",
     "claude_session.__main__",
     "claude_session.hookevent",
     "claude_session.store",
     "claude_session.outbox",
+    "claude_session.secretindex",
     "claude_session.gateway",
     "claude_session.errors",
     "claude_session.logs",

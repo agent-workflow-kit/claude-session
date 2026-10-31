@@ -33,7 +33,8 @@ The plan splits five modules out of design.md's module list to keep files focuse
 | `endmap.py` | 1, 2 | headless and interactive outcome mapping |
 | `supervisor.py` | 1, 2 | `exec`/`resume` process supervision |
 | `toolhooks.py` | 2, 4 | `pre-launch` and `post-state-change` execution and delivery |
-| `isolation.py` | 3 | path rules, session-writable paths, PATH sanitizing, secret index |
+| `isolation.py` | 3 | path rules, session-writable paths, PATH sanitizing |
+| `secretindex.py` | 3 | `contains_secret` keyed q-gram index: build, read, streamed scan (stdlib only: on the hook path) |
 | `lifecycle.py` | 4 | start/adoption, resume/fork carry-over, taint, stop, forget, liveness |
 | `reconcile.py` | 4 | reconcile, retention, cron block |
 | `transcripts.py` | 5 | transcript discovery and rendering |

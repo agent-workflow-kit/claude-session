@@ -2,8 +2,9 @@
 
 See design.md (Hook-event fast path, State machine) and interface.md (State transitions,
 Internal commands). ``__main__`` dispatches here before importing ``cli``, so this module and
-everything it imports stay standard library only, plus ``store``, ``outbox`` (itself stdlib
-only) and, once it is needed, ``gateway``: never ``config``, Pydantic, YAML or argparse.
+everything it imports stay standard library only, plus ``store``, ``outbox`` and
+``secretindex`` (both stdlib only) and, once it is needed, ``gateway``: never ``config``,
+Pydantic, YAML or argparse.
 
 ``PostToolUse`` and ``Stop`` drain the run's outbox: requests are claimed and pre-checked
 before the transaction (``prepare_drain``), recorded inside it after the hook's own row, and
@@ -27,7 +28,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, BinaryIO
 
-from . import outbox
+from . import outbox, secretindex
 from .store import BUSY_TIMEOUT, HookRun, Store, db_path
 
 # The events the injected hooks pass (interface.md, Internal commands). Kept equal to
@@ -568,6 +569,7 @@ def prepare_drain(store: Store, csession_id: str, log: _Log) -> outbox.Drain | N
             artifacts_dev_ino=run.artifacts_dev_ino,
             secret_sha256=run.secret_sha256,
             limits=lambda: read_hookconf_at(run_fd).limits,
+            scanner=lambda: secretindex.read_at(run_fd),
         )
     except outbox.OutboxDirError:
         log.write("report_rejected", "warn", csession_id, run.run_no, reason="outside_dir")
@@ -820,7 +822,7 @@ def main(
                 drain = prepare_drain(store, csession_id, log)
             except Exception as exc:
                 # The hook's own event must not depend on the outbox: a drain that cannot run
-                # (an unusable private directory or hookconf.json) is logged with the
+                # (an unusable private directory, hookconf.json or secret-index) is logged with the
                 # exception type only, and its claimed requests stay for the next drain.
                 log.failure(csession_id, f"{cause}: outbox drain: {type(exc).__name__}")
         try:

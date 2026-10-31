@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import hookevent, outbox
+from claude_session import hookevent, outbox, secretindex
 from claude_session.store import Store
 
 from .outbox_env import ARTIFACT_MAX, SUMMARY_MAX, Run, listing, rejection
@@ -502,37 +502,135 @@ def test_the_log_never_contains_agent_text(run: Run) -> None:
 # Secrets
 
 
-def test_contains_secret_rejects_through_the_scanner(run: Run, tmp_path: Path) -> None:
-    """The contains_secret seam (#26): a scanner hit rejects the summary, the reason or the
-    artifact copy."""
-    run.write_artifact("a.md", b"has CANARY inside")
-    run.report(artifact="a.md")
-    with Store.open(run.db) as store:
-        hook_run = store.hook_run(SID)
-    assert hook_run is not None
-    fd = hookevent.open_private_run_dir(run.private_dir, 1)
+# Configured values (made up; lengths of real credentials).
+AUTH_VALUE = "test-auth-" + "Qw3rTy9" * 6  # a claude_auth_env value
+SECRET_ENV_VALUE = "tok_" + "x7Yk2" * 7 + "Pq"  # a secret_env value
+
+
+@pytest.fixture
+def secret_run(tmp_path: Path) -> Iterator[Run]:
+    root = tmp_path / "state"
+    Store.open(str(root / "state.db")).close()
+    yield Run(root).setup(secrets=(AUTH_VALUE, SECRET_ENV_VALUE))
+
+
+def text_request(run: Run, field: str, text: str) -> dict[str, Any]:
+    if field == "summary":
+        return run.request(summary=text)
+    return run.request(status="blocked", summary=None, reason=text)
+
+
+def artifact_request(run: Run, data: bytes) -> dict[str, Any]:
+    run.write_artifact("a.md", data)
+    return run.request(artifact="a.md", artifact_sha256=hashlib.sha256(data).hexdigest())
+
+
+@pytest.mark.parametrize("value", [AUTH_VALUE, SECRET_ENV_VALUE])
+@pytest.mark.parametrize("field", ["summary", "reason"])
+def test_a_configured_value_in_the_text_is_rejected(
+    secret_run: Run, field: str, value: str
+) -> None:
+    secret_run.plant(text_request(secret_run, field, f"here it is: {value}\nbye"))
+    assert_rejected(secret_run, "contains_secret", secret_run.post_tool_use())
+    assert value not in (secret_run.root / "log.jsonl").read_text()
+
+
+@pytest.mark.parametrize("value", [AUTH_VALUE, SECRET_ENV_VALUE])
+@pytest.mark.parametrize("offset", [0, 9, 15, 16, 31])
+def test_a_configured_value_split_across_artifact_chunks_is_rejected(
+    secret_run: Run, value: str, offset: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The copy is scanned chunk by chunk as it is written; a value spanning chunks is
+    found."""
+    monkeypatch.setattr(outbox, "_READ_CHUNK", 16)
+    data = b"y" * offset + value.encode() + b"z" * 40
+    secret_run.plant(artifact_request(secret_run, data))
+    assert_rejected(secret_run, "contains_secret", secret_run.post_tool_use())
+    assert listing(secret_run.private_run / "scan") == []
+    assert listing(secret_run.private_run / "artifact") == []
+
+
+def test_a_configured_value_found_by_stop_is_logged(secret_run: Run) -> None:
+    secret_run.plant(text_request(secret_run, "summary", AUTH_VALUE))
+    assert secret_run.stop_hook() != ""  # no report ingested: the backstop blocks
+    assert results(secret_run) == ["contains_secret"]
+    assert ("report_rejected", "contains_secret") in log_events(secret_run)
+
+
+def test_clean_reports_pass_the_scan(secret_run: Run) -> None:
+    data = b"report body\n" * 200 + AUTH_VALUE.encode()[:-1]  # all but the last character
+    secret_run.write_artifact("a.md", data)
+    secret_run.report(summary=f"ok {SECRET_ENV_VALUE[1:]}", artifact="a.md")
+    assert secret_run.post_tool_use() == ""
+    assert results(secret_run) == ["ingested"]
+
+
+def test_only_literal_values_are_refused(secret_run: Run) -> None:
+    """interface.md, Residual risks: a transformed configured value is not caught."""
+    secret_run.report(summary=f"leak {SECRET_ENV_VALUE.upper()}")
+    assert secret_run.post_tool_use() == ""
+    assert results(secret_run) == ["ingested"]
+
+
+class Recording:
+    """A scanner that records what each scan was fed."""
+
+    def __init__(self) -> None:
+        self.scans: list[list[bytes]] = []
+
+    def scan(self) -> Recording.Feed:
+        feed = Recording.Feed()
+        self.scans.append(feed.chunks)
+        return feed
+
+    class Feed:
+        def __init__(self) -> None:
+            self.chunks: list[bytes] = []
+
+        def update(self, data: bytes) -> bool:
+            self.chunks.append(data)
+            return False
+
+
+def test_the_scanner_is_fed_the_copy_in_chunks(run: Run, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The artifact is never read back whole: the scan sees exactly the copied bytes, chunk
+    by chunk, and the summary in its own scan."""
+    monkeypatch.setattr(outbox, "_READ_CHUNK", 64)
+    data = os.urandom(1000)
+    run.write_artifact("a.md", data)
+    run.report(summary="see the artifact", artifact="a.md")
+    recording = Recording()
+    drain = prepared(run, scanner=recording)
     try:
-        drain = outbox.Drain.prepare(
-            csession_id=SID,
-            run_no=1,
-            csession_dir=run.csession_dir,
-            private_run_fd=fd,
-            private_run_dir=str(run.private_run),
-            outbox_dev_ino=hook_run.outbox_dev_ino or "",
-            artifacts_dev_ino=hook_run.artifacts_dev_ino or "",
-            secret_sha256=hook_run.secret_sha256 or "",
-            limits=lambda: outbox.Limits(SUMMARY_MAX, ARTIFACT_MAX),
-            scanner=lambda data: b"CANARY" in data,
-        )
-    finally:
-        os.close(fd)
-    try:
-        assert [item.rejection for item in drain.items] == ["contains_secret"]
-        assert drain.winner is None
+        assert drain.winner is not None
     finally:
         drain.finish()
-    assert listing(run.private_run / "scan") == []
-    assert len(listing(run.claimed)) == 1  # not recorded: kept for the next drain
+    summary_scan, artifact_scan = recording.scans
+    assert summary_scan == [b"see the artifact"]
+    assert b"".join(artifact_scan) == data
+    assert max(len(chunk) for chunk in artifact_scan) <= 64
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "readable-by-others"])
+def test_a_drain_without_a_usable_secret_index_ingests_nothing(run: Run, damage: str) -> None:
+    """Fail closed: the drain fails (logged with the exception type only), the request stays
+    claimed, and the next drain with a usable index ingests it."""
+    index = run.private_run / "secret-index"
+    if damage == "missing":
+        index.unlink()
+    elif damage == "corrupt":
+        index.write_bytes(b"not an index")
+    else:
+        index.chmod(0o644)
+    queued = run.report(summary="done")
+    assert run.post_tool_use() == ""
+    assert run.requests() == []
+    assert listing(run.claimed) == [f"{queued.request_id}.json"]
+    failures = [r for r in run.log() if r["event"] == "hook_event_failed"]
+    assert len(failures) == 1 and "outbox drain" in failures[0]["message"]
+    run.write_index(1, (run.secret,))
+    run.post_tool_use()
+    assert results(run) == ["ingested"]
 
 
 def test_secret_comparison_uses_the_stored_digest_only(run: Run) -> None:
@@ -659,6 +757,7 @@ def prepared(
     scanner: outbox.Scanner | None = None,
     clock: Callable[[], float] | None = None,
 ) -> outbox.Drain:
+    """A drain prepared as hook-event does; ``scanner`` replaces the run's secret index."""
     with Store.open(run.db) as store:
         hook_run = store.hook_run(SID)
     assert hook_run is not None
@@ -674,7 +773,7 @@ def prepared(
             artifacts_dev_ino=hook_run.artifacts_dev_ino or "",
             secret_sha256=hook_run.secret_sha256 or "",
             limits=lambda: outbox.Limits(SUMMARY_MAX, ARTIFACT_MAX),
-            scanner=scanner,
+            scanner=(lambda: secretindex.read_at(fd)) if scanner is None else lambda: scanner,
             **({} if clock is None else {"clock": clock}),
         )
     finally:
@@ -848,7 +947,7 @@ def test_a_previous_runs_leftover_request_is_stale(tmp_path: Path) -> None:
     assert [(r["result"], r["run_no"]) for r in run.requests()] == [("stale_run", 2)]
 
 
-# Secrets refused by ingestion itself (independent of the #26 scanner)
+# Secrets refused by ingestion itself (independent of the secret index)
 
 
 @pytest.mark.parametrize("field", ["summary", "reason", "artifact"])
@@ -905,11 +1004,16 @@ def test_a_drain_stops_checking_past_its_deadline(run: Run) -> None:
     ids = [run.report(summary=f"report {n}").request_id for n in range(3)]
     now = [0.0]
 
-    def slow_scanner(data: bytes) -> bool:
-        now[0] += outbox.DRAIN_BUDGET + 1  # the first check uses up the budget
-        return True
+    class SlowScan:
+        def update(self, data: bytes) -> bool:
+            now[0] += outbox.DRAIN_BUDGET + 1  # the first check uses up the budget
+            return True
 
-    drain = prepared(run, scanner=slow_scanner, clock=lambda: now[0])
+    class SlowScanner:
+        def scan(self) -> SlowScan:
+            return SlowScan()
+
+    drain = prepared(run, scanner=SlowScanner(), clock=lambda: now[0])
     with Store.open(run.db) as store:
         with store.transaction():
             drain.record(store, run_no=1, live=True)

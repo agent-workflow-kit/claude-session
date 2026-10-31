@@ -42,7 +42,7 @@ import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
-from . import config, ids, kinds
+from . import config, ids, kinds, logs
 from .errors import UsageError
 
 # Step 1: passed in allowlist mode (design.md, Environment).
@@ -134,9 +134,8 @@ def build(
     for an ``exe_dir`` that is not one absolute path.
     """
     # TODO(#15): exec passes exe_dir (from the absolute argv[0]), git_dir (from gitinfo) and
-    # the private tmpdir (#25), and feeds auth_names and secret_names to logs.secret_values
-    # and the contains_secret index (#26); the auth values come from SessionEnv.env (they may
-    # come from env.set), the secret_env values from the input environment.
+    # the private tmpdir (#25), and builds the redaction set and the contains_secret index
+    # (secretindex.write_at) from secret_values(session_env, environ, run_secret).
     _check_path_entry(exe_dir, ValueError, "the claude-session executable directory")
     profile = resolution.profile
 
@@ -213,6 +212,21 @@ def build(
 
     auth_names = tuple(name for name in env if name in auth or _matches(name, auth_globs))
     return SessionEnv(env=env, auth_names=auth_names, secret_names=secret_names)
+
+
+def secret_values(
+    session_env: SessionEnv, environ: Mapping[str, str], *, run_secret: str | None = None
+) -> frozenset[str]:
+    """The run's secret values (interface.md, report: ``contains_secret``), which the log and
+    audit writers also redact: the ``claude_auth_env`` values as passed (from
+    ``session_env.env``, so a value ``env.set`` supplies or overrides is the one indexed),
+    the ``secret_env`` values of ``environ`` (passed or stripped) and the run secret; only
+    values of ``logs.MIN_SECRET_CHARS`` or more characters. Other ``env.set`` values are
+    literal configuration, not secrets."""
+    passed = logs.secret_values(
+        session_env.env, claude_auth_env=session_env.auth_names, run_secret=run_secret
+    )
+    return passed | logs.secret_values(environ, secret_env=session_env.secret_names)
 
 
 def _passable(name: str, value: str) -> bool:

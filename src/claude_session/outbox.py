@@ -125,8 +125,20 @@ _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _READ_CHUNK = 1 << 16
 
-# ``contains_secret`` over some bytes (summary, reason or the artifact copy).
-Scanner = Callable[[bytes], bool]
+
+class Scan(Protocol):
+    """One streamed ``contains_secret`` scan (``secretindex.Scan``)."""
+
+    def update(self, data: bytes) -> bool:
+        """Feed the next bytes; True once a secret value occurred in the bytes fed so far."""
+        ...
+
+
+class Scanner(Protocol):
+    """``contains_secret`` over the configured secret values (``secretindex.SecretIndex``):
+    the summary, the reason and the artifact copy are each scanned with a fresh ``scan()``."""
+
+    def scan(self) -> Scan: ...
 
 
 def rejection_output(code: str) -> dict[str, Any]:
@@ -803,15 +815,17 @@ class Drain:
         artifacts_dev_ino: str,
         secret_sha256: str,
         limits: Callable[[], Limits],
-        scanner: Scanner | None = None,
+        scanner: Callable[[], Scanner],
         clock: Callable[[], float] = time.monotonic,
     ) -> Drain:
         """Claim the run's outbox requests (and pick up those claimed earlier but never
         recorded) and pre-check them, newest first, until one passes every check (the
         winner). ``private_run_fd`` is the verified private run directory; it stays owned by
-        the caller. ``limits`` is called only when there is a request to check. ``scanner``
-        is ``contains_secret``. Claiming and checking stop ``DRAIN_BUDGET`` seconds (by
-        ``clock``) after the start; what is left waits for the next drain.
+        the caller. ``limits`` and ``scanner`` (``contains_secret``: the run's secret index)
+        are called only when there is a request to check; an error from either fails the
+        drain (nothing is ingested without the scan). Claiming and checking stop
+        ``DRAIN_BUDGET`` seconds (by ``clock``) after the start; what is left waits for the
+        next drain.
 
         Raises ``OutboxDirError`` when ``outbox/`` cannot be trusted (nothing is claimed) and
         ``OSError`` for an unusable private directory."""
@@ -845,7 +859,7 @@ class Drain:
         artifacts_dev_ino: str,
         secret_sha256: str,
         limits: Callable[[], Limits],
-        scanner: Scanner | None,
+        scanner: Callable[[], Scanner],
     ) -> None:
         session_fd = self._open_session_dir(csession_dir)
         self._fds["session"] = session_fd
@@ -867,6 +881,7 @@ class Drain:
         checked = [Item(name[: -len(REQUEST_SUFFIX)]) for name in names[-DRAIN_MAX_REQUESTS:]]
         self.items += checked
         caps = limits()
+        index = scanner()
         scan_fd = fsutil.ensure_private_dir_at(private_run_fd, SCAN)
         self._fds["scan"] = scan_fd
         _remove_leftovers(scan_fd, self._past_deadline)
@@ -878,7 +893,7 @@ class Drain:
             elif self._past_deadline():
                 item.deferred = True
             else:
-                self._check(item, caps, secret_sha256, artifacts_dev_ino, scanner)
+                self._check(item, caps, secret_sha256, artifacts_dev_ino, index)
                 winner_found = item.request is not None
 
     @staticmethod
@@ -946,7 +961,7 @@ class Drain:
         caps: Limits,
         secret_sha256_hex: str,
         artifacts_dev_ino: str,
-        scanner: Scanner | None,
+        scanner: Scanner,
     ) -> None:
         """The pre-checks of one claimed request (design.md, Ingestion). Sets
         ``item.rejection`` or ``item.request`` (and the artifact copy)."""
@@ -975,7 +990,7 @@ class Drain:
             if text is None:
                 continue
             blob = text.encode("utf-8")
-            if _has_secret(blob, parsed.secret) or _scan(scanner, blob):
+            if _has_secret(blob, parsed.secret) or scanner.scan().update(blob):
                 item.rejection = "contains_secret"
                 return
         if parsed.artifact is not None:
@@ -1001,11 +1016,12 @@ class Drain:
         request: Request,
         caps: Limits,
         expected_dir: str,
-        scanner: Scanner | None,
+        scanner: Scanner,
     ) -> str | None:
         """Copy the artifact in chunks through one ``O_NOFOLLOW`` descriptor into a private
-        file in ``scan/``, hashing it and looking for the run secret as it goes; only that
-        copy is scanned and later frozen. Returns a rejection code, or None."""
+        file in ``scan/``, hashing it and scanning it (the run secret in any letter case, and
+        ``contains_secret``) as it goes; only the bytes written to the copy are checked, and
+        only the copy is later frozen. Returns a rejection code, or None."""
         assert request.artifact is not None
         artifacts_fd = self._artifacts_fd(expected_dir)
         if artifacts_fd is None:
@@ -1024,7 +1040,7 @@ class Drain:
             item.copy_name = copy_name
             try:
                 os.fchmod(fd, 0o600)
-                size, digest, found = _copy_stream(src, fd, cap, request.secret)
+                size, digest, found = _copy_stream(src, fd, cap, request.secret, scanner.scan())
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -1038,11 +1054,6 @@ class Drain:
             return "artifact_changed"
         if found:
             return "contains_secret"
-        if scanner is not None:
-            # TODO(#26): give the scanner the copy in chunks; until then it reads the copy
-            # (at most artifact_max_bytes, and only the winner's artifact is copied).
-            if _scan(scanner, _read_regular(scan_fd, copy_name, cap)):
-                return "contains_secret"
         item.artifact_size = size
         return None
 
@@ -1173,10 +1184,10 @@ class Drain:
             self.finish()
 
 
-def _copy_stream(src: int, dst: int, cap: int, secret: str) -> tuple[int, str, bool]:
+def _copy_stream(src: int, dst: int, cap: int, secret: str, scan: Scan) -> tuple[int, str, bool]:
     """Copy ``src`` to ``dst`` in chunks, reading at most ``cap + 1`` bytes. Returns the size
-    read, the SHA-256 of the bytes written and whether the run secret occurs in them in any
-    letter case (searched across chunk boundaries)."""
+    read, the SHA-256 of the bytes written and whether they contain a secret: the run secret
+    in any letter case, or a value ``scan`` finds (both across chunk boundaries)."""
     token = secret.encode("ascii")
     keep = len(token) - 1
     hasher = hashlib.sha256()
@@ -1195,15 +1206,9 @@ def _copy_stream(src: int, dst: int, cap: int, secret: str) -> tuple[int, str, b
             view = view[os.write(dst, view) :]
         hasher.update(chunk)
         window = tail + chunk.lower()
-        found = found or token in window
+        found = found or token in window or scan.update(chunk)
         tail = window[-keep:] if keep else b""
     return size, hasher.hexdigest(), found
-
-
-def _scan(scanner: Scanner | None, data: bytes) -> bool:
-    # TODO(#26): the hook path passes the scanner built from the run's secret-index
-    # (keyed q-gram index); until then no scanner is given and nothing is found.
-    return scanner is not None and scanner(data)
 
 
 def _entries(dir_fd: int) -> list[tuple[str, bool]]:

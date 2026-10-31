@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import config, envbuild, kinds
+from claude_session import config, envbuild, kinds, secretindex
 from claude_session.errors import UsageError
 
 SID = "cs-k3v7q2xa"
@@ -1052,3 +1052,42 @@ def test_repeated_builds_are_identical(cfg_dir: Path) -> None:
     cfg = load(cfg_dir, "secret_env: [WEBHOOK_URL]\n")
     environ = {**CALLER, "WEBHOOK_URL": SECRET, "ANTHROPIC_API_KEY": "k"}
     assert build(cfg, "review", environ) == build(cfg, "review", environ)
+
+
+# secret_values: the contains_secret and redaction set (#26)
+
+AUTH_PASSED = "auth-value-as-passed-123"
+AUTH_CALLER = "auth-value-of-the-caller"
+VAULT = "vault-token-0123456789"
+RUN_SECRET = "ab" * 32
+
+
+def session_env(env: dict[str, str], auth: tuple[str, ...], secret: tuple[str, ...]) -> Any:
+    return envbuild.SessionEnv(env=env, auth_names=auth, secret_names=secret)
+
+
+def test_secret_values_take_auth_from_the_session_env_and_secrets_from_the_caller() -> None:
+    built = session_env(
+        {"ANTHROPIC_API_KEY": AUTH_PASSED, "PLAIN": "literal-env-set-value"},
+        ("ANTHROPIC_API_KEY",),
+        ("VAULT_TOKEN",),
+    )
+    caller = {"ANTHROPIC_API_KEY": AUTH_CALLER, "VAULT_TOKEN": VAULT}
+    values = envbuild.secret_values(built, caller, run_secret=RUN_SECRET)
+    assert values == {AUTH_PASSED, VAULT, RUN_SECRET}
+
+
+def test_secret_values_drop_short_and_absent_values() -> None:
+    built = session_env({"ANTHROPIC_API_KEY": "short"}, ("ANTHROPIC_API_KEY",), ("GONE",))
+    assert envbuild.secret_values(built, {}) == frozenset()
+    assert envbuild.secret_values(built, {"GONE": "1234567"}) == frozenset()
+    assert envbuild.secret_values(built, {"GONE": "12345678"}) == {"12345678"}
+
+
+def test_secret_values_feed_an_index_that_catches_them(tmp_path: Path) -> None:
+    built = session_env({"ANTHROPIC_API_KEY": AUTH_PASSED}, ("ANTHROPIC_API_KEY",), ("V",))
+    values = envbuild.secret_values(built, {"V": VAULT}, run_secret=RUN_SECRET)
+    index = secretindex.parse(secretindex.build(values))
+    for value in (AUTH_PASSED, VAULT, RUN_SECRET):
+        assert index.contains(f"x {value} y".encode())
+    assert not index.contains(AUTH_CALLER.encode())
