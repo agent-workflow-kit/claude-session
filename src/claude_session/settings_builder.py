@@ -18,9 +18,10 @@ session-writable paths) are #24's.
 TODO(#24): before build(), the launch validations refuse unsafe cwd, read_dirs, write_dirs,
 plugin directories and generated read entries (Isolation fields), and pass the
 session_writable check and the session-writable paths to check_interpreter().
-TODO(#15): exec runs selfcheck.self_check() in launch step 5 (and at adoption): it creates
-the private tmpdir (tmpdir.create) that becomes Isolation.tmpdir, gives sandbox_active, and
-returns the warning of a `preferred` run without a working sandbox.
+TODO(#15): exec calls tmpdir.check() at the temporary-directory slot of launch step 5 and
+selfcheck.self_check() after the claude_args check (and both again at adoption):
+self_check creates the private tmpdir (tmpdir.create) that becomes Isolation.tmpdir, gives
+sandbox_active, and returns the warning of a `preferred` run without a working sandbox.
 
 TODO(#15): exec calls build() in launch step 7 and writes the settings with
 SessionDirs.write_settings before spawning claude. Before allocation, the step-5 launch

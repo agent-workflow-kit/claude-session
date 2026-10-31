@@ -2,10 +2,16 @@
 design.md, Generated settings: ``sandbox_active``).
 
 ``sandbox_active`` is true when the run's sandbox mode is not ``off``, the prerequisites are
-present (Linux and WSL2: ``bwrap`` and ``socat`` resolved to absolute paths, and user
-namespaces usable; macOS: ``sandbox-exec``) and the socket path fits. ``self_check`` is that
-test; it also validates and creates the private temporary directory (``tmpdir``), in the
-launch order of interface.md: temporary directory, sandbox prerequisites, socket path length.
+present (Linux and WSL2: ``bwrap`` and ``socat`` resolved to absolute paths, ``socat -V``
+runs and user namespaces are usable; macOS: ``sandbox-exec``) and the socket path fits.
+
+Launch step 5 (interface.md, Launch order) checks, in this order: permission profile, cwd
+and the other path rules, plugin directories, git directory, temporary directory,
+``claude_bin``, ``claude --version``, ``claude_args`` (isolated runs), sandbox
+prerequisites, socket path length. The caller runs ``tmpdir.check`` at the
+temporary-directory slot; ``self_check`` runs after ``claude_args``: sandbox prerequisites,
+socket path length, then (unless a dry run) ``tmpdir.create``, which validates the base and
+per-uid root again, so nothing is created before every check has passed.
 
 - ``required``: a missing prerequisite fails the launch (``sandbox_unavailable``).
 - ``preferred``: it gives a warning and ``sandbox_active: false``; the run still gets its
@@ -20,7 +26,8 @@ launch order of interface.md: temporary directory, sandbox prerequisites, socket
 Prerequisite probes run through ``gateway`` (an injected runner in tests), by absolute path
 and with a fixed minimal environment.
 
-TODO(#15): exec calls ``self_check`` in launch step 5 (and again at adoption) with the
+TODO(#15): exec calls ``tmpdir.check`` at the temporary-directory slot of launch step 5 and
+``self_check`` after the ``claude_args`` check (and both again at adoption) with the
 resolved ``bwrap`` and ``socat``, records ``sandbox_active`` on the run, adds the warnings to
 the run's warnings, passes ``tmpdir`` to ``settings_builder.Isolation`` and ``envbuild``, and
 maps a ``LaunchValidationError`` (with its ``hint``) to a not-started run. Switch the default
@@ -83,6 +90,8 @@ BWRAP_PROBE_ARGS = (
 SANDBOX_EXEC_PROBE_ARGS = ("-p", "(version 1)(allow default)", "/usr/bin/true")
 
 _INSTALL_HINT = "install bubblewrap and socat (for example: sudo apt install bubblewrap socat)"
+_SOCAT_HINT = "reinstall socat (for example: sudo apt install --reinstall socat)"
+SOCAT_PROBE_ARGS = ("-V",)
 _USERNS_HINT = (
     "bubblewrap could not create its namespaces: enable unprivileged user namespaces"
     " (sysctl kernel.unprivileged_userns_clone=1 and user.max_user_namespaces > 0; on Ubuntu,"
@@ -176,11 +185,13 @@ def self_check(
     create: bool = True,
     sandbox_exec: str = SANDBOX_EXEC,
 ) -> SelfCheck:
-    """Run the sandbox self-check for a run with sandbox ``mode``. ``create=False`` (dry run)
-    validates the same things and creates nothing; ``csession_id`` may then be None (a new
-    session), and the socket path is checked for an id of the fixed length. Raises
-    ``LaunchValidationError`` (``tmpdir_unsafe``, ``sandbox_unavailable``,
-    ``socket_path_too_long``) in that order of precedence."""
+    """Run the sandbox self-check for a run with sandbox ``mode``: sandbox prerequisites,
+    socket path length, then the private tmpdir is created. The caller has run
+    ``tmpdir.check`` earlier in launch step 5. ``create=False`` (dry run) checks the same and
+    does not touch the tmpdir at all; ``csession_id`` may then be None (a new session), and
+    the socket path is checked for an id of the fixed length. Raises
+    ``LaunchValidationError`` (``sandbox_unavailable``, ``socket_path_too_long``,
+    ``tmpdir_unsafe``) in that order of precedence."""
     if mode not in SANDBOX_MODES:
         raise ValueError(f"unknown sandbox mode: {mode!r}")
     if mode == "off":
@@ -189,7 +200,6 @@ def self_check(
         raise ValueError("creating the private tmpdir needs the session id")
     if platform is None:
         platform = detect_platform()
-    path = tmpdir.check(csession_id, base=tmp_base)
     prerequisites = check_prerequisites(
         platform, bwrap=bwrap, socat=socat, runner=runner, sandbox_exec=sandbox_exec
     )
@@ -206,6 +216,7 @@ def self_check(
             f" sandboxed; {prerequisites.hint}",
         )
     check_socket_path(tmpdir.run_path(csession_id or _PLACEHOLDER_ID, tmp_base), platform)
+    path = None if csession_id is None else tmpdir.run_path(csession_id, tmp_base)
     if create:
         assert csession_id is not None
         path = tmpdir.create(csession_id, base=tmp_base)
@@ -221,7 +232,10 @@ def _linux(bwrap: str | None, socat: str | None, runner: Runner) -> Prerequisite
         problem = _tool_problem(name, path)
         if problem is not None:
             return Prerequisites(False, problem, _INSTALL_HINT)
-    assert bwrap is not None
+    assert bwrap is not None and socat is not None
+    problem = _probe([socat, *SOCAT_PROBE_ARGS], runner)
+    if problem is not None:
+        return Prerequisites(False, f"socat does not run: {problem}", _SOCAT_HINT)
     problem = _probe([bwrap, *BWRAP_PROBE_ARGS], runner)
     if problem is not None:
         return Prerequisites(False, f"bubblewrap cannot create namespaces: {problem}", _USERNS_HINT)
@@ -261,6 +275,10 @@ def _probe(argv: list[str], runner: Runner) -> str | None:
         return f"probe timed out after {PROBE_TIMEOUT:g} s"
     except OSError as exc:
         return f"probe could not run: {exc.strerror or exc}"
+    except UnicodeDecodeError:
+        return "probe output undecodable"
+    except ValueError as exc:
+        return f"probe could not run: {exc}"
     if result.returncode != 0:
         return f"probe exited with status {result.returncode}"
     return None

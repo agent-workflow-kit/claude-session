@@ -22,11 +22,18 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 class FakeRunner:
-    """Records every call; answers with ``returncode`` or raises ``error``."""
+    """Records every call; answers with ``returncode`` or raises ``error``. ``by_tool`` maps
+    the basename of ``argv[0]`` to a return code or an exception for that tool only."""
 
-    def __init__(self, returncode: int = 0, error: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        returncode: int = 0,
+        error: BaseException | None = None,
+        by_tool: Mapping[str, int | BaseException] | None = None,
+    ) -> None:
         self.returncode = returncode
         self.error = error
+        self.by_tool = dict(by_tool or {})
         self.calls: list[dict[str, Any]] = []
 
     def __call__(
@@ -38,9 +45,15 @@ class FakeRunner:
         env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append({"argv": list(argv), "timeout": timeout, "env": env, "stdin": stdin})
-        if self.error is not None:
-            raise self.error
-        return subprocess.CompletedProcess(argv, self.returncode, "", "probe stderr")
+        answer: int | BaseException | None = self.by_tool.get(Path(argv[0]).name)
+        if answer is None:
+            answer = self.error if self.error is not None else self.returncode
+        if isinstance(answer, BaseException):
+            raise answer
+        return subprocess.CompletedProcess(argv, answer, "", "probe stderr")
+
+
+UNDECODABLE = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
 
 
 def executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> str:
@@ -135,7 +148,10 @@ def test_linux_prerequisites_present_and_probe_succeeds(
     runner = FakeRunner(0)
     result = selfcheck.check_prerequisites(platform, bwrap=tools[0], socat=tools[1], runner=runner)
     assert result == Prerequisites(available=True, problem=None, hint=None)
-    (call,) = runner.calls
+    socat_call, call = runner.calls
+    assert socat_call["argv"] == [tools[1], "-V"]
+    assert socat_call["timeout"] == selfcheck.PROBE_TIMEOUT
+    assert socat_call["env"] == {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
     assert call["argv"][0] == tools[0]
     assert "--unshare-user" in call["argv"]
     assert "--unshare-net" in call["argv"]
@@ -190,7 +206,7 @@ def test_linux_tool_that_is_a_directory_is_unavailable(
 
 def test_linux_failing_probe_means_no_user_namespaces(tools: tuple[str, str]) -> None:
     result = selfcheck.check_prerequisites(
-        "linux", bwrap=tools[0], socat=tools[1], runner=FakeRunner(1)
+        "linux", bwrap=tools[0], socat=tools[1], runner=FakeRunner(by_tool={"bwrap": 1})
     )
     assert not result.available
     assert result.problem is not None and "namespace" in result.problem
@@ -203,15 +219,52 @@ def test_linux_failing_probe_means_no_user_namespaces(tools: tuple[str, str]) ->
         subprocess.TimeoutExpired(["bwrap"], 10),
         FileNotFoundError(2, "No such file or directory"),
         PermissionError(13, "Permission denied"),
+        UNDECODABLE,
     ],
 )
 def test_linux_probe_that_cannot_run_is_unavailable(
     tools: tuple[str, str], error: BaseException
 ) -> None:
     result = selfcheck.check_prerequisites(
-        "linux", bwrap=tools[0], socat=tools[1], runner=FakeRunner(error=error)
+        "linux", bwrap=tools[0], socat=tools[1], runner=FakeRunner(by_tool={"bwrap": error})
     )
     assert not result.available
+    assert result.problem is not None and result.problem.startswith("bubblewrap")
+
+
+def test_probe_with_undecodable_output_is_a_probe_failure(tools: tuple[str, str]) -> None:
+    result = selfcheck.check_prerequisites(
+        "linux", bwrap=tools[0], socat=tools[1], runner=FakeRunner(by_tool={"bwrap": UNDECODABLE})
+    )
+    assert not result.available
+    assert result.problem is not None and "probe output undecodable" in result.problem
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        1,
+        subprocess.TimeoutExpired(["socat"], 10),
+        PermissionError(13, "Permission denied"),
+        UNDECODABLE,
+    ],
+)
+def test_linux_socat_that_does_not_run_is_unavailable(
+    tools: tuple[str, str], answer: int | BaseException
+) -> None:
+    runner = FakeRunner(by_tool={"socat": answer})
+    result = selfcheck.check_prerequisites("linux", bwrap=tools[0], socat=tools[1], runner=runner)
+    assert not result.available
+    assert result.problem is not None and result.problem.startswith("socat does not run: ")
+    assert result.hint is not None and "socat" in result.hint
+    assert [Path(call["argv"][0]).name for call in runner.calls] == ["socat"]
+
+
+def test_failing_socat_with_the_real_gateway(tmp_path: Path, tools: tuple[str, str]) -> None:
+    socat = executable(tmp_path / "broken-socat", "#!/bin/sh\nexit 127\n")
+    result = selfcheck.check_prerequisites("linux", bwrap=tools[0], socat=socat)
+    assert not result.available
+    assert result.problem == "socat does not run: probe exited with status 127"
 
 
 def test_probe_with_the_real_gateway(tmp_path: Path, tools: tuple[str, str]) -> None:
@@ -338,7 +391,7 @@ def test_required_without_prerequisites_fails_and_leaves_nothing(base: Path) -> 
 
 def test_required_with_failing_probe_fails(base: Path, tools: tuple[str, str]) -> None:
     with pytest.raises(LaunchValidationError) as info:
-        run_check("required", base, tools, FakeRunner(1))
+        run_check("required", base, tools, FakeRunner(by_tool={"bwrap": 1}))
     assert info.value.end_reason == "sandbox_unavailable"
 
 
@@ -369,15 +422,63 @@ def test_socket_path_too_long_fails_every_sandboxed_mode(
     assert list(deep.iterdir()) == []
 
 
-def test_unsafe_tmpdir_is_reported_before_prerequisites(base: Path) -> None:
-    # Launch order: temporary directory before sandbox prerequisites and socket path.
-    tmpdir_root = Path(tmpdir.root_path(str(base)))
-    tmpdir_root.mkdir(mode=0o755)
-    runner = FakeRunner(0)
+def test_required_with_broken_socat_fails(base: Path, tools: tuple[str, str]) -> None:
     with pytest.raises(LaunchValidationError) as info:
-        run_check("required", base, (None, None), runner)
+        run_check("required", base, tools, FakeRunner(by_tool={"socat": 1}))
+    assert info.value.end_reason == "sandbox_unavailable"
+    assert "socat" in str(info.value)
+    assert list(base.iterdir()) == []
+
+
+def test_preferred_with_broken_socat_warns(base: Path, tools: tuple[str, str]) -> None:
+    result = run_check("preferred", base, tools, FakeRunner(by_tool={"socat": 1}))
+    assert not result.sandbox_active
+    (warning,) = result.warnings
+    assert "socat does not run" in warning
+
+
+def test_self_check_refuses_an_unsafe_root_through_create_and_creates_nothing(
+    base: Path, tools: tuple[str, str]
+) -> None:
+    # The caller runs tmpdir.check earlier in step 5; create validates the root again.
+    root = Path(tmpdir.root_path(str(base)))
+    root.mkdir(mode=0o755)
+    with pytest.raises(LaunchValidationError) as info:
+        run_check("required", base, tools, FakeRunner(0))
     assert info.value.end_reason == "tmpdir_unsafe"
-    assert runner.calls == []
+    assert list(root.iterdir()) == []
+
+
+def test_self_check_does_not_check_the_tmpdir_itself(
+    base: Path, tools: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The temporary-directory slot of step 5 comes before claude_bin, claude --version and
+    # claude_args: the caller runs tmpdir.check there, not self_check.
+    def not_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError("tmpdir.check must not be called by self_check")
+
+    monkeypatch.setattr(tmpdir, "check", not_called)
+    assert run_check("required", base, tools, FakeRunner(0)).sandbox_active
+
+
+@pytest.mark.parametrize("csession_id", [SID, None])
+def test_dry_run_does_not_touch_the_tmpdir(
+    base: Path, tools: tuple[str, str], monkeypatch: pytest.MonkeyPatch, csession_id: str | None
+) -> None:
+    root = Path(tmpdir.root_path(str(base)))
+    root.mkdir(mode=0o755)  # unsafe, but only tmpdir.check (run by the caller) looks at it
+
+    def not_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a dry run must not check or create the tmpdir")
+
+    monkeypatch.setattr(tmpdir, "check", not_called)
+    monkeypatch.setattr(tmpdir, "create", not_called)
+    result = run_check(
+        "required", base, tools, FakeRunner(0), create=False, csession_id=csession_id
+    )
+    assert result.sandbox_active
+    assert list(root.iterdir()) == []
+    assert (root.stat().st_mode & 0o777) == 0o755
 
 
 def test_prerequisites_are_reported_before_socket_path(tmp_path: Path) -> None:

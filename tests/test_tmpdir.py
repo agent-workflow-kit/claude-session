@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from claude_session import fsutil, tmpdir
+from claude_session import fsutil, ids, tmpdir
 from claude_session.errors import LaunchValidationError
-from claude_session.tmpdir import TmpdirUnsafe
+from claude_session.tmpdir import TmpdirLeftover, TmpdirUnsafe
 
 SID = "cs-abcd2345"
 
@@ -31,6 +31,25 @@ def root_of(base: Path) -> Path:
 
 def mode(path: Path) -> int:
     return stat.S_IMODE(path.lstat().st_mode)
+
+
+def deep_tree(top: Path, levels: int) -> None:
+    path = top
+    for _ in range(levels):
+        path = path / "d"
+        path.mkdir()
+    (path / "f").write_text("x")
+
+
+def stale_entries(base: Path) -> list[Path]:
+    return sorted(root_of(base).glob(f"{tmpdir.STALE_PREFIX}*"))
+
+
+@pytest.fixture
+def low_depth_cap(monkeypatch: pytest.MonkeyPatch) -> int:
+    """``fsutil.remove_tree_at`` refuses trees deeper than 3 levels (instead of 256)."""
+    monkeypatch.setattr(fsutil, "tree_depth_cap", lambda: 3)
+    return 3
 
 
 # Paths
@@ -205,8 +224,38 @@ def test_root_owned_by_another_user_is_refused(base: Path, monkeypatch: pytest.M
     # The base stand-in is owned by real_uid, which is neither root nor 4242: it is refused
     # first. Make its owner check pass so the root's owner check is what fails.
     monkeypatch.setattr(tmpdir, "_TRUSTED_BASE_OWNERS", (0, real_uid))
-    with pytest.raises(TmpdirUnsafe, match="owned by uid"):
+    root = base / "csession-4242"
+    with pytest.raises(TmpdirUnsafe) as info:
         tmpdir.create(SID, base=str(base))
+    assert str(info.value) == (
+        f"private temporary directory unsafe: {root}: owned by uid {real_uid}"
+    )
+    assert info.value.hint is not None
+    assert f"another user created {root}" in info.value.hint
+    assert "administrator" in info.value.hint and "sandbox to off" in info.value.hint
+    assert "rm -rf" not in info.value.hint
+
+
+def test_squatted_root_names_its_owner_even_when_it_cannot_be_opened(
+    base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Another user's 0700 root: opening it fails with EACCES, which would hide the owner.
+    real_uid = os.geteuid()
+    (base / "csession-4242").mkdir(mode=0o700)
+    monkeypatch.setattr(os, "geteuid", lambda: 4242)
+    monkeypatch.setattr(tmpdir, "_TRUSTED_BASE_OWNERS", (0, real_uid))
+    real_open = os.open
+
+    def denied_open(path: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        if path == "csession-4242":
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", denied_open)
+    for call in (tmpdir.check, tmpdir.create):
+        with pytest.raises(TmpdirUnsafe, match=f"owned by uid {real_uid}") as info:
+            call(SID, base=str(base))
+        assert info.value.hint is not None and "another user created" in info.value.hint
 
 
 def test_squatted_root_created_between_mkdir_and_open_is_refused(
@@ -234,9 +283,14 @@ def test_squatted_root_created_between_mkdir_and_open_is_refused(
 
 def test_world_writable_base_without_sticky_bit_is_refused(base: Path) -> None:
     base.chmod(0o777)
-    with pytest.raises(TmpdirUnsafe, match="sticky"):
+    with pytest.raises(TmpdirUnsafe, match="sticky") as info:
         tmpdir.create(SID, base=str(base))
     assert not root_of(base).exists()
+    assert str(info.value).startswith(f"private temporary directory unsafe: {base}: ")
+    hint = info.value.hint
+    assert hint is not None
+    assert f"system temporary directory {base} is misconfigured" in hint
+    assert "administrator" in hint and "sticky bit" in hint and "sandbox to off" in hint
 
 
 def test_group_writable_base_without_sticky_bit_is_refused(base: Path) -> None:
@@ -251,9 +305,25 @@ def test_private_base_without_sticky_bit_is_accepted(base: Path) -> None:
 
 
 def test_base_owned_by_another_user_is_refused(base: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_uid = os.geteuid()
     monkeypatch.setattr(os, "geteuid", lambda: 4242)
-    with pytest.raises(TmpdirUnsafe, match="owned by uid"):
+    with pytest.raises(TmpdirUnsafe, match=f"owned by uid {real_uid}"):
         tmpdir.create(SID, base=str(base))
+
+
+def test_base_owned_by_another_uid_explains_user_namespaces(
+    base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Inside a user namespace /tmp's owner is often unmapped (the overflow uid 65534): still
+    # refused, with a hint naming that likely cause and the remedy.
+    monkeypatch.setattr(os, "geteuid", lambda: 4242)
+    with pytest.raises(TmpdirUnsafe) as info:
+        tmpdir.create(SID, base=str(base))
+    assert str(info.value).startswith(f"private temporary directory unsafe: {base}: owned by")
+    hint = info.value.hint
+    assert hint is not None
+    assert "user namespace" in hint and "65534" in hint
+    assert "sandbox to off" in hint and "owned by root or you" in hint
 
 
 def test_missing_base_is_refused(tmp_path: Path) -> None:
@@ -265,6 +335,136 @@ def test_base_that_is_a_file_is_refused(tmp_path: Path) -> None:
     (tmp_path / "file").write_text("x")
     with pytest.raises(TmpdirUnsafe):
         tmpdir.create(SID, base=str(tmp_path / "file"))
+
+
+# Messages name the failing entry; check and create report the same text
+
+
+@pytest.mark.parametrize("setup", ["mode", "symlink", "file"])
+def test_bad_own_root_names_the_root_and_says_remove_it(
+    tmp_path: Path, base: Path, setup: str
+) -> None:
+    root = root_of(base)
+    if setup == "mode":
+        root.mkdir(mode=0o755)
+    elif setup == "symlink":
+        (tmp_path / "elsewhere").mkdir(mode=0o700)
+        root.symlink_to(tmp_path / "elsewhere")
+    else:
+        root.write_text("x")
+    errors = []
+    for call in (tmpdir.check, tmpdir.create):
+        with pytest.raises(TmpdirUnsafe) as info:
+            call(SID, base=str(base))
+        errors.append((str(info.value), info.value.hint))
+    assert errors[0] == errors[1]
+    message, hint = errors[0]
+    assert message.startswith(f"private temporary directory unsafe: {root}: ")
+    assert hint == f"remove it (rm -rf {root}) and run again: it is recreated with mode 0700"
+
+
+def test_unsafe_base_gives_the_same_text_from_check_and_create(base: Path) -> None:
+    base.chmod(0o777)
+    errors = []
+    for call in (tmpdir.check, tmpdir.create):
+        with pytest.raises(TmpdirUnsafe) as info:
+            call(SID, base=str(base))
+        errors.append((str(info.value), info.value.hint))
+    assert errors[0] == errors[1]
+
+
+# Leftovers that cannot be removed (a sandboxed agent can build a tree deeper than the cap)
+
+
+def test_stale_names_are_never_session_ids() -> None:
+    assert tmpdir.STALE_PREFIX.startswith(".")
+    assert not ids.is_session_id(f"{tmpdir.STALE_PREFIX}{SID}-0123456789abcdef")
+
+
+def test_create_moves_an_unremovable_leftover_aside(base: Path, low_depth_cap: int) -> None:
+    run = Path(tmpdir.create(SID, base=str(base)))
+    deep_tree(run, low_depth_cap + 3)
+    assert Path(tmpdir.create(SID, base=str(base))) == run
+    assert list(run.iterdir()) == []
+    assert mode(run) == 0o700
+    (stale,) = stale_entries(base)
+    assert stale.name.startswith(f"{tmpdir.STALE_PREFIX}{SID}-")
+    assert not ids.is_session_id(stale.name)
+    assert (stale / "d").is_dir()  # the second removal failed too: left for reconcile
+
+
+def test_create_removes_the_moved_aside_leftover_when_it_can(
+    base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = Path(tmpdir.create(SID, base=str(base)))
+    (run / "x").write_text("x")
+    real_remove = fsutil.remove_tree_at
+    calls: list[str] = []
+
+    def fail_once(dir_fd: int, name: str) -> None:
+        calls.append(name)
+        if len(calls) == 1:
+            raise fsutil.UnsafePathError(f"{name}: directory tree deeper than 3 levels")
+        real_remove(dir_fd, name)
+
+    monkeypatch.setattr(fsutil, "remove_tree_at", fail_once)
+    tmpdir.create(SID, base=str(base))
+    assert list(run.iterdir()) == []
+    assert stale_entries(base) == []
+    assert calls[0] == SID and calls[1].startswith(tmpdir.STALE_PREFIX)
+
+
+def test_create_refuses_a_leftover_it_can_neither_remove_nor_move(
+    base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = Path(tmpdir.create(SID, base=str(base)))
+
+    def cannot_remove(dir_fd: int, name: str) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    def cannot_rename(*args: object, **kwargs: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(fsutil, "remove_tree_at", cannot_remove)
+    monkeypatch.setattr(os, "rename", cannot_rename)
+    with pytest.raises(TmpdirUnsafe) as info:
+        tmpdir.create(SID, base=str(base))
+    assert str(info.value).startswith(f"private temporary directory unsafe: {run}: ")
+    assert "leftover" in str(info.value)
+    assert info.value.hint == f"remove it: rm -rf {run}"
+
+
+def test_remove_moves_an_unremovable_tree_aside(base: Path, low_depth_cap: int) -> None:
+    run = Path(tmpdir.create(SID, base=str(base)))
+    deep_tree(run, low_depth_cap + 3)
+    with pytest.raises(TmpdirLeftover) as info:
+        tmpdir.remove(SID, base=str(base))
+    assert isinstance(info.value, OSError)
+    assert not run.exists() and not run.is_symlink()  # the session's path is free
+    (stale,) = stale_entries(base)
+    assert info.value.path == str(run)
+    assert info.value.stale_path == str(stale)
+    assert str(stale) in str(info.value)
+    assert info.value.hint == f"remove it: rm -rf {stale}"
+    # A later run of the session gets a fresh tmpdir.
+    assert Path(tmpdir.create(SID, base=str(base))).is_dir()
+
+
+def test_remove_that_cannot_move_aside_names_the_run_path(
+    base: Path, low_depth_cap: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = Path(tmpdir.create(SID, base=str(base)))
+    deep_tree(run, low_depth_cap + 3)
+
+    def cannot_rename(*args: object, **kwargs: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "rename", cannot_rename)
+    with pytest.raises(TmpdirLeftover) as info:
+        tmpdir.remove(SID, base=str(base))
+    assert info.value.stale_path is None
+    assert info.value.hint == f"remove it: rm -rf {run}"
+    assert run.is_dir()
 
 
 # check: the same validation, with no side effects (dry run)
