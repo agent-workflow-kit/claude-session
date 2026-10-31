@@ -9,6 +9,7 @@ import errno
 import json
 import os
 import re
+import socket
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -1067,6 +1068,73 @@ def test_an_unsafe_offloaded_entry_is_not_referenced(
     assert f"[offloaded] {results}/ok.txt" in lines
     assert not any("abc.txt" in line and line.startswith("[offloaded]") for line in lines)
     assert f"offloaded tool result not shown: {results}/abc.txt" in err
+
+
+def _socket_entry(path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(path.parent)  # a relative name keeps the socket path short
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(path.name)
+    sock.close()
+
+
+def _mode_000_entry(path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root opens a mode-000 file")
+    path.write_text("secret")
+    path.chmod(0)
+
+
+@pytest.mark.parametrize("plant", [_socket_entry, _mode_000_entry])
+def test_an_unreadable_offloaded_entry_is_not_referenced(
+    st: Store,
+    clock: Clock,
+    projects: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    plant: Any,
+) -> None:
+    session(st, clock)
+    results = projects / PROJECT / CID1 / "tool-results"
+    results.mkdir(parents=True)
+    plant(results / "abc.txt", monkeypatch)
+    (results / "ok.txt").write_text("fine")
+    data = jsonl(tool_result("t", "saved to tool-results/abc.txt and tool-results/ok.txt"))
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, data)))
+    code, out, err = run(["transcript", SID], capsys)
+    assert code == 0
+    lines = out.splitlines()
+    assert "[offloaded result not shown: unreadable file]" in lines
+    assert f"[offloaded] {results}/ok.txt" in lines
+    assert not any("abc.txt" in line and line.startswith("[offloaded]") for line in lines)
+    assert f"offloaded tool result not shown: {results}/abc.txt" in err
+
+
+def test_the_deadline_still_stops_offloaded_references(
+    st: Store,
+    clock: Clock,
+    projects: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    session(st, clock)
+    results = projects / PROJECT / CID1 / "tool-results"
+    results.mkdir(parents=True)
+    (results / "abc.txt").write_text("one")
+    (results / "ok.txt").write_text("two")
+    data = jsonl(tool_result("t", "saved to tool-results/abc.txt and tool-results/ok.txt"))
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, data)))
+    now = FakeTime()
+    real_reader, real_open = transcripts.Reader, os.open
+
+    def slow_open(name: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if name == "abc.txt":
+            now.now += 10
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(transcripts, "Reader", lambda: real_reader(deadline=3, clock=now))
+    monkeypatch.setattr(transcripts.os, "open", slow_open)
+    assert main(["transcript", SID]) == 12
+    assert "longer than 3 seconds" in capsys.readouterr().err
 
 
 def test_raw_separates_files_without_a_final_newline(

@@ -104,6 +104,11 @@ class _Unsafe(FailedError):
     directory that is not a real directory owned by the user."""
 
 
+class _Unreadable(FailedError):
+    """A file or directory that exists but cannot be opened or read (permission denied, a
+    socket, an I/O error). The read deadline is a plain ``FailedError``, not this."""
+
+
 # Allowed locations
 
 
@@ -389,7 +394,7 @@ def _check_file(fd: int, shown: str) -> None:
 
 
 def _failed(shown: str, exc: OSError) -> FailedError:
-    return FailedError("cannot read transcript file", detail=f"{shown}: {exc.strerror or exc}")
+    return _Unreadable("cannot read transcript file", detail=f"{shown}: {exc.strerror or exc}")
 
 
 # Discovery
@@ -713,7 +718,8 @@ class Renderer:
 
     def _reference(self, loc: Location, name: str) -> str:
         """The line for an offloaded result: its path when it is a regular file with one
-        link owned by the user (checked once per file), else a marker and a warning."""
+        link owned by the user (checked once per file), else a marker and a warning. Only
+        the read deadline ends the command here."""
         key = (loc.claude_session_id, name)
         if key not in self._references:
             path = loc.tool_result_path(name)
@@ -728,6 +734,9 @@ class Renderer:
                     f"offloaded tool result not shown: {path} is not a regular file with one"
                     " link owned by this user"
                 )
+            except _Unreadable:
+                line = "[offloaded result not shown: unreadable file]"
+                self.warnings.append(f"offloaded tool result not shown: {path} cannot be opened")
             self._references[key] = line
         return self._references[key]
 
