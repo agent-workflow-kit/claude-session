@@ -174,7 +174,7 @@ def read_file(
     opened at that real path without following symlinks, so a swap after the check fails. At
     most ``MAX_FILE_BYTES``; regular files only. With ``expected_label`` (a carried snapshot's
     recorded ``file:<prefix>``), a file whose label differs fails."""
-    # TODO(#24): the launch path passes the session-writable path check here.
+    # The check is pathrules.session_writable(...) (TODO(#15): the launch path passes it).
     _require_check(isolated, session_writable)
     problem: str | None = None
     try:
@@ -218,10 +218,9 @@ def validate(content: Any, *, isolated: bool, source: str = "permission profile"
     rule lists are lists of strings and whose numbers are finite. For isolated runs, also the
     sandbox key allowlist and the refused keys. Raises ``InvalidPermissionProfile`` listing
     every problem (key paths only)."""
-    # TODO(#24): refused paths (state root, /tmp/csession-<uid>, unsafe write targets) are
-    # checked on the expanded profile, for trusted and isolated runs; for isolated runs also
-    # sandbox.filesystem.allowRead against the read_dirs credential paths (interface.md, Path
-    # rules), which this module does not check.
+    # The paths in the profile are checked after expansion by pathrules.PathRules
+    # .check_profile: refused paths (state root, /tmp/csession-<uid>) for every run; for
+    # isolated runs also unsafe write targets and the credential paths for sandbox allowRead.
     problems = _shape(content)
     if not problems and isolated:
         problems = _refused(content)
