@@ -8,9 +8,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from claude_session import endmap
 from claude_session.endmap import HeadlessResult, Mapped
+
+from .schemas import registry
 
 
 def line(obj: Any) -> bytes:
@@ -340,11 +343,24 @@ def test_auto_exit_with_a_later_report_keeps_that_reports_outcome() -> None:
     assert headless(cause="auto_exit", report="failed") == Mapped("failed", "auto_exit")
 
 
-# The interactive table: the cause and signal rows (#17); the other rows are #18's
+# The interactive table (interface.md, Outcome mapping: Interactive)
 
 
-def interactive(*, cause: str | None = None, report: str | None = None, code: int = 0) -> Mapped:
-    return endmap.map_interactive(pending_cause=cause, report_status=report, returncode=code)
+def interactive(
+    *,
+    cause: str | None = None,
+    report: str | None = None,
+    code: int = 0,
+    started: bool = True,
+    end: str | None = None,
+) -> Mapped:
+    return endmap.map_interactive(
+        pending_cause=cause,
+        report_status=report,
+        returncode=code,
+        session_started=started,
+        session_end_reason=end,
+    )
 
 
 @pytest.mark.parametrize(
@@ -373,3 +389,81 @@ def test_interactive_rows(kwargs: dict[str, Any], expected: Mapped) -> None:
 def test_interactive_auto_exit_without_a_report_is_a_programming_error() -> None:
     with pytest.raises(ValueError):
         interactive(cause="auto_exit")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        # claude gone before SessionStart: the trust dialog quit (Esc exits 0, "No, exit" 1)
+        ({"started": False, "code": 0}, Mapped("exited-unreported", "no_session_start")),
+        ({"started": False, "code": 1}, Mapped("exited-unreported", "no_session_start")),
+        ({"started": False, "code": 1, "report": "done"}, Mapped("done", "no_session_start")),
+        # before user_exit: a SessionEnd without a SessionStart is still no_session_start
+        (
+            {"started": False, "end": "prompt_input_exit"},
+            Mapped("exited-unreported", "no_session_start"),
+        ),
+        # the user quit (/exit): the last process-ending SessionEnd reason
+        ({"end": "prompt_input_exit"}, Mapped("exited-unreported", "user_exit")),
+        ({"end": "prompt_input_exit", "code": 1}, Mapped("exited-unreported", "user_exit")),
+        ({"end": "prompt_input_exit", "report": "blocked"}, Mapped("blocked", "user_exit")),
+        ({"end": "prompt_input_exit", "report": "needs-input"}, Mapped("needs-input", "user_exit")),
+        # reasons that are not prompt_input_exit, verbatim (no case folding, no trimming)
+        ({"end": "other"}, Mapped("exited-unreported", "normal")),
+        ({"end": "logout", "code": 2}, Mapped("exited-unreported", "exit_2")),
+        ({"end": "clear"}, Mapped("exited-unreported", "normal")),
+        ({"end": "PROMPT_INPUT_EXIT"}, Mapped("exited-unreported", "normal")),
+        ({"end": "prompt_input_exit "}, Mapped("exited-unreported", "normal")),
+        ({"end": ""}, Mapped("exited-unreported", "normal")),
+        # the cause and signal rows come first
+        (
+            {"cause": "forwarded_term", "end": "prompt_input_exit"},
+            Mapped("killed", "forwarded_term"),
+        ),
+        ({"cause": "stopped", "started": False}, Mapped("killed", "stopped")),
+        (
+            {"cause": "auto_exit", "report": "done", "end": "prompt_input_exit"},
+            Mapped("done", "auto_exit"),
+        ),
+        ({"code": 143, "end": "prompt_input_exit"}, Mapped("killed", "signal_term")),
+        ({"code": -9, "started": False}, Mapped("killed", "signal_kill")),
+    ],
+)
+def test_interactive_session_rows(kwargs: dict[str, Any], expected: Mapped) -> None:
+    assert interactive(**kwargs) == expected
+
+
+OUTCOME_SCHEMA = "claude-session/cli/outcome.json"
+
+
+def outcome_def_validator(name: str) -> Draft202012Validator:
+    """A validator for ``$defs/<name>`` of schemas/cli/outcome.json."""
+    return Draft202012Validator({"$ref": f"{OUTCOME_SCHEMA}#/$defs/{name}"}, registry=registry())
+
+
+def test_every_interactive_mapping_passes_the_outcome_rules() -> None:
+    """Each interactive row, recorded causes included, gives an end reason in outcome.json
+    ``$defs/end_reason`` that its outcome allows (``$defs/outcome_rules``)."""
+    end_reasons = outcome_def_validator("end_reason")
+    rules = outcome_def_validator("outcome_rules")
+    for cause in (None, *sorted(endmap.CAUSES)):
+        for started in (True, False):
+            for end in (None, "prompt_input_exit", "clear"):
+                for report in (None, *sorted(endmap.REPORT_OUTCOMES)):
+                    if cause == "auto_exit" and report is None:
+                        continue  # auto_exit is set only after a done report
+                    for code in (0, 1, 255, 130, -15):
+                        mapped = interactive(
+                            cause=cause, code=code, started=started, end=end, report=report
+                        )
+                        end_reasons.validate(mapped.end_reason)
+                        rules.validate(
+                            {
+                                "outcome": mapped.outcome,
+                                "end_reason": mapped.end_reason,
+                                "phase": "session",
+                                "report": None if report is None else {"status": report},
+                            }
+                        )
+                        if report is not None:
+                            assert mapped.outcome == report

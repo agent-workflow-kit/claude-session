@@ -446,6 +446,8 @@ def _finalize(
                 pending_cause=record["pending_cause"],
                 report_status=record["report_status"],
                 returncode=returncode,
+                session_started=record["session_started_at"] is not None,
+                session_end_reason=record["session_end_reason"],
             )
         else:
             mapped = endmap.map_headless(

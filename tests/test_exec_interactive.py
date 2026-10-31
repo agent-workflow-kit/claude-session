@@ -178,14 +178,19 @@ def start_terminal(
     patch: str = "",
     ignore: Sequence[int] = (),
     status_to: Path | None = None,
+    signals: Mapping[str, Any] | None = None,
 ) -> Terminal:
     """``controlling``: None (the terminal is only exec's stdin and stdout), ``"exec"`` (it
     is exec's controlling terminal, exec the session leader) or ``"leader"`` (``LEADER`` is
     the session leader, exec in its foreground process group). ``patch``: Python run in
     exec's process before its entry point (a fault injected into exec). ``ignore``: signals
     exec inherits as ignored. ``status_to``: claude first copies its ``/proc`` status there
-    (a shell wrapper that then execs the fake, same PID)."""
-    scenario = write_json(tmp_path / "scenario.json", {"steps": steps})
+    (a shell wrapper that then execs the fake, same PID). ``signals``: the fake's signal
+    overrides (its scenario ``signals``)."""
+    body: dict[str, Any] = {"steps": steps}
+    if signals is not None:
+        body["signals"] = dict(signals)
+    scenario = write_json(tmp_path / "scenario.json", body)
     fake = claude_bin(tmp_path / "fakebin", scenario, tmp_path / "fake.jsonl")
     if status_to is not None:
         fake = script(
