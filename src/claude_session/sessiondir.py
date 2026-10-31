@@ -388,6 +388,58 @@ def _check_same_device(session_fd: int, private_fd: int, session: str, private: 
 # The directories
 
 
+def check_dirs(state_root: str, csession_id: str) -> None:
+    """What ``SessionDirs.open`` and ``prepare_run`` would find, read only (``--dry-run``,
+    which creates nothing): the state root a directory of ours reached without a symlink,
+    and each of ``sessions/``, ``private/``, the session's two directories and its
+    ``outbox/``, ``artifacts/``, ``work/`` and ``inputs/`` that exists a real directory of
+    ours (``lstat``: never followed). A missing entry is fine: the launch creates it.
+    Raises ``SessionDirUnsafe``."""
+    if not ids.is_session_id(csession_id):
+        raise ValueError(f"not a session id: {csession_id!r}")
+    root = os.path.realpath(state_root)
+    try:
+        root_fd = fsutil.open_dir_nofollow(root)
+        try:
+            fsutil.check_private_dir_fd(root_fd, root)
+        finally:
+            os.close(root_fd)
+    except OSError as exc:
+        raise _failed(root, exc) from exc
+    found: list[str] = []
+    for top in (SESSIONS, PRIVATE):
+        path = os.path.join(root, top)
+        if not _checked_dir(path):
+            continue
+        session = os.path.join(path, csession_id)
+        if _checked_dir(session):
+            found.append(session)
+            if top == SESSIONS:
+                for name in (OUTBOX, ARTIFACTS, WORK, INPUTS):
+                    _checked_dir(os.path.join(session, name))
+    if len(found) == 2 and os.lstat(found[0]).st_dev != os.lstat(found[1]).st_dev:
+        raise SessionDirUnsafe(f"{found[0]} and {found[1]} are not on the same file system")
+
+
+def _checked_dir(path: str) -> bool:
+    """Whether ``path`` exists; when it does it must be a real directory of ours."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise _failed(path, exc) from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise SessionDirUnsafe(
+            f"unsafe or unusable session directory entry {path}: not a directory"
+        )
+    if info.st_uid != os.geteuid():
+        raise SessionDirUnsafe(
+            f"unsafe or unusable session directory entry {path}: owned by uid {info.st_uid}"
+        )
+    return True
+
+
 class SessionDirs:
     """The pinned session and private directories of one session.
 
