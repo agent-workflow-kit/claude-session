@@ -1,1 +1,0 @@
-{"error": {"code": "schema_newer", "message": "state.db schema 1.1 is newer than this claude-session (schema 1.0); upgrade claude-session"}}
