@@ -1393,3 +1393,77 @@ def _reaped_or_zombie(pid: int) -> bool:
             return fh.read().rpartition(b")")[2].split()[0] == b"Z"
     except FileNotFoundError:
         return True
+
+
+# --- a gated child's signal state (every platform) ----------------------------------------
+
+
+def _gated_status(gw: SystemGateway, tmp_path: Path, *, die_with_parent: bool) -> dict[str, int]:
+    """The signal masks (``SigBlk``, ``SigIgn``) of the program a gated spawn runs."""
+    out = tmp_path / "status"
+    with open(out, "wb") as fh:
+        child = gw.spawn(
+            ["/bin/cat", "/proc/self/status"],
+            stdout=fh.fileno(),
+            die_with_parent=die_with_parent,
+            gated=True,
+        )
+        child.release()
+        assert child.wait(timeout=30) == 0
+    fields = dict(line.split(":", 1) for line in out.read_text().splitlines() if ":" in line)
+    return {name: int(fields[name].strip(), 16) for name in ("SigBlk", "SigIgn")}
+
+
+def _bits(signals: Iterable[int]) -> int:
+    return sum(1 << (int(sig) - 1) for sig in set(signals))
+
+
+def _no_prctl() -> Callable[..., int]:
+    raise AssertionError("prctl resolved off Linux")
+
+
+@linux_only  # reads /proc; the non-Linux branch is forced
+@pytest.mark.parametrize("die_with_parent", [False, True])
+def test_a_gated_child_off_linux_restores_the_callers_mask(
+    gw: SystemGateway,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    usr1_blocked: None,
+    die_with_parent: bool,
+) -> None:
+    """G1: the gated fork blocks every signal on every platform; off Linux the child must
+    still restore the caller's mask (no death signal there, and no prctl)."""
+    monkeypatch.setattr(gateway, "_prctl", _no_prctl)
+    monkeypatch.setattr(gateway.sys, "platform", "darwin")
+    expected = _sigmask() - ({signal.SIGTERM} if die_with_parent else set())
+    status = _gated_status(gw, tmp_path, die_with_parent=die_with_parent)
+    monkeypatch.undo()
+    assert status["SigBlk"] == _bits(expected)
+
+
+@linux_only
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.parametrize("die_with_parent", [False, True])
+def test_only_a_gated_child_that_dies_with_its_parent_resets_an_inherited_sigterm(
+    gw: SystemGateway,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    die_with_parent: bool,
+) -> None:
+    """G2: an interactive (``die_with_parent=False``) gated child inherits an ignored or
+    blocked SIGTERM as an ungated one does; a headless one starts with it at its default."""
+    if platform != "linux":
+        monkeypatch.setattr(gateway, "_prctl", _no_prctl)
+    monkeypatch.setattr(gateway.sys, "platform", platform)
+    term = _bits([signal.SIGTERM])
+    previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    saved = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        status = _gated_status(gw, tmp_path, die_with_parent=die_with_parent)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, saved)
+        signal.signal(signal.SIGTERM, previous)
+        monkeypatch.undo()
+    assert bool(status["SigIgn"] & term) == (not die_with_parent)
+    assert bool(status["SigBlk"] & term) == (not die_with_parent)
