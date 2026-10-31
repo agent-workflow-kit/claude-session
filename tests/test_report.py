@@ -349,6 +349,14 @@ def test_the_run_secret_in_upper_case_is_refused(run: Run, field: str) -> None:
         usage(run, "artifact contains a secret", artifact="out.txt")
 
 
+@pytest.mark.parametrize("case", ["lower", "upper"])
+def test_the_run_secret_as_the_artifact_name_is_refused(run: Run, case: str) -> None:
+    """The name is shown in status JSON: it is checked like the texts."""
+    name = run.secret if case == "lower" else run.secret.upper()
+    run.write_artifact(f"x-{name}.md", b"harmless")
+    usage(run, "artifact name contains a secret", artifact=f"x-{name}.md")
+
+
 # The outbox write
 
 

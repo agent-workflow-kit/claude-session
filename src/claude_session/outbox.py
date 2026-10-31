@@ -112,9 +112,12 @@ REJECTION_DETAILS: Mapping[str, str] = {
         "The request or the artifact is not a regular file with a single link (symbolic "
         "links, hard links, directories and special files are refused)."
     ),
-    "too_large": "The request, the summary, the reason or the artifact is over its size limit.",
+    "too_large": (
+        "The request, the summary, the reason or the artifact is over its size limit, or too "
+        "large to scan for secrets within the time limit."
+    ),
     "contains_secret": (
-        "The summary, the reason or the artifact contains a secret value; remove it."
+        "The summary, the reason, the artifact or its name contains a secret value; remove it."
     ),
     "malformed": "The request is not a valid report request; file it with claude-session report.",
 }
@@ -136,9 +139,27 @@ class Scan(Protocol):
 
 class Scanner(Protocol):
     """``contains_secret`` over the configured secret values (``secretindex.SecretIndex``):
-    the summary, the reason and the artifact copy are each scanned with a fresh ``scan()``."""
+    the summary, the reason, the artifact name and the artifact copy are each scanned with a
+    fresh ``scan(check)``. ``check`` is the drain's deadline: the scan calls it at a bounded
+    interval of work (at least once per ``update``), and the ``ScanTimeout`` it raises ends
+    the scan."""
 
-    def scan(self) -> Scan: ...
+    def scan(self, check: Callable[[], None] | None = None) -> Scan: ...
+
+
+class ScanTimeout(Exception):
+    """The drain's deadline passed during a scan (raised by the drain's ``check``)."""
+
+
+class DrainSetupError(Exception):
+    """The run's limits (``hookconf.json``) or secret index could not be loaded while claimed
+    requests wait: nothing was checked, and the requests stay in ``claimed/`` for the next
+    drain. ``reason`` (``hookconf_unusable`` or ``secret_index_unusable``) is for the log;
+    the original exception is the cause."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def rejection_output(code: str) -> dict[str, Any]:
@@ -562,6 +583,7 @@ def file_report(
         for what, blob in (
             ("summary", (summary_text or "").encode("utf-8")),
             ("reason", (reason_text or "").encode("utf-8")),
+            ("artifact name", (name or "").encode("ascii")),
             ("artifact", data),
         ):
             if _has_secret(blob, secret):
@@ -823,12 +845,14 @@ class Drain:
         winner). ``private_run_fd`` is the verified private run directory; it stays owned by
         the caller. ``limits`` and ``scanner`` (``contains_secret``: the run's secret index)
         are called only when there is a request to check; an error from either fails the
-        drain (nothing is ingested without the scan). Claiming and checking stop
-        ``DRAIN_BUDGET`` seconds (by ``clock``) after the start; what is left waits for the
-        next drain.
+        drain (``DrainSetupError``: nothing is ingested without the scan). Claiming and
+        checking stop ``DRAIN_BUDGET`` seconds (by ``clock``) after the start; what is left
+        waits for the next drain. A scan still running at that deadline is stopped: the
+        request is rejected ``too_large`` when it was the first one checked (it had the whole
+        budget), and otherwise left for the next drain.
 
-        Raises ``OutboxDirError`` when ``outbox/`` cannot be trusted (nothing is claimed) and
-        ``OSError`` for an unusable private directory."""
+        Raises ``OutboxDirError`` when ``outbox/`` cannot be trusted (nothing is claimed),
+        ``DrainSetupError`` and ``OSError`` for an unusable private directory."""
         drain = cls(csession_id, run_no, private_run_dir, [])
         drain._clock = clock
         drain._deadline = clock() + DRAIN_BUDGET
@@ -849,6 +873,11 @@ class Drain:
 
     def _past_deadline(self) -> bool:
         return self._clock() > self._deadline
+
+    def _check_deadline(self) -> None:
+        """A scan's ``check``: raises ``ScanTimeout`` past the deadline."""
+        if self._past_deadline():
+            raise ScanTimeout
 
     def _prepare(
         self,
@@ -880,21 +909,45 @@ class Drain:
         self.items = [Item(name[: -len(REQUEST_SUFFIX)], unchecked=True) for name in unchecked]
         checked = [Item(name[: -len(REQUEST_SUFFIX)]) for name in names[-DRAIN_MAX_REQUESTS:]]
         self.items += checked
-        caps = limits()
-        index = scanner()
+        try:
+            caps = limits()
+        except Exception as exc:
+            raise DrainSetupError("hookconf_unusable") from exc
+        try:
+            index = scanner()
+        except Exception as exc:
+            raise DrainSetupError("secret_index_unusable") from exc
         scan_fd = fsutil.ensure_private_dir_at(private_run_fd, SCAN)
         self._fds["scan"] = scan_fd
         _remove_leftovers(scan_fd, self._past_deadline)
         self._fds["private_run"] = os.dup(private_run_fd)
         winner_found = False
+        first = True
         for item in reversed(checked):  # newest first: the first valid one wins
             if winner_found:
                 item.superseded = True
             elif self._past_deadline():
                 item.deferred = True
             else:
-                self._check(item, caps, secret_sha256, artifacts_dev_ino, index)
+                try:
+                    self._check(item, caps, secret_sha256, artifacts_dev_ino, index)
+                except ScanTimeout:
+                    self._timed_out(item, first)
+                first = False
                 winner_found = item.request is not None
+
+    def _timed_out(self, item: Item, first: bool) -> None:
+        """A scan of ``item`` outlasted the drain's budget. The first request checked had the
+        whole budget, so it never will fit: rejected ``too_large``. A later one is left in
+        ``claimed/`` for the next drain. Either way its partial copy is removed now."""
+        if item.copy_name is not None:
+            _unlink_quietly(self._fds["scan"], item.copy_name)
+            item.copy_name = None
+        item.request = None
+        if first:
+            item.rejection = "too_large"
+        else:
+            item.deferred = True
 
     @staticmethod
     def _open_session_dir(csession_dir: str) -> int:
@@ -985,12 +1038,13 @@ class Drain:
             item.rejection = "bad_secret"
             return
         # The secret matched, so parsed.secret is the run secret: refused in any letter case
-        # in the texts and the artifact, independently of the scanner.
-        for text in (parsed.summary, parsed.reason):
+        # in the texts, the artifact name and the artifact, independently of the scanner.
+        for text in (parsed.summary, parsed.reason, parsed.artifact):
             if text is None:
                 continue
             blob = text.encode("utf-8")
-            if _has_secret(blob, parsed.secret) or scanner.scan().update(blob):
+            check = self._check_deadline
+            if _has_secret(blob, parsed.secret) or scanner.scan(check).update(blob):
                 item.rejection = "contains_secret"
                 return
         if parsed.artifact is not None:
@@ -1040,7 +1094,9 @@ class Drain:
             item.copy_name = copy_name
             try:
                 os.fchmod(fd, 0o600)
-                size, digest, found = _copy_stream(src, fd, cap, request.secret, scanner.scan())
+                check = self._check_deadline
+                scan = scanner.scan(check)
+                size, digest, found = _copy_stream(src, fd, cap, request.secret, scan, check)
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -1184,10 +1240,13 @@ class Drain:
             self.finish()
 
 
-def _copy_stream(src: int, dst: int, cap: int, secret: str, scan: Scan) -> tuple[int, str, bool]:
+def _copy_stream(
+    src: int, dst: int, cap: int, secret: str, scan: Scan, check: Callable[[], None]
+) -> tuple[int, str, bool]:
     """Copy ``src`` to ``dst`` in chunks, reading at most ``cap + 1`` bytes. Returns the size
     read, the SHA-256 of the bytes written and whether they contain a secret: the run secret
-    in any letter case, or a value ``scan`` finds (both across chunk boundaries)."""
+    in any letter case, or a value ``scan`` finds (both across chunk boundaries). ``check``
+    (the drain's deadline) is called before each chunk."""
     token = secret.encode("ascii")
     keep = len(token) - 1
     hasher = hashlib.sha256()
@@ -1195,6 +1254,7 @@ def _copy_stream(src: int, dst: int, cap: int, secret: str, scan: Scan) -> tuple
     tail = b""
     found = False
     while size <= cap:
+        check()
         chunk = os.read(src, min(_READ_CHUNK, cap + 1 - size))
         if not chunk:
             break

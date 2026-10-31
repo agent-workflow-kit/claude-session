@@ -13,7 +13,7 @@ Status: planned, 2026-10-29. Implements [interface.md](interface.md) (normative)
 
 ## Module map
 
-The plan splits five modules out of design.md's module list to keep files focused: `ids` (from `cli`/`store`), `endmap` (from `supervisor`), `isolation` (from `settings_builder`), `lifecycle` (from `supervisor` and `reconcile`) and `notes` (from `hookevent`). Responsibilities are unchanged.
+The plan splits six modules out of design.md's module list to keep files focused: `ids` (from `cli`/`store`), `endmap` (from `supervisor`), `isolation` (from `settings_builder`), `lifecycle` (from `supervisor` and `reconcile`), `notes` (from `hookevent`) and `secretindex` (from `outbox`). Responsibilities are unchanged.
 
 | Module | Stage | Responsibility |
 |---|---|---|
