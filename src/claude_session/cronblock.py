@@ -18,8 +18,8 @@ Safety rules:
   UTF-8 cannot be rewritten faithfully, so it is refused. Lines are split on ``\n`` only, so
   carriage returns (lone or in CRLF line ends) stay where they are in every foreign line.
 - A malformed marker structure (an unterminated or repeated block, a stray end marker) is
-  refused with a message; the user fixes it by hand. A marker line may end in spaces and
-  tabs, nothing else.
+  refused with a message; the user fixes it by hand. A marker line may end in spaces, tabs
+  and a carriage return (a crontab saved with CRLF line ends), nothing else.
 - Read-modify-write is not atomic across processes and ``crontab`` has no lock: the crontab
   is read again right before the write and the edit recomputed when it changed
   (``ATTEMPTS`` times), and after the write the block (only the block) is read back and
@@ -195,8 +195,8 @@ def _lines(text: str) -> list[str]:
 
 def split_block(text: str) -> Split:
     lines = _lines(text)
-    heads = [i for i, line in enumerate(lines) if line.rstrip(" \t") == HEADER]
-    feet = [i for i, line in enumerate(lines) if line.rstrip(" \t") == FOOTER]
+    heads = [i for i, line in enumerate(lines) if line.rstrip(" \t\r") == HEADER]
+    feet = [i for i, line in enumerate(lines) if line.rstrip(" \t\r") == FOOTER]
     if not heads and not feet:
         return Split(lines, None, [])
     if len(heads) != 1 or len(feet) != 1 or feet[0] < heads[0]:

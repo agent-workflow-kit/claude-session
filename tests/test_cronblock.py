@@ -551,12 +551,34 @@ def test_markers_with_trailing_whitespace_still_match(
     assert out["action"] == "updated" and env.crontab() == out["block"] + "\n"
 
 
-@pytest.mark.parametrize("trail", ["\u00a0", "\u3000", "\r", "\x0b"])
+def test_all_crlf_crontab_with_a_block_is_updated_and_removed_in_place(
+    env: Env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A crontab saved with CRLF line ends after install: the markers still count (a
+    # trailing carriage return is allowed), so there is never a second block.
+    _, first, _ = install(capsys)
+    crlf_block = first["block"].replace("\n", "\r\n") + "\r\n"
+    before = "SHELL=/bin/sh\r\n0 0 * * * mine\r\n"
+    after = "1 1 * * * later\r\n"
+    text = before + crlf_block + after
+    env.state.write_bytes(text.encode())
+    code, out, _ = install(capsys)
+    assert (code, out["action"]) == (0, "updated")
+    written = env.state.read_bytes().decode()
+    assert written.split("\n").count(cronblock.HEADER) == 1
+    assert written == before + out["block"] + "\n" + after
+    env.state.write_bytes(text.encode())
+    code, out, _ = uninstall(capsys)
+    assert (code, out["action"]) == (0, "removed")
+    assert env.state.read_bytes() == (before + after).encode()
+
+
+@pytest.mark.parametrize("trail", ["\u00a0", "\u3000", "\x0b"])
 def test_markers_followed_by_other_whitespace_are_not_markers(
     env: Env, capsys: pytest.CaptureFixture[str], trail: str
 ) -> None:
-    # Only spaces and tabs may follow a marker. An end marker that does not count leaves
-    # the block unterminated: refused, nothing deleted.
+    # Only spaces, tabs and a carriage return may follow a marker. An end marker that does
+    # not count leaves the block unterminated: refused, nothing deleted.
     text = f"# claude-session managed\n*/1 * * * * old\n# claude-session managed end{trail}\n"
     env.state.write_bytes(text.encode())
     code, out, _ = run(capsys, *UNINSTALL)
