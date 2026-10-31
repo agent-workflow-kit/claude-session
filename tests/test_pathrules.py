@@ -1179,6 +1179,57 @@ def test_user_entries_equal_to_the_runs_own_directories_pass(world: World) -> No
     rules.check_profile(content, isolated=True, writable=writable)
 
 
+def _deep_link(world: World, at: Path) -> Path:
+    """``at -> <root>/data/a/b``: ``..`` after it climbs the target, not ``at``'s parent."""
+    deep = world.root / "data" / "a" / "b"
+    deep.mkdir(parents=True)
+    (world.root / "data" / "c").mkdir()
+    at.symlink_to(deep)
+    return at
+
+
+def test_profile_entries_with_dot_dot_after_a_symlink_in_the_cwd_are_refused(
+    world: World,
+) -> None:
+    link = _deep_link(world, world.repo / "lnk")
+    rules = world.rules(cwd=world.repo)
+    writable = world.writable(cwd=world.repo)
+    for content in (
+        {"sandbox": {"filesystem": {"allowWrite": [f"{link}/.."]}}},
+        {"sandbox": {"filesystem": {"allowRead": [f"{link}/../../c"]}}},
+    ):
+        with pytest.raises(InvalidPermissionProfile) as info:
+            rules.check_profile(content, isolated=True, writable=writable)
+        assert info.value.detail is not None and "must not contain '..'" in info.value.detail
+
+
+def test_write_dirs_with_dot_dot_after_a_symlink_in_outbox_are_refused(world: World) -> None:
+    link = _deep_link(world, world.csdir / "outbox" / "l")
+    rules = world.rules(cwd=world.repo)
+    with pytest.raises(InvalidPermissionProfile, match="write_dirs") as info:
+        rules.check_write_dirs([f"{link}/../.."], world.writable(cwd=world.repo))
+    assert info.value.detail is not None and "must not contain '..'" in info.value.detail
+
+
+def test_user_entries_with_dot_dot_are_refused_without_symlinks(world: World) -> None:
+    rules = world.rules(cwd=world.repo)
+    writable = world.writable(cwd=world.repo)
+    (world.root / "data").mkdir()
+    with pytest.raises(InvalidPermissionProfile, match="read_dirs"):
+        rules.check_read_dirs([f"{world.root}/data/../data"], writable)
+
+
+def test_writable_hop_follows_dot_dot_after_a_symlink_as_the_kernel_does(world: World) -> None:
+    writable = world.writable(cwd=world.repo)
+    hop = _deep_link(world, world.repo / "hop")
+    via = world.root / "via"
+    via.symlink_to(hop)  # /via -> <cwd>/hop -> /data/a/b; /via/.. is /data/a
+    assert pathrules.writable_hop(str(world.root / "data"), writable) is None
+    assert pathrules.writable_hop(f"{via}/../x", writable) is not None
+    with pytest.raises(LaunchValidationError):
+        pathrules.check_path_entries([f"{via}/.."], writable)
+
+
 def test_resolve_tool_keeps_the_tool_name_for_argv0(world: World) -> None:
     writable = world.writable(cwd=world.repo)
     shim = executable(world.root / "opt" / "volta-shim")

@@ -659,11 +659,16 @@ class PathRules:
         session-writable directory (the agent could re-point it). An entry equal to the
         run's own ``$CSESSION_DIR``, ``outbox/``, ``artifacts/``, ``work/`` or private
         tmpdir (by realpath, each a real directory) is exempt from the first part; an entry
-        strictly below one of them is refused (list the directory itself)."""
+        strictly below one of them is refused (list the directory itself). An entry with a
+        ``..`` component is refused outright."""
         if path == _SETTINGS_RELATIVE:
             return "is relative to the generated settings file, inside the state root"
         if not os.path.isabs(path):
             return "is not an absolute path"
+        if ".." in path.split("/"):
+            # The kernel applies ``..`` after following the symlink before it, so
+            # ``<cwd>/lnk/..`` names the parent of whatever ``lnk`` points to.
+            return "must not contain '..' (list the directory itself)"
         steps = _resolution_steps(path)
         if steps is None:
             return "cannot be resolved"
@@ -1019,13 +1024,17 @@ def _resolution_steps(path: str) -> list[tuple[str, bool]] | None:
     """The steps of resolving ``path``, in order, each paired with whether it is the
     directory holding a symlink followed: every literal normalized prefix of ``path``, every
     path visited while following its symlinks one component at a time (``lstat``), the
-    directory holding each symlink followed, and the final realpath. None for more than
-    ``MAX_SYMLINKS`` symlinks or a path that cannot be resolved (callers fail closed)."""
+    directory holding each symlink followed, and the final realpath. The walk takes the
+    raw components of ``path`` as the kernel does: a ``..`` applies to the directory
+    reached so far, after the symlinks before it are followed (``normpath`` would drop
+    ``lnk/..`` without visiting ``lnk``). None for more than ``MAX_SYMLINKS`` symlinks or
+    a path that cannot be resolved (callers fail closed)."""
     try:
         literal = os.path.normpath(path)
         steps = [(literal, False)]
-        parts = [part for part in literal.split("/") if part]
-        steps += [("/" + "/".join(parts[:end]), False) for end in range(1, len(parts))]
+        prefixes = [part for part in literal.split("/") if part]
+        steps += [("/" + "/".join(prefixes[:end]), False) for end in range(1, len(prefixes))]
+        parts = [part for part in path.split("/") if part]
         current = "/"
         links = 0
         while parts:
@@ -1053,7 +1062,7 @@ def _resolution_steps(path: str) -> list[tuple[str, bool]] | None:
             if target.startswith("/"):
                 current = "/"
             parts = [part for part in target.split("/") if part] + parts
-        steps.append((os.path.realpath(literal), False))
+        steps.append((os.path.realpath(path), False))
     except (OSError, ValueError):
         return None
     return list(dict.fromkeys(steps))
