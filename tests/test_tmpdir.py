@@ -414,9 +414,12 @@ def test_create_reporting_reports_nothing_without_a_stale_entry(base: Path) -> N
 
 def test_root_name_is_the_single_root_definition() -> None:
     assert tmpdir.root_name(1000) == "csession-1000"
-    assert pathrules.tmp_parent(1000) == os.path.join(tmpdir.DEFAULT_BASE, tmpdir.root_name(1000))
+    assert pathrules.tmp_parent(1000) == os.path.join(pathrules.TMP_ROOT, tmpdir.root_name(1000))
     assert pathrules.tmp_parent() == os.path.join(
-        tmpdir.DEFAULT_BASE, tmpdir.root_name(os.geteuid())
+        pathrules.TMP_ROOT, tmpdir.root_name(os.geteuid())
+    )
+    assert tmpdir.root_path() == os.path.join(
+        os.path.realpath(pathrules.TMP_ROOT), tmpdir.root_name(os.geteuid())
     )
 
 

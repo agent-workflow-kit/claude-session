@@ -85,7 +85,9 @@ WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 FILE_TOOLS = WRITE_TOOLS | {"Read", "Glob", "Grep", "NotebookRead"}
 GRANT_LISTS = ("allow", "ask")
 # The parent of every session's private temporary directory: /tmp/csession-<uid>. The only
-# definition of that name (tmpdir builds its per-uid root from tmp_root_name).
+# definition of that name (tmpdir builds its per-uid root from tmp_root_name). Read at call
+# time by tmp_parent and tmpdir, so the test suite can point it at a private directory
+# (tests/conftest.py); production never changes it and no environment variable moves it.
 TMP_ROOT = "/tmp"
 TMP_ROOT_PREFIX = "csession-"
 CASE_INSENSITIVE = sys.platform == "darwin"

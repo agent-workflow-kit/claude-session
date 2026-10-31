@@ -182,7 +182,7 @@ def self_check(
     socat: str | None,
     platform: str | None = None,
     gw: Gateway = _SYSTEM_GATEWAY,
-    tmp_base: str = tmpdir.DEFAULT_BASE,
+    tmp_base: str | None = None,  # None: pathrules.TMP_ROOT
     create: bool = True,
     sandbox_exec: str = SANDBOX_EXEC,
 ) -> SelfCheck:

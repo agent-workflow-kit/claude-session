@@ -26,6 +26,12 @@ stderr, SIGKILLs every tracked process that has a pidfd (exact: a pidfd never na
 PID, so this cannot race the test's own wait), and the test fails at teardown. It sends no
 other signal: without pidfds it only reports, and a test hung on something else stays hung.
 This module is test-only; nothing under ``src/`` imports it.
+
+The other autouse fixtures keep every test off the user's real directories: its own
+``XDG_STATE_HOME`` (``_private_state_dir``), ``HOME`` and ``XDG_CONFIG_HOME``
+(``_private_home``; not for ``live`` tests, which need the real Claude Code login) and
+temporary-directory root (``private_tmp_root``: ``pathrules.TMP_ROOT``, so no run creates
+anything under the real ``/tmp/csession-<uid>``).
 """
 
 from __future__ import annotations
@@ -35,9 +41,11 @@ import ctypes
 import errno
 import os
 import platform
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -46,11 +54,15 @@ from typing import Any
 
 import pytest
 
+from claude_session import pathrules
+
 pytest_plugins = ["pytester"]  # test_leftover_guard.py runs the guard in a pytest of its own
 
 LINUX = sys.platform.startswith("linux")
 # A test still running after this long is reported as hung and its pidfd processes killed.
 WATCHDOG_SECONDS = 60.0
+# The production base of the per-uid temporary-directory root, read before any test patches it.
+REAL_TMP_ROOT = pathrules.TMP_ROOT
 
 
 def _stat(pid: int) -> tuple[int, int, int] | None:
@@ -249,3 +261,54 @@ def _private_state_dir(
     state_home = tmp_path_factory.mktemp("xdg") / "state"
     monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
     return state_home
+
+
+@pytest.fixture(autouse=True)
+def _private_home(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every test (and every subprocess it starts) gets its own empty ``HOME`` and
+    ``XDG_CONFIG_HOME``, so no test reads or writes the user's real configuration. ``live``
+    tests keep the real ones: real Claude Code needs its login."""
+    if request.node.get_closest_marker("live") is not None:
+        return
+    home = tmp_path_factory.mktemp("home")
+    (home / ".config").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+
+
+def _remove_tree(path: str) -> None:
+    """Remove a test's tree even where it left a directory without write or search
+    permission (the tests own every entry in it)."""
+
+    def retry(func: Any, failed: str, exc: BaseException) -> None:
+        os.chmod(os.path.dirname(failed), 0o700)
+        with contextlib.suppress(OSError):
+            os.chmod(failed, 0o700)
+        func(failed)
+
+    shutil.rmtree(path, onexc=retry)
+
+
+@pytest.fixture(autouse=True)
+def private_tmp_root(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Every test gets its own base for the per-uid temporary-directory root
+    (``pathrules.TMP_ROOT``), so no run creates anything under the real
+    ``/tmp/csession-<uid>``. Subprocesses do not inherit the patch: tests that start the
+    ``claude-session`` executable pass the path on (see ``test_exec_headless.run_exec``).
+
+    The base is 0700 and owned by the test user, which passes tmpdir's base checks (owner root
+    or the user; group- or other-writable only with the sticky bit). It is a short directory
+    directly in the system temporary directory rather than under ``tmp_path``: the private
+    tmpdir under it must leave room for Claude Code's socket names (``selfcheck``'s socket
+    path limit), and ``tmp_path`` is too long for that."""
+    base = tempfile.mkdtemp(prefix="cs-t-", dir="/tmp")
+    os.chmod(base, 0o700)
+    monkeypatch.setattr(pathrules, "TMP_ROOT", base)
+    try:
+        yield Path(base)
+    finally:
+        _remove_tree(base)

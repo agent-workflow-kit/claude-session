@@ -1,4 +1,4 @@
-"""``exec --mode headless`` end to end: the real ``claude-session`` executable launches the fake
+"""``exec --mode headless`` end to end: the ``claude-session`` entry point launches the fake
 ``claude`` (``tests/fakebin``), which plays a scenario through the generated settings: the
 injected hooks (``hook-event``), ``claude-session report`` and ``stream-json`` output.
 
@@ -23,12 +23,33 @@ from typing import Any
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker
 
+from claude_session import pathrules
+
+from .conftest import REAL_TMP_ROOT
 from .fakeclaude import claude_bin, read_jsonl, write_json
 from .test_schemas import registry
 
 CLAUDE_SESSION = Path(sys.executable).parent / "claude-session"
 EXEC_SCHEMA = "claude-session/cli/exec.json"
 SECRET_VALUE = "vault-token-value-0123456789"
+# The ``claude-session`` entry point with this test's temporary-directory root
+# (``conftest.private_tmp_root``): a subprocess does not inherit the in-process patch.
+# ``sys.argv[0]`` stays the real executable, whose directory exec puts on the agent's PATH.
+ENTRY = """\
+import sys
+from claude_session import pathrules
+pathrules.TMP_ROOT = {tmp_root!r}
+sys.argv[0] = {exe!r}
+from claude_session.__main__ import main
+sys.exit(main())
+"""
+
+
+def claude_session_cmd() -> list[str]:
+    """The command that runs ``claude-session`` as the executable does, under the current
+    (test-private) ``pathrules.TMP_ROOT``."""
+    entry = ENTRY.format(tmp_root=pathrules.TMP_ROOT, exe=str(CLAUDE_SESSION))
+    return [sys.executable, "-c", entry]
 
 
 @dataclass
@@ -116,7 +137,7 @@ def run_exec(
     fake = claude or claude_bin(tmp_path / "fakebin", scenario, log)
     cfg = tmp_path / "config.yaml"
     cfg.write_text(f"claude_bin: {fake}\n{config}", encoding="utf-8")
-    argv = [str(CLAUDE_SESSION), "exec", "--mode", "headless", "--json", "--config", str(cfg)]
+    argv = [*claude_session_cmd(), "exec", "--mode", "headless", "--json", "--config", str(cfg)]
     if prompt is not None:
         prompt_file = tmp_path / "prompt.md"
         prompt_file.write_text(prompt, encoding="utf-8")
@@ -381,7 +402,7 @@ def test_claude_not_found_ends_the_run_not_started(tmp_path: Path, state: Path, 
     (tmp_path / "p.md").write_text("x")
     proc = subprocess.run(
         [
-            str(CLAUDE_SESSION),
+            *claude_session_cmd(),
             "exec",
             "--mode",
             "headless",
@@ -474,6 +495,44 @@ def test_a_preferred_sandbox_without_prerequisites_warns_and_cleans_its_tmpdir(
     assert not tmp.exists()  # removed at run end
 
 
+def real_tmp_root_entries() -> set[str] | None:
+    """The entries of the real ``/tmp/csession-<uid>`` (None: it does not exist)."""
+    root = os.path.join(REAL_TMP_ROOT, pathrules.tmp_root_name(os.geteuid()))
+    try:
+        return set(os.listdir(root))
+    except FileNotFoundError:
+        return None
+
+
+def test_the_suite_keeps_runs_out_of_the_real_tmp_root(
+    tmp_path: Path, state: Path, work: Path, private_tmp_root: Path
+) -> None:
+    """A run's private tmpdir is made under the test's own root, never the user's real
+    ``/tmp/csession-<uid>`` (whose location is fixed: ``/tmp``)."""
+    assert REAL_TMP_ROOT == "/tmp"
+    before = real_tmp_root_entries()
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [
+            START,
+            {"do": "bash", "command": 'printf "%s" "$TMPDIR" > tmpdir.txt'},
+            {"do": "report", "args": ["done", "--summary", "ok"]},
+            STOP,
+            result_step(),
+        ],
+        args=["--sandbox", "preferred"],
+        config=FAST,
+    )
+    assert run.code == 0, run.proc.stderr
+    tmp = Path((work / "tmpdir.txt").read_text())
+    root = private_tmp_root.resolve() / pathrules.tmp_root_name(os.geteuid())
+    assert tmp == root / run.sid
+    assert root.is_dir() and not tmp.exists()
+    assert real_tmp_root_entries() == before
+
+
 def test_a_required_sandbox_without_prerequisites_is_not_started(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
@@ -510,7 +569,7 @@ def test_sigint_during_supervision_is_an_internal_error_that_ends_the_child(
     (tmp_path / "p.md").write_text("x")
     proc = subprocess.Popen(
         [
-            str(CLAUDE_SESSION),
+            *claude_session_cmd(),
             "exec",
             "--mode",
             "headless",
@@ -941,7 +1000,7 @@ def start_hanging(
     (tmp_path / "p.md").write_text("x")
     proc = subprocess.Popen(
         [
-            str(CLAUDE_SESSION),
+            *claude_session_cmd(),
             "exec",
             "--mode",
             "headless",
