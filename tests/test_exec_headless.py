@@ -1157,3 +1157,34 @@ def test_a_report_committed_while_the_end_is_mapped_is_not_lost(
     assert calls == [None, "failed"]
     assert (code, outcome["outcome"], outcome["end_reason"]) == (18, "failed", "normal")
     assert outcome["state"] == "exited"
+
+
+def test_a_run_record_failure_after_spawn_is_an_internal_error_and_the_run_ends(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    state: Path,
+    work: Path,
+) -> None:
+    """The record is read after the spawn (R2-1): a failure there goes through the
+    internal-error path, so no output descriptor is left open before a spawn."""
+    from claude_session import store
+
+    real_run_record = store.Store.run_record
+    failed: list[bool] = []
+
+    def flaky(self: store.Store, *args: Any, **kwargs: Any) -> Any:
+        if not failed and sys._getframe(1).f_code.co_name == "run_headless":
+            failed.append(True)
+            raise sqlite3.OperationalError("database is locked")
+        return real_run_record(self, *args, **kwargs)
+
+    monkeypatch.setattr(store.Store, "run_record", flaky)
+    code, printed = exec_in_process(
+        monkeypatch, capsys, tmp_path, work, [START, STOP, result_step()]
+    )
+    assert failed
+    assert code == 1 and printed["error"]["code"] == "internal"
+    row = run_row_of(state)
+    assert (row["outcome"], row["end_reason"], row["exit_code"]) == ("killed", "internal_error", 15)
+    assert row["ended_at"] is not None and row["child_pid"] is not None

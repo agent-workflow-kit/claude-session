@@ -335,8 +335,7 @@ def run_headless(
     the run in the launch phase (exit 12; a ``KeyboardInterrupt`` is re-raised)."""
     sid, run_no = alloc.csession_id, alloc.run
     secret = prepared.run_secret
-    try:
-        record = st.run_record(sid, run_no)
+    try:  # only the spawn here: its finally closes the output descriptors
         child = spawn(prepared, v, process)
     except Exception as exc:
         error = launch.interrupted(exc, _not_started(exc))
@@ -354,6 +353,7 @@ def run_headless(
             child_start=store.start_time(child.pid, zombie=True),  # unreaped: still ours
             started_at=store.format_ts(st.clock()),
         )
+        record = st.run_record(sid, run_no)
         log = launch.event_log(process, sorted(prepared.secrets))
         launch.log_best_effort(
             log,
