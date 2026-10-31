@@ -247,6 +247,8 @@ def test_hook_command_uses_isolated_interpreter_and_absolute_state_dir(
             "hook-event",
             "--state-dir",
             STATE,
+            "--run",
+            "1",
             event,
         ]
 
@@ -299,6 +301,8 @@ def test_hook_command_quotes_paths_with_spaces_and_shell_characters(cfg: config.
         "hook-event",
         "--state-dir",
         state,
+        "--run",
+        "1",
         "Stop",
     ]
 

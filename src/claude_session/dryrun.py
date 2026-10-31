@@ -722,6 +722,14 @@ def run_checks(
     try:
         settings_builder.check_rule_paths(process.state_root, process.claude_session)
         sessiondir.check_dirs(process.state_root, alloc.csession_id)
+        if alloc.fork_source is not None:
+            # A fork's copy of the source's inputs/, read only (session_dir_unsafe).
+            sessiondir.check_fork_inputs(
+                process.state_root,
+                alloc.fork_source,
+                exclude_run=alloc.fork_exclude_run,
+                cap=cfg.input_max_bytes,
+            )
         found.checked = launch.checks(cfg, req, resolved, alloc, process, effects)
         found.warnings += found.checked.warnings
         # The size check of step 7, with a run secret of the real length (never printed).

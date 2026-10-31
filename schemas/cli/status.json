@@ -238,7 +238,15 @@
           "items": {
             "type": "string"
           },
-          "description": "Basenames of this run's input files ($CSESSION_DIR/inputs/<run>/), including inputs carried from a not-started previous run or copied from a fork source."
+          "description": "Basenames of this run's input files ($CSESSION_DIR/inputs/<run>/), including inputs carried from a not-started previous run."
+        },
+        "copied_inputs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^inputs/[1-9][0-9]*/[A-Za-z0-9._-]{1,128}$"
+          },
+          "description": "A fork's run 1 only (absent otherwise): the inputs the fork copied from its source's inputs/, as paths relative to $CSESSION_DIR (inputs/<n>/<name>)."
         },
         "pending": {
           "type": "boolean",

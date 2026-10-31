@@ -5,8 +5,9 @@ Resume and fork).
 ``resume <id>``, ``start --resume <id>`` and their ``--fork`` variants share launch steps 5 to
 7 with a new session (``launch``); this module builds what differs:
 
-- the **source** (``load_source``): the session's current run, read in one transaction after
-  the inline liveness check has expired a pending run past its deadline (``liveness``);
+- the **source** (``load_source``): the session's current run, read in one transaction (a
+  pending run past its deadline counts as final: the inline liveness check, ``liveness``,
+  finalizes it just before allocation);
 - the **request** (``prepare``, launch step 2): the kind and mode default to the previous
   run's; the explicit flags the previous run stored (``spec_json``) are carried by the
   carry-over table (``carry``: nothing but repo, cwd and mode when the kind changes; no
@@ -16,19 +17,24 @@ Resume and fork).
   implication; the prompt and inputs of a previous run that ended ``not-started`` are carried
   unless given now (``sessiondir.read_undelivered``);
 - the **cwd**: a resume always runs in the previous run's resolved cwd (a different
-  ``--cwd`` exits 2); a fork in ``--cwd`` when given, else in the source's cwd, except a
-  session ``work/`` directory, which fails the launch ``fork_cwd_unsupported``;
+  ``--cwd`` exits 2; a trusted run in the session's own ``work/`` after an isolated run
+  exits 2); a fork in ``--cwd`` when given, else in the source's cwd, except a session
+  ``work/`` directory (any session's), which fails the launch ``fork_cwd_unsupported``;
 - the **conversation**: ``--resume <latest Claude id>``, or for a fork ``--resume <id>
   --fork-session --session-id <new>``; with no captured Claude id, a fresh conversation
-  (``--session-id <new>``) and a warning;
+  (``--session-id <new>``) and a warning. A resume of a fork that never captured a Claude
+  id (its run 1 never started) repeats the fork (``ForkOrigin``): the source's
+  conversation forked again, with the fork's cwd rules;
 - the **allocation** (launch step 4): a resume is run n + 1 with the refusal checks in the
   same transaction (``Store.allocate_resume``: ``live``, ``tainted``); a fork is a new
   session (``forked_from``, the source's taint), whose step 5 copies the source's
   ``inputs/`` (``SessionDirs.copy_inputs``).
 
 TODO(#33): the inline liveness check proper (wrapper-lost runs finalized and salvaged before
-the refusal checks). Until it exists, a resume of a run that is not final is refused ``live``
-(also when its wrapper is gone); only a pending run past its deadline is finalized here.
+the refusal checks). Until it exists, a resume of a run that is not final is refused ``live``,
+also when its wrapper died after allocation (that run then blocks every resume until #33
+finalizes it; ``--fork`` still works); only a pending run past its deadline is finalized
+here.
 TODO(#17): interactive resume (a TTY on stdin and stdout; ``claude`` on the terminal).
 TODO(#30): ``--allow-tainted`` (human-only, audited ``resume_tainted``); until then a tainted
 session is refused for a run that is not third-party-reading whatever the flags.
@@ -45,7 +51,7 @@ import dataclasses
 import json
 import os
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -102,10 +108,33 @@ class Source:
     labels: tuple[str, ...]
     session_dir: str
     outcome: str | None
+    forked_from: str | None = None
+    # A fork: the Claude id its run 1 forked (None: a fresh conversation, or not recorded).
+    fork_resume_from: str | None = None
+    # Whether any run of the session was isolated (third-party-reading or sandboxed).
+    isolated_before: bool = False
 
     @property
     def work_dir(self) -> str:
         return os.path.realpath(os.path.join(self.session_dir, sessiondir.WORK))
+
+    @property
+    def reforks(self) -> bool:
+        """A fork that never captured a Claude id: a resume of it repeats the fork."""
+        return self.forked_from is not None and self.claude_session_id is None
+
+
+@dataclass(frozen=True)
+class ForkOrigin:
+    """A resume that repeats a fork (``Source.reforks``): the fork's source session, the
+    Claude id the fork forked (None: a fresh conversation), and the source's current cwd,
+    git directory and taint (all None or false when the source's rows are gone)."""
+
+    source: str
+    resume_from: str | None
+    cwd: str | None
+    git_dir: str | None
+    tainted: bool
 
 
 def lookup(st: store.Store, given: str) -> str:
@@ -114,9 +143,11 @@ def lookup(st: store.Store, given: str) -> str:
 
 
 def liveness(st: store.Store, process: launch.Process, csession_id: str) -> None:
-    """The part of the inline liveness check this branch has: a current run still pending at
-    or past its ``expires_at`` is finalized ``not-started`` (``never_adopted``, cause
-    ``liveness``) and its launch spec deleted. TODO(#33): the wrapper-lost rules.
+    """The part of the inline liveness check this branch has, run just before allocation
+    (after every step-2 check, so a usage error finalizes nothing): a current run still
+    pending at or past its ``expires_at`` is finalized ``not-started`` (``never_adopted``,
+    cause ``liveness``) and its launch spec deleted. TODO(#33): the wrapper-lost rules (a
+    run whose wrapper died stays live until then, and is refused ``live``).
     TODO(#21): the outcome file of the run finalized here. TODO(#20): its delivery."""
     from . import lifecycle
 
@@ -150,6 +181,15 @@ def load_source(st: store.Store, csession_id: str, state_root: str) -> Source:
         input_files = invocation.get("input_files", [])
         if not isinstance(input_files, list) or not all(isinstance(n, str) for n in input_files):
             raise ValueError("input_files")
+        fork_resume_from = None
+        if record["session_forked_from"] is not None:
+            first = json.loads(record["run1_invocation_json"] or "{}")
+            if not isinstance(first, dict):
+                raise ValueError("run 1 is not an object")
+            fork_resume_from = first.get("fork_resume_from")
+            if fork_resume_from is not None and not isinstance(fork_resume_from, str):
+                raise ValueError("fork_resume_from")
+        isolated_before = any(_was_isolated(value) for value in record["runs_resolved_json"])
     except ValueError as exc:
         raise InternalError(
             f"run {record['run_no']} of {csession_id} has an unreadable stored record"
@@ -176,6 +216,34 @@ def load_source(st: store.Store, csession_id: str, state_root: str) -> Source:
         labels=tuple(record["labels"]),
         session_dir=sessiondir.session_dir(state_root, csession_id),
         outcome=record["outcome"],
+        forked_from=record["session_forked_from"],
+        fork_resume_from=fork_resume_from,
+        isolated_before=isolated_before,
+    )
+
+
+def _was_isolated(resolved_json: str | None) -> bool:
+    """Whether a run was isolated, from its ``resolved_json`` (third-party-reading or a
+    sandbox that is not ``off``); an unreadable record counts as isolated."""
+    try:
+        profile = json.loads(resolved_json or "")["profile"]
+        return bool(profile["reads_third_party"]) or profile["sandbox"] != "off"
+    except (ValueError, KeyError, TypeError):
+        return True
+
+
+def load_origin(st: store.Store, source: Source) -> ForkOrigin:
+    """The fork origin of a resume that repeats a fork (``Source.reforks``)."""
+    assert source.forked_from is not None
+    record = st.resume_source(source.forked_from)
+    if record is None:
+        return ForkOrigin(source.forked_from, source.fork_resume_from, None, None, False)
+    return ForkOrigin(
+        source=source.forked_from,
+        resume_from=source.fork_resume_from,
+        cwd=record["last_cwd"],
+        git_dir=record["session_git_dir"],
+        tainted=bool(record["session_tainted"]),
     )
 
 
@@ -193,36 +261,50 @@ class Carried:
     permission_profile_label: str | None
 
 
-def carry(source: Source, *, kind: str, mode: str, resets: Sequence[str]) -> Carried:
+def carry(
+    source: Source,
+    *,
+    kind: str,
+    mode: str,
+    resets: Sequence[str],
+    given: Collection[str] = (),
+    plugin_dirs_given: bool = False,
+) -> Carried:
     """The carry-over table (interface.md, Resume and fork carry-over) applied to the
     previous run's stored explicit flags: a kind change carries none of them (repo, cwd and
     mode are carried elsewhere); a mode change drops ``--timeout`` and ``--max-turns``;
-    ``--reset`` drops the setting it names. A profile file is carried as the previous run's
-    snapshot with the label that run recorded (never the original file); without a snapshot
-    it cannot be carried (``kinds.resolve`` then exits 2). A stored value of the wrong type
-    exits 2 (``kinds`` checks the flag values themselves)."""
+    ``--reset`` drops the setting it names, and a flag given now (``given``,
+    ``plugin_dirs_given``) replaces it. Only the stored values still carried after that are
+    checked, so a reset or a flag given now always recovers from an unusable stored value.
+    A profile file is carried as the previous run's snapshot with the label that run
+    recorded (never the original file); without a snapshot it cannot be carried
+    (``kinds.resolve`` then exits 2). A stored value of the wrong type exits 2 (``kinds``
+    checks the flag values themselves)."""
     if kind != source.run_kind:
         return Carried({}, (), None)
     spec = source.spec
-    flags = {key: spec[key] for key in kinds.FLAG_KEYS if spec.get(key) is not None}
-    plugins = spec.get("plugin_dir") or []
-    if not isinstance(plugins, list) or not all(
-        isinstance(entry, str) and os.path.isabs(entry) and "\x00" not in entry for entry in plugins
-    ):
-        raise UsageError(
-            "the previous run's stored --plugin-dir list is unusable",
-            detail="use --reset plugin-dir or give --plugin-dir",
-        )
-    plugin_dirs = tuple(plugins)
+    flags = {
+        key: spec[key] for key in kinds.FLAG_KEYS if spec.get(key) is not None and key not in given
+    }
     if mode != source.mode:
         for key in MODE_BOUND:
             flags.pop(key, None)
     for name in resets:
         key = RESETS[name]
-        if key == "plugin_dir":
-            plugin_dirs = ()
-        else:
+        if key != "plugin_dir":
             flags.pop(key, None)
+    plugin_dirs: tuple[str, ...] = ()
+    if "plugin-dir" not in resets and not plugin_dirs_given:
+        plugins = spec.get("plugin_dir") or []
+        if not isinstance(plugins, list) or not all(
+            isinstance(entry, str) and os.path.isabs(entry) and "\x00" not in entry
+            for entry in plugins
+        ):
+            raise UsageError(
+                "the previous run's stored --plugin-dir list is unusable",
+                detail="use --reset plugin-dir or give --plugin-dir",
+            )
+        plugin_dirs = tuple(plugins)
     _check_stored(source, flags, plugin_dirs)
     label = None
     profile = flags.get("permission_profile")
@@ -272,6 +354,7 @@ class Planned:
     resolved: launch.Resolved
     fork: bool
     warnings: tuple[str, ...]
+    origin: ForkOrigin | None = None  # a resume that repeats a fork
 
     def fork_of(self) -> launch.Fork | None:
         if not self.fork:
@@ -280,10 +363,26 @@ class Planned:
         return launch.Fork(source=self.source.csession_id, exclude_run=exclude)
 
 
-def conversation(source: Source, *, fork: bool) -> tuple[launch.Conversation, list[str]]:
+def conversation(
+    source: Source, *, fork: bool, origin: ForkOrigin | None = None
+) -> tuple[launch.Conversation, list[str]]:
     """The Claude Code conversation the run continues: the session's latest Claude id
     (``--resume``; a fork adds ``--fork-session`` and a new ``--session-id``), or with none
-    captured a fresh conversation (a new ``--session-id``) and a warning."""
+    captured a fresh conversation (a new ``--session-id``) and a warning. A resume that
+    repeats a fork (``origin``) forks the conversation the fork forked."""
+    if origin is not None:
+        if origin.resume_from is None:
+            fresh = launch.Conversation(resume=True, session_id=str(uuid.uuid4()))
+            return fresh, [FRESH_FORK_WARNING]
+        return (
+            launch.Conversation(
+                resume=True,
+                resume_from=origin.resume_from,
+                fork=True,
+                session_id=str(uuid.uuid4()),
+            ),
+            [],
+        )
     claude_id = source.claude_session_id
     if claude_id is None:
         fresh = launch.Conversation(resume=True, session_id=str(uuid.uuid4()))
@@ -343,6 +442,30 @@ def _undelivered(
         ) from None
 
 
+def in_session_work(path: str, state_root: str) -> bool:
+    """Whether the real path ``path`` is a session ``work/`` directory (any session's:
+    ``<state>/sessions/<id>/work``) or inside one."""
+    sessions = os.path.realpath(os.path.join(state_root, sessiondir.SESSIONS))
+    try:
+        if os.path.commonpath([path, sessions]) != sessions:
+            return False
+    except ValueError:
+        return False
+    parts = os.path.relpath(path, sessions).split(os.sep)
+    return len(parts) >= 2 and parts[1] == sessiondir.WORK
+
+
+def _new_cwd(
+    given: str | None, resolution: kinds.Resolution, process: launch.Process
+) -> str | None:
+    """The cwd as a new session resolves it (None: the session's own ``work/``)."""
+    if given == "session-dir":
+        return None
+    if given is not None or resolution.profile.cwd == "caller":
+        return launch.resolve_caller_cwd(given, process)
+    return None
+
+
 def _cwd(
     args: argparse.Namespace,
     source: Source,
@@ -350,23 +473,34 @@ def _cwd(
     process: launch.Process,
     *,
     fork: bool,
+    origin: ForkOrigin | None = None,
 ) -> tuple[str | None, bool]:
     """The run's caller-side cwd (None: the session's own ``work/``) and whether a fork must
     fail ``fork_cwd_unsupported``. A resume runs in the previous run's resolved cwd; a
     ``--cwd`` that resolves elsewhere exits 2. A fork runs in ``--cwd`` when given, else in
-    the source's cwd. A session that never resolved a cwd (every run ended before step 5
-    recorded one) resolves it as a new session would."""
+    the source's cwd, unless that is a session ``work/`` directory (any session's, or inside
+    one). A resume that repeats a fork (``origin``) follows the fork's rules: ``--cwd`` when
+    given, else the cwd the fork's runs resolved, else the source's. A session that never
+    resolved a cwd (every run ended before step 5 recorded one) resolves it as a new session
+    would."""
     given = args.cwd
-    if source.cwd is None or (fork and given is not None):
-        if given == "session-dir":
-            return None, False
-        if given is not None or resolution.profile.cwd == "caller":
-            return launch.resolve_caller_cwd(given, process), False
-        return None, False
+    if fork or origin is not None:
+        if given is not None:
+            return _new_cwd(given, resolution, process), False
+        if origin is not None and source.cwd is not None:
+            previous = os.path.realpath(source.cwd)
+            return (None, False) if previous == source.work_dir else (previous, False)
+        base = source.cwd if origin is None else origin.cwd
+        if base is None:
+            return _new_cwd(None, resolution, process), False
+        previous = os.path.realpath(base)
+        if in_session_work(previous, process.state_root):
+            return None, True
+        return previous, False
+    if source.cwd is None:
+        return _new_cwd(given, resolution, process), False
     previous = os.path.realpath(source.cwd)
     own_work = previous == source.work_dir
-    if fork:
-        return (None, True) if own_work else (previous, False)
     if given is not None:
         if given == "session-dir":
             wanted = source.work_dir
@@ -380,24 +514,71 @@ def _cwd(
     return (None, False) if own_work else (previous, False)
 
 
-def _check_fork_inputs(
-    source: Source, req: launch.Request, process: launch.Process, *, fork: bool
+def _check_isolated_work(
+    source: Source, resolution: kinds.Resolution, caller_cwd: str | None, *, fork: bool
 ) -> None:
-    """A fork's run-1 inputs go into ``inputs/1/``, which the copy of the source's
-    ``inputs/`` may already hold: a name already there exits 2 (never replaced)."""
-    if not fork or not req.inputs or (source.not_started and source.run == 1):
+    """A run that is not isolated must not continue in the session's own ``work/`` once an
+    isolated run (third-party-reading or sandboxed) of the session wrote it: exit 2 before
+    anything is allocated (a fork with ``--cwd`` continues elsewhere)."""
+    if fork or caller_cwd is not None or source.cwd is None or resolution.isolated():
+        return
+    if source.isolated_before:
+        raise UsageError(
+            "a run that is not isolated cannot continue in the session's work/ directory,"
+            " which an isolated run of the session wrote",
+            detail=f"fork it elsewhere: resume {source.csession_id} --fork --cwd <dir>",
+        )
+
+
+def _check_merged_inputs(
+    source: Source,
+    req: launch.Request,
+    args: argparse.Namespace,
+    process: launch.Process,
+    *,
+    fork: bool,
+    cap: int,
+) -> None:
+    """The run's inputs go into ``inputs/<run>/``, which a fork's copy of its source's
+    ``inputs/`` may already hold: a fork's run 1 into the copy of the source's ``inputs/1/``,
+    any later run of a fork into its own ``inputs/<run>/`` when the copy made one. A name
+    already there exits 2 (never replaced), except an input carried from a not-started run
+    whose bytes are the ones already there (one file is kept)."""
+    if not req.inputs:
+        return
+    if fork:
+        if source.not_started and source.run == 1:
+            return  # the source's inputs/1/ is not copied: its inputs are carried instead
+        target, run = source.csession_id, 1
+        where = "the source's inputs/1/, which the fork copies"
+    elif source.forked_from is not None:
+        target, run = source.csession_id, source.run + 1
+        where = f"inputs/{run}/, which the fork copied from its source"
+    else:
         return
     try:
-        existing = set(sessiondir.input_names(process.state_root, source.csession_id, 1))
+        existing = set(sessiondir.input_names(process.state_root, target, run))
     except LaunchValidationError:
-        return  # the copy refuses the source's entry (session_dir_unsafe) at step 5
-    clash = sorted(existing & {item.name for item in req.inputs})
-    if clash:
-        raise UsageError(
-            f"--input-file name {clash[0]!r} is already in the source's inputs/1/, which the"
-            " fork copies",
-            detail="rename the input",
-        )
+        return  # refused at step 5 (session_dir_unsafe)
+    carried = args.input_file is None
+    for item in req.inputs:
+        if item.name not in existing:
+            continue
+        if not carried:
+            raise UsageError(
+                f"--input-file name {item.name!r} is already in {where}",
+                detail="rename the input",
+            )
+        try:
+            data = sessiondir.read_input(process.state_root, target, run, item.name, cap)
+        except LaunchValidationError:
+            data = None
+        if data != item.data:
+            raise UsageError(
+                f"input {item.name!r}, carried from the not-started run {source.run}, is"
+                f" already in {where} with other content",
+                detail="--input-file replaces the carried input set",
+            )
 
 
 def prepare(
@@ -410,18 +591,25 @@ def prepare(
     dry_run: bool = False,
 ) -> Planned:
     """Launch step 2 of ``resume`` and ``start --resume`` (``args.id`` or ``args.resume``):
-    the session looked up (exit 10, 21), the liveness check (not in a dry run, which never
-    finalizes), the source read, then the request with the carry-over and the resolution.
-    Usage errors exit 2 before anything is allocated."""
+    the session looked up (exit 10, 21), the source read (a pending run past its deadline
+    counts as final; the liveness check that finalizes it runs at ``allocate``, after every
+    usage check), then the request with the carry-over and the resolution. Usage errors
+    exit 2 before anything is allocated or finalized."""
     given = args.id if getattr(args, "id", None) is not None else args.resume
     fork = bool(getattr(args, "fork", False))
     sid = lookup(st, given)
-    if not dry_run:
-        liveness(st, process, sid)
     source = load_source(st, sid, process.state_root)
+    origin = load_origin(st, source) if not fork and source.reforks else None
     kind = args.kind or source.run_kind
     mode = args.mode or source.mode
-    carried = carry(source, kind=kind, mode=mode, resets=args.reset or ())
+    carried = carry(
+        source,
+        kind=kind,
+        mode=mode,
+        resets=args.reset or (),
+        given={key for key in kinds.FLAG_KEYS if getattr(args, key, None) is not None},
+        plugin_dirs_given=args.plugin_dir is not None,
+    )
     req = _read_request(args, cfg, mode, any_mode=any_mode or dry_run)
     undelivered = _undelivered(source, args, process, cfg.input_max_bytes)
     if undelivered is not None:
@@ -430,7 +618,7 @@ def prepare(
             req = dataclasses.replace(req, prompt=prompt)
         if args.input_file is None:
             req = dataclasses.replace(req, inputs=tuple(inputs))
-    talk, warnings = conversation(source, fork=fork)
+    talk, warnings = conversation(source, fork=fork, origin=origin)
     req = dataclasses.replace(
         req,
         kind=kind,
@@ -438,7 +626,7 @@ def prepare(
         carried=carried.flags,
         conversation=talk,
     )
-    _check_fork_inputs(source, req, process, fork=fork)
+    _check_merged_inputs(source, req, args, process, fork=fork, cap=cfg.input_max_bytes)
     previous = kinds.Previous(
         repo=source.repo,
         flags=carried.flags,
@@ -455,14 +643,49 @@ def prepare(
     )
     if warnings:
         resolution = dataclasses.replace(resolution, warnings=(*resolution.warnings, *warnings))
-    caller_cwd, unsupported = _cwd(args, source, resolution, process, fork=fork)
+    caller_cwd, unsupported = _cwd(args, source, resolution, process, fork=fork, origin=origin)
+    _check_isolated_work(source, resolution, caller_cwd, fork=fork)
     resolved = launch.Resolved(
         resolution=resolution, caller_cwd=caller_cwd, fork_cwd_unsupported=unsupported
     )
-    return Planned(source=source, req=req, resolved=resolved, fork=fork, warnings=tuple(warnings))
+    return Planned(
+        source=source,
+        req=req,
+        resolved=resolved,
+        fork=fork,
+        warnings=tuple(warnings),
+        origin=origin,
+    )
 
 
 # Step 4
+
+
+def _same_dir(cwd: str | None, other: str | None) -> bool:
+    return (
+        cwd is not None and other is not None and os.path.realpath(cwd) == os.path.realpath(other)
+    )
+
+
+def stored_git_dir(planned: Planned, process: launch.Process) -> str | None:
+    """The git directory the run's must equal (``git_dir_changed``), or None: a fork that
+    runs in its source's cwd (whether or not ``--cwd`` names it) is checked against the
+    source's; a resume against the session's; a resume that repeats a fork against the
+    session's when it runs in the cwd the fork resolved, else against the source's when it
+    runs in the source's cwd."""
+    source, cwd = planned.source, planned.resolved.caller_cwd
+    if planned.fork:
+        return source.git_dir if _same_dir(cwd, source.cwd) else None
+    if planned.origin is None:
+        return source.git_dir
+    target = cwd or os.path.join(
+        sessiondir.session_dir(process.state_root, source.csession_id), "work"
+    )
+    if source.git_dir is not None and _same_dir(target, source.cwd):
+        return source.git_dir
+    if _same_dir(target, planned.origin.cwd):
+        return planned.origin.git_dir
+    return None
 
 
 def allocate(
@@ -472,30 +695,33 @@ def allocate(
     *,
     pending: launch.Pending | None = None,
 ) -> launch.Allocated:
-    """Launch step 4: a fork is a new session (``launch.allocate``; its git directory is
-    checked against the source's when it runs in the source's cwd); a resume is run n + 1
-    (``launch.allocate_resume``, refusals in the same transaction)."""
+    """Launch step 4, after the inline liveness check (``liveness``): a fork is a new
+    session (``launch.allocate``; its git directory is checked against the source's when it
+    runs in the source's cwd); a resume is run n + 1 (``launch.allocate_resume``, refusals
+    in the same transaction). Any run of a fork may merge into the copied ``inputs/<run>/``;
+    a resume that repeats a fork re-checks the source's taint before step 7."""
     source = planned.source
+    liveness(st, process, source.csession_id)
+    git_dir = stored_git_dir(planned, process)
     if planned.fork:
         alloc = launch.allocate(
             st, planned.req, planned.resolved, process, pending=pending, fork=planned.fork_of()
         )
-        if planned.resolved.caller_cwd is not None and planned.req.cwd is None:
-            # The fork runs where the source did: a git directory that appeared or changed
-            # there since the source's first launch is refused as on a resume.
-            alloc = dataclasses.replace(
-                alloc, check_git_dir=source.git_dir is not None, stored_git_dir=source.git_dir
-            )
-        return alloc
-    return launch.allocate_resume(
+        return dataclasses.replace(alloc, check_git_dir=git_dir is not None, stored_git_dir=git_dir)
+    alloc = launch.allocate_resume(
         st,
         planned.req,
         planned.resolved,
         process,
         csession_id=source.csession_id,
         previous_run=source.run,
-        git_dir=source.git_dir,
+        git_dir=git_dir,
         pending=pending,
+    )
+    return dataclasses.replace(
+        alloc,
+        forked=source.forked_from is not None,
+        taint_source=None if planned.origin is None else planned.origin.source,
     )
 
 
@@ -509,7 +735,8 @@ def would_refuse(planned: Planned) -> str | None:
     source = planned.source
     if not planned.fork and not source.final:
         return "live"
-    if source.tainted and not planned.resolved.resolution.profile.reads_third_party:
+    trusted = not planned.resolved.resolution.profile.reads_third_party
+    if trusted and (source.tainted or (planned.origin is not None and planned.origin.tainted)):
         return "tainted"
     return None
 
@@ -544,12 +771,18 @@ def plan(
     planned = prepare(st, args, cfg, process, dry_run=True)
     source, req, resolved = planned.source, planned.req, planned.resolved
     resolution = resolved.resolution
+    git_dir = stored_git_dir(planned, process)
     if planned.fork:
-        alloc = launch.placeholder_alloc(process, resolution)
-        if resolved.caller_cwd is not None and req.cwd is None:
-            alloc = dataclasses.replace(
-                alloc, check_git_dir=source.git_dir is not None, stored_git_dir=source.git_dir
-            )
+        fork = planned.fork_of()
+        assert fork is not None
+        alloc = dataclasses.replace(
+            launch.placeholder_alloc(process, resolution),
+            check_git_dir=git_dir is not None,
+            stored_git_dir=git_dir,
+            fork_source=fork.source,
+            fork_exclude_run=fork.exclude_run,
+            forked=True,
+        )
     else:
         alloc = launch.Allocated(
             csession_id=source.csession_id,
@@ -558,7 +791,7 @@ def plan(
             private_dir=sessiondir.private_dir(process.state_root, source.csession_id),
             warnings=resolution.warnings,
             check_git_dir=True,
-            stored_git_dir=source.git_dir,
+            stored_git_dir=git_dir,
         )
     found = dryrun.run_checks(cfg, req, resolved, alloc, process, effects=ResumeDryRun(alloc))
     writable = dryrun.unchecked_writable(

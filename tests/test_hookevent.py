@@ -155,14 +155,17 @@ class Env:
         *,
         raw: bytes | None = None,
         csession_id: str | None = SID,
+        run: int | None = None,
     ) -> str:
-        """Run hookevent.main in-process; returns what it wrote to stdout."""
+        """Run hookevent.main in-process (``run``: the injected ``--run <n>``; None: the
+        older argv without it); returns what it wrote to stdout."""
         data = raw if raw is not None else json.dumps(payload or {}).encode()
         out = io.StringIO()
         environ = {} if csession_id is None else {"CSESSION_ID": csession_id}
+        run_args = [] if run is None else ["--run", str(run)]
         with redirect_stdout(out):
             code = hookevent.main(
-                ["--state-dir", str(self.root), event],
+                ["--state-dir", str(self.root), *run_args, event],
                 stdin=io.BytesIO(data),
                 environ=environ,
             )
@@ -793,11 +796,29 @@ def test_extra_payload_fields_are_ignored(env: Env) -> None:
         ["--state-dir", "/s", "SubagentStop"],
         ["--state-dir", "/s", "stop"],
         ["--state-dir", "/s\0x", "Stop"],
+        ["--state-dir", "/s", "--run", "0", "Stop"],
+        ["--state-dir", "/s", "--run", "x", "Stop"],
+        ["--state-dir", "/s", "--run", "01", "Stop"],
+        ["--state-dir", "/s", "--run", "1"],
+        ["--state-dir", "/s", "Stop", "--run", "1"],
+        ["--run", "1", "--state-dir", "/s", "Stop"],
     ],
 )
 def test_only_the_injected_argv_is_accepted(argv: list[str]) -> None:
     with pytest.raises(HookEventError):
         hookevent.main(argv, stdin=io.BytesIO(b"{}"), environ={"CSESSION_ID": SID})
+
+
+def test_a_hook_of_an_earlier_run_never_changes_the_current_run(env: Env) -> None:
+    # A leftover hook of run 1 (its settings named run 1) fires after run 2 became current:
+    # it is ignored silently; the same event for run 2 applies.
+    env.add(run_no=2, state="working", activity="working", started=True)
+    payload = common("PermissionRequest", tool_name="Bash")
+    assert env.hook("PermissionRequest", payload, run=1) == ""
+    assert env.state() == ("working", None, "working")
+    assert env.events() == []
+    env.hook("PermissionRequest", payload, run=2)
+    assert env.state()[:2] == ("needs-input", "permission")
 
 
 @pytest.mark.parametrize("value", [None, "", "cs-ABCDEFGH", "cs-abc", "cs-abcdefgh\n", "x"])

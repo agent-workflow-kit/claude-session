@@ -74,6 +74,7 @@ from .errors import (
     InternalError,
     InvalidPermissionProfile,
     LaunchValidationError,
+    RefusedError,
     UsageError,
 )
 from .gateway import Gateway
@@ -386,11 +387,16 @@ class Allocated:
     check_git_dir: bool = False
     stored_git_dir: str | None = None
     # A fork's run 1: the source session whose inputs/ is copied (step 5; None at adoption:
-    # start copied it), the source's not-started run whose undelivered inputs are carried
-    # instead of copied, and whether inputs/1/ may already hold copied inputs (merged).
+    # start copied it) and the source's not-started run whose undelivered inputs are carried
+    # instead of copied. ``forked``: the session is a fork, so inputs/<run>/ may already hold
+    # copied inputs (merged, any run).
     fork_source: str | None = None
     fork_exclude_run: int | None = None
     forked: bool = False
+    # A run that forks this session's conversation (a fork's run 1, or a later run of a
+    # fork that never captured a Claude id): the source whose taint is re-checked right
+    # before step 7 (``Store.recheck_fork_taint``).
+    taint_source: str | None = None
 
 
 def _resolved_record(resolution: kinds.Resolution) -> dict[str, Any]:
@@ -457,6 +463,10 @@ def new_run(
         "outcome_file": req.outcome_file,
         "input_files": [item.name for item in req.inputs],
     }
+    if req.conversation.fork:
+        # The conversation a fork forked: a later run of a fork that never captured a
+        # Claude id forks it again (interface.md, Resume and fork carry-over).
+        invocation["fork_resume_from"] = req.conversation.resume_from
     if pending is not None:
         invocation["config_default"] = pending.config_default
     warnings = tuple(resolution.warnings)
@@ -526,6 +536,7 @@ def allocate(
         fork_source=None if fork is None else fork.source,
         fork_exclude_run=None if fork is None else fork.exclude_run,
         forked=fork is not None,
+        taint_source=None if fork is None else fork.source,
     )
 
 
@@ -585,6 +596,17 @@ class Checked:
     warnings: list[str] = field(default_factory=list)
     credential_warnings: tuple[str, ...] = ()
     sandbox_problems: tuple[str, ...] = ()  # why a preferred sandbox is unavailable
+    # An open descriptor of the private tmpdir this run created (``tmpdir.create_pinned``):
+    # its removal is identity-checked against it; closed with the session directories.
+    tmpdir_pin: int | None = None
+
+    def close_tmpdir_pin(self) -> None:
+        if self.tmpdir_pin is not None:
+            try:
+                os.close(self.tmpdir_pin)
+            except OSError:
+                pass
+            self.tmpdir_pin = None
 
 
 @dataclass
@@ -1313,6 +1335,7 @@ def checks(
         warnings=warnings,
         credential_warnings=tuple(credential),
         sandbox_problems=check.problems,
+        tmpdir_pin=check.tmpdir_pin,
     )
 
 
@@ -1335,20 +1358,24 @@ def validate(
     (``Recording``, or ``effects``: ``start`` and the adopting ``exec``). Raises
     ``LaunchValidationError``; the first failure wins.
 
-    Once the directories are open, and before the checks, a fork's run copies the source's
-    ``inputs/`` (``SessionDirs.copy_inputs``; an unsafe entry is ``session_dir_unsafe``) and
-    the run's prompt and inputs are staged in its private ``staged/`` (``stage``; the
-    adopting ``exec`` passes False: ``start`` staged them), so a run that then ends
-    ``not-started`` keeps them for the next run (interface.md, Prompts and inputs)."""
+    Once the directories are open, and before the checks, the run's prompt and inputs are
+    staged in its private ``staged/`` (``stage``; the adopting ``exec`` passes False:
+    ``start`` staged them), so a run that then ends ``not-started`` keeps them for the next
+    run (interface.md, Prompts and inputs), and then a fork's run copies the source's
+    ``inputs/`` (``SessionDirs.copy_inputs``; an unsafe entry is ``session_dir_unsafe``)
+    and records the copied paths (``copied_inputs``)."""
     settings_builder.check_rule_paths(process.state_root, process.claude_session)
     dirs, layout = open_dirs(alloc, process, isolated=resolved.resolution.isolated())
     try:
-        if alloc.fork_source is not None:
-            dirs.copy_inputs(
-                alloc.fork_source, exclude_run=alloc.fork_exclude_run, cap=cfg.input_max_bytes
-            )
         if stage:
             dirs.stage(alloc.run, req.prompt, req.inputs)
+        if alloc.fork_source is not None:
+            copied = dirs.copy_inputs(
+                alloc.fork_source, exclude_run=alloc.fork_exclude_run, cap=cfg.input_max_bytes
+            )
+            st.record_copied_inputs(
+                alloc.csession_id, alloc.run, [f"{sessiondir.INPUTS}/{path}" for path in copied]
+            )
         made = (effects or Recording)(st, alloc, dirs)
         checked = checks(cfg, req, resolved, alloc, process, made)
     except BaseException:
@@ -1522,7 +1549,7 @@ def prepare(
     generated settings and the output files."""
     dirs, run, sid = v.dirs, alloc.run, alloc.csession_id
     drain_previous(st, alloc, dirs, process)
-    placed = dirs.place_staged(run, merge_inputs=alloc.forked and run == 1)
+    placed = dirs.place_staged(run, merge_inputs=alloc.forked)
     expected = sorted(item.name for item in req.inputs)
     if (placed.prompt_path is not None) != (req.prompt is not None) or sorted(
         placed.input_names
@@ -1702,9 +1729,11 @@ def log_credential_warnings(
 
 def _cleanup(alloc: Allocated, v: Validated | None) -> list[str]:
     """After a launch-phase end: the secret index and the private tmpdir are removed (best
-    effort; a leftover tmpdir is reported as a run warning and is reconcile's, #33). The
-    tmpdir is removed whenever it exists, also when the failure came before ``validate``
-    returned."""
+    effort; a leftover tmpdir is reported as a run warning and is reconcile's, #33). Only
+    the tmpdir this run created is removed (``tmpdir.remove`` with its pin): the run
+    is final by now, so the next run of the session may already have created its own. A
+    run whose ``validate`` did not return created none (the self-check is the last action
+    of step 5); a leftover of an earlier run is cleared by the next ``tmpdir.create``."""
     warnings: list[str] = []
     if v is not None:
         try:
@@ -1715,14 +1744,35 @@ def _cleanup(alloc: Allocated, v: Validated | None) -> list[str]:
                 os.close(run_fd)
         except OSError:
             pass
-    if os.path.lexists(tmpdir.run_path(alloc.csession_id)):
+    if v is not None and v.tmpdir_pin is not None:
         try:
-            tmpdir.remove(alloc.csession_id)
+            tmpdir.remove(alloc.csession_id, pin=v.tmpdir_pin)
         except tmpdir.TmpdirLeftover as exc:
             warnings.append(f"{exc}; {exc.hint}")
         except OSError:
             pass
     return warnings
+
+
+def recheck_fork_taint(st: store.Store, alloc: Allocated, resolution: kinds.Resolution) -> None:
+    """Right before step 7 of a run that forks a conversation (``alloc.taint_source``): the
+    source's taint read again (``Store.recheck_fork_taint``; it may have been tainted since
+    allocation). Raises ``RefusedError`` (``tainted``) for a run that is not
+    third-party-reading."""
+    if alloc.taint_source is not None:
+        st.recheck_fork_taint(
+            alloc.csession_id,
+            alloc.taint_source,
+            reads_third_party=resolution.profile.reads_third_party,
+        )
+
+
+def _refused_end(refused: RefusedError) -> LaunchValidationError:
+    """The launch-phase end of a run refused after allocation: ``launch_interrupted`` (the
+    launch was stopped before ``claude`` was spawned), with the refusal as its message."""
+    return LaunchValidationError(
+        f"launch refused ({refused.reason}): {refused.message}", end_reason="launch_interrupted"
+    )
 
 
 def run(
@@ -1757,11 +1807,18 @@ def run(
             # used for the log from here on, is that set plus the run secret.
             audit_sandbox_lowered(process, req, resolution, alloc, secrets)
             st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
+            # TODO(#31): the pre-launch hooks (step 6) run before this re-check.
+            recheck_fork_taint(st, alloc, resolution)
             prepared = prepare(st, cfg, req, resolution, alloc, v, process)
             st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
         except LaunchValidationError as error:
             end_launch(st, alloc, v, prepared, process, error)
             return None
+        except RefusedError as refused:
+            # The fork source became tainted after allocation: the run ends not-started and
+            # the command exits 20 (tainted), as the refusal at step 3 would have.
+            end_launch(st, alloc, v, prepared, process, _refused_end(refused))
+            raise
         except Exception as exc:
             end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc)
             return None
@@ -1773,4 +1830,5 @@ def run(
         )
     finally:
         if v is not None:
+            v.close_tmpdir_pin()
             v.dirs.close()

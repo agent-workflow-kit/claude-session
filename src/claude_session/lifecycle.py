@@ -448,6 +448,7 @@ def start(
             raise
     finally:
         if v is not None:
+            v.close_tmpdir_pin()
             v.dirs.close()
     assert v is not None
     return {
@@ -493,9 +494,9 @@ def freeze(
         sid, run, permission_profile=v.profile.label, permission_profile_snapshot=snapshot
     )
     warnings = list(v.warnings)
-    if v.tmpdir is not None:
+    if v.tmpdir is not None and v.tmpdir_pin is not None:
         try:
-            tmpdir.remove(sid)
+            tmpdir.remove(sid, pin=v.tmpdir_pin)
         except tmpdir.TmpdirLeftover as exc:
             warnings.append(f"{exc}; {exc.hint}")
         except OSError as exc:
@@ -857,8 +858,9 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
 
 def _conversation(value: Any, record: Mapping[str, Any]) -> launch.Conversation:
     """The conversation ``start`` froze: a new session's (run 1, not forked: none), a
-    resume's (run n > 1: ``--resume`` or a fresh ``--session-id``) or a fork's (its run 1);
-    the ids must be canonical UUIDs (``settings_builder`` checks the combination)."""
+    resume's (run n > 1: ``--resume`` or a fresh ``--session-id``) or a fork's (its run 1,
+    or a later run of a fork that never captured a Claude id, which repeats the fork); the
+    ids must be canonical UUIDs (``settings_builder`` checks the combination)."""
     data = _mapping(value)
     _keys(data, CONVERSATION_KEYS)
     talk = launch.Conversation(
@@ -870,7 +872,7 @@ def _conversation(value: Any, record: Mapping[str, Any]) -> launch.Conversation:
     for claude_id in (talk.resume_from, talk.session_id):
         if claude_id is not None and str(uuid.UUID(claude_id)) != claude_id:
             raise ValueError("not a canonical UUID")
-    forked = record["session_forked_from"] is not None and record["run_no"] == 1
+    forked = record["session_forked_from"] is not None
     if talk.resume != (record["run_no"] > 1 or forked) or talk.fork and not forked:
         raise ValueError("the launch spec's conversation is not the run's")
     return talk
@@ -970,6 +972,16 @@ def adopt(
             discard_spec_at(process.state_root, sid, result.run_no)
             # TODO(#21): write the run's outcome file with the never_adopted outcome.
             # TODO(#20): the run's exactly one final post-state-change.
+        if result.outcome == "tainted":
+            # A fork's source became tainted after start allocated the fork (interface.md,
+            # Taint): the run was finalized never_adopted.
+            assert result.run_no is not None
+            source = record["session_forked_from"]
+            raise RefusedError(
+                f"cannot adopt {sid}: its fork source {source} is tainted and run"
+                f" {result.run_no} is not third-party-reading; the run ended not-started",
+                reason="tainted",
+            )
         reason = "already_adopted" if result.outcome == "already_adopted" else "expired"
         raise RefusedError(f"cannot adopt {sid}: {reason.replace('_', ' ')}", reason=reason)
     assert result.run_no is not None
@@ -980,7 +992,8 @@ def adopt(
     launch.log_best_effort(
         launch.event_log(process), "adopt", level="info", csession_id=sid, run=run
     )
-    forked = record["session_forked_from"] is not None and run == 1
+    # Any run of a fork may merge into an inputs/<run>/ the fork copy made.
+    forked = record["session_forked_from"] is not None
     alloc = launch.Allocated(
         csession_id=sid,
         run=run,
@@ -1066,6 +1079,8 @@ def adoption_plan(
     envelope and any other one 12 (``failed``)."""
     sid, record = lookup(st, args.session_id)
     would_refuse = refusal(record, st.past_deadline(record["expires_at"]))
+    if would_refuse is None and st.fork_source_taints(sid):
+        would_refuse = "tainted"
     try:
         adoption = load_adoption(record, process, dry_run=True)
     except LaunchValidationError as error:

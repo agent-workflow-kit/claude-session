@@ -647,6 +647,8 @@ def _hooks(paths: Paths, tools: Tools) -> dict[str, list[dict[str, Any]]]:
                 "hook-event",
                 "--state-dir",
                 paths.state_root,
+                "--run",
+                str(paths.run),
                 event,
             ]
         )

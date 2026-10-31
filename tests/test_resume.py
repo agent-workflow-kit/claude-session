@@ -12,6 +12,8 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -19,10 +21,10 @@ from typing import Any
 
 import pytest
 
-from claude_session import outbox
+from claude_session import launch, outbox
 
 from .fakeclaude import read_jsonl
-from .test_exec_headless import claude_session_cmd
+from .test_exec_headless import CLAUDE_SESSION, claude_session_cmd, private_home
 from .test_start_adopt import DONE, START, STOP, Env, result_step, validate
 
 STEPS = [START, DONE, STOP, result_step()]
@@ -381,6 +383,7 @@ def test_a_pending_run_is_live_and_refuses_a_resume(env: Env) -> None:
     proc, out = resume(env, sid)
     assert proc.returncode == 20
     assert (out["error"]["code"], out["error"]["reason"]) == ("refused", "live")
+    assert "--fork still works" in out["error"]["message"]
     assert env.rows("SELECT COUNT(*) FROM runs") == [(1,)]
     # The dry run reports the same refusal and allocates nothing.
     proc, out = resume(env, sid, "--dry-run")
@@ -596,9 +599,10 @@ def test_a_fork_input_given_now_is_placed_beside_the_copied_ones(env: Env) -> No
     assert proc.returncode == 0, proc.stderr
     inputs = env.state / "sessions" / out["csession_id"] / "inputs" / "1"
     assert sorted(p.name for p in inputs.iterdir()) == ["a.txt", "b.txt"]
-    assert json.loads(env.run_row(out["csession_id"])["invocation_json"])["input_files"] == [
-        "b.txt"
-    ]
+    invocation = json.loads(env.run_row(out["csession_id"])["invocation_json"])
+    assert invocation["input_files"] == ["b.txt"]
+    # The inputs the fork copied from its source are recorded on its run 1.
+    assert invocation["copied_inputs"] == ["inputs/1/a.txt"]
     # A name the copy already holds is refused before anything is allocated.
     proc, out = resume(env, sid, "--fork", "--input-file", str(data))
     assert proc.returncode == 2 and "inputs/1/" in out["error"]["message"]
@@ -791,3 +795,299 @@ def test_override_escalation_with_fork_exits_2(env: Env) -> None:
     proc, out = resume(env, sid, "--fork", "--override-escalation", "--actor", "human:me")
     assert proc.returncode == 2
     assert env.rows("SELECT COUNT(*) FROM sessions") == [(1,)]
+
+
+# Later runs of a fork, the fork's taint and cwd, and repeated forks
+
+
+def write_input(env: Env, name: str, text: str) -> Path:
+    path = env.tmp_path / "in" / name
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def two_run_fork(env: Env) -> tuple[str, str]:
+    """A source whose runs 1 and 2 had inputs (inputs/1/a.txt, inputs/2/b.txt), and its
+    fork (which copied both)."""
+    sid = exec_session(env, "--input-file", str(write_input(env, "a.txt", "a\n")))["csession_id"]
+    proc, _out = resume(env, sid, "--input-file", str(write_input(env, "b.txt", "b\n")))
+    assert proc.returncode == 0, proc.stderr
+    proc, out = resume(env, sid, "--fork")
+    assert proc.returncode == 0, proc.stderr
+    return sid, out["csession_id"]
+
+
+def test_a_later_run_of_a_fork_merges_into_its_copied_inputs(env: Env) -> None:
+    _sid, fork = two_run_fork(env)
+    inputs = env.state / "sessions" / fork / "inputs"
+    assert (inputs / "2" / "b.txt").read_text() == "b\n"
+    # Run 2 of the fork goes into the copied inputs/2/: a name already there exits 2
+    # before anything is allocated (resume and start --resume alike) ...
+    clash = write_input(env, "b.txt", "other\n")
+    proc, out = resume(env, fork, "--input-file", str(clash))
+    assert proc.returncode == 2 and "inputs/2/" in out["error"]["message"]
+    proc, out = run_cs(env, ["start", "--json", "--resume", fork, "--input-file", str(clash)])
+    assert proc.returncode == 2 and out["error"]["code"] == "usage"
+    assert env.rows("SELECT COUNT(*) FROM runs WHERE csession_id = ?", (fork,)) == [(1,)]
+    # ... and a new name is placed beside the copied one.
+    proc, out = resume(env, fork, "--input-file", str(write_input(env, "c.txt", "c\n")))
+    assert proc.returncode == 0, proc.stderr
+    assert out["run"] == 2
+    assert sorted(p.name for p in (inputs / "2").iterdir()) == ["b.txt", "c.txt"]
+
+
+def test_a_pending_fork_is_refused_at_adoption_when_its_source_became_tainted(env: Env) -> None:
+    sid = exec_session(env)["csession_id"]
+    proc, out = run_cs(env, ["start", "--json", "--resume", sid, "--fork"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    fork = out["csession_id"]
+    # The source is tainted after the fork was allocated (and appends to the transcript the
+    # fork would resume).
+    proc, _out = resume(env, sid, "--reads-third-party", "--sandbox", "off")
+    assert proc.returncode == 0, proc.stderr
+    assert env.rows("SELECT tainted FROM sessions WHERE csession_id = ?", (sid,)) == [(1,)]
+    proc, out = env.adopt(fork, "--dry-run")
+    assert proc.returncode == 20 and out["would_refuse"] == "tainted"
+    proc, out = env.adopt(fork)
+    assert proc.returncode == 20 and out["error"]["reason"] == "tainted"
+    row = env.run_row(fork)
+    assert (row["outcome"], row["end_reason"]) == ("not-started", "never_adopted")
+    assert len(starts(env)) == 2  # the source's two runs; the fork never started
+    assert not (env.private_run(fork) / "launch-spec.json").exists()
+
+
+def resume_in_process(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], *argv: str
+) -> tuple[int, dict[str, Any]]:
+    """``cli.main`` of ``resume`` in this process (so a test can patch launch steps)."""
+    from claude_session import cli
+
+    monkeypatch.chdir(env.work)
+    monkeypatch.setattr(sys, "argv", [str(CLAUDE_SESSION)])
+    for key, value in private_home(env.tmp_path).items():
+        monkeypatch.setenv(key, value)
+    capsys.readouterr()
+    code = cli.main(["resume", *argv, "--json", "--config", str(env.config)])
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_a_fork_whose_source_became_tainted_before_the_spawn_is_refused(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = exec_session(env)["csession_id"]
+    real_validate = launch.validate
+
+    def tainting(*args: Any, **kwargs: Any) -> launch.Validated:
+        validated = real_validate(*args, **kwargs)
+        # Between the fork's allocation and step 7, a third-party-reading run of the source
+        # taints it.
+        env.write_db(
+            "UPDATE sessions SET tainted = 1, tainted_at = '2026-01-01T00:00:00Z' "
+            "WHERE csession_id = ?",
+            (sid,),
+        )
+        return validated
+
+    monkeypatch.setattr(launch, "validate", tainting)
+    code, out = resume_in_process(env, monkeypatch, capsys, sid, "--fork")
+    assert code == 20 and out["error"]["reason"] == "tainted", out
+    (fork,) = [
+        row[0] for row in env.rows("SELECT csession_id FROM sessions WHERE forked_from = ?", (sid,))
+    ]
+    row = env.run_row(fork)
+    assert (row["outcome"], row["end_reason"]) == ("not-started", "launch_interrupted")
+    assert "tainted" in row["message"]
+    assert len(starts(env)) == 1
+
+
+def test_a_resume_of_a_fork_that_never_started_repeats_the_fork(env: Env) -> None:
+    sid = exec_session(env, "--cwd", "session-dir")["csession_id"]
+    source_claude = claude_id(env, sid)
+    proc, out = resume(env, sid, "--fork")
+    assert_not_started(proc, out, "fork_cwd_unsupported")
+    fork = out["csession_id"]
+    # Without --cwd the repeated fork follows the fork's cwd rule again.
+    proc, out = resume(env, fork)
+    assert_not_started(proc, out, "fork_cwd_unsupported")
+    other = env.tmp_path / "other"
+    other.mkdir()
+    proc, out = resume(env, fork, "--cwd", str(other))
+    assert proc.returncode == 0, proc.stderr
+    assert (out["csession_id"], out["run"]) == (fork, 3)
+    record = starts(env)[-1]
+    assert flag_value(record, "--resume") == source_claude
+    assert record["flags"].get("--fork-session") is True
+    new_id = flag_value(record, "--session-id")
+    assert new_id != source_claude and claude_id(env, fork) == new_id
+    assert record["cwd"] == str(other.resolve())
+    # Once the fork has its own conversation, a resume continues it as usual.
+    proc, out = resume(env, fork)
+    assert proc.returncode == 0, proc.stderr
+    record = starts(env)[-1]
+    assert flag_value(record, "--resume") == new_id and "--fork-session" not in record["flags"]
+
+
+def test_a_fork_without_cwd_never_runs_in_another_sessions_work_dir(env: Env) -> None:
+    first = exec_session(env, "--cwd", "session-dir")["csession_id"]
+    first_work = env.state / "sessions" / first / "work"
+    proc, out = resume(env, first, "--fork", "--cwd", str(first_work))
+    assert proc.returncode == 0, proc.stderr
+    second = out["csession_id"]
+    proc, out = resume(env, second, "--fork")
+    assert_not_started(proc, out, "fork_cwd_unsupported")
+
+
+def test_a_trusted_resume_never_continues_in_an_isolated_runs_work_dir(env: Env) -> None:
+    sid = exec_session(env, "--kind", "rank")["csession_id"]
+    work = (env.state / "sessions" / sid / "work").resolve()
+    assert env.run_row(sid)["cwd"] == str(work)
+    for extra in ([], ["--dry-run"]):
+        proc, out = resume(env, sid, "--kind", "implement", *extra)
+        assert proc.returncode == 2 and out["error"]["code"] == "usage"
+        assert "--fork --cwd" in out["error"]["detail"]
+    proc, out = run_cs(env, ["start", "--json", "--resume", sid, "--kind", "implement"])
+    assert proc.returncode == 2
+    assert env.rows("SELECT COUNT(*) FROM runs") == [(1,)]
+    # An isolated kind may continue there.
+    proc, _out = resume(env, sid)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_an_expired_pending_run_is_not_finalized_by_a_usage_error(env: Env) -> None:
+    env.write_config("lost_grace: 0.2s\n")
+    sid = env.started()["csession_id"]
+    time.sleep(0.5)
+    env.write_config()
+    (env.private_run(sid) / "staged" / "prompt.md").unlink()
+    proc, _out = resume(env, sid, "--mode", "headless")
+    assert proc.returncode == 2
+    assert env.run_row(sid)["ended_at"] is None
+
+
+def not_started_source(env: Env, run2_text: str) -> str:
+    """A source whose run 1 delivered inputs/1/a.txt ("a") and whose run 2 ended
+    not-started with an undelivered a.txt (``run2_text``)."""
+    sid = exec_session(env, "--input-file", str(write_input(env, "a.txt", "a\n")))["csession_id"]
+    again = write_input(env, "a.txt", run2_text)
+    proc, out = resume(
+        env, sid, "--input-file", str(again), "--plugin-dir", str(env.tmp_path / "gone")
+    )
+    assert_not_started(proc, out, "plugin_dir_missing")
+    return sid
+
+
+def test_a_carried_input_identical_to_a_copied_one_is_kept_once(env: Env) -> None:
+    sid = not_started_source(env, "a\n")
+    proc, out = resume(env, sid, "--fork", "--reset", "plugin-dir")
+    assert proc.returncode == 0, proc.stderr
+    inputs = env.state / "sessions" / out["csession_id"] / "inputs" / "1"
+    assert [p.name for p in inputs.iterdir()] == ["a.txt"]
+    assert (inputs / "a.txt").read_text() == "a\n"
+    invocation = json.loads(env.run_row(out["csession_id"])["invocation_json"])
+    assert invocation["input_files"] == ["a.txt"]
+
+
+def test_a_carried_input_that_differs_from_a_copied_one_exits_2(env: Env) -> None:
+    sid = not_started_source(env, "changed\n")
+    proc, out = resume(env, sid, "--fork", "--reset", "plugin-dir")
+    assert proc.returncode == 2
+    assert "carried from the not-started run 2" in out["error"]["message"]
+    assert "--input-file replaces the carried input set" in out["error"]["detail"]
+    assert env.rows("SELECT COUNT(*) FROM sessions") == [(1,)]
+
+
+def test_a_fork_that_failed_its_copy_still_carries_its_prompt(env: Env) -> None:
+    sid = exec_session(env, "--input-file", str(write_input(env, "a.txt", "a\n")))["csession_id"]
+    secret = write_input(env, "secret.txt", "not for the fork\n")
+    (env.state / "sessions" / sid / "inputs" / "1" / "evil.txt").symlink_to(secret)
+    prompt = env.tmp_path / "fork-prompt.md"
+    prompt.write_text("Fork task.\n", encoding="utf-8")
+    proc, out = resume(env, sid, "--fork", "--prompt-file", str(prompt))
+    assert_not_started(proc, out, "session_dir_unsafe")
+    fork = out["csession_id"]
+    prompt.unlink()
+    proc, out = resume(env, fork)
+    assert proc.returncode == 0, proc.stderr
+    placed = env.state / "sessions" / fork / "prompts" / "2.md"
+    assert placed.read_text() == "Fork task.\n"
+
+
+def test_an_unsearchable_source_inputs_dir_is_refused(env: Env) -> None:
+    sid = exec_session(env, "--input-file", str(write_input(env, "a.txt", "a\n")))["csession_id"]
+    inputs = env.state / "sessions" / sid / "inputs"
+    inputs.chmod(0o000)
+    try:
+        proc, out = resume(env, sid, "--fork", "--dry-run")
+        assert proc.returncode == 12 and out["would_fail"] == "session_dir_unsafe"
+        proc, out = resume(env, sid, "--fork")
+        assert_not_started(proc, out, "session_dir_unsafe")
+    finally:
+        inputs.chmod(0o700)
+
+
+def test_the_fork_copy_copies_every_file_and_caps_each(env: Env) -> None:
+    files = [str(write_input(env, f"{name}.txt", f"{name}\n")) for name in "abc"]
+    argv = [arg for path in files for arg in ("--input-file", path)]
+    sid = exec_session(env, *argv)["csession_id"]
+    proc, out = resume(env, sid, "--fork")
+    assert proc.returncode == 0, proc.stderr
+    inputs = env.state / "sessions" / out["csession_id"] / "inputs" / "1"
+    assert sorted(p.name for p in inputs.iterdir()) == ["a.txt", "b.txt", "c.txt"]
+    # A source file over input_max_bytes is refused.
+    (env.state / "sessions" / sid / "inputs" / "1" / "b.txt").chmod(0o600)
+    (env.state / "sessions" / sid / "inputs" / "1" / "b.txt").write_bytes(b"x" * 2048)
+    env.write_config("input_max_bytes: 1024\n")
+    proc, out = resume(env, sid, "--fork")
+    assert_not_started(proc, out, "session_dir_unsafe")
+
+
+def test_a_fork_into_its_sources_cwd_named_by_cwd_checks_the_git_dir(env: Env) -> None:
+    sid = exec_session(env)["csession_id"]
+    git_env = {**env.environ(), "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(["git", "init", "-q", str(env.work)], env=git_env, check=True, timeout=30)
+    proc, out = resume(env, sid, "--fork", "--cwd", str(env.work), "--dry-run")
+    assert proc.returncode == 12 and out["would_fail"] == "git_dir_changed"
+    proc, out = resume(env, sid, "--fork", "--cwd", str(env.work))
+    assert_not_started(proc, out, "git_dir_changed")
+
+
+def test_a_fork_dry_run_inspects_the_source_inputs(env: Env) -> None:
+    sid = exec_session(env, "--input-file", str(write_input(env, "a.txt", "a\n")))["csession_id"]
+    secret = write_input(env, "secret.txt", "not for the fork\n")
+    (env.state / "sessions" / sid / "inputs" / "1" / "evil.txt").symlink_to(secret)
+    proc, out = resume(env, sid, "--fork", "--dry-run")
+    assert proc.returncode == 12 and out["would_fail"] == "session_dir_unsafe"
+    assert env.rows("SELECT COUNT(*) FROM sessions") == [(1,)]
+
+
+def test_an_unusable_stored_plugin_dir_is_recovered_by_reset_or_a_given_one(env: Env) -> None:
+    sid = exec_session(env)["csession_id"]
+    env.write_db(
+        "UPDATE runs SET spec_json = ? WHERE csession_id = ?",
+        (json.dumps({"plugin_dir": "relative"}), sid),
+    )
+    proc, out = resume(env, sid)
+    assert proc.returncode == 2 and "--reset plugin-dir" in out["error"]["detail"]
+    proc, _out = resume(env, sid, "--reset", "plugin-dir")
+    assert proc.returncode == 0, proc.stderr
+    env.write_db(
+        "UPDATE runs SET spec_json = ? WHERE csession_id = ?",
+        (json.dumps({"plugin_dir": "relative"}), sid),
+    )
+    plugin = env.tmp_path / "plugin"
+    plugin.mkdir()
+    proc, _out = resume(env, sid, "--plugin-dir", str(plugin))
+    assert proc.returncode == 0, proc.stderr
+    assert flag_value(starts(env)[-1], "--plugin-dir") == [str(plugin)]
+
+
+def test_the_repo_is_carried_across_a_kind_change_and_into_a_fork(env: Env) -> None:
+    repo = "example.com/org/repo"
+    sid = exec_session(env, "--repo", repo)["csession_id"]
+    proc, _out = resume(env, sid, "--kind", "draft-ticket")
+    assert proc.returncode == 0, proc.stderr
+    assert env.run_row(sid, 2)["repo"] == repo
+    proc, out = resume(env, sid, "--fork")
+    assert proc.returncode == 0, proc.stderr
+    assert env.run_row(out["csession_id"])["repo"] == repo

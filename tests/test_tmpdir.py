@@ -551,6 +551,23 @@ def test_remove_is_idempotent(base: Path) -> None:
     assert tmpdir.remove(SID, base=str(base)) is False
 
 
+def test_a_late_remove_never_deletes_the_next_runs_tmpdir(base: Path) -> None:
+    # Run n created its tmpdir; run n + 1 of the same session created its own (clearing run
+    # n's) before run n's late cleanup: that removal leaves run n + 1's directory alone.
+    first = tmpdir.create_pinned(SID, base=str(base))
+    second = tmpdir.create_pinned(SID, base=str(base))
+    try:
+        assert first.path == second.path
+        (Path(second.path) / "f").write_text("run n + 1")
+        assert tmpdir.remove(SID, base=str(base), pin=first.pin) is False
+        assert (Path(second.path) / "f").read_text() == "run n + 1"
+        assert tmpdir.remove(SID, base=str(base), pin=second.pin) is True
+        assert not Path(second.path).exists()
+    finally:
+        os.close(first.pin)
+        os.close(second.pin)
+
+
 def test_remove_never_follows_symlinks(tmp_path: Path, base: Path) -> None:
     victim = tmp_path / "victim"
     victim.mkdir()

@@ -36,7 +36,7 @@ import re
 import secrets
 import select
 import stat
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -505,13 +505,15 @@ def _unlink_at(dir_fd: int, name: str, path: str) -> None:
         raise _failed(path, exc) from exc
 
 
-def _inspect_tree(state_root: str, *names: str) -> tuple[int | None, str]:
+def _inspect_tree(state_root: str, *names: str, strict: bool = False) -> tuple[int | None, str]:
     """The directory ``<state root>/<names...>`` reached read only, as ``SessionDirs.open``
     reaches its directories (the state root resolved once, then each directory opened
     no-follow and owner checked through its parent's descriptor;
     ``fsutil.inspect_private_dir_at``). Returns its descriptor (the caller closes it), or
     None when a directory on the way is missing or its mode denies searching it, and its
-    path. Creates and changes nothing; raises ``SessionDirUnsafe``."""
+    path. ``strict``: only a missing directory gives None; one that exists but cannot be
+    searched raises ``SessionDirUnsafe`` (it is not empty, it is unreadable). Creates and
+    changes nothing; raises ``SessionDirUnsafe``."""
     root = os.path.realpath(state_root)
     where = os.path.join(root, *names)
     try:
@@ -528,11 +530,13 @@ def _inspect_tree(state_root: str, *names: str) -> tuple[int | None, str]:
         path = os.path.join(path, name)
         try:
             try:
-                _exists, child = fsutil.inspect_private_dir_at(fd, name)
+                exists, child = fsutil.inspect_private_dir_at(fd, name)
             except OSError as exc:
                 raise _failed(path, exc) from exc
         finally:
             os.close(fd)
+        if child is None and exists and strict:
+            raise SessionDirUnsafe(f"{path} cannot be searched (its mode denies it)")
         if child is None:
             return None, where
         fd = child
@@ -647,11 +651,12 @@ def read_undelivered(
 
 def input_names(state_root: str, csession_id: str, run: int) -> list[str]:
     """The names in ``inputs/<run>/`` of a session's directory, read only (sorted; none when
-    it is missing). Raises ``SessionDirUnsafe`` when a directory on the way is refused."""
+    it is missing). Raises ``SessionDirUnsafe`` when a directory on the way is refused or
+    cannot be searched."""
     if not ids.is_session_id(csession_id):
         raise ValueError(f"not a session id: {csession_id!r}")
     _check_run(run)
-    fd, path = _inspect_tree(state_root, SESSIONS, csession_id, INPUTS, str(run))
+    fd, path = _inspect_tree(state_root, SESSIONS, csession_id, INPUTS, str(run), strict=True)
     if fd is None:
         return []
     try:
@@ -660,6 +665,77 @@ def input_names(state_root: str, csession_id: str, run: int) -> list[str]:
         raise _failed(path, exc) from exc
     finally:
         os.close(fd)
+
+
+def read_input(state_root: str, csession_id: str, run: int, name: str, cap: int) -> bytes | None:
+    """The input ``inputs/<run>/<name>`` of a session's directory, read only and no-follow
+    (a regular file of ours with one link and at most ``cap`` bytes), or None when it is
+    missing. Raises ``SessionDirUnsafe``."""
+    if not ids.is_session_id(csession_id):
+        raise ValueError(f"not a session id: {csession_id!r}")
+    _check_run(run)
+    check_input_names([name])
+    fd, path = _inspect_tree(state_root, SESSIONS, csession_id, INPUTS, str(run), strict=True)
+    try:
+        return _read_optional_at(fd, name, os.path.join(path, name), cap)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _fork_inputs(
+    state_root: str, source: str, *, exclude_run: int | None, cap: int
+) -> Iterator[tuple[int, InputFile | None]]:
+    """The source session's ``inputs/``, read through no-follow descriptors only (it may be
+    live and its agent may have planted entries there): for each run directory, in order,
+    ``(run, None)`` first, then ``(run, file)`` for each of its files, read one at a time
+    (memory is bounded by one file). ``inputs/<exclude_run>/`` is skipped. Every directory
+    must be a run number of ours that can be listed, every file an input name, a regular
+    file of ours with one link and at most ``cap`` bytes; an ``inputs/`` that exists but
+    cannot be searched is refused too. Else ``SessionDirUnsafe``."""
+    src_fd, src_path = _inspect_tree(state_root, SESSIONS, source, INPUTS, strict=True)
+    if src_fd is None:
+        return
+    try:
+        try:
+            runs = sorted(os.listdir(src_fd))
+        except OSError as exc:
+            raise _failed(src_path, exc) from exc
+        for name in runs:
+            where = os.path.join(src_path, name)
+            if _RUN_NAME.fullmatch(name) is None:
+                raise SessionDirUnsafe(f"unexpected entry {where} in the fork source")
+            if exclude_run is not None and int(name) == exclude_run:
+                continue
+            opened: list[int] = []
+            try:
+                run_fd = _inspect_dir(src_fd, name, where, opened)
+                if run_fd is None:
+                    raise SessionDirUnsafe(f"{where} cannot be listed")
+                try:
+                    files = sorted(os.listdir(run_fd))
+                except OSError as exc:
+                    raise _failed(where, exc) from exc
+                yield int(name), None
+                for file in files:
+                    path = os.path.join(where, file)
+                    if not ids.is_artifact_name(file):
+                        raise SessionDirUnsafe(f"unexpected entry {path} in the fork source")
+                    yield int(name), InputFile(file, _read_private_file_at(run_fd, file, path, cap))
+            finally:
+                for fd in opened:
+                    os.close(fd)
+    finally:
+        os.close(src_fd)
+
+
+def check_fork_inputs(state_root: str, source: str, *, exclude_run: int | None, cap: int) -> None:
+    """The checks ``SessionDirs.copy_inputs`` makes on the source's ``inputs/``, read only
+    and writing nothing (a fork's dry run). Raises ``SessionDirUnsafe``."""
+    if not ids.is_session_id(source):
+        raise ValueError(f"not a fork source: {source!r}")
+    for _item in _fork_inputs(state_root, source, exclude_run=exclude_run, cap=cap):
+        pass
 
 
 def read_private_run_file(
@@ -1074,51 +1150,33 @@ class SessionDirs:
         """A fork: copy the source session's whole ``inputs/`` into this (new) session's,
         keeping each ``inputs/<n>/`` (the forked conversation names those paths), except
         ``inputs/<exclude_run>/`` (the source's not-started run, whose undelivered inputs
-        become the fork's own). The source is read through no-follow descriptors only, as
-        it may be live and its agent may have planted entries there: every directory must
-        be a run number of ours, every file an input name, a regular file of ours with one
-        link and at most ``cap`` bytes, else ``SessionDirUnsafe`` (``session_dir_unsafe``).
+        become the fork's own). The source is read as ``_fork_inputs`` reads it (no-follow
+        descriptors only; an unsafe entry is ``SessionDirUnsafe``, ``session_dir_unsafe``),
+        and each file is written as soon as it is read, so memory is bounded by one file.
         The copies are written like every file (temporary file in the private directory).
         Returns the copied paths relative to ``inputs/``."""
         if not ids.is_session_id(source) or source == self.csession_id:
             raise ValueError(f"not a fork source: {source!r}")
-        src_fd, src_path = _inspect_tree(self.state_root, SESSIONS, source, INPUTS)
-        if src_fd is None:
-            return []
         copied: list[str] = []
+        run_fd: int | None = None
         try:
-            try:
-                runs = sorted(os.listdir(src_fd))
-            except OSError as exc:
-                raise _failed(src_path, exc) from exc
-            for name in runs:
-                where = os.path.join(src_path, name)
-                if _RUN_NAME.fullmatch(name) is None:
-                    raise SessionDirUnsafe(f"unexpected entry {where} in the fork source")
-                if exclude_run is not None and int(name) == exclude_run:
+            for run, item in _fork_inputs(
+                self.state_root, source, exclude_run=exclude_run, cap=cap
+            ):
+                where = os.path.join(self.session_path, INPUTS, str(run))
+                if item is None:
+                    if run_fd is not None:
+                        os.close(run_fd)
+                        run_fd = None
+                    run_fd = self._new_run_inputs_dir(run)
                     continue
-                opened: list[int] = []
-                try:
-                    run_fd = _inspect_dir(src_fd, name, where, opened)
-                    if run_fd is None:
-                        raise SessionDirUnsafe(f"{where} cannot be listed")
-                    try:
-                        files = sorted(os.listdir(run_fd))
-                    except OSError as exc:
-                        raise _failed(where, exc) from exc
-                    data: list[InputFile] = []
-                    for file in files:
-                        path = os.path.join(where, file)
-                        if not ids.is_artifact_name(file):
-                            raise SessionDirUnsafe(f"unexpected entry {path} in the fork source")
-                        data.append(InputFile(file, _read_private_file_at(run_fd, file, path, cap)))
-                finally:
-                    for fd in opened:
-                        os.close(fd)
-                self.write_inputs(int(name), data, create_empty=True)
-                copied += [f"{name}/{item.name}" for item in data]
+                assert run_fd is not None
+                check_input_names([item.name])
+                self._write(run_fd, item.name, item.data, where)
+                copied.append(f"{run}/{item.name}")
         finally:
-            os.close(src_fd)
+            if run_fd is not None:
+                os.close(run_fd)
         return copied
 
     def discard_outbox(self, run: int) -> list[str]:
@@ -1199,9 +1257,11 @@ class SessionDirs:
         """Step 7: move the staged prompt and inputs into the session directory (renames
         relative to the pinned descriptors). Every staged entry must be a regular file with
         one link and a valid name; ``inputs/<run>/`` must not exist yet, except with
-        ``merge_inputs`` (a fork's run 1, whose ``inputs/1/`` may hold the source's copied
-        inputs): the staged inputs are then moved into it one by one, and a name already
-        there is refused. Every check and destination directory comes first, then the
+        ``merge_inputs`` (a run of a fork, whose ``inputs/<run>/`` may hold the source's
+        copied inputs): the staged inputs are then moved into it one by one; a name already
+        there is refused unless that file has the staged file's exact bytes (an input
+        carried from a not-started run that the copy holds too), whose staged copy is then
+        dropped and the file kept. Every check and destination directory comes first, then the
         prompt is moved and the inputs last, so a failure before the moves leaves
         ``staged/`` intact."""
         _check_run(run)
@@ -1234,6 +1294,7 @@ class SessionDirs:
                 prompt_dst = (prompts_fd, f"{run}.md", prompts)
             inputs_fd = None
             merge_fd = None
+            already: list[str] = []  # identical inputs the merged directory holds already
             inputs = os.path.join(self.session_path, INPUTS)
             if INPUTS in names:
                 inputs_fd = _ensure_dir(self._sfd, INPUTS, inputs)
@@ -1250,16 +1311,22 @@ class SessionDirs:
                 if exists:
                     merge_fd = _open_dir(inputs_fd, str(run), os.path.join(inputs, str(run)))
                     opened.append(merge_fd)
+                    src = os.path.join(staged, INPUTS)
+                    staged_inputs_fd = _open_dir(staged_fd, INPUTS, src)
+                    opened.append(staged_inputs_fd)
                     for name in input_names:
+                        where = os.path.join(inputs, str(run), name)
                         try:
                             os.stat(name, dir_fd=merge_fd, follow_symlinks=False)
                         except FileNotFoundError:
                             continue
                         except OSError as exc:
-                            raise _failed(os.path.join(inputs, str(run), name), exc) from exc
-                        raise SessionDirUnsafe(
-                            f"{INPUTS}/{run}/{name} already exists in {self.session_path}"
-                        )
+                            raise _failed(where, exc) from exc
+                        if not _same_bytes(staged_inputs_fd, merge_fd, name, src, where):
+                            raise SessionDirUnsafe(
+                                f"{INPUTS}/{run}/{name} already exists in {self.session_path}"
+                            )
+                        already.append(name)
             # Moves: the prompt first, the inputs directory last.
             prompt_path = None
             if prompt_dst is not None:
@@ -1272,7 +1339,10 @@ class SessionDirs:
                 try:
                     where = os.path.join(inputs, str(run))
                     for name in input_names:
-                        self._move(src_fd, name, merge_fd, name, where)
+                        if name in already:
+                            _unlink_at(src_fd, name, os.path.join(src, name))
+                        else:
+                            self._move(src_fd, name, merge_fd, name, where)
                 finally:
                     os.close(src_fd)
             elif inputs_fd is not None:
@@ -1316,6 +1386,53 @@ def _open_dir(dir_fd: int, name: str, path: str) -> int:
         return fsutil.open_private_dir_at(dir_fd, name)
     except OSError as exc:
         raise _failed(path, exc) from exc
+
+
+def _same_bytes(a_fd: int, b_fd: int, name: str, a_path: str, b_path: str) -> bool:
+    """Whether ``name`` in ``a_fd`` and in ``b_fd`` hold the same bytes: both opened
+    no-follow, regular files of ours with one link (else ``SessionDirUnsafe``), compared in
+    chunks."""
+    fds: list[int] = []
+    try:
+        for dir_fd, path in ((a_fd, a_path), (b_fd, b_path)):
+            try:
+                fd = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd
+                )
+            except OSError as exc:
+                raise _failed(path, exc) from exc
+            fds.append(fd)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise SessionDirUnsafe(f"{path} is not a regular single-link file")
+            if info.st_uid != os.geteuid():
+                raise SessionDirUnsafe(f"{path} is owned by uid {info.st_uid}")
+        if os.fstat(fds[0]).st_size != os.fstat(fds[1]).st_size:
+            return False
+        while True:
+            left, right = _read_full(fds[0], 65536), _read_full(fds[1], 65536)
+            if left != right:
+                return False
+            if not left:
+                return True
+    except OSError as exc:
+        raise _failed(b_path, exc) from exc
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def _read_full(fd: int, size: int) -> bytes:
+    """Up to ``size`` bytes, fewer only at the end of the file."""
+    chunks: list[bytes] = []
+    left = size
+    while left > 0:
+        chunk = os.read(fd, left)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        left -= len(chunk)
+    return b"".join(chunks)
 
 
 def _check_staged_inputs(staged_fd: int, src: str) -> list[str]:

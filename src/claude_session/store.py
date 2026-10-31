@@ -1068,10 +1068,16 @@ class Store:
             _, current, tainted, before_state, before_activity, ended = row
             if current != previous_run:
                 raise RefusedError(
-                    f"cannot resume {csession_id}: another run started meanwhile", reason="live"
+                    f"cannot resume {csession_id}: another run started meanwhile; {LIVE_HINT}",
+                    reason="live",
                 )
             if ended is None:
-                raise RefusedError(f"cannot resume {csession_id}: it is live", reason="live")
+                # TODO(#33): a run whose wrapper died after allocation (before or after the
+                # spawn) stays "live" here until the liveness check finalizes it as
+                # wrapper-lost; until then every resume is refused (--fork still works).
+                raise RefusedError(
+                    f"cannot resume {csession_id}: it is live; {LIVE_HINT}", reason="live"
+                )
             if tainted:
                 _refuse_tainted(csession_id, run.reads_third_party)
             run_no = previous_run + 1
@@ -1174,6 +1180,62 @@ class Store:
             )
             if cursor.rowcount != 1:
                 raise InternalError(f"no run {run_no} of session {csession_id}")
+
+    def record_copied_inputs(self, csession_id: str, run_no: int, paths: Sequence[str]) -> None:
+        """A fork's run 1: record the inputs its launch copied from the source (paths
+        relative to the session directory, e.g. ``inputs/2/b.txt``) in the run's
+        ``invocation_json`` (``copied_inputs``). ``InternalError`` when the run row does not
+        exist."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT invocation_json FROM runs WHERE csession_id = ? AND run_no = ?",
+                (csession_id, run_no),
+            ).fetchone()
+            if row is None:
+                raise InternalError(f"no run {run_no} of session {csession_id}")
+            try:
+                invocation = json.loads(row[0] or "{}")
+            except ValueError:
+                invocation = None
+            if not isinstance(invocation, dict):
+                raise InternalError(f"run {run_no} of {csession_id} has an unreadable record")
+            invocation["copied_inputs"] = list(paths)
+            conn.execute(
+                "UPDATE runs SET invocation_json = ? WHERE csession_id = ? AND run_no = ?",
+                (json.dumps(invocation, ensure_ascii=False), csession_id, run_no),
+            )
+
+    def recheck_fork_taint(self, csession_id: str, source: str, *, reads_third_party: bool) -> None:
+        """Right before step 7 of a run that forks ``source``'s conversation (a fork's run 1,
+        or a later run of a fork that never captured a Claude id): the source's taint read
+        again in one transaction (it may have been tainted since the fork was allocated).
+        A tainted source and a third-party-reading run: the taint is copied onto the fork
+        (when it is not tainted yet); a run that is not third-party-reading is refused
+        ``tainted`` (``_refuse_tainted``, ``RefusedError``)."""
+        with self.transaction() as conn:
+            _recheck_fork_taint(conn, csession_id, source, reads_third_party)
+
+    def fork_source_taints(self, csession_id: str) -> bool:
+        """Whether adopting the session's current run now would be refused ``tainted`` by
+        the fork re-check (``adopt``): the run forks its source's conversation, is not
+        third-party-reading, and the source is tainted. Reads only (a dry run)."""
+        row = self.conn.execute(
+            "SELECT s.forked_from, s.claude_session_id, r.reads_third_party, src.tainted "
+            "FROM sessions s JOIN runs r "
+            "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
+            "LEFT JOIN sessions src ON src.csession_id = s.forked_from "
+            "WHERE s.csession_id = ?",
+            (csession_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        forked_from, claude_id, third_party, source_tainted = row
+        return (
+            forked_from is not None
+            and claude_id is None
+            and not third_party
+            and bool(source_tainted)
+        )
 
     def update_session(self, csession_id: str, **fields: Any) -> None:
         """Set columns of a session row (only ``SESSION_FIELDS``)."""
@@ -1339,13 +1401,18 @@ class Store:
         - a run that has a wrapper: ``already_adopted``;
         - a pending run at or past ``expires_at`` (or without one): finalized ``not-started``
           with ``never_adopted`` in this transaction (cause ``adopt``), then ``expired``;
+        - a pending run that forks its source's conversation (a fork's run 1, or a later run
+          of a fork that never captured a Claude id) whose source is tainted now while the
+          run is not third-party-reading (``_refuse_tainted``): finalized ``not-started``
+          with ``never_adopted`` (cause ``adopt``) in this transaction, then ``tainted``;
         - otherwise the wrapper is set (this process), and ``outcome_file`` and
           ``hook_interpreter`` (the adopting process's, written into the injected hooks),
           when given, replace the stored values: ``adopted``. Exactly one caller ever
           wins."""
         with self.transaction() as conn:
             row = conn.execute(
-                "SELECT s.forgotten_at, r.run_no, r.wrapper_pid, r.ended_at, r.expires_at "
+                "SELECT s.forgotten_at, r.run_no, r.wrapper_pid, r.ended_at, r.expires_at, "
+                "s.forked_from, s.claude_session_id, r.reads_third_party "
                 "FROM sessions s JOIN runs r "
                 "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
                 "WHERE s.csession_id = ?",
@@ -1353,7 +1420,7 @@ class Store:
             ).fetchone()
             if row is None or row[0] is not None:
                 return Adoption("not_found", None)
-            _, run_no, wrapper, ended, expires = row
+            _, run_no, wrapper, ended, expires, forked_from, claude_id, third_party = row
             if ended is not None:
                 return Adoption("expired", run_no)
             if wrapper is not None:
@@ -1363,6 +1430,19 @@ class Store:
                 # TODO(#21): write the run's outcome file with the never_adopted outcome.
                 # TODO(#20): the run's exactly one final post-state-change.
                 return Adoption("expired", run_no, expired_now=True)
+            if forked_from is not None and claude_id is None:
+                try:
+                    _recheck_fork_taint(conn, csession_id, forked_from, bool(third_party))
+                except RefusedError:
+                    final = dataclasses.replace(
+                        NEVER_ADOPTED,
+                        message=f"the fork source {forked_from} became tainted; a run that is"
+                        " not third-party-reading is refused",
+                    )
+                    self._finalize(conn, csession_id, run_no, final)
+                    # TODO(#21): write the run's outcome file with the never_adopted outcome.
+                    # TODO(#20): the run's exactly one final post-state-change.
+                    return Adoption("tainted", run_no, expired_now=True)
             cursor = conn.execute(
                 "UPDATE runs SET wrapper_pid = ?, wrapper_start = ?, "
                 "outcome_file = COALESCE(?, outcome_file), "
@@ -1457,9 +1537,11 @@ class Store:
         """What a resume or fork reads of a session (one consistent snapshot): ``run_record``
         of its current run, plus the session's ``launch_kind``, ``tainted``, ``git_dir``,
         ``forgotten_at`` and ``csession_dir`` (``session_`` prefixed), its labels
-        (``labels``, sorted ``key=value``) and the latest resolved cwd of any of its runs
-        (``last_cwd``: a run that ended before recording one has none). None when the
-        session or its current run row does not exist."""
+        (``labels``, sorted ``key=value``), the latest resolved cwd of any of its runs
+        (``last_cwd``: a run that ended before recording one has none), every run's
+        ``resolved_json`` (``runs_resolved_json``) and run 1's ``invocation_json``
+        (``run1_invocation_json``). None when the session or its current run row does not
+        exist."""
         with self.transaction():
             record = self.current_run(csession_id)
             if record is None:
@@ -1483,6 +1565,18 @@ class Store:
                 (csession_id,),
             ).fetchone()
             record["last_cwd"] = None if row is None else row[0]
+            record["runs_resolved_json"] = [
+                value
+                for (value,) in self.conn.execute(
+                    "SELECT resolved_json FROM runs WHERE csession_id = ? ORDER BY run_no",
+                    (csession_id,),
+                )
+            ]
+            row = self.conn.execute(
+                "SELECT invocation_json FROM runs WHERE csession_id = ? AND run_no = 1",
+                (csession_id,),
+            ).fetchone()
+            record["run1_invocation_json"] = None if row is None else row[0]
         return record
 
     def run_record(self, csession_id: str, run_no: int) -> dict[str, Any]:
@@ -1721,6 +1815,27 @@ class Store:
         return cursor.rowcount == 1
 
 
+LIVE_HINT = "resume --fork still works"
+
+
+def _recheck_fork_taint(
+    conn: sqlite3.Connection, csession_id: str, source: str, reads_third_party: bool
+) -> None:
+    """``Store.recheck_fork_taint`` inside the caller's transaction. An unknown source (its
+    rows deleted by retention) has nothing to re-check."""
+    row = conn.execute(
+        "SELECT tainted, tainted_at FROM sessions WHERE csession_id = ?", (source,)
+    ).fetchone()
+    if row is None or not row[0]:
+        return
+    _refuse_tainted(source, reads_third_party)
+    conn.execute(
+        "UPDATE sessions SET tainted = 1, tainted_at = ?, tainted_by_run = NULL "
+        "WHERE csession_id = ? AND tainted = 0",
+        (row[1], csession_id),
+    )
+
+
 def _refuse_tainted(csession_id: str, reads_third_party: bool) -> None:
     """A tainted session resumed or forked into a run that is not third-party-reading is
     refused (interface.md, Taint).
@@ -1813,8 +1928,8 @@ NEVER_ADOPTED = Final(
 @dataclass(frozen=True)
 class Adoption:
     """The result of ``Store.adopt``: ``outcome`` is ``adopted``, ``already_adopted``,
-    ``expired`` or ``not_found``; ``run_no`` the session's current run (None when not found);
-    ``expired_now`` whether this call finalized the run ``never_adopted``."""
+    ``expired``, ``tainted`` or ``not_found``; ``run_no`` the session's current run (None
+    when not found); ``expired_now`` whether this call finalized the run ``never_adopted``."""
 
     outcome: str
     run_no: int | None

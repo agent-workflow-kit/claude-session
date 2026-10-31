@@ -507,6 +507,7 @@ def test_dry_run_does_not_touch_the_tmpdir(
     monkeypatch.setattr(tmpdir, "check", not_called)
     monkeypatch.setattr(tmpdir, "create", not_called)
     monkeypatch.setattr(tmpdir, "create_reporting", not_called)
+    monkeypatch.setattr(tmpdir, "create_pinned", not_called)
     result = run_check(
         "required", base, tools, FakeRunner(0), create=False, csession_id=csession_id
     )
