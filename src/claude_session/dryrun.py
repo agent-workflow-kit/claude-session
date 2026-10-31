@@ -11,8 +11,9 @@ no hook and writes no audit or log record. The processes it starts are the read-
 of a launch: ``git`` (repo id and git directory) and the sandbox prerequisite probes. When
 the checks pass, the sandbox state comes from them (no second probe); when one fails, the
 prerequisites are probed with ``bwrap`` and ``socat`` resolved against the session-writable
-paths known without a session (``unchecked_writable``), and a binary a launch would refuse
-is reported, never run.
+paths known without a session (``unchecked_writable``: with the permission profile's write
+paths), and a binary a launch would refuse is reported, never run; with a profile file that
+was not read, nothing is probed.
 
 A new session has no id yet: its paths (session directory, private tmpdir, settings file)
 are shown with the placeholder id ``PLACEHOLDER_ID``, and its own ``work/``, ``outbox/`` and
@@ -22,7 +23,8 @@ are shown with the placeholder id ``PLACEHOLDER_ID``, and its own ``work/``, ``o
 ``kinds`` resolves every kind (or one) without a session and without the session-writable
 checks of a launch (it has no session); it probes ``claude --version`` (minimal environment,
 ``claude_version.probe``) and the sandbox prerequisites, never running a binary under a path
-a session could write without a session context (``launch.step2_writable``).
+a session could write without a session context (``launch.step2_writable``) or under the
+kind's ``write_dirs`` and permission profile write paths (``unchecked_writable``).
 
 TODO(#28): ``start --resume --dry-run`` and ``exec --session-id <id> --dry-run`` (inspect
 the pending run without adopting it: ``would_refuse`` ``already_adopted``/``expired``,
@@ -36,7 +38,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -47,6 +49,7 @@ from . import (
     kinds,
     launch,
     pathrules,
+    permission_profiles,
     selfcheck,
     sessiondir,
     settings_builder,
@@ -80,10 +83,13 @@ _SESSION_VARIABLES = ("${CSESSION_DIR}", "${CWD}", "${GIT_DIR}")
 
 @dataclass(frozen=True)
 class Sandbox:
-    """The sandbox prerequisites as a run of a kind would find them."""
+    """The sandbox prerequisites as a run of a kind would find them. ``probed`` False: the
+    dry run could not tell which tools a launch would accept and probed nothing
+    (``available`` False, the reason in ``problems``)."""
 
     available: bool
     problems: tuple[str, ...] = ()
+    probed: bool = True
 
 
 @dataclass(frozen=True)
@@ -186,34 +192,109 @@ def _entries(process: launch.Process, resolution: kinds.Resolution) -> list[str]
 @dataclass(frozen=True)
 class Lookup:
     """A tool looked up on the sanitized ``PATH``: ``tool`` None when it is not found or
-    refused; ``refused`` names why a launch would refuse it (it is never run)."""
+    refused; ``refused`` names why it is not run (it is never run)."""
 
     tool: pathrules.ResolvedTool | None
     refused: str | None = None
 
 
-def _tool(name: str, entries: Sequence[str], writable: pathrules.SessionWritable) -> Lookup:
-    """``name`` resolved as a launch resolves it, against ``writable``."""
+REFUSED = "not run (a launch refuses it: unsafe_path)"
+# A trusted kind's launch checks no session-writable path: it would use the tool, which a
+# dry run still never runs.
+NOT_PROBED = "not run (not probed by a dry run: under a session-writable path)"
+# The session-writable paths are not known (a profile file that was not read, a profile or
+# write_dirs entry that does not expand): nothing is run.
+UNKNOWN = "not run (not probed by a dry run: the permission profile or write_dirs are not known)"
+
+
+def _tool(
+    name: str,
+    entries: Sequence[str],
+    writable: Callable[[str], bool],
+    *,
+    launch_refuses: bool = True,
+) -> Lookup:
+    """``name`` resolved as a launch resolves it, against ``writable``; ``launch_refuses``
+    words a refusal as the launch's own (isolated kinds) or as a dry run's (trusted)."""
     try:
         return Lookup(pathrules.resolve_tool(name, entries, writable))
     except LaunchValidationError as error:
-        return Lookup(None, f"{error.message}: not run (a launch refuses it: unsafe_path)")
+        return Lookup(None, f"{error.message}: {REFUSED if launch_refuses else NOT_PROBED}")
+
+
+def _kind_profile(
+    cfg: Config, resolution: kinds.Resolution, recorded: Profile | None
+) -> Profile | None:
+    """The permission profile a launch would use: the one its checks read (``recorded``),
+    else the kind's built-in or configured profile; None for a profile file that was not
+    read (a dry run never reads it outside the launch checks)."""
+    if recorded is not None:
+        return recorded
+    if resolution.permission_profile_file is not None:
+        return None
+    try:
+        return permission_profiles.select(cfg, resolution, session_writable=launch.NO_SANDBOX)
+    except LaunchValidationError:
+        return None
 
 
 def unchecked_writable(
-    process: launch.Process, resolved: launch.Resolved | None, resolution: kinds.Resolution
-) -> pathrules.SessionWritable:
+    cfg: Config,
+    process: launch.Process,
+    resolution: kinds.Resolution,
+    *,
+    probe_cwd: str | None,
+    caller_cwd: str | None,
+    recorded: Profile | None = None,
+) -> pathrules.SessionWritable | None:
     """The session-writable paths known without a session (a dry run whose checks failed,
-    and ``kinds``): the step-2 set (the caller's cwd, ``<state>/sessions``, the tmp root;
-    ``launch.step2_writable``) plus the kind's ``write_dirs`` that resolve without one."""
-    cwd = process.caller_cwd if resolved is None else resolved.caller_cwd
+    and ``kinds``): the step-2 set (``probe_cwd``, ``<state>/sessions``, the tmp root;
+    ``launch.step2_writable``) plus, for an isolated kind, the set the launch resolves git
+    against (``launch.git_writable``: the placeholder session's paths, ``write_dirs`` and the
+    permission profile's write paths, without ``${GIT_DIR}``), and for a trusted kind (a
+    launch checks none) its ``write_dirs`` that resolve without a session. None when the
+    profile or the ``write_dirs`` cannot be known (a profile file that was not read, an entry
+    that does not expand): nothing may be probed. ``caller_cwd`` is the run's
+    (None: ``work/``)."""
+    step2 = launch.step2_writable(process, probe_cwd).paths
     home = os.path.realpath(process.environ.get("HOME", "/"))
-    write = [
-        entry
-        for entry in _expanded_dirs(resolution.profile.write_dirs, home, "write_dirs")
-        if os.path.isabs(entry) and not any(v in entry for v in _SESSION_VARIABLES)
-    ]
-    return pathrules.SessionWritable([*launch.step2_writable(process, cwd).paths, *write])
+    if not resolution.isolated():
+        write = [
+            entry
+            for entry in _expanded_dirs(resolution.profile.write_dirs, home, "write_dirs")
+            if os.path.isabs(entry) and not any(v in entry for v in _SESSION_VARIABLES)
+        ]
+        return pathrules.SessionWritable([*step2, *write])
+    profile = _kind_profile(cfg, resolution, recorded)
+    if profile is None:
+        return None
+    alloc = placeholder_alloc(process, resolution)
+    tmp = None if resolution.profile.sandbox == "off" else tmpdir.run_path(PLACEHOLDER_ID)
+    cwd = os.path.realpath(caller_cwd or os.path.join(alloc.session_dir, sessiondir.WORK))
+    try:
+        writable = launch.git_writable(resolution, alloc, cwd, home, tmp, profile)
+    except LaunchValidationError:
+        return None
+    assert isinstance(writable, pathrules.SessionWritable)
+    return pathrules.SessionWritable([*step2, *writable.paths])
+
+
+def placeholder_alloc(process: launch.Process, resolution: kinds.Resolution) -> launch.Allocated:
+    """A new session as the dry run shows it (``PLACEHOLDER_ID``)."""
+    return launch.Allocated(
+        csession_id=PLACEHOLDER_ID,
+        run=1,
+        session_dir=sessiondir.session_dir(process.state_root, PLACEHOLDER_ID),
+        private_dir=sessiondir.private_dir(process.state_root, PLACEHOLDER_ID),
+        warnings=resolution.warnings,
+    )
+
+
+def not_probed(resolution: kinds.Resolution) -> Sandbox | None:
+    """The sandbox of a kind whose session-writable paths are not known: nothing probed."""
+    if resolution.profile.sandbox == "off":
+        return None
+    return Sandbox(available=False, problems=(f"sandbox prerequisites {UNKNOWN}",), probed=False)
 
 
 class Prerequisites:
@@ -228,15 +309,20 @@ class Prerequisites:
         self,
         process: launch.Process,
         resolution: kinds.Resolution,
-        writable: pathrules.SessionWritable,
+        writable: pathrules.SessionWritable | None,
     ) -> Sandbox | None:
         """None for sandbox ``off``; else whether the prerequisites are present here, with
         ``bwrap`` and ``socat`` resolved against ``writable``: a refused one is reported as a
-        problem and nothing is probed."""
+        problem and nothing is probed (nor when ``writable`` is None: not known)."""
         if resolution.profile.sandbox == "off":
             return None
+        if writable is None:
+            return not_probed(resolution)
         entries = _entries(process, resolution)
-        found = [_tool("bwrap", entries, writable), _tool("socat", entries, writable)]
+        refuses = resolution.isolated()
+        found = [
+            _tool(name, entries, writable, launch_refuses=refuses) for name in ("bwrap", "socat")
+        ]
         refused = tuple(item.refused for item in found if item.refused is not None)
         if refused:
             return Sandbox(available=False, problems=refused)
@@ -277,7 +363,7 @@ def preview(
     resolution: kinds.Resolution,
     process: launch.Process,
     claude: str | None,
-    writable: pathrules.SessionWritable,
+    writable: pathrules.SessionWritable | None,
 ) -> Preview:
     """A kind's ``PATH``, directories and required names without a session: the
     environment is built with the placeholder session and no session-writable check; the
@@ -306,7 +392,9 @@ def preview(
     read = _expanded_dirs(profile.read_dirs, home, "read_dirs")
     if resolution.isolated():
         entries = _entries(process, resolution)
-        tools = [_tool(name, entries, writable).tool for name in ("bwrap", "socat", "git")]
+        tools: list[pathrules.ResolvedTool | None] = []
+        if writable is not None:
+            tools = [_tool(name, entries, writable).tool for name in ("bwrap", "socat", "git")]
         paths = [t.path for t in tools if t is not None] + ([claude] if claude else [])
         read = [
             *settings_builder.system_read_dirs(),
@@ -338,8 +426,19 @@ def kinds_report(
     is given (never derived: ``cwd=None``)."""
     probes = prerequisites or Prerequisites(process.gateway)
     default = kinds.resolve(cfg, None, mode="headless", repo=repo, cwd=None)
-    writable = launch.step2_writable(process, process.caller_cwd)
-    lookup = _tool(cfg.claude_bin, _entries(process, default), writable)
+    names = [kind] if kind is not None else list(cfg.kinds)
+    resolutions = [kinds.resolve(cfg, name, mode="headless", repo=repo, cwd=None) for name in names]
+    sets = [
+        unchecked_writable(
+            cfg,
+            process,
+            resolution,
+            probe_cwd=process.caller_cwd,
+            caller_cwd=_kinds_cwd(process, resolution),
+        )
+        for resolution in resolutions
+    ]
+    lookup = _claude_lookup(cfg, process, default, resolutions, sets)
     claude = lookup.tool
     version = (
         None if claude is None else claude_version.probe(claude, process.environ, process.gateway)
@@ -351,12 +450,9 @@ def kinds_report(
         warnings.append(f"claude not found: {cfg.claude_bin!r}")
     elif version is None:
         warnings.append(f"could not run {claude.path} --version")
-    names = [kind] if kind is not None else list(cfg.kinds)
     profiles = []
-    for name in names:
-        resolution = kinds.resolve(cfg, name, mode="headless", repo=repo, cwd=None)
+    for resolution, kind_writable in zip(resolutions, sets, strict=True):
         warnings += resolution.warnings
-        kind_writable = unchecked_writable(process, None, resolution)
         sandbox = probes.check(process, resolution, kind_writable)
         claude_path = None if claude is None else claude.path
         profiles.append(
@@ -381,8 +477,41 @@ def kinds_report(
     }
 
 
+def _kinds_cwd(process: launch.Process, resolution: kinds.Resolution) -> str | None:
+    """The cwd a ``kinds`` row assumes: the caller's, unless the kind runs in ``work/``."""
+    return None if resolution.profile.cwd == "session-dir" else process.caller_cwd
+
+
+def _claude_lookup(
+    cfg: Config,
+    process: launch.Process,
+    default: kinds.Resolution,
+    resolutions: Sequence[kinds.Resolution],
+    sets: Sequence[pathrules.SessionWritable | None],
+) -> Lookup:
+    """``claude_bin`` on the default kind's ``PATH``, checked against the step-2 set and the
+    union of the reported kinds' sets; never run when a set is not known. A refusal is the
+    launch's own when an isolated kind's set holds it."""
+    known = [writable for writable in sets if writable is not None]
+    if len(known) != len(sets):
+        return Lookup(None, f"{cfg.claude_bin!r}: {UNKNOWN}")
+    entries = _entries(process, default)
+    step2 = launch.step2_writable(process, process.caller_cwd).paths
+    union = pathrules.SessionWritable([*step2, *(p for writable in known for p in writable.paths)])
+    found = _tool(cfg.claude_bin, entries, union, launch_refuses=False)
+    if found.refused is None:
+        return found
+    isolated = pathrules.SessionWritable(
+        [p for r, w in zip(resolutions, known, strict=True) if r.isolated() for p in w.paths]
+    )
+    by_launch = _tool(cfg.claude_bin, entries, isolated)
+    return by_launch if by_launch.refused is not None else found
+
+
 def _sandbox_warnings(resolution: kinds.Resolution, sandbox: Sandbox | None) -> list[str]:
     warnings = list(settings_builder.isolation_warnings(resolution))
+    if sandbox is not None and not sandbox.probed:
+        return warnings
     if sandbox is not None and not sandbox.available:
         if resolution.profile.sandbox == "required":
             warnings.append("sandbox 'required' but unavailable here: a launch fails")
@@ -581,15 +710,16 @@ def new_session_plan(
     req = request(args, cfg)
     resolved = launch.resolve_kind(req, cfg, process)
     resolution = resolved.resolution
-    alloc = launch.Allocated(
-        csession_id=PLACEHOLDER_ID,
-        run=1,
-        session_dir=sessiondir.session_dir(process.state_root, PLACEHOLDER_ID),
-        private_dir=sessiondir.private_dir(process.state_root, PLACEHOLDER_ID),
-        warnings=resolution.warnings,
-    )
+    alloc = placeholder_alloc(process, resolution)
     found = run_checks(cfg, req, resolved, alloc, process)
-    writable = unchecked_writable(process, resolved, resolution)
+    writable = unchecked_writable(
+        cfg,
+        process,
+        resolution,
+        probe_cwd=resolved.caller_cwd,
+        caller_cwd=resolved.caller_cwd,
+        recorded=found.profile,
+    )
     sandbox: Sandbox | None
     if found.checked is not None:
         # The checks passed: their (verified) tools and self-check, no second probe.
@@ -626,7 +756,7 @@ def _plan_preview(
     resolution: kinds.Resolution,
     process: launch.Process,
     found: Outcome,
-    writable: pathrules.SessionWritable,
+    writable: pathrules.SessionWritable | None,
 ) -> Preview:
     """The profile's ``PATH``, directories and required names: from the launch checks when
     they passed, else as ``kinds`` computes them."""

@@ -574,6 +574,124 @@ def test_a_passing_dry_run_probes_the_sandbox_once(tmp_path: Path, tools: Path, 
     assert sorted(log.read_text(encoding="utf-8").split()) == ["bwrap", "socat"]
 
 
+# Tools under the permission profile's write paths (V1) and trusted kinds (V2)
+
+
+def wide_profile(path: Path, scratch: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "permissions": {"allow": ["Read"]},
+                "sandbox": {"filesystem": {"allowWrite": [str(scratch)]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.parametrize("in_git", [False, True])
+def test_a_failing_dry_run_never_runs_a_tool_under_a_profile_write_path(
+    in_git: bool, tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """A launch counts the profile's ``allowWrite`` as session-writable and refuses a tool
+    found under it; the dry run's probes never run it (no git: ``no_git_cwd``; in git: the
+    launch's own ``unsafe_path``)."""
+    if in_git:
+        git_repo(work)
+    marker = tmp_path / "ran"
+    scratch = tmp_path / "scratch"
+    plant(scratch / "bin", marker)
+    profile = wide_profile(tmp_path / "profile.json", scratch)
+    proc, plan = dry_run(
+        "respond",
+        "--permission-profile",
+        str(profile),
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        env={"PATH": f"{scratch / 'bin'}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 12
+    assert plan["would_fail"] == ("unsafe_path" if in_git else "no_git_cwd")
+    assert not marker.exists()
+    assert plan["sandbox"]["available"] is False
+    assert any("a launch refuses it" in p for p in plan["sandbox"]["problems"])
+
+
+def test_an_unread_profile_file_leaves_the_sandbox_not_probed(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    log = tmp_path / "probes"
+    logging_tools(tools, log)
+    proc, plan = dry_run(
+        "review",
+        "--permission-profile",
+        str(tmp_path / "missing.json"),
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+    )
+    assert proc.returncode == 12 and plan["would_fail"] == "invalid_permission_profile"
+    assert not log.exists()
+    assert plan["sandbox"]["available"] is False
+    assert any("not probed by a dry run" in p for p in plan["sandbox"]["problems"])
+    assert not any("sandbox 'required' but unavailable" in w for w in plan["warnings"])
+
+
+def test_kinds_never_runs_a_tool_under_a_configured_profile_write_path(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    marker = tmp_path / "ran"
+    scratch = tmp_path / "scratch"
+    plant(scratch / "bin", marker)
+    config = (
+        "permission_profiles:\n  wide:\n    sandbox:\n      filesystem:\n"
+        f"        allowWrite: ['{scratch}']\n"
+        "kinds:\n  review:\n    permission_profile: wide\n"
+    )
+    proc = cli(
+        ["kinds", "--json", "--kind", "review"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=config,
+        env={"PATH": f"{scratch / 'bin'}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists()
+    report = json.loads(proc.stdout)
+    validate(report, KINDS)
+    assert report["claude_bin_resolved"] is None
+    assert any("a launch refuses it" in w for w in report["warnings"])
+    (review,) = report["kinds"]
+    assert review["sandbox_available"] is False
+    assert any("a launch refuses it" in p for p in review["sandbox_problems"])
+
+
+def test_kinds_words_a_trusted_kinds_unrun_claude_as_not_probed(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """A launch of a trusted kind checks no session-writable path, so it would not refuse a
+    ``claude`` under the caller's cwd; ``kinds`` still never runs it, and says so."""
+    marker = tmp_path / "ran"
+    plant(work / "bin", marker)
+    proc = cli(
+        ["kinds", "--json", "--kind", "implement"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        env={"PATH": f"{work / 'bin'}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists()
+    report = json.loads(proc.stdout)
+    validate(report, KINDS)
+    claude = [w for w in report["warnings"] if w.startswith("claude:")]
+    assert claude and all("not probed by a dry run" in w for w in claude), claude
+    assert not any("a launch refuses it" in w for w in claude)
+
+
 # permission_profile when a later check fails (R2)
 
 
