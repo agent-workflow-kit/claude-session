@@ -30,6 +30,9 @@ Rules every call follows:
   timeout its group gets SIGKILL. Either way a timeout ends everything still in the child's
   process group; a descendant that calls ``setsid``/``setpgid`` escapes (see
   ``GatewayTimeout``).
+- The ``claude --version`` probe adds ``kill_group_on_exit=True``: its group also gets SIGKILL
+  when ``claude`` exits normally (Linux: after the exit, before the leader is reaped, so the
+  group ID still names that group), so no descendant outlives the probe.
 
 ``die_with_parent`` (``spawn``, Linux only, ignored elsewhere) sets ``PR_SET_PDEATHSIG(SIGTERM)``
 in the child between fork and exec (through ``ctypes``, resolved before the fork, in

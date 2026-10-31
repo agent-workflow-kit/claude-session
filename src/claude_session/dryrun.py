@@ -22,12 +22,16 @@ are shown with the placeholder id ``PLACEHOLDER_ID``, and its own ``work/``, ``o
 (``pathrules.PathRules(planned=True)``).
 
 ``kinds`` resolves every kind (or one) without a session and without the session-writable
-checks of a launch (it has no session); it probes ``claude --version`` (minimal environment,
-``claude_version.probe``) and the sandbox prerequisites, never running a binary under a path
-a session could write without a session context (``launch.step2_writable``) or under the
-kind's ``write_dirs`` and permission profile write paths (``unchecked_writable``); it never
-knows the git directory, so an isolated kind with a ``${GIT_DIR}`` write entry probes
-nothing.
+checks of a launch (it has no session); it probes ``claude --version`` (minimal environment
+whose ``PATH`` holds no session-writable entry, ``claude_version.probe``) and the sandbox
+prerequisites, never running a binary under a path a session could write without a session
+context (``launch.step2_writable``) or under a kind's ``write_dirs`` and permission profile
+write paths (``unchecked_writable``; without ``--repo``, also every per-repo override's:
+``kind_writable``). ``bwrap`` and ``socat`` are checked against their row's kind,
+``claude_bin`` (shared by every kind) against every built-in and configured kind and every
+per-repo override of it (``_every_kind``). It never knows the git directory, so a kind
+with a ``${GIT_DIR}`` write entry has paths that are not known: its row probes nothing,
+and ``claude`` is not run at all.
 
 TODO(#28): ``start --resume --dry-run`` and ``exec --session-id <id> --dry-run`` (inspect
 the pending run without adopting it: ``would_refuse`` ``already_adopted``/``expired``,
