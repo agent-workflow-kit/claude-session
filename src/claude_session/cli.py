@@ -17,7 +17,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NoReturn
 
-from . import durations, fsutil, ids
+from . import durations, fsutil, ids, store
 from .defaults import MAX_INTEGER
 from .errors import CliError, InternalError, RefusedError, UsageError
 
@@ -122,6 +122,21 @@ def _not_implemented(args: argparse.Namespace) -> int:
     raise InternalError(f"{args.handler} is not implemented yet", detail="not_implemented")
 
 
+def _list(args: argparse.Namespace) -> int:
+    with store.open_state() as state:
+        sessions = state.list_sessions()
+    if sessions:
+        # TODO(#16): list items (current run, labels, liveness) and the list filters.
+        raise InternalError(
+            "list of existing sessions is not implemented yet", detail="not_implemented"
+        )
+    if args.json:
+        print(json.dumps({"sessions": []}))
+    else:
+        print("No sessions.")
+    return 0
+
+
 # Command name (as typed, nested commands joined by a space) -> handler.
 HANDLERS: dict[str, Handler] = {
     "exec": _not_implemented,
@@ -131,7 +146,7 @@ HANDLERS: dict[str, Handler] = {
     "wait": _not_implemented,
     "report": _not_implemented,
     "status": _not_implemented,
-    "list": _not_implemented,
+    "list": _list,
     "kinds": _not_implemented,
     "label add": _not_implemented,
     "label remove": _not_implemented,
@@ -662,10 +677,44 @@ def _print_error(error: CliError, json_mode: bool) -> None:
         print(json.dumps(error.envelope()))
 
 
+# Schema check (interface.md, Launch order step 1).
+
+# `report` never opens state.db; `hook-event` never reaches this module.
+SCHEMA_CHECK_EXEMPT = ("report",)
+HELP_OR_VERSION = ("-h", "--help", "--version")
+
+
+def _needs_schema_check(argv: Sequence[str]) -> bool:
+    """Whether ``argv`` runs a command that must check the schema before anything else.
+
+    Exempt: ``report``; no command or an unknown one (a usage error); ``--help`` and
+    ``--version`` anywhere before ``--``, which only print text and never open state.db
+    (an option value spelled ``--help`` therefore also skips the check; interface.md,
+    Launch order step 1).
+    """
+    commands = {name.split()[0] for name in HANDLERS}
+    if not argv or argv[0] not in commands or argv[0] in SCHEMA_CHECK_EXEMPT:
+        return False
+    for token in argv:
+        if token == "--":
+            break
+        if token in HELP_OR_VERSION:
+            return False
+    return True
+
+
+def check_schema(argv: Sequence[str]) -> None:
+    """Refuse a newer ``state.db`` (``schema_newer``, exit 12) and migrate an older one,
+    before parsing, so nothing is allocated and no usage check runs first."""
+    if _needs_schema_check(argv):
+        store.open_state().close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args: argparse.Namespace | None = None
     try:
+        check_schema(argv)
         args = parse(build_parser(), argv)
         check_flag_rules(args)
         return HANDLERS[args.handler](args)
