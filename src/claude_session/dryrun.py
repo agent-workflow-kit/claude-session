@@ -432,17 +432,28 @@ def kinds_report(
     lookup = _claude_lookup(cfg, process, default, every)
     claude = lookup.tool
     version = None
+    not_run = None
     if claude is not None and every is not None:
-        version = claude_version.probe(
-            claude, process.environ, process.gateway, writable=every.union
-        )
+        try:
+            claude_version.check_interpreter(
+                claude, claude_version.probe_path(process.environ, every.union), every.union
+            )
+            version = claude_version.run(
+                claude, process.environ, process.gateway, writable=every.union
+            )
+        except LaunchValidationError as error:
+            not_run = error.message
+        except claude_version.NotRun as error:
+            not_run = error.reason
     warnings: list[str] = []
     if lookup.refused is not None:
         warnings.append(f"claude: {lookup.refused}")
     elif claude is None:
         warnings.append(f"claude not found: {cfg.claude_bin!r}")
     elif version is None:
-        warnings.append(f"could not run {claude.path} --version")
+        warnings.append(
+            f"could not run {claude.path} --version" + ("" if not_run is None else f": {not_run}")
+        )
     profiles = []
     for resolution, writable in zip(resolutions, sets, strict=True):
         warnings += resolution.warnings
@@ -461,8 +472,12 @@ def kinds_report(
         "default_kind": cfg.default_kind,
         "repo": repo,
         "claude_bin_resolved": None if claude is None else claude.path,
-        "claude_version": version,
-        "claude_version_ok": claude_version.at_least(version, cfg.min_claude_version),
+        "claude_version": None if version is None else version.text,
+        "claude_version_ok": (
+            None
+            if version is None
+            else claude_version.at_least(version.line, cfg.min_claude_version)
+        ),
         "state_dir_warnings": state_dir_warnings(process.state_root, probes.platform),
         "min_claude_version": cfg.min_claude_version,
         "kinds": profiles,

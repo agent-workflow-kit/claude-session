@@ -825,7 +825,9 @@ def check_tools(
 ) -> Tools:
     """``claude_bin``, ``git``, ``bwrap`` and ``socat`` resolved on the sanitized PATH, outside
     the session-writable paths (``unsafe_path``); each runs from its realpath with ``argv[0]``
-    its name. ``claude_not_found`` when there is no ``claude_bin``. git must be the one the
+    its name. ``claude_not_found`` when there is no ``claude_bin``. With session-writable
+    paths (not ``NO_SANDBOX``) a script ``claude``'s ``#!`` interpreter is checked too
+    (``claude_version.check_interpreter``, on the version probe's ``PATH``). git must be the one the
     git directory was resolved with (it was looked up before the full set was known)."""
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
     claude = pathrules.resolve_tool(cfg.claude_bin, entries, writable)
@@ -835,6 +837,8 @@ def check_tools(
             end_reason="claude_not_found",
             hint=HINTS["claude_not_found"],
         )
+    if writable is not NO_SANDBOX:
+        claude_version.check_interpreter(claude, _probe_entries(entries, writable), writable)
     git = pathrules.resolve_tool("git", entries, writable)
     if git != git_before:
         raise LaunchValidationError(
@@ -846,6 +850,11 @@ def check_tools(
         bwrap = pathrules.resolve_tool("bwrap", entries, writable)
         socat = pathrules.resolve_tool("socat", entries, writable)
     return Tools(claude=claude, git=git, bwrap=bwrap, socat=socat)
+
+
+def _probe_entries(entries: Sequence[str], writable: Callable[[str], bool]) -> list[str]:
+    """The version probe's ``PATH`` entries for tools looked up on ``entries``."""
+    return claude_version.probe_path({"PATH": ":".join(entries)}, writable)
 
 
 def check_claude_version(
@@ -1042,9 +1051,12 @@ class Effects:
         """The version check of a dry run: ``claude`` resolved again against the paths a
         dry run never runs a binary under (``dry_run``, trusted kinds too, and the run's
         own ``writable``); under one of them, or when they are not known, it is not run and
-        a warning says so (a trusted kind's launch would run it). Otherwise
+        a warning says so (a trusted kind's launch would run it). So is a script ``claude``
+        whose ``#!`` interpreter, as the launch's probe would find it, is under one of them
+        or cannot be checked (``claude_version.check_interpreter``). Otherwise
         ``check_claude_version`` as a launch makes it, the probe's ``PATH`` without those
-        paths either."""
+        paths either; a ``claude_not_found`` is then only a warning when that ``PATH`` lost
+        entries the launch's probe keeps (the launch may well run it)."""
         known = dry_run()
         if known is None:
             why = "the permission profile or write_dirs are not known"
@@ -1056,6 +1068,9 @@ class Effects:
         entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
         try:
             claude = pathrules.resolve_tool(cfg.claude_bin, entries, guard)
+            if claude is not None:
+                # The interpreter as the launch's probe would find it, checked against both.
+                claude_version.check_interpreter(claude, _probe_entries(entries, writable), guard)
         except LaunchValidationError as error:
             return [VERSION_NOT_PROBED.format(why=error.message)]
         if claude is None:  # check_tools found it; it has gone since
@@ -1064,7 +1079,14 @@ class Effects:
                 end_reason="claude_not_found",
                 hint=HINTS["claude_not_found"],
             )
-        check_claude_version(cfg, resolution, process, claude, guard)
+        try:
+            check_claude_version(cfg, resolution, process, claude, guard)
+        except LaunchValidationError as error:
+            dropped = set(_probe_entries(entries, writable)) - set(_probe_entries(entries, guard))
+            if error.end_reason != "claude_not_found" or not dropped:
+                raise
+            why = f"{error.message}; PATH entries under session-writable paths were dropped"
+            return [VERSION_NOT_PROBED.format(why=why)]
         return []
 
 

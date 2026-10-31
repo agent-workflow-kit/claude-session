@@ -357,7 +357,9 @@ def test_required_env_names_are_auth_allow_and_set_names(tmp_path: Path) -> None
     [
         ("2.1.312 (Claude Code)", (2, 1, 312)),
         ("2.1.312", (2, 1, 312)),
-        ("  10.0\n", (10, 0)),
+        ("10.0\n", (10, 0)),
+        ("  10.0", None),
+        ("2.1.3\t12", (2, 1, 3)),
         ("v2.1.312", None),
         ("2.1.312beta", None),
         ("", None),
@@ -391,10 +393,9 @@ def test_version_probe_runs_the_realpath_with_the_tool_name() -> None:
     gw = FakeGateway()
     gw.on(["claude", "--version"], stdout="2.1.314 (Claude Code)\nmore\n")
     tool = pathrules.ResolvedTool("/opt/claude/bin/claude-real", "claude")
-    assert (
-        claude_version.probe(tool, {"PATH": "/usr/bin"}, gw, writable=NOTHING)
-        == "2.1.314 (Claude Code)"
-    )
+    assert claude_version.probe(
+        tool, {"PATH": "/usr/bin"}, gw, writable=NOTHING
+    ) == claude_version.Version("2.1.314 (Claude Code)", "2.1.314 (Claude Code)")
     assert gw.calls[0].executable == "/opt/claude/bin/claude-real"
 
 
@@ -422,10 +423,12 @@ def test_version_probe_failures_are_none(answer: dict[str, Any]) -> None:
 def test_version_probe_strips_control_characters_and_caps_length() -> None:
     gw = FakeGateway()
     gw.on(["claude"], stdout="\x1b[31m2.1.314" + "x" * 500 + "\n")
-    text = claude_version.probe(
+    version = claude_version.probe(
         pathrules.ResolvedTool("/x/claude", "claude"), PATH_ONLY, gw, writable=NOTHING
     )
-    assert text is not None and "\x1b" not in text and len(text) == claude_version.MAX_TEXT
+    assert version is not None and version.line.startswith("\x1b[31m2.1.314")
+    text = version.text
+    assert "\x1b" not in text and len(text) == claude_version.MAX_TEXT
 
 
 # The read-only session-directory check

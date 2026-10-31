@@ -1549,18 +1549,26 @@ def test_a_trusted_dry_run_never_runs_a_claude_under_the_cwd(
     )
 
 
+INTERP = "cs-test-interp"  # a name no host has: the results never depend on the host
+
+
+def plant_interp(directory: Path, marker: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / INTERP
+    path.write_text(f"#!/bin/sh\necho {INTERP} >> {marker}\necho '9.9.9'\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
 def test_a_dry_run_version_probe_never_runs_an_interpreter_from_a_write_dir(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
-    """S5 for the launch check: a ``#!/usr/bin/env node`` claude never finds a ``node``
-    planted in a trusted kind's ``write_dirs``; with no other ``node`` it cannot run."""
+    """S5 for the launch check: a ``#!/usr/bin/env`` claude whose interpreter a trusted
+    launch would find in the kind's ``write_dirs`` is not run by a dry run: a warning, and
+    no ``would_fail`` the launch would not have."""
     marker = tmp_path / "ran"
-    planted = home() / "wd" / "bin"
-    planted.mkdir(parents=True)
-    node = planted / "node"
-    node.write_text(f"#!/bin/sh\necho node >> {marker}\necho '9.9.9'\n", encoding="utf-8")
-    node.chmod(0o755)
-    (tools / "claude").write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    planted = plant_interp(home() / "wd" / "bin", marker).parent
+    (tools / "claude").write_text(f"#!/usr/bin/env {INTERP}\n", encoding="utf-8")
     proc, plan = dry_run(
         "implement",
         cwd=work,
@@ -1570,5 +1578,76 @@ def test_a_dry_run_version_probe_never_runs_an_interpreter_from_a_write_dir(
         env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
     )
     assert not marker.exists()
-    if not any(os.access(os.path.join(d, "node"), os.X_OK) for d in ("/usr/bin", "/bin")):
-        assert proc.returncode == 12 and plan["would_fail"] == "claude_not_found"
+    assert proc.returncode == 0 and plan["would_fail"] is None
+    assert any(
+        w.startswith("claude --version not run (not probed by a dry run") and INTERP in w
+        for w in plan["warnings"]
+    ), plan["warnings"]
+
+
+def test_a_dry_run_claude_failing_only_for_the_dropped_path_entries_is_a_warning(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """A trusted launch keeps the ``PATH`` entries under the kind's ``write_dirs``; the dry
+    run's probe drops them, so a ``claude`` that then cannot run is not predicted to fail."""
+    marker = tmp_path / "ran"
+    planted = plant_interp(home() / "wd" / "bin", marker).parent
+    (tools / "claude").write_text(f"#!/bin/sh\nexec {INTERP}\n", encoding="utf-8")
+    proc, plan = dry_run(
+        "implement",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config="kinds:\n  implement:\n    write_dirs: ['~/wd']\n",
+        env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
+    )
+    assert not marker.exists()
+    assert proc.returncode == 0 and plan["would_fail"] is None
+    assert any(
+        w.startswith("claude --version not run (not probed by a dry run")
+        and "PATH entries under session-writable paths were dropped" in w
+        for w in plan["warnings"]
+    ), plan["warnings"]
+
+
+def test_a_dry_run_claude_that_cannot_run_anyway_would_fail(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """No entry dropped: the dry run predicts the launch's ``claude_not_found``."""
+    (tools / "claude").write_text(f"#!/bin/sh\nexec {INTERP}\n", encoding="utf-8")
+    proc, plan = dry_run("implement", cwd=work, tools=tools, tmp_path=tmp_path)
+    assert proc.returncode == 12 and plan["would_fail"] == "claude_not_found"
+
+
+def interp_symlinked_into(work: Path, tmp_path: Path, marker: Path) -> Path:
+    """A safe ``PATH`` directory whose interpreter is a symlink into the cwd."""
+    safe = tmp_path / "safe"
+    safe.mkdir()
+    (safe / INTERP).symlink_to(plant_interp(work / "bin", marker))
+    return safe
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_a_planted_interpreter_is_never_run_by_a_dry_run_or_kinds(
+    absolute: bool, tmp_path: Path, tools: Path, work: Path
+) -> None:
+    marker = tmp_path / "ran"
+    safe = interp_symlinked_into(work, tmp_path, marker)
+    line = f"#!{safe / INTERP}" if absolute else f"#!/usr/bin/env {INTERP}"
+    (tools / "claude").write_text(line + "\n", encoding="utf-8")
+    env = {"PATH": f"{safe}:{tools}:/usr/bin:/bin"}
+    git_repo(work)
+    proc, plan = dry_run("implement", cwd=work, tools=tools, tmp_path=tmp_path, env=env)
+    assert proc.returncode == 0 and plan["would_fail"] is None
+    assert any(
+        w.startswith("claude --version not run (not probed by a dry run") for w in plan["warnings"]
+    ), plan["warnings"]
+    proc, plan = dry_run("respond", cwd=work, tools=tools, tmp_path=tmp_path, env=env)
+    assert plan["would_fail"] == "unsafe_path"
+    kinds_proc = cli(["kinds", "--json"], cwd=work, tools=tools, tmp_path=tmp_path, env=env)
+    assert kinds_proc.returncode == 0, kinds_proc.stderr
+    report = json.loads(kinds_proc.stdout)
+    validate(report, KINDS)
+    assert report["claude_version"] is None
+    assert any("interpreter" in w for w in report["warnings"]), report["warnings"]
+    assert not marker.exists(), marker.read_text()

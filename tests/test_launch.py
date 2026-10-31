@@ -151,6 +151,28 @@ def test_claude_inside_a_session_writable_path_is_refused(tmp_path: Path) -> Non
     assert info.value.end_reason == "unsafe_path"
 
 
+def test_a_claude_whose_interpreter_is_under_a_session_writable_path_is_refused(
+    tmp_path: Path,
+) -> None:
+    """An isolated run never lets ``claude --version`` (or the session) run a planted
+    ``#!`` interpreter; a trusted run (``NO_SANDBOX``) is unchanged."""
+    planted = executable(tmp_path / "cwd" / "cs-test-interp")
+    claude = tmp_path / "safe" / "claude"
+    claude.parent.mkdir()
+    claude.write_text(f"#!{planted}\n")
+    claude.chmod(0o755)
+    cfg = load(tmp_path, f"claude_bin: {claude}\n")
+    writable = pathrules.SessionWritable([str(tmp_path / "cwd")])
+    git = pathrules.resolve_tool("git", ["/usr/bin", "/bin"], launch.NO_SANDBOX)
+    with pytest.raises(LaunchValidationError) as info:
+        launch.check_tools(cfg, resolution(cfg), process(tmp_path), writable, git)
+    assert info.value.end_reason == "unsafe_path"
+    assert "interpreter" in info.value.message
+    claude.write_text("#!/usr/bin/env -S cs-test-interp\n")  # unknown: no check when trusted
+    tools = launch.check_tools(cfg, resolution(cfg), process(tmp_path), launch.NO_SANDBOX, git)
+    assert tools.claude.path == str(claude)
+
+
 def test_claude_resolves_to_its_realpath_with_its_name(tmp_path: Path) -> None:
     real = executable(tmp_path / "real" / "claude-2.1")
     link = tmp_path / "bin" / "claude"

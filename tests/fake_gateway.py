@@ -27,7 +27,7 @@ from claude_session.gateway import (
     Result,
     check_argv,
     check_kill_grace,
-    check_max_output,
+    check_output_limit,
     check_spawn_stdin,
 )
 
@@ -35,13 +35,6 @@ from .fake_clock import FakeClock
 
 # Above the largest Linux pid_max (2**22), so a fake PID can never name a real process.
 FAKE_PID_BASE = 2**22 + 1
-
-
-def _capped(text: str, max_output: int | None) -> str:
-    """``text`` as the real gateway returns it with ``max_output``: its first bytes."""
-    if max_output is None:
-        return text
-    return text.encode("utf-8")[:max_output].decode("utf-8", "replace")
 
 
 @dataclass(frozen=True)
@@ -62,7 +55,7 @@ class Call:
     kill_grace: float | None = None  # run only
     kill_group_on_exit: bool = False  # run only
     executable: str | None = None  # the program run when argv[0] is only its name
-    max_output: int | None = None  # run only
+    output_limit: int | None = None  # run only
 
 
 @dataclass(frozen=True)
@@ -179,13 +172,13 @@ class FakeGateway:
         kill_grace: float | None = None,
         executable: str | None = None,
         kill_group_on_exit: bool = False,
-        max_output: int | None = None,
+        output_limit: int | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
         check_kill_grace(
             kill_grace, new_process_group=new_process_group, kill_group_on_exit=kill_group_on_exit
         )
-        check_max_output(max_output)
+        check_output_limit(output_limit)
         args = tuple(argv)
         self.calls.append(
             Call(
@@ -200,7 +193,7 @@ class FakeGateway:
                 kill_grace=kill_grace,
                 kill_group_on_exit=kill_group_on_exit,
                 executable=executable,
-                max_output=max_output,
+                output_limit=output_limit,
             )
         )
         response = self._answer(args)
@@ -215,12 +208,11 @@ class FakeGateway:
             if self._clock is not None:
                 self._clock.advance(timeout + (kill_grace or 0))
             raise GatewayTimeout(args, timeout)
-        return Result(
-            args,
-            response.returncode,
-            _capped(response.stdout, max_output),
-            _capped(response.stderr, max_output),
-        )
+        out, err = response.stdout, response.stderr
+        if output_limit is not None:  # as the real gateway: a byte prefix of each stream
+            out = out.encode()[:output_limit].decode("utf-8", "replace")
+            err = err.encode()[:output_limit].decode("utf-8", "replace")
+        return Result(args, response.returncode, out, err)
 
     def spawn(
         self,
