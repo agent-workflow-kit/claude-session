@@ -753,6 +753,7 @@ def test_run_timeout_counts_the_wait_after_output_closes(gw: SystemGateway) -> N
 def test_run_translates_newlines_like_text_mode(gw: SystemGateway) -> None:
     proc = gw.run(py("import sys; sys.stdout.buffer.write(b'a\\r\\nb\\rc\\n')"))
     assert proc.stdout == "a\nb\nc\n"
+    assert proc.stdout_bytes == b"a\r\nb\rc\n"  # the bytes as read, untranslated
 
 
 def test_run_with_empty_stdin_text_gives_eof(gw: SystemGateway) -> None:

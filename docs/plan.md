@@ -13,7 +13,7 @@ Status: planned, 2026-10-29. Implements [interface.md](interface.md) (normative)
 
 ## Module map
 
-The plan splits seven modules out of design.md's module list to keep files focused: `ids` (from `cli`/`store`), `endmap` and `launch` (from `supervisor`), `pathrules` (from `settings_builder`), `lifecycle` (from `supervisor` and `reconcile`), `notes` (from `hookevent`) and `secretindex` (from `outbox`). Responsibilities are unchanged.
+The plan splits eight modules out of design.md's module list to keep files focused: `ids` (from `cli`/`store`), `endmap` and `launch` (from `supervisor`), `pathrules` (from `settings_builder`), `lifecycle` (from `supervisor` and `reconcile`), `cronblock` (from `reconcile`), `notes` (from `hookevent`) and `secretindex` (from `outbox`). Responsibilities are unchanged.
 
 | Module | Stage | Responsibility |
 |---|---|---|
@@ -37,7 +37,8 @@ The plan splits seven modules out of design.md's module list to keep files focus
 | `secretindex.py` | 3 | `contains_secret` keyed q-gram index: build, read, streamed scan (stdlib only: on the hook path) |
 | `pathrules.py` | 3 | path rules, session-writable paths, PATH sanitizing |
 | `lifecycle.py` | 4 | start/adoption, resume/fork carry-over, taint, stop, forget, liveness |
-| `reconcile.py` | 4 | reconcile, retention, cron block |
+| `reconcile.py` | 4 | reconcile, retention |
+| `cronblock.py` | 4 | `cron install`/`cron uninstall`: the managed crontab block |
 | `transcripts.py` | 5 | transcript discovery and rendering |
 | `notes.py` | 5 | notes-context command |
 | `tests/fakebin/claude` | 1 | scenario-driven fake Claude Code |

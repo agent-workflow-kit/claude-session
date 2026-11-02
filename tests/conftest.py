@@ -40,6 +40,11 @@ pidfd (exact: a pidfd never names a reused PID, so this cannot race the test's o
 the test fails at teardown. It sends no other signal: without pidfds it only reports, and a
 test hung on something else stays hung. This module is test-only; nothing under ``src/`` imports it (it imports ``gateway``).
 
+The same ``Popen`` wrapper refuses, before anything starts, to run a ``crontab`` program
+that is not a fake under the pytest base temporary directory (``crontab_guard``), and
+``_crontab_tripwire`` puts a failing ``crontab`` first on every test's ``PATH`` for the
+processes that tests start, so no test ever reads or writes the user's real crontab.
+
 The other autouse fixtures keep every test off the user's real directories: its own
 ``XDG_STATE_HOME`` (``_private_state_dir``), ``HOME`` and ``XDG_CONFIG_HOME``
 (``_private_home``; ``live`` tests too: they build their own private environment for the real
@@ -222,11 +227,43 @@ def _end_leftover_fakes(directory: str) -> list[str]:
     return leftovers
 
 
-def _tracking_popen(started: list[_Started]) -> type[subprocess.Popen[Any]]:
+def crontab_guard(args: Any, kwargs: dict[str, Any], allowed_root: str) -> None:
+    """``pytest.fail`` (a ``BaseException``: no ``except Exception`` and no ``-O`` hides it)
+    when a ``Popen(args, **kwargs)`` about to start would run a ``crontab`` program that is
+    not a test fake under ``allowed_root`` (the pytest base temporary directory). A bare name
+    is resolved on the PATH the child would search; ``shell=True`` fails when the command
+    text mentions ``crontab`` at all."""
+    if kwargs.get("shell"):
+        text = args if isinstance(args, (str, bytes)) else " ".join(map(os.fsdecode, args))
+        if "crontab" in os.fsdecode(text):
+            pytest.fail(f"a test tried to run crontab through a shell: {text!r}", pytrace=False)
+        return
+    program = kwargs.get("executable")
+    if program is None:
+        program = args if isinstance(args, (str, bytes, os.PathLike)) else list(args)[0]
+    program = os.fsdecode(program)
+    if os.path.basename(program) != "crontab":
+        return
+    if os.sep not in program:
+        env = kwargs.get("env")
+        search = os.get_exec_path(env)  # the PATH Popen itself searches
+        program = shutil.which(program, path=os.pathsep.join(search)) or program
+    resolved = os.path.realpath(program)
+    root = os.path.realpath(allowed_root)
+    if os.path.commonpath([resolved, root]) != root:
+        pytest.fail(
+            f"a test tried to run a crontab outside the test temporary directory: {resolved}",
+            pytrace=False,
+        )
+
+
+def _tracking_popen(started: list[_Started], allowed_root: str) -> type[subprocess.Popen[Any]]:
     real = subprocess.Popen
 
     class TrackedPopen(real):  # type: ignore[valid-type,misc]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # Before anything starts: never the user's real crontab (only test fakes).
+            crontab_guard(args[0] if args else kwargs.get("args"), kwargs, allowed_root)
             super().__init__(*args, **kwargs)
             stat = _stat(self.pid) if LINUX else None
             own = kwargs.get("process_group") == 0 or bool(kwargs.get("start_new_session"))
@@ -243,7 +280,9 @@ def watchdog_seconds(item: Any) -> float:
 
 
 @pytest.fixture(autouse=True)
-def no_leftover_processes(request: pytest.FixtureRequest) -> Iterator[list[_Started]]:
+def no_leftover_processes(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[list[_Started]]:
     limit = watchdog_seconds(request.node)
     started: list[_Started] = []
     real = subprocess.Popen
@@ -267,7 +306,9 @@ def no_leftover_processes(request: pytest.FixtureRequest) -> Iterator[list[_Star
     try:
         fakes_dir = tempfile.mkdtemp(prefix="cs-fakes-")
         os.environ[STARTED_ENV] = fakes_dir
-        subprocess.Popen = _tracking_popen(started)  # type: ignore[misc]
+        subprocess.Popen = _tracking_popen(  # type: ignore[misc]
+            started, str(tmp_path_factory.getbasetemp())
+        )
         thread = threading.Thread(target=watchdog, daemon=True)
         thread.start()
         yield started
@@ -325,6 +366,30 @@ def _private_home(
     (home / ".config").mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+
+
+TRIPWIRE_CRONTAB = """#!/bin/sh
+echo "tripwire crontab: a test ran crontab $*; it must use its own fake" >&2
+exit 97
+"""
+
+
+@pytest.fixture(scope="session")
+def _tripwire_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    directory = tmp_path_factory.mktemp("tripwire-bin")
+    program = directory / "crontab"
+    program.write_text(TRIPWIRE_CRONTAB, encoding="utf-8")
+    program.chmod(0o755)
+    return directory
+
+
+@pytest.fixture(autouse=True)
+def _crontab_tripwire(_tripwire_bin: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``crontab`` that only fails (exit 97) comes first on every test's ``PATH``, so a
+    process a test starts (``claude-session`` itself included, which the ``Popen`` guard does
+    not see) finds it instead of the user's real crontab. Tests of ``cron`` set their own
+    ``PATH`` to a fake."""
+    monkeypatch.setenv("PATH", f"{_tripwire_bin}{os.pathsep}{os.environ.get('PATH', '')}")
 
 
 def _remove_tree(path: str) -> None:

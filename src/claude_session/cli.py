@@ -302,6 +302,40 @@ def _exec(args: argparse.Namespace) -> int:
     return _supervised(args, begin)
 
 
+def _cron_report(args: argparse.Namespace, result: dict[str, Any]) -> int:
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+        return 0
+    print(f"crontab block {result['action']}" + (" (dry run)" if result["dry_run"] else ""))
+    if result["block"] is not None:
+        for line in result["block"].split("\n"):
+            print(sanitize(line))
+    return 0
+
+
+def _cron_install(args: argparse.Namespace) -> int:
+    """``cron install`` (interface.md, cron install / cron uninstall)."""
+    from . import cronblock
+    from .gateway import SystemGateway
+
+    result = cronblock.install(
+        SystemGateway(),
+        os.environ,
+        interval=args.interval,
+        env_file=args.env_file,
+        dry_run=args.dry_run,
+    )
+    return _cron_report(args, result)
+
+
+def _cron_uninstall(args: argparse.Namespace) -> int:
+    from . import cronblock
+    from .gateway import SystemGateway
+
+    result = cronblock.uninstall(SystemGateway(), os.environ, dry_run=args.dry_run)
+    return _cron_report(args, result)
+
+
 def _reconcile(args: argparse.Namespace) -> int:
     """``reconcile [--dry-run]`` (interface.md, reconcile): one repair pass; exit 0 (also
     when another reconcile holds the lease: ``already_running``)."""
@@ -767,8 +801,8 @@ HANDLERS: dict[str, Handler] = {
     "forget": _forget,
     "reconcile": _reconcile,
     "export": _not_implemented,
-    "cron install": _not_implemented,
-    "cron uninstall": _not_implemented,
+    "cron install": _cron_install,
+    "cron uninstall": _cron_uninstall,
     "verify-secret": _not_implemented,
 }
 

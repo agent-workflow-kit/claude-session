@@ -106,7 +106,7 @@ def test_stat_of_an_unreadable_process_is_not_ours(monkeypatch: pytest.MonkeyPat
 
 
 def test_the_tracking_popen_is_restored_when_the_setup_fails(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
     real = subprocess.Popen
 
@@ -115,7 +115,7 @@ def test_the_tracking_popen_is_restored_when_the_setup_fails(
 
     monkeypatch.setattr(conftest.threading, "Thread", failing)
     request = SimpleNamespace(node=_Item())
-    guard = conftest.no_leftover_processes.__wrapped__(request)  # pyright: ignore[reportAttributeAccessIssue]
+    guard = conftest.no_leftover_processes.__wrapped__(request, tmp_path_factory)  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(RuntimeError):
         next(guard)
     assert subprocess.Popen is real
