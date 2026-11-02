@@ -53,7 +53,25 @@ def test_envelope_matches_schema_and_exit_code(error: CliError, code: str, exit_
 def test_launch_validation_errors_carry_their_end_reason() -> None:
     error = InvalidPermissionProfile("bad profile", detail="sandbox.enabled: refused")
     assert isinstance(error, LaunchValidationError)
-    assert not isinstance(error, CliError)  # the launch path maps it to not-started, exit 12
+    assert isinstance(error, FailedError)  # uncaught, it still exits 12
+    assert error.exit_code == 12
     assert error.end_reason == "invalid_permission_profile"
     assert (error.message, error.detail) == ("bad profile", "sandbox.enabled: refused")
     assert str(error) == "bad profile"
+    validate(error.envelope(), "claude-session/cli/error.json")
+
+
+def test_launch_validation_error_end_reason_keyword() -> None:
+    error = LaunchValidationError("cwd contains *", end_reason="unsafe_cwd")
+    assert (error.end_reason, error.exit_code, error.detail) == ("unsafe_cwd", 12, None)
+
+
+def test_launch_validation_error_keyword_overrides_the_class_default() -> None:
+    error = InvalidPermissionProfile("bad", end_reason="unsafe_read_dir")
+    assert error.end_reason == "unsafe_read_dir"
+    assert InvalidPermissionProfile("bad").end_reason == "invalid_permission_profile"
+
+
+def test_launch_validation_error_needs_an_end_reason() -> None:
+    with pytest.raises(TypeError, match="end_reason"):
+        LaunchValidationError("no reason")

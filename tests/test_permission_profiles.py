@@ -179,6 +179,54 @@ def test_auto_allow_false_is_allowed_for_isolated_runs() -> None:
     pp.validate({"sandbox": {"autoAllowBashIfSandboxed": False}}, isolated=True)
 
 
+# Sandbox escape keys outside the isolated-run allowlist (review round 1, R1).
+ESCAPES = [
+    {"sandbox": {"filesystem": {"disabled": True}}},
+    {"sandbox": {"allowNestedUserNamespaces": True}},
+    {"sandbox": {"allowAppleEvents": True}},
+    {"sandbox": {"network": {"allowMachLookup": ["com.apple.x"]}}},
+    {"sandbox": {"enableWeakerNetworkIsolation": True}},
+    {"sandbox": {"enableWeakerNestedSandbox": True}},
+    {"sandbox": {"ignoreViolations": {"*": ["/"]}}},
+    {"sandbox": {"network": {"allowUnixSockets": ["/var/run/docker.sock"]}}},
+    {"sandbox": {"network": {"allowAllUnixSockets": True}}},
+    {"sandbox": {"network": {"allowLocalBinding": True}}},
+    {"sandbox": {"network": {"httpProxyPort": 8080}}},
+    {"sandbox": {"network": {"socksProxyPort": 1080}}},
+    {"sandbox": {"network": {"strictAllowlist": False}}},
+    {"sandbox": {"someFutureKey": True}},
+]
+
+
+@pytest.mark.parametrize("content", ESCAPES)
+def test_sandbox_keys_outside_the_allowlist_fail_isolated_runs(content: dict[str, Any]) -> None:
+    error = refused(pp.validate, content, isolated=True)
+    assert "not allowed for isolated runs" in text_of(error)
+
+
+def test_allowlisted_sandbox_keys_pass_isolated_runs() -> None:
+    pp.validate(
+        {
+            "sandbox": {
+                "filesystem": {
+                    "allowRead": ["/a"],
+                    "denyRead": ["/b"],
+                    "allowWrite": ["/c"],
+                    "denyWrite": ["/d"],
+                },
+                "network": {"allowedDomains": ["pypi.org"], "deniedDomains": ["example.org"]},
+                "autoAllowBashIfSandboxed": False,
+            }
+        },
+        isolated=True,
+    )
+
+
+def test_denied_domains_must_be_a_list_of_strings() -> None:
+    error = refused(pp.validate, {"sandbox": {"network": {"deniedDomains": "x"}}}, isolated=False)
+    assert "sandbox.network.deniedDomains" in text_of(error)
+
+
 def test_default_mode_is_allowed_for_isolated_runs() -> None:
     # Ignored there (dontAsk is forced by the generated settings), never refused.
     pp.validate({"permissions": {"defaultMode": "bypassPermissions"}}, isolated=True)
@@ -256,7 +304,8 @@ def test_shape_is_checked_for_every_run(content: Any, key: str, isolated: bool) 
 
 def test_unknown_nested_keys_are_kept() -> None:
     content = {"permissions": {"future": {"x": 1}}, "sandbox": {"network": {"other": True}}}
-    pp.validate(content, isolated=True)
+    pp.validate(content, isolated=False)
+    pp.validate({"permissions": {"future": {"x": 1}}}, isolated=True)
 
 
 def test_empty_profile_is_valid() -> None:

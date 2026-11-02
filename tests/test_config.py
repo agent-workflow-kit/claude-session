@@ -1388,6 +1388,17 @@ def test_positive_duration_that_underflows_to_zero_is_refused(cfg_dir: Path) -> 
     assert "lost_grace" in str(invalid(cfg_dir).detail)
 
 
+@pytest.mark.parametrize("number", [".inf", "-.inf", ".nan", "1.0e+400"])
+def test_non_finite_numbers_are_invalid(cfg_dir: Path, number: str) -> None:
+    write(
+        cfg_dir / "config.yaml",
+        f"permission_profiles: {{mine: {{sandbox: {{network: {{x: {number}}}}}}}}}\n",
+    )
+    detail = str(invalid(cfg_dir).detail)
+    assert "permission_profiles.mine.sandbox.network.x: not a finite number" in detail
+    assert number not in detail
+
+
 # Environment rules: secret_env, claude_auth_env and the kind env keys (#10 review R1-R3, R7)
 
 _REPO_ENV = "repos: {example.com/x: {kinds: {respond: {env: %s}}}}\n"
@@ -1499,14 +1510,3 @@ def test_invalid_env_rules_are_not_echoed(cfg_dir: Path, text: str) -> None:
     error = invalid(cfg_dir)
     assert "SENTINEL0secret" not in str(error.detail)
     assert "SENTINEL0secret" not in error.message
-
-
-@pytest.mark.parametrize("number", [".inf", "-.inf", ".nan", "1.0e+400"])
-def test_non_finite_numbers_are_invalid(cfg_dir: Path, number: str) -> None:
-    write(
-        cfg_dir / "config.yaml",
-        f"permission_profiles: {{mine: {{sandbox: {{network: {{x: {number}}}}}}}}}\n",
-    )
-    detail = str(invalid(cfg_dir).detail)
-    assert "permission_profiles.mine.sandbox.network.x: not a finite number" in detail
-    assert number not in detail

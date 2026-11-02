@@ -14,7 +14,14 @@ import pytest
 
 from claude_session import __version__, cli
 from claude_session.cli import build_parser, main
-from claude_session.errors import AmbiguousError, NotFoundError, RefusedError, UsageError
+from claude_session.errors import (
+    AmbiguousError,
+    InvalidPermissionProfile,
+    LaunchValidationError,
+    NotFoundError,
+    RefusedError,
+    UsageError,
+)
 
 from .golden import assert_golden
 from .schemas import validate
@@ -400,6 +407,23 @@ def test_error_without_json_goes_to_stderr_only(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "claude-session: error: unknown session: xxxx\n"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LaunchValidationError("cwd is unsafe", end_reason="unsafe_cwd"),
+        InvalidPermissionProfile("invalid permission profile", detail="sandbox.x: not allowed"),
+    ],
+)
+def test_uncaught_launch_validation_error_exits_12(
+    error: Exception, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setitem(cli.HANDLERS, "status", raising(error))
+    code, envelope, _ = run_json(["status", SID, "--json"], capsys)
+    assert code == 12
+    validate(envelope, ERROR_SCHEMA)
+    assert envelope["error"]["code"] == "failed"
 
 
 # Internal errors
