@@ -232,6 +232,52 @@ def init_event(events: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
     raise AssertionError("no system/init event in the stream")
 
 
+@dataclass(frozen=True)
+class ToolCall:
+    """One tool use of a ``stream-json`` run and the text of its result ("" if none came)."""
+
+    name: str
+    input: Mapping[str, Any]
+    output: str
+    is_error: bool
+
+
+def _result_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(b.get("text", ""))
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+def tool_calls(events: Sequence[Mapping[str, Any]]) -> list[ToolCall]:
+    """The tool uses in a ``stream-json`` run (``--verbose``), in order, each with the result the
+    tool returned: what the agent was actually given, not what it said about it."""
+    uses: dict[str, tuple[str, Mapping[str, Any]]] = {}
+    order: list[str] = []
+    outputs: dict[str, tuple[str, bool]] = {}
+    for event in events:
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            ident = str(block.get("id") or block.get("tool_use_id") or "")
+            if block.get("type") == "tool_use":
+                raw = block.get("input")
+                uses[ident] = (str(block.get("name")), raw if isinstance(raw, dict) else {})
+                order.append(ident)
+            elif block.get("type") == "tool_result":
+                outputs[ident] = (_result_text(block.get("content")), bool(block.get("is_error")))
+    return [ToolCall(uses[i][0], uses[i][1], *outputs.get(i, ("", False))) for i in order]
+
+
 def total_cost(events: Sequence[Mapping[str, Any]]) -> float:
     """The cost of all ``result`` objects (one per turn with background tasks)."""
     total = 0.0

@@ -37,7 +37,7 @@ Tests that need a login skip without one. The zero-cost tests (`--version`, `--h
 
 Some checks are open questions (an exit code, a payload shape, a message text). Those tests assert what the design tolerates and record the value seen with `live.observe(key, value)`: printed in the terminal summary and, with `CSESSION_LIVE_OBSERVATIONS`, written to a file. After a run, compare the observations with the fake claude's assumptions (`tests/fakebin/fake_claude.py`) and with the table rows named in the tests, and update them.
 
-## Extending (issues #42 and #43)
+## Extending
 
 - New API-using tests take the `live` fixture, zero-cost ones `cheap`; both come from `tests/live/conftest.py`. Put helpers in `tests/live/harness.py` and unit-test them in `tests/test_live_harness.py`, with the fake claude or `sh`.
 - `LiveEnv.headless(prompt, *flags)` runs a small-model `-p` with `stream-json`, the prompt after `--`. `LiveEnv.claude_run` runs with exactly the given argv. `spawn_headless` and `tmux_driver.Tmux` are for signals and interactive sessions.
@@ -98,7 +98,8 @@ Not covered, with the reason:
 | B5 planted `.git` with `core.fsmonitor`; C (built-in write protections, placeholder files), C1 to C3, C5 (uv tool install in the sandbox), C7, C8 | Sandbox internals and a tool install; list for a sandbox host session (#43 covers macOS). `test_e2e.py::test_a_review_run_...` checks that no stray files land in the denied host directory. |
 | Respond isolation: network, tmux socket and SSH agent blocked | Needs an outside listener; manual. |
 | Sandbox: TMPDIR socket length; `excludedCommands` matching; `.bash_profile` placeholder | Unit-tested in `selfcheck`; the rest is informational. |
-| Search tools under the review profile (Glob, Grep, LS); symlink planted by sandboxed Bash and the Read tool (F1); `/proc` isolation (F2); MCP elicitation (`elicitation_dialog`) | Open items: issue #42. |
+| LS under the review profile | Not a tool in the Claude Code the design was verified against (design.md, D3); `test_open_items.py::test_search_tools_...` records the `init` tool list, so a later version that adds it shows up in the observations. Nothing asserts on it. |
+| Glob and Grep through the generated review settings end to end | Isolated runs refuse `--tools` in `claude_args` (`unsafe_claude_args`), and without it Glob and Grep are not offered, so the product cannot enable them. `test_open_items.py` builds the same permission keys by hand. |
 | macOS Seatbelt checks | Manual checklist: issue #43. |
 
 ### Comments on issue #41
@@ -107,7 +108,7 @@ Not covered, with the reason:
 |---|---|
 | #55 Bedrock/Vertex truthy values | `test_provider_env.py` (zero cost; message patterns are guesses, see the docstring) |
 | #56 1 `--` before the prompt | `test_headless.py::test_double_dash_...` and the control |
-| #56 2 Notification matchers | `test_interactive.py::test_permission_prompt_notifications_...` (`permission_prompt` and `idle_prompt`; `elicitation_dialog` is #42) |
+| #56 2 Notification matchers | `test_interactive.py::test_permission_prompt_notifications_...` (`permission_prompt` and `idle_prompt`; `elicitation_dialog` is `test_interactive.py::test_an_mcp_elicitation_...`) |
 | #56 3 Omitted `matcher` | `test_hooks.py::test_a_group_without_a_matcher_...` (PostToolUse and SessionStart; PermissionRequest is only ever seen unmatched in the interactive test) |
 | #56 4 Hook `timeout` unit | `test_hooks.py::test_hook_timeout_is_in_seconds` |
 | #56 5 `defaultMode` precedence | `test_settings.py::test_settings_default_mode_...` |
@@ -123,7 +124,7 @@ Not covered, with the reason:
 | #59 3 `failIfUnavailable` | `test_sandbox.py::test_a_missing_sandbox_fails_...` |
 | #59 4, 7, 8, 9 network bridge, system dirs, full golden settings, `~/.gitconfig` | `test_e2e.py::test_a_review_run_...` (generated settings, deny-root); the network bridge and gitconfig re-open are not separately asserted |
 | #59 5, 6, 10, 11 `strictAllowlist`, disabled modes, explicit `false` keys, skills in `--add-dir`, `sandbox: off` vs user `enabled: true` | Not covered yet (need a sandbox host); listed for the first human run |
-| #59 12 Grep and Glob read denies | #42 |
+| #59 12 Grep and Glob read denies | `test_open_items.py::test_search_tools_and_the_home_read_denies` (three variants; only `both`, which is what isolated runs generate, asserts, and only for Read and Grep content; the rest is recorded) |
 | #60 bwrap probe fidelity, socat, socket names, `TMPDIR` vs `CLAUDE_CODE_TMPDIR`, `preferred` fallback, `/tmp` ownership | Not covered (need a sandbox host and a namespace); unit tests cover the probe |
 | #63 10 MiB artifact | `test_e2e.py::test_a_10_mib_artifact_...` |
 | #64 trailing newline; exit form on a signal | `test_headless.py::test_headless_stream_json_ends_...`, `test_headless_signals.py` |
@@ -131,6 +132,20 @@ Not covered, with the reason:
 | #37 1 to 7 and review additions | `test_transcript.py` (item 7 also in `test_headless.py`); counts of `subagents/` and `tool-results/` entries are recorded, not compared with the bounds |
 | #76 SessionStart `source` values | `test_headless.py`, `test_interactive.py::test_clear_changes_the_id_...` |
 
+### Open items (issue #42)
+
+None of these tests has been run against a real Claude Code. They are queued for the first human `make live`; until then the findings columns of design.md (F1, F2) and interface.md (residual risks, home-directory Read denies) are unchanged. After the run, read the observations (`CSESSION_LIVE_OBSERVATIONS`) and update those rows, and open a follow-up issue for any required change.
+
+| Item | Test | What it asserts and records |
+|---|---|---|
+| F1 Read, Grep, Glob on a symlink planted by sandboxed Bash | `test_open_items.py::test_f1_...[Read\|Grep\|Glob]` (needs a sandbox) | Bash plants a file symlink and a directory symlink to a private `outside/` dir; Read and Grep must not return the secret (assert, with a plain file in the cwd as the control that the tool works); what Glob lists behind the directory link is recorded. If this fails, the home Read denies in the isolated settings must stay. |
+| F2 `/proc` isolation | `test_open_items.py::test_f2_...` (needs a sandbox, Linux) | A host child (exact PID, killed at teardown) holds a marker in its environment; sandboxed `cat /proc/<pid>/environ` must not show it, and `ls /proc` must list fewer processes than the host. `/proc/<pid>/root` and `/proc/1/cmdline` are recorded only. |
+| MCP elicitation | `test_interactive.py::test_an_mcp_elicitation_...` | A stdlib stdio MCP server (`tests/live/mcp_elicit_server.py`) sends `elicitation/create` from its tool; the `elicitation_dialog` Notification hook must fire. Records the payload, any `PermissionRequest`, the screen, and what Esc does to the pending request. |
+| Search tools and the home Read denies (#59 12) | `test_open_items.py::test_search_tools_...[block-reads\|read-deny\|both]` | A planted `~/.ssh/id_test` in the private home; Read, Grep and Glob under `blockReadsOutsideWorkingDirectories` only, a `Read(//<home>/.ssh/**)` deny only, and both. Records which tools return the key or its name; asserts only for `both` and only for Read and Grep content. |
+| `--strict-mcp-config` drops plugin MCP servers | already covered: `test_headless.py::test_strict_mcp_config_...` | The issue's scope lists it; no new test. |
+
+Planted files and symlinks live only under the test's private root (`live.root`); the private `HOME` is the only home used.
+
 ### Tests of the suite itself
 
-`tests/test_live_harness.py` covers the helpers (environment allowlist, credentials, ledger, stream parsing, tmux driver, recorded-PID kill, `headless` against the fake claude) and the gating: a default run deselects every live test, `-m live` without the opt-in skips them all, `make live` sets the opt-in and `verify` does not depend on it.
+`tests/test_live_harness.py` covers the helpers (environment allowlist, credentials, ledger, stream parsing, tool-call pairing, the elicitation MCP server driven by a fake client, tmux driver, recorded-PID kill, `headless` against the fake claude) and the gating: a default run deselects every live test, `-m live` without the opt-in skips them all, `make live` sets the opt-in and `verify` does not depend on it.

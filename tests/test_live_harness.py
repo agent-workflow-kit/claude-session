@@ -414,3 +414,112 @@ def test_kill_recorded_requires_the_matching_start_token() -> None:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+# --- tool calls in a stream, and the elicitation test server --------------------------------
+
+
+def _stream_with_tools() -> list[dict[str, object]]:
+    def use(ident: str, name: str, **inp: object) -> dict[str, object]:
+        block = {"type": "tool_use", "id": ident, "name": name, "input": inp}
+        return {"type": "assistant", "message": {"content": [block]}}
+
+    def text(value: str) -> dict[str, object]:
+        return {"type": "text", "text": value}
+
+    def result(ident: str, content: object, error: bool = False) -> dict[str, object]:
+        block = {"type": "tool_result", "tool_use_id": ident, "content": content}
+        if error:
+            block["is_error"] = True
+        return {"type": "user", "message": {"content": [block]}}
+
+    return [
+        {"type": "system", "subtype": "init"},
+        use("a", "Read", file_path="/x"),
+        result("a", "file text"),
+        use("b", "Grep", pattern="p"),
+        result("b", [{"type": "text", "text": "one"}, {"type": "image"}, text("two")], True),
+        use("c", "Bash", command="ls"),  # no result came back
+        {"type": "assistant", "message": {"content": "plain string content"}},
+        {"type": "result", "result": "done"},
+    ]  # fmt: skip
+
+
+def test_tool_calls_pair_each_use_with_its_result_in_order() -> None:
+    calls = harness.tool_calls(_stream_with_tools())
+    assert [(c.name, c.output, c.is_error) for c in calls] == [
+        ("Read", "file text", False),
+        ("Grep", "one\ntwo", True),
+        ("Bash", "", False),
+    ]
+    assert calls[0].input == {"file_path": "/x"}
+
+
+def test_tool_calls_ignore_results_without_a_matching_use() -> None:
+    orphan = {
+        "type": "user",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": "zz", "content": "x"}]},
+    }
+    assert harness.tool_calls([orphan]) == []
+
+
+ELICIT_SERVER = REPO / "tests" / "live" / "mcp_elicit_server.py"
+
+
+def _elicit_session(tmp_path: Path, answer: dict[str, object] | None) -> tuple[list[dict], str]:
+    """Drive the server like a client: initialize, list tools, call `ask`, answer the
+    elicitation with `answer` (None: close stdin instead). Returns the server's messages."""
+    log = tmp_path / "server.log"
+    proc = subprocess.Popen(
+        [sys.executable, "-I", str(ELICIT_SERVER)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env={"ELICIT_SERVER_LOG": str(log), "PATH": os.environ["PATH"]},
+    )
+    assert proc.stdin and proc.stdout
+    seen: list[dict] = []
+
+    def send(message: dict[str, object]) -> None:
+        proc.stdin.write(json.dumps(message) + "\n")  # type: ignore[union-attr]
+        proc.stdin.flush()  # type: ignore[union-attr]
+
+    def receive() -> dict:
+        message = json.loads(proc.stdout.readline())  # type: ignore[union-attr]
+        seen.append(message)
+        return message
+
+    params = {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}}
+    send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params})
+    receive()
+    send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    receive()
+    send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "ask"}})
+    asked = receive()
+    if answer is None:
+        proc.stdin.close()
+    else:
+        send({"jsonrpc": "2.0", "id": asked["id"], "result": answer})
+        receive()
+        proc.stdin.close()
+    proc.wait(10)
+    proc.stdout.close()
+    return seen, log.read_text(encoding="utf-8")
+
+
+def test_the_elicit_server_asks_and_reports_the_users_action(tmp_path: Path) -> None:
+    seen, log = _elicit_session(tmp_path, {"action": "cancel"})
+    assert seen[0]["result"]["capabilities"] == {"tools": {}}
+    assert [t["name"] for t in seen[1]["result"]["tools"]] == ["ask"]
+    assert seen[2]["method"] == "elicitation/create"
+    assert seen[2]["params"]["requestedSchema"]["type"] == "object"
+    assert seen[3]["id"] == 3 and "cancel" in seen[3]["result"]["content"][0]["text"]
+    assert "elicitation sent" in log and "answered cancel" in log
+    assert '"elicitation": {}' in log  # the client's capabilities are recorded
+
+
+def test_the_elicit_server_exits_when_the_client_goes_away_mid_question(tmp_path: Path) -> None:
+    seen, log = _elicit_session(tmp_path, None)
+    assert seen[-1]["method"] == "elicitation/create"
+    assert "answered closed" in log
