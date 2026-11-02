@@ -920,6 +920,38 @@ def test_status_and_list_run_the_liveness_hook_and_never_write(
     assert seeded.conn.execute("SELECT COUNT(*) FROM events").fetchone() == events
 
 
+def final_unwritten(st: Store, clock: Clock, out: Path) -> str:
+    """A final run with an outcome file whose write was never claimed (its finalizer died
+    before claiming): the liveness check's backfill writes it."""
+    trusted = {"kind": "implement", "profile": {"sandbox": "off", "reads_third_party": False}}
+    sid = allocate(st, "cs-eeeeeeee", clock, outcome_file=str(out), resolved=trusted)
+    finalize(st, sid, clock, DONE)
+    assert st.run_record(sid, 1)["outcome_file_written_at"] is None
+    return sid
+
+
+def test_status_backfills_an_unwritten_outcome_file(
+    st: Store, clock: Clock, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "out.json"
+    sid = final_unwritten(st, clock, out)
+    code, _ = run_json(["status", sid], capsys)
+    assert code == 0
+    assert json.loads(out.read_text())["outcome"] == "done"
+    assert st.run_record(sid, 1)["outcome_file_written_at"] is not None
+
+
+def test_list_backfills_an_unwritten_outcome_file(
+    st: Store, clock: Clock, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "out.json"
+    sid = final_unwritten(st, clock, out)
+    code, _ = run_json(["list"], capsys)
+    assert code == 0
+    assert json.loads(out.read_text())["outcome"] == "done"
+    assert st.run_record(sid, 1)["outcome_file_written_at"] is not None
+
+
 def test_store_open_failure_exits_12(
     _private_state_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

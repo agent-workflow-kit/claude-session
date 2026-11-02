@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from . import endmap, ids, liveness, store
+from . import endmap, ids, liveness, outcomefile, store
 from .errors import NotFoundError
 from .terminal import display, display_width, no_surrogates
 
@@ -36,18 +36,23 @@ _LABEL_ESCAPED = ","
 def check_liveness(st: store.Store, csession_id: str) -> None:
     """The inline liveness check ``status`` runs before reading (``liveness.check_session``,
     cause ``liveness``): it may finalize a run nobody owns any more and write its outcome
-    file, and never runs hooks (its final events are delivered by the next delivering
+    file; then the session's final runs whose outcome file is still unwritten are
+    backfilled. It never runs hooks (its final events are delivered by the next delivering
     command or ``reconcile``). Text is decoded leniently, as the views read it, so stored
     bytes that are not UTF-8 never fail the check."""
     with st.lenient_decoding():
         liveness.check_session(st, None, csession_id)
+        outcomefile.backfill(st, csession_id)
 
 
 def check_liveness_all(st: store.Store) -> None:
-    """The inline liveness check ``list`` runs before reading: ``check_liveness`` for every
-    session with a run that is not final."""
-    for sid in st.sessions_with_open_runs():
-        check_liveness(st, sid)
+    """The inline liveness check ``list`` runs before reading: ``liveness.check_session`` for
+    every session with a run that is not final, then the backfill of every session's final
+    runs whose outcome file is still unwritten."""
+    with st.lenient_decoding():
+        for sid in st.sessions_with_open_runs():
+            liveness.check_session(st, None, sid)
+        outcomefile.backfill(st)
 
 
 # Value coercion: state.db is SQLite (dynamic types), so every value is checked on the way out.
