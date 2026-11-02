@@ -36,8 +36,9 @@ resume ``live``. The source is read earlier, at step 2: a run the check will fin
 counts as final there (``liveness.classify``), and as ``not-started`` when it never spawned.
 ``--allow-tainted`` is checked human-only at step 2 (``taint.from_args``, exit 2) and recorded
 on the run; the store lifts the ``tainted`` refusal for it (``taint``).
-TODO(#31): ``--override-escalation`` (human-only; only after a run that ended ``escalated``;
-it overrides that run's escalating ``pre-launch`` hooks).
+``--override-escalation`` is checked at step 2 (``check_override_escalation``: only after a run
+that ended ``escalated``, only for a human actor; exit 2); launch step 6 (``launch.pre_launch``)
+then overrides exactly that run's escalating ``pre-launch`` entries and audits it.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ import argparse
 import dataclasses
 import json
 import os
+import sys
 import uuid
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -430,6 +432,23 @@ def _read_request(
     return launch.read_request(with_mode, cfg)
 
 
+def check_override_escalation(req: launch.Request, source: Source, *, fork: bool) -> None:
+    """``--override-escalation`` at step 2 (interface.md, Flag rules; exit 2): never with
+    ``--fork``; only when the previous run ended ``escalated``; and only for a human
+    (``taint.check_human_only`` on the effective actor)."""
+    if not req.override_escalation:
+        return
+    if fork:
+        raise UsageError("--override-escalation cannot be combined with --fork")
+    if source.outcome != "escalated":
+        shown = "has not ended" if source.outcome is None else f"ended {source.outcome}"
+        raise UsageError(
+            f"--override-escalation needs a previous run that ended escalated; run"
+            f" {source.run} of {source.csession_id} {shown}"
+        )
+    taint.check_human_only("--override-escalation", req.actor, tty=taint.stdin_is_tty())
+
+
 def _undelivered(
     source: Source, args: argparse.Namespace, process: launch.Process, cap: int
 ) -> tuple[bytes | None, list[sessiondir.InputFile]] | None:
@@ -626,6 +645,7 @@ def prepare(
         plugin_dirs_given=args.plugin_dir is not None,
     )
     req = _read_request(args, cfg, mode, any_mode=any_mode or dry_run)
+    check_override_escalation(req, source, fork=fork)
     undelivered = _undelivered(source, args, process, cfg.input_max_bytes)
     if undelivered is not None:
         prompt, inputs = undelivered
