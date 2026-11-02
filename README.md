@@ -11,7 +11,7 @@ and watch sessions through the commands below.
 
 Pre-1.0. Several commands and flags documented in [docs/interface.md](docs/interface.md) are still
 being merged and are marked **coming in the same release** below; until then they are not
-usable (the commands exit with a `not_implemented` error). [docs/interface.md](docs/interface.md) is the normative
+usable (the commands exit 1 with an `internal` error whose detail is `not_implemented`). [docs/interface.md](docs/interface.md) is the normative
 interface (launch order, state transitions, outcome mapping, isolation);
 [docs/design.md](docs/design.md) explains the design. Where this README differs from them, they win.
 
@@ -44,14 +44,16 @@ Prerequisites:
   and WSL2: `bubblewrap` and `socat` (`sudo apt install bubblewrap socat`). macOS needs nothing
   extra. WSL1 has no sandbox. Keep the state directory on the Linux file system under WSL.
 - memoctl, optional, for session-start context (config `notes_context_cmd`, enabled per kind with
-  `notes_context: true`): `uv tool install git+https://github.com/agent-workflow-kit/memoctl`.
+  `notes_context: true`; **coming in the same release**):
+  `uv tool install git+https://github.com/agent-workflow-kit/memoctl`.
 
 Upgrade claude-session while no sessions are live.
 
 ## Configuration
 
 Everything works without a config file. To change defaults, create
-`~/.config/claude-session/config.yaml` (plus optional `config.d/*.yaml` drop-ins);
+`$XDG_CONFIG_HOME/claude-session/config.yaml` (default `~/.config/claude-session/config.yaml`;
+plus optional `config.d/*.yaml` drop-ins next to it);
 [config.example.yaml](config.example.yaml) lists every key with its default. A few top-level
 scalars can also be set from the environment with the `CSESSION_` prefix, for example
 `CSESSION_CLAUDE_BIN`. `--config <path>` reads only that file. State (the database, session
@@ -128,7 +130,9 @@ another with `--kind`.
 
 ### `exec`: run a session in the foreground
 
-Headless, with an input file the agent can read at `$CSESSION_DIR/inputs/<run>/` and a time limit:
+Headless, with an input file the agent can read at `$CSESSION_DIR/inputs/<run>/` and a time limit
+(input file names may use only letters, digits, `.`, `_` and `-`, at most 128 characters; other
+names exit 2):
 
 ```sh
 claude-session exec --mode headless --prompt-file prompt.md --input-file notes.txt --timeout 30m
@@ -153,7 +157,7 @@ dialog; the session stays `starting` until you answer it.
 ### `start`: allocate a session for another process to place
 
 `start` does everything up to the launch, then prints the command line for a caller to run in a
-terminal or process of its choice. The run is pending until that command adopts it; a pending run
+terminal or process of its choice (as JSON; `--json` is required). The run is pending until that command adopts it; a pending run
 not adopted within `lost_grace` (10 minutes) ends `not-started`.
 
 ```sh
@@ -171,7 +175,8 @@ claude-session exec --session-id cs-fsean3kj --run 1
 ```
 
 Meanwhile `claude-session list --pending` shows the session in state `starting`. Adoption accepts
-only `--run`, `--json`, `--dry-run` and `--outcome-file`: every other setting was frozen by `start`.
+only `--run`, `--json`, `--dry-run`, `--outcome-file` and the global `--verbose`, `--quiet` and
+`--yes`: every other setting was frozen by `start`.
 
 ### `resume` and `--fork`
 
@@ -225,24 +230,26 @@ adopts ends `not-started` (`never_adopted`, exit 12) once it expires.
 
 ### `report`: from inside a session
 
-Agents run `report` themselves; claude-session adds the instructions and the permission rule that
-allow exactly these forms. You rarely run it by hand. For reference, the forms the agent is told to
-use:
+Agents run `report` themselves; claude-session adds the instructions and the permission rules
+that pre-approve `claude-session report …` commands. You rarely run it by hand. For reference, the
+forms the agent is told to use (it writes a summary or reason file to `artifacts/` first):
 
 ```sh
 claude-session report done --summary-file "$CSESSION_DIR/artifacts/summary.md"
-claude-session report done --summary="Fixed the flaky test; see the artifact." --artifact report.md
-claude-session report blocked --reason-file - <<'EOF'
-Cannot proceed: the repository has no test command.
+claude-session report done --summary="Fixed the flaky test; see the artifact." \
+  --artifact "$CSESSION_DIR/artifacts/report.md"
+claude-session report done --summary-file - <<'EOF'
+Fixed the flaky test.
 EOF
-claude-session report needs-input --reason-file reason.md
-claude-session report failed --reason-file reason.md
+claude-session report blocked --reason-file "$CSESSION_DIR/artifacts/reason.md"
+claude-session report needs-input --reason-file "$CSESSION_DIR/artifacts/reason.md"
+claude-session report failed --reason-file "$CSESSION_DIR/artifacts/reason.md"
 ```
 
 `done` needs a non-empty summary; the other three need a reason. A report that contains a secret
 (an authentication variable's value or the run secret) is rejected. The latest ingested report of a
 run wins. `report` needs `CSESSION_ID` and `CSESSION_DIR`, which `exec` sets for the session. Only a
-bare `claude-session report ...` (or the absolute path of the executable) is allowed; commands
+bare `claude-session report ...` (or the absolute path of the executable) is pre-approved; commands
 prefixed with `cd ... &&` or containing `$(...)` are denied. Details:
 [`report`](docs/interface.md#report).
 
@@ -258,14 +265,21 @@ claude-session treats the agent as untrusted wherever a kind says so. At a user 
 
 - **Trusted kinds** (`implement`, `draft-ticket`, `audit`, `improve`) run `claude` in your
   directory with your settings and no sandbox. Use them for your own work.
-- **Isolated runs** are runs of third-party-reading kinds (`review`, `gate-check`, `respond`, or any
-  run with `--reads-third-party`) and runs whose sandbox mode is not `off`. They run `claude` in
-  Claude Code's sandbox (`bubblewrap` on Linux and WSL2, Seatbelt on macOS) with network
-  access limited to an allow list, reads denied except an allow list, writes limited to the session directory and the
-  paths the kind names, and `dontAsk` permission mode, so anything not explicitly allowed is
-  denied. A kind with sandbox `required` fails to launch (`sandbox_unavailable`) rather than run
-  unsandboxed; `preferred` degrades to unsandboxed. `status` shows whether the sandbox actually ran
-  (`sandbox_active`).
+- **Isolated runs** are runs of third-party-reading kinds (`review`, `gate-check`, `respond`, or
+  any run with `--reads-third-party`) and runs whose sandbox mode is not `off` (such as `rank`).
+  They run in `dontAsk` permission mode, so anything the permission rules do not allow is denied.
+  Writes are limited to the session-writable paths: the cwd (for `cwd: caller` kinds such as
+  `respond`, your checkout), the session directory (`outbox/` and `artifacts/` for the Edit and
+  Write tools; never its protected files), the kind's `write_dirs`, the profile's `allowWrite` and
+  a private temporary directory. The sandbox (`bubblewrap` on Linux and WSL2, Seatbelt on macOS)
+  also enforces the write limits on Bash commands, denies them reads outside an allow list (the
+  cwd, the session directory, system and tool directories, `read_dirs`) and gives them no network
+  unless the profile allows domains (the built-in profiles allow none). A kind with sandbox `required` fails
+  to launch (`sandbox_unavailable`) rather than run unsandboxed; `preferred` degrades to
+  unsandboxed. `status` shows whether the sandbox actually ran (`sandbox_active`). A
+  third-party-reading run whose sandbox mode is below `required` is allowed, with a warning, and
+  audited `sandbox_lowered`; when it runs without a sandbox (`off`, or `preferred` with none
+  available) it relies on the permission rules alone, which a command can evade.
 - **Permission profiles** (`--permission-profile <name|file>`, or the kind's setting) are the
   per-kind allow and deny rules: the built-ins are `default`, `readonly`, `review` and `respond`.
   Isolated runs may only add to the narrow set of `sandbox` keys the interface allows; settings
@@ -274,12 +288,15 @@ claude-session treats the agent as untrusted wherever a kind says so. At a user 
 - **Taint**: a session that has run a third-party-reading kind (one that reads content written by
   other people, such as a pull request) is *tainted*, permanently. `status --json` shows it and
   `list --tainted` filters on it. Resuming or forking a tainted session into a kind that is not
-  third-party-reading is meant to be refused unless a human passes `--allow-tainted`: that
-  enforcement is **coming in the same release** (see below).
+  third-party-reading is refused (exit 20, `tainted`). The human override, `--allow-tainted`, is
+  **coming in the same release**: the flag is accepted now, but the refusal stands.
 - **Secrets**: reports, summaries and artifacts are scanned for the values of your authentication
-  variables and the run secret before they are accepted; kinds with
-  `env.inherit: false` (the restricted built-ins) give the agent only the environment variables
-  they name.
+  variables, your `secret_env` variables and the run secret before they are accepted. Kinds with
+  `env.inherit: false` (the restricted built-ins) pass only a fixed base set (`PATH`, `HOME`,
+  `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `COLORTERM`, `TZ`), Claude's
+  authentication variables (`claude_auth_env`, so the agent can read your API key), the
+  `CSESSION_*` variables and the kind's `env.allow` and `env.set`; see
+  [Environment](docs/design.md#environment).
 - **Integrity**: hooks run outside the sandbox from claude-session's own files, so isolated runs
   refuse to launch when those files are hard-linked (see [Install](#install)).
 
@@ -308,10 +325,13 @@ The guarantees, their limits and the residual risks are in
 | `verify-secret` | internal | coming in the same release |
 
 Also **coming in the same release**: `pre-launch` hooks (config `hooks.pre-launch`, with
-`--override-escalation`), the taint refusal with `--allow-tainted`, session labels and secret
-verification, session-start notes context, and the `claude` version check. They are specified in
+`--override-escalation`), `--allow-tainted`, `label add`/`label remove` and secret verification,
+session-start notes context, and the `claude` version check. They are specified in
 [docs/interface.md](docs/interface.md); this README does not describe them until they ship, so
 treat the exit codes and config keys that mention them (for example exit 11) as not yet reachable.
+`hooks.pre-launch`, `--hook pre-launch=…`, `--allow-tainted` and `--override-escalation` are
+accepted but have no effect until they ship: a `pre-launch` hook never runs, so do not rely on it
+as a gate.
 
 Full reference: [docs/interface.md](docs/interface.md).
 
@@ -321,9 +341,9 @@ Exit codes, global flags and the environment sessions see.
 
 Exit codes: 0 done; 1 internal error; 2 usage (including interactive `exec`/`resume` without a TTY and an invalid config); 10 unknown session; 11 `pre-launch` veto or hook timeout; 12 never started (launch failed, canceled, never adopted, interrupted, or config invalid at adoption), or an error with code `schema_newer` (database newer than this claude-session) or `failed`; 13 blocked or needs input (or a `pre-launch` escalation); 14 exited unreported; 15 killed (stopped, a forwarded signal such as `forwarded_term`, or an internal error); 16 timeout; 17 lost; 18 failed; 20 refused (`live`, `tainted`, `already_adopted`, `expired`); 21 ambiguous id; 22 `wait` timed out. A run that never started ends in state `not-started` with an `end_reason` naming the cause (e.g. `unsafe_path`, `no_git_cwd`, `config_invalid`). With `--json`, waiting commands print an outcome object (also written to `--outcome-file` by whichever process finalizes the run; a write failure is only a warning); other failures print an error envelope. The full mapping is in [Outcome mapping](docs/interface.md#outcome-mapping).
 
-Global flags: `--json`, `--config`, `--verbose`, `--quiet`, `--version`, and `--yes` (accepted everywhere, a no-op: claude-session never asks for confirmation).
+Global flags: `--json`, `--config`, `--verbose`, `--quiet`, `--version`, and `--yes` (accepted everywhere, a no-op: claude-session never asks for confirmation). Global flags follow the command name (`claude-session list --json`); only `--version` may also precede it.
 
-Environment: sessions get `CSESSION_ID`, `CSESSION_DIR` and `CSESSION_KIND`. Config overrides use the `CSESSION_` prefix (top-level scalar keys only). Hooks (`pre-launch`, `post-state-change`) run as `sh -c` with the state directory as cwd and get `CSESSION_HOOK`, `CSESSION_ID` and `CSESSION_OBJECT_TYPE`. `post-state-change` fires on every turn (`working` ↔ `idle`) and is delivered at least once (deduplicate on `event_id`), so notification hooks should filter with the `states` selector (e.g. `states: [needs-input, exited, exited-unreported, killed, timeout, lost, not-started]`); hook entries also take `kinds`, `exclude_kinds` and `labels` selectors. A hook that launches sessions must exclude their kinds (`exclude_kinds`) to avoid recursion. claude-session needs no credentials of its own.
+Environment: sessions get `CSESSION_ID`, `CSESSION_DIR` and `CSESSION_KIND`. Config overrides use the `CSESSION_` prefix (top-level scalar keys only). `post-state-change` hooks (and, once they ship, `pre-launch` hooks) run as `sh -c` with the state directory as cwd and get `CSESSION_HOOK`, `CSESSION_ID` and `CSESSION_OBJECT_TYPE`. `post-state-change` fires on every turn (`working` ↔ `idle`) and is delivered at least once (deduplicate on `event_id`), so notification hooks should filter with the `states` selector (e.g. `states: [needs-input, exited, exited-unreported, killed, timeout, lost, not-started]`); hook entries also take `kinds`, `exclude_kinds` and `labels` selectors. A hook that launches sessions must exclude their kinds (`exclude_kinds`) to avoid recursion. claude-session needs no credentials of its own.
 
 ## Documentation
 

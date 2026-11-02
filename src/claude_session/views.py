@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from . import endmap, ids, store
+from . import endmap, ids, liveness, store
 from .errors import NotFoundError
 from .terminal import display, display_width, no_surrogates
 
@@ -34,17 +34,20 @@ _LABEL_ESCAPED = ","
 
 
 def check_liveness(st: store.Store, csession_id: str) -> None:
-    """Hook point for the inline liveness check ``status`` and ``list`` run before reading:
-    it may finalize a run whose wrapper is dead, and never runs hooks."""
-    # TODO(#33): run the single-session liveness check (finalize when the wrapper is dead,
-    # cause `liveness`, outcome-file backfill); status and list never deliver its events.
-    del st, csession_id
+    """The inline liveness check ``status`` runs before reading (``liveness.check_session``,
+    cause ``liveness``): it may finalize a run nobody owns any more and write its outcome
+    file, and never runs hooks (its final events are delivered by the next delivering
+    command or ``reconcile``). Text is decoded leniently, as the views read it, so stored
+    bytes that are not UTF-8 never fail the check."""
+    with st.lenient_decoding():
+        liveness.check_session(st, None, csession_id)
 
 
 def check_liveness_all(st: store.Store) -> None:
-    """Hook point for ``list``: the inline liveness check of every live session."""
-    # TODO(#33): run check_liveness for each session whose current run is live.
-    del st
+    """The inline liveness check ``list`` runs before reading: ``check_liveness`` for every
+    session with a run that is not final."""
+    for sid in st.sessions_with_open_runs():
+        check_liveness(st, sid)
 
 
 # Value coercion: state.db is SQLite (dynamic types), so every value is checked on the way out.
@@ -267,7 +270,6 @@ def _run_object(
         "implicit_done": resolved.get("implicit_done") is True,
         "mode": mode,
         # Null until resolved: pending runs and runs that ended during launch.
-        # TODO(#28): adoption must record the resolved cwd.
         "cwd": _text(run.get("cwd")) or None,
         "repo": _text(run.get("repo")),
         "model": _text(run.get("model")),
