@@ -11,7 +11,7 @@ The 1.0 criteria are in [plan.md, Version roadmap](plan.md#version-roadmap) and 
 
 | Criterion | State | Evidence or what is left |
 |---|---|---|
-| Every command, flag, state, outcome, error code, exit code and schema in [interface.md](interface.md) is implemented and golden-tested | Automated for what is merged | `tests/test_interface_audit.py` parses interface.md and checks each against the parser, handlers, schemas and goldens; `tests/test_golden_commands.py` and `tests/test_golden_launch.py` add the missing golden files. Commands still on open pull requests are listed in `AWAITING` in the audit test and fail it as soon as they merge until they have goldens (see "Left for the 1.0 commit") |
+| Every command, flag, state, outcome, error code, exit code and schema in [interface.md](interface.md) is implemented and golden-tested | Partly automated | `tests/test_interface_audit.py` checks interface.md two ways against the implementation: commands and each command's flags against the parser, states and end reasons against the code, error codes against the schema and the error classes. Every output schema of an implemented command has at least one schema-validated golden (`tests/test_golden_commands.py`, `tests/test_golden_launch.py`). Not every outcome has a golden: outcomes other than those in the existing goldens (for example each end reason and state of `status`, `wait` and `report`) are covered by behavior tests only, and per-outcome goldens remain 1.0 work. Commands still on open pull requests are listed in `AWAITING` in the audit test and fail it as soon as they merge until they have goldens (see "Left for the 1.0 commit") |
 | `make verify` passes; golden `--json` outputs validate against `schemas/` | Passes | `assert_golden` validates every golden output against its schema before comparing |
 | `make live` passes on Linux and WSL2 against the current Claude Code | Human step | Billed; see [live-tests.md](live-tests.md). Never run by an agent or in CI |
 | The macOS checklist has been run once | Human step | [macos-checklist.md](macos-checklist.md); its status line says "not run on macOS" until then |
@@ -75,7 +75,8 @@ In this order:
      table and the "Also coming in the same release" paragraph, and the "Status" section's
      "marked coming" wording; in the README also drop the `memoctl` and `claude` version
      notes once notes context (#38) and the version check (#40) are in.
-2. Resolve the open questions in the handoff and re-run `make verify`.
+2. Resolve the open questions on issue #45, including the per-outcome goldens (see
+   "Criteria"), and re-run `make verify`.
 3. Run `make live` on Linux and on WSL2 (billed), and the macOS checklist once; record the
    results in [live-tests.md](live-tests.md) and the checklist's status line.
 4. Confirm agent-spawn and review-run have integrated without interface changes for a
@@ -84,9 +85,12 @@ In this order:
 
 ## Cutting 1.0
 
-Only the maintainer, after the steps above. The release job moves a `0.x` version to `1.0.0`
-only for a commit whose title carries `!` (`major_on_zero = false`); do not edit the version
-or `CHANGELOG.md` by hand.
+Only the maintainer, after the steps above. With `major_on_zero = false` (the current setting
+in `[tool.semantic_release]` in `pyproject.toml`) the release job turns a `!` commit on a `0.x`
+version into a minor bump, not `1.0.0`. So the 1.0 pull request also sets
+`major_on_zero = true` in `[tool.semantic_release]`: a release-config edit, not a hand edit of
+the version or of `CHANGELOG.md` (those stay with the release job). With that setting the `!`
+commit below moves the version to `1.0.0`.
 
 PR title (it becomes the squash commit, the version bump and the changelog line):
 

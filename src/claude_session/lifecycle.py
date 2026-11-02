@@ -977,7 +977,9 @@ def _check_request(frozen: Frozen, data: Mapping[str, Any], record: Mapping[str,
     if args.override_escalation != (_invocation(record).get("override_escalation") is True):
         raise ValueError("the launch spec's --override-escalation is not the run's")
     if args.override_escalation:
-        taint.check_human_only("--override-escalation", args.actor, tty=False)
+        taint.check_frozen_actor("--override-escalation", args.actor)
+    if taint.AllowTainted.from_invocation(_invocation(record)) is not None:
+        taint.check_frozen_actor(taint.FLAG, args.actor)
     args.input_file = _texts(data["input_files"])
     args.prompt_file = SPEC_NAME if data["has_prompt"] else None  # any non-stdin name
     if _mapping(data["conversation"]).get("resume") is True:

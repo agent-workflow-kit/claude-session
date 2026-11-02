@@ -19,6 +19,7 @@ import pytest
 from claude_session import cronblock
 from claude_session.cli import main
 from claude_session.errors import FailedError, UsageError
+from claude_session.gateway import Result
 
 from .fake_gateway import FakeGateway, Response
 from .schemas import validate
@@ -1092,3 +1093,38 @@ def test_unusable_passwd_home_exits_12(
             program=program,
         )
     assert fake.calls == []
+
+
+class BytelessGateway:
+    """A gateway double that builds its ``Result`` without the raw bytes, as a double written
+    before ``stdout_bytes`` existed would: the crontab it reports must never read as empty."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def run(self, argv: Any, **_: Any) -> Result:
+        self.calls.append(tuple(argv))
+        return Result(tuple(argv), 0, USER_LINES, "")  # type: ignore[call-arg]
+
+
+def test_a_result_without_its_raw_bytes_cannot_be_built() -> None:
+    with pytest.raises(TypeError):
+        Result(("crontab", "-l"), 0, USER_LINES, "")  # type: ignore[call-arg]
+
+
+def test_install_with_a_result_lacking_bytes_refuses_rather_than_overwriting(
+    tmp_path: Path,
+) -> None:
+    gateway = BytelessGateway()
+    _, environ, program = scripted(tmp_path)
+    with pytest.raises(TypeError):
+        cronblock.install(
+            gateway,  # type: ignore[arg-type]
+            environ,
+            interval=7,
+            env_file=None,
+            dry_run=False,
+            python="/p/py",
+            program=program,
+        )
+    assert (program, "-") not in gateway.calls and (program, "-r") not in gateway.calls

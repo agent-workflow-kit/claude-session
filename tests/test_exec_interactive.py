@@ -446,6 +446,9 @@ def test_auto_exit_rechecks_the_latest_event_before_sigterm(
     steps = [i for i, r in enumerate(log) if r["event"] == "step" and r["step"]["do"] == "stop"]
     term_at = next(i for i, r in enumerate(log) if r["event"] == "signal")
     assert len(steps) == 2 and term_at > steps[1]  # only after the second Stop
+    # ... and the delay counts from that Stop (both times from the fake's own clock).
+    waited = log[term_at]["ts"] - log[steps[1]]["ts"]
+    assert waited >= 0.9 * RECHECK_DELAY, waited
 
 
 def test_auto_exit_counts_the_delay(tmp_path: Path, state: Path, work: Path) -> None:

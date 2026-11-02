@@ -936,7 +936,7 @@ class _BlockingGateway:
         self.entered.set()
         assert self.release.wait(20)
         kw["on_started"]()
-        return Result(tuple(argv), 0, "", "")
+        return Result(tuple(argv), 0, "", "", b"", b"")
 
     def spawn(self, argv: Any, **kw: Any) -> Any:
         raise AssertionError("hooks are run, never spawned")
@@ -1076,14 +1076,15 @@ def test_a_hook_leaving_a_process_in_the_background_finishes_when_sh_exits(
     pidfile = tmp_path / "pid"
     # The hook's timeout and the background sleep are far longer than the time `sh` needs to
     # run two commands even on a starved machine; a delivery that waited for the background
-    # process would end in a timeout, not in "exit 0".
+    # process would end in a timeout, not in "exit 0". The timeout and the bound below stay
+    # well under the test watchdog (conftest.WATCHDOG_SECONDS), the sleep well above both.
     cmd = f"/bin/sleep 120 & echo $! > {shlex.quote(str(pidfile))}; exit 0"
-    cfg = load_config(tmp_path, hooks_config({"cmd": cmd, "timeout": "60s"}))
+    cfg = load_config(tmp_path, hooks_config({"cmd": cmd, "timeout": "25s"}))
     sid = allocate(st, root)
     start = time.monotonic()
     try:
         done = deliverer(st, cfg, root).deliver(sid)
-        assert time.monotonic() - start < 45  # not the 120 s of the background sleep
+        assert time.monotonic() - start < 20  # not the 25 s timeout, nor the 120 s sleep
         assert len(done.delivered) == 1
         hooks = [r for r in log_records(root) if r["event"].startswith("hook_")]
         assert [r["event"] for r in hooks] == ["hook_delivered"]

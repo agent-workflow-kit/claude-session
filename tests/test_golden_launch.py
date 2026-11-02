@@ -15,6 +15,8 @@ from typing import Any
 
 import pytest
 
+from claude_session import envbuild
+
 from .golden import assert_golden
 from .test_exec_hooks import HOOK as POST_HOOK
 from .test_exec_prelaunch import HOOK as PRE_HOOK
@@ -29,11 +31,20 @@ UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 
 
 @pytest.fixture
-def env(tmp_path: Path, _private_state_dir: Path) -> Env:
+def env(tmp_path: Path, _private_state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
     """A configured state directory and a fake ``claude`` that reports done."""
+    return make_env(tmp_path, _private_state_dir, monkeypatch)
+
+
+def make_env(tmp_path: Path, private_state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
+    """The ``env`` fixture's state, without the caller's built-in ``claude_auth_env`` variables
+    (the default config adds none; the provider flags among them gate the conditional ones):
+    they would appear in ``required_env_names`` and make the goldens machine-dependent."""
+    for name in envbuild.AUTH_ENV:
+        monkeypatch.delenv(name, raising=False)
     work = tmp_path / "work"
     work.mkdir()
-    state = _private_state_dir / "claude-session"
+    state = private_state_dir / "claude-session"
     e = Env(tmp_path, state, work, tmp_path / "config.yaml", tmp_path / "fake.jsonl")
     e.scenario(STEPS)
     e.write_config()
@@ -75,6 +86,13 @@ def test_start_prints_the_start_object(env: Env) -> None:
         return value
 
     assert_golden(out, "start-new", normalize=normalize)
+
+
+def test_the_start_golden_does_not_depend_on_the_callers_auth_env(
+    tmp_path: Path, _private_state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "not-a-real-key")
+    test_start_prints_the_start_object(make_env(tmp_path, _private_state_dir, monkeypatch))
 
 
 def test_exec_prints_the_outcome_object(env: Env) -> None:

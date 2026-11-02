@@ -26,6 +26,7 @@ from claude_session.gateway import (
     GatewayTimeout,
     Inherit,
     Result,
+    _text,
     check_argv,
     check_kill_grace,
     check_output_limit,
@@ -255,14 +256,13 @@ class FakeGateway:
         out, err = response.stdout, response.stderr
         out_bytes = response.stdout.encode() if response.raw_stdout is None else response.raw_stdout
         if response.raw_stdout is not None:  # as the real gateway: decoded from the bytes
-            out = out_bytes.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+            out = _text(out_bytes)
         err_bytes = err.encode()
         if discard_output:
             out, err, out_bytes, err_bytes = "", "", b"", b""
         if output_limit is not None:  # as the real gateway: a byte prefix of each stream
             out_bytes, err_bytes = out_bytes[:output_limit], err_bytes[:output_limit]
-            out = out_bytes.decode("utf-8", "replace")
-            err = err_bytes.decode("utf-8", "replace")
+            out, err = _text(out_bytes), _text(err_bytes)
         return Result(args, response.returncode, out, err, out_bytes, err_bytes)
 
     def spawn(

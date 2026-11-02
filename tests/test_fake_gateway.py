@@ -266,3 +266,24 @@ def test_the_scripted_raw_bytes_are_stdout_bytes() -> None:
     raw = fake.run(["/opt/tool", "raw"])
     assert raw.stdout_bytes == b"a\r\nb\xff\n" and raw.stdout == "a\nb\ufffd\n"
     assert fake.run(["/opt/tool", "text"]).stdout_bytes == b"t\n"
+
+
+@pytest.mark.parametrize("output_limit", [None, 100])
+def test_the_fake_decodes_stdout_as_the_real_gateway(output_limit: int | None) -> None:
+    raw = b"a\r\nb\rc\xff\n"
+    code = f"import sys; sys.stdout.buffer.write({raw!r})"
+    real = SystemGateway().run([sys.executable, "-I", "-c", code], output_limit=output_limit)
+    fake = FakeGateway()
+    fake.on(["/opt/tool"], raw_stdout=raw)
+    scripted = fake.run(["/opt/tool"], output_limit=output_limit)
+    assert (scripted.stdout, scripted.stdout_bytes) == (real.stdout, real.stdout_bytes)
+    assert scripted.stdout == "a\nb\nc\ufffd\n"
+
+
+def test_the_fake_decodes_stderr_with_an_output_limit_as_the_real_gateway() -> None:
+    code = r"import sys; sys.stderr.buffer.write(b'e\r\nf\n')"
+    real = SystemGateway().run([sys.executable, "-I", "-c", code], output_limit=100)
+    fake = FakeGateway()
+    fake.on(["/opt/tool"], stderr="e\r\nf\n")
+    scripted = fake.run(["/opt/tool"], output_limit=100)
+    assert (scripted.stderr, scripted.stderr_bytes) == (real.stderr, real.stderr_bytes)

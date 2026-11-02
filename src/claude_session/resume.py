@@ -34,10 +34,11 @@ The inline liveness check (``liveness``) runs right before allocation: a run who
 died is finalized (and salvaged) there, so only a run that is still live (or pending) refuses a
 resume ``live``. The source is read earlier, at step 2: a run the check will finalize already
 counts as final there (``liveness.classify``), and as ``not-started`` when it never spawned.
-``--allow-tainted`` is checked human-only at step 2 (``taint.from_args``, exit 2) and recorded
-on the run; the store lifts the ``tainted`` refusal for it (``taint``).
-``--override-escalation`` is checked at step 2 (``check_override_escalation``: only after a run
-that ended ``escalated``, only for a human actor; exit 2); launch step 6 (``launch.pre_launch``)
+``--allow-tainted`` and ``--override-escalation`` are checked human-only at step 2, before the
+session lookup, by one rule (``taint.check_human_only``, exit 2). ``--allow-tainted`` is
+recorded on the run; the store lifts the ``tainted`` refusal for it (``taint``).
+``--override-escalation`` is then checked after the lookup (``check_override_escalation``:
+only after a run that ended ``escalated``; exit 2); launch step 6 (``launch.pre_launch``)
 then overrides exactly that run's escalating ``pre-launch`` entries and audits it.
 """
 
@@ -433,8 +434,8 @@ def _read_request(
 
 def check_override_escalation(req: launch.Request, source: Source, *, fork: bool) -> None:
     """``--override-escalation`` at step 2 (interface.md, Flag rules; exit 2): never with
-    ``--fork``; only when the previous run ended ``escalated``; and only for a human
-    (``taint.check_human_only`` on the effective actor)."""
+    ``--fork``; only when the previous run ended ``escalated``. Its human-only check
+    (``taint.check_human_only``) ran before the lookup (``prepare``)."""
     if not req.override_escalation:
         return
     if fork:
@@ -445,7 +446,6 @@ def check_override_escalation(req: launch.Request, source: Source, *, fork: bool
             f"--override-escalation needs a previous run that ended escalated; run"
             f" {source.run} of {source.csession_id} {shown}"
         )
-    taint.check_human_only("--override-escalation", req.actor, tty=taint.stdin_is_tty())
 
 
 def _undelivered(
@@ -629,7 +629,16 @@ def prepare(
     exit 2 before anything is allocated or finalized."""
     given = args.id if getattr(args, "id", None) is not None else args.resume
     fork = bool(getattr(args, "fork", False))
-    allow_tainted = taint.from_args(args)  # human-only (exit 2), before the lookup
+    # The human-only flags (exit 2), before the lookup: one rule for both.
+    effective = launch.default_actor(getattr(args, "actor", None), cfg)
+    allow_tainted = taint.from_args(args, effective)
+    if getattr(args, "override_escalation", False):
+        taint.check_human_only(
+            "--override-escalation",
+            getattr(args, "actor", None),
+            tty=taint.stdin_is_tty(),
+            effective=effective,
+        )
     sid = lookup(st, given)
     source = load_source(st, sid, process.state_root)
     origin = load_origin(st, source) if not fork and source.reforks else None
