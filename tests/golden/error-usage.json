@@ -1,0 +1,1 @@
+{"error": {"code": "usage", "message": "invalid config", "detail": "kinds.review.timeout: bad duration"}}

@@ -15,7 +15,7 @@ Runs and supervises Claude Code sessions (terminal-agnostic). Layer 1 (primitive
 | `bubblewrap`, `socat` (Linux, WSL2) | system packages | Needed by Claude Code's sandbox for sandboxed kinds; checked before launch. |
 | `git` | A, read-only | Only `git rev-parse --git-common-dir`/`--git-dir` for `${GIT_DIR}` and a linked worktree's gitdir, and the `origin` URL for the derived `--repo`, always hardened (section [Git calls](#git-calls)). claude-session never writes a repository. |
 
-Python dependencies: `pyyaml` and `pydantic` (both required by the design guide for config). Nothing else: process start times come from `/proc` (Linux) or `ps -o lstart=` (macOS) rather than `psutil`; the secret scan uses the standard library's keyed BLAKE2b.
+Python dependencies: `pyyaml` and `pydantic` (both required by the design guide for config). Nothing else: process start times come from `/proc` (Linux) or `ps -o lstart=` (macOS) rather than `psutil`; the secret scan uses the standard library's keyed BLAKE2b. Test-only (dev group): `jsonschema` and `referencing`, to validate every `--json` golden output against `schemas/` with a registry keyed by `$id`.
 
 Minimum Claude Code version: `exec` runs `claude --version` at launch and compares it with the built-in `min_claude_version` (2.1.312, the version the spike verified; overridable in config); an older version fails the launch with `claude_too_old`.
 
@@ -204,7 +204,9 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 
 | Module | Responsibility |
 |---|---|
-| `cli` | argparse surface, dispatch, `--json` error envelope, human output sanitization. |
+| `__main__` | Entry point of `python -m claude_session` and the `claude-session` script. Standard library only; dispatches `hook-event` before importing `cli`, and contains its errors (exit 0, no output). |
+| `cli` | argparse surface, argv-only flag rules, dispatch of every other command, printing of error envelopes (stdout with `--json`, and to `--outcome-file` for usage errors and refusals), human output sanitization. |
+| `errors` | Standard library only: one error class per error code, with its exit code and envelope fields. |
 | `config` | YAML and `config.d/` merge (maps deep-merged, lists replaced, `hooks.*` lists appended), Pydantic models, `CSESSION_*` overrides (top-level scalar keys only: `claude_bin`, `default_kind`, caps, durations, `retention_days`; `kinds`, `permission_profiles`, `repos`, `hooks`, `secret_env`, `claude_auth_env`, `claude_args`, `notes_context_cmd`, `notes_context_sources` and `me` cannot be set from the environment; reserved names ignored), precedence (built-in → config files → environment → flags for those scalars). Never imported by the hook path. |
 | `kinds` | Effective profile and its origins: built-in kind → config kind → per-repo override → previous run's explicit flags → flags given now (section [Resume](#resume-and-fork)); unknown-kind fallback; profile validation. |
 | `settings_builder` | Pure function: effective profile + session paths → generated settings JSON, `claude` argv, sandbox lists. The security boundary; exhaustively unit-tested. |
@@ -222,6 +224,7 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 | `procinfo` | Process start time and liveness (Linux `/proc/<pid>/stat`, macOS `ps -o lstart= -p`). |
 | `gateway` | The only module that starts subprocesses: `claude`, `git`, the notes command, sandbox prerequisite checks, `crontab`. Standard library only; runs every child with an absolute path, the sanitized `PATH` and, on Linux, `PR_SET_PDEATHSIG(SIGTERM)` for headless `claude`. Tests replace it. |
 | `audit`, `logs` | `audit.jsonl` and `log.jsonl` writers. |
+| `fsutil` | Standard library only: atomic private-file writes (temporary file plus rename relative to a parent-directory descriptor opened with `O_NOFOLLOW`, mode 0600), used for `--outcome-file`. |
 
 ### Session directories
 
@@ -448,7 +451,7 @@ The SessionStart hook always adds a trusted context line for every source (`star
 
 ### Hook-event fast path
 
-`python -I -m claude_session hook-event --state-dir <dir> <Event>` is the latency-critical path: the `cli` module dispatches it before importing `config`, Pydantic or argparse subparsers for other commands. It reads the payload, opens `<dir>/state.db`, claims and pre-checks outbox requests (claim by rename, secret scan and artifact copy, outside any transaction; PostToolUse and Stop only, see below), and in one transaction: loads the session by `CSESSION_ID`, appends `claude_ids` rows on SessionStart (setting `session_started_at` on the first), records the claimed requests, applies the transition table, appends an `events` row (with the session's labels) if the state or activity changed, and decides the Stop backstop. All of it runs within the hook's own budget, below the injected timeout (section [Generated settings](#generated-settings)). It reads the notes command settings from `private/<id>/runs/<n>/hookconf.json`, never from config or any agent-writable file. It never migrates the database (section [Data model](#data-model-statedb-sqlite-wal)). It imports only the standard library, `store`, `outbox`'s ingestion side and the stdlib-only `gateway`, which runs the notes command with cwd = the state root, the sanitized `PATH` and argv `<cmd> [--repo=<id>] [--label=<k>=<v>]...` (each label one token; `--repo` omitted when the run has no repo).
+`python -I -m claude_session hook-event --state-dir <dir> <Event>` is the latency-critical path: `__main__` dispatches it before importing `cli`, `config`, Pydantic or argparse. It reads the payload, opens `<dir>/state.db`, claims and pre-checks outbox requests (claim by rename, secret scan and artifact copy, outside any transaction; PostToolUse and Stop only, see below), and in one transaction: loads the session by `CSESSION_ID`, appends `claude_ids` rows on SessionStart (setting `session_started_at` on the first), records the claimed requests, applies the transition table, appends an `events` row (with the session's labels) if the state or activity changed, and decides the Stop backstop. All of it runs within the hook's own budget, below the injected timeout (section [Generated settings](#generated-settings)). It reads the notes command settings from `private/<id>/runs/<n>/hookconf.json`, never from config or any agent-writable file. It never migrates the database (section [Data model](#data-model-statedb-sqlite-wal)). It imports only the standard library, `store`, `outbox`'s ingestion side and the stdlib-only `gateway`, which runs the notes command with cwd = the state root, the sanitized `PATH` and argv `<cmd> [--repo=<id>] [--label=<k>=<v>]...` (each label one token; `--repo` omitted when the run has no repo).
 
 **Failure handling.** On an internal error (e.g. a busy timeout) `hook-event` logs at `error` and exits 0 with no output, so a claude-session bug never blocks a session. Unprocessed outbox requests stay for the next drain. `exec` re-derives the final state at child exit (it drains the outbox and applies the end mapping regardless of the last recorded activity), so a dropped Stop cannot leave a wrong final state. A missed auto-exit trigger is retried on the next qualifying Stop.
 

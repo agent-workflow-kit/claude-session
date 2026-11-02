@@ -8,7 +8,7 @@ license = "MIT"
 dependencies = []
 
 [project.scripts]
-claude-session = "claude_session.cli:main"
+claude-session = "claude_session.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -18,7 +18,14 @@ build-backend = "hatchling.build"
 packages = ["src/claude_session"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6", "pyright>=1.1.380", "pymarkdownlnt>=0.9.41"]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+    "pymarkdownlnt>=0.9.41",
+    "jsonschema>=4.26.0",
+    "referencing>=0.37.0",
+]
 
 [tool.ruff]
 line-length = 100

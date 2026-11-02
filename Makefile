@@ -1,9 +1,13 @@
-.PHONY: verify test lint fmt fmt-check typecheck mdlint
+.PHONY: verify test live lint fmt fmt-check typecheck mdlint
 
 verify: lint fmt-check typecheck test mdlint
 
 test:
 	uv run pytest
+
+# Real Claude Code; run locally after every Claude Code upgrade, never in CI.
+live:
+	uv run pytest -m live
 
 lint:
 	uv run ruff check .
