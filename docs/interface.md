@@ -488,7 +488,7 @@ Writes or removes the managed crontab block `# claude-session managed`, which ru
 
 ## Global flags
 
-`--json`, `--config <path>`, `--verbose`, `--quiet`, `--version`, `--yes` (accepted by every command and a no-op: claude-session never prompts for confirmation). Global flags follow the command name (`claude-session list --json`); only `--version` is also accepted before it. `--verbose` and `--quiet` are mutually exclusive (exit 2). `--help` is exempt from `--json`, and `--version` prints plain text even with `--json`. `--dry-run` is accepted by `exec`, `start`, `resume`, `stop`, `forget`, `label add/remove`, `reconcile` and `cron install/uninstall` (for the non-launch commands it prints what would change).
+`--json`, `--config <path>`, `--verbose`, `--quiet`, `--version`, `--yes` (accepted by every command and a no-op: claude-session never prompts for confirmation). Internal commands (`hook-event`, see [Internal commands](#internal-commands)) take only their documented argv; global flags do not apply to them. Global flags follow the command name (`claude-session list --json`); only `--version` is also accepted before it. `--verbose` and `--quiet` are mutually exclusive (exit 2). `--help` is exempt from `--json`, and `--version` prints plain text even with `--json`. `--dry-run` is accepted by `exec`, `start`, `resume`, `stop`, `forget`, `label add/remove`, `reconcile` and `cron install/uninstall` (for the non-launch commands it prints what would change).
 
 Human-readable output of untrusted fields (transcript text, summaries, reasons, subagent descriptions) strips or escapes C0 and C1 control characters. `--json` output carries them JSON-escaped; `transcript --raw` prints files unchanged.
 
@@ -523,7 +523,8 @@ The state is **derived** from four per-run values, which the events below change
 | `SessionStart` `startup`/`resume`/`fork` | any other live state | Claude session id recorded | unchanged |
 | `SessionStart` `clear`/`compact` | any live state | Claude session id recorded (`clear` gives a new one); context line re-added | unchanged |
 | `UserPromptSubmit` | any live state | activity `working`; prompt none; `escalation_open` false | `reported` (working) if a report exists, else `working` (working) |
-| `PermissionRequest`, `Notification` `permission_prompt` | any live state after `SessionStart` | prompt `permission`; activity `working` | `needs-input(permission)` (working) |
+| `PermissionRequest` | any live state after `SessionStart` | prompt `permission`; activity `working` | `needs-input(permission)` (working) |
+| `Notification` `permission_prompt` (follows a `PermissionRequest` by about 6 s) | any live state after `SessionStart` | prompt `permission` unless a `question` or `elicitation` prompt is waiting (then kept); activity `working` | `needs-input(question\|elicitation)` (working) if one was waiting, else `needs-input(permission)` (working) |
 | `PermissionRequest` with `tool_name: AskUserQuestion` | any live state after `SessionStart` | prompt `question`; activity `working` | `needs-input(question)` (working) |
 | `Notification` `elicitation_dialog` | any live state after `SessionStart` | prompt `elicitation`; activity `working` | `needs-input(elicitation)` (working) |
 | `PostToolUse` (a tool ran, so any prompt was approved) | any live state after `SessionStart` | prompt none; activity `working` | `needs-input(escalation)` (working) if `escalation_open`, else `reported` (working) if a report exists, else `working` (working) |
