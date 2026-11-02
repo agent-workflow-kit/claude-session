@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import os
 import stat
-import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -105,7 +104,10 @@ _MACOS_HINT = f"the macOS Seatbelt sandbox needs {SANDBOX_EXEC}"
 _UNSUPPORTED_HINT = "Claude Code has no sandbox on this platform; set sandbox to preferred or off"
 _SOCKET_HINT = "use a shorter temporary directory path (the private TMPDIR lives under /tmp)"
 
-Runner = Callable[..., subprocess.CompletedProcess[str]]
+Runner = Callable[..., gateway.Result]
+
+
+_GATEWAY_RUN: Runner = gateway.SystemGateway().run
 
 
 @dataclass(frozen=True)
@@ -163,7 +165,7 @@ def check_prerequisites(
     *,
     bwrap: str | None,
     socat: str | None,
-    runner: Runner = gateway.run,
+    runner: Runner = _GATEWAY_RUN,
     sandbox_exec: str = SANDBOX_EXEC,
 ) -> Prerequisites:
     """Whether the sandbox can run here: the tools present and a probe that succeeds."""
@@ -183,7 +185,7 @@ def self_check(
     bwrap: str | None,
     socat: str | None,
     platform: str | None = None,
-    runner: Runner = gateway.run,
+    runner: Runner = _GATEWAY_RUN,
     tmp_base: str = tmpdir.DEFAULT_BASE,
     create: bool = True,
     sandbox_exec: str = SANDBOX_EXEC,
@@ -280,7 +282,7 @@ def _probe(argv: list[str], runner: Runner) -> str | None:
     kwargs: dict[str, Any] = {"timeout": PROBE_TIMEOUT, "env": dict(PROBE_ENV)}
     try:
         result = runner(argv, **kwargs)
-    except subprocess.TimeoutExpired:
+    except gateway.GatewayTimeout:
         return f"probe timed out after {PROBE_TIMEOUT:g} s"
     except OSError as exc:
         return f"probe could not run: {exc.strerror or exc}"

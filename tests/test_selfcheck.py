@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import tempfile
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -13,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import fsutil, selfcheck, tmpdir
+from claude_session import fsutil, gateway, selfcheck, tmpdir
 from claude_session.errors import LaunchValidationError
 from claude_session.selfcheck import Prerequisites
 
@@ -43,14 +42,14 @@ class FakeRunner:
         stdin: str | None = None,
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> gateway.Result:
         self.calls.append({"argv": list(argv), "timeout": timeout, "env": env, "stdin": stdin})
         answer: int | BaseException | None = self.by_tool.get(Path(argv[0]).name)
         if answer is None:
             answer = self.error if self.error is not None else self.returncode
         if isinstance(answer, BaseException):
             raise answer
-        return subprocess.CompletedProcess(argv, answer, "", "probe stderr")
+        return gateway.Result(tuple(argv), answer, "", "probe stderr")
 
 
 UNDECODABLE = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
@@ -216,7 +215,7 @@ def test_linux_failing_probe_means_no_user_namespaces(tools: tuple[str, str]) ->
 @pytest.mark.parametrize(
     "error",
     [
-        subprocess.TimeoutExpired(["bwrap"], 10),
+        gateway.GatewayTimeout(["bwrap"], 10),
         FileNotFoundError(2, "No such file or directory"),
         PermissionError(13, "Permission denied"),
         UNDECODABLE,
@@ -244,7 +243,7 @@ def test_probe_with_undecodable_output_is_a_probe_failure(tools: tuple[str, str]
     "answer",
     [
         1,
-        subprocess.TimeoutExpired(["socat"], 10),
+        gateway.GatewayTimeout(["socat"], 10),
         PermissionError(13, "Permission denied"),
         UNDECODABLE,
     ],
