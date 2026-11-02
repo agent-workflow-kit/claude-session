@@ -48,7 +48,8 @@ taint re-check (``launch.recheck_fork_taint``).
 The adopting ``exec`` installs its signal handlers before the compare-and-set and defers
 them from just before it (a signal then acts once the run is its own, in the launch phase);
 an interactive run is handed the terminal as plain ``exec`` hands it.
-TODO(#32): ``stop`` canceling a pending run deletes its launch spec too (``discard_spec``).
+``stop`` canceling a pending run deletes its launch spec too (``discard_spec_at``, from
+``stopper``).
 """
 
 from __future__ import annotations
