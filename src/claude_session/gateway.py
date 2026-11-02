@@ -61,9 +61,6 @@ import select
 import selectors
 import signal
 import subprocess
-<<<<<<< HEAD
-from collections.abc import Mapping
-=======
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -72,7 +69,6 @@ from typing import Final, Protocol, runtime_checkable
 
 # Pass as a ``spawn`` stream to connect it to /dev/null (``spawn``'s default stdin).
 DEVNULL: Final = subprocess.DEVNULL
->>>>>>> 0f4a6cbfa103309023813b922fbf6c8b6e6b6594
 
 
 class Inherit(enum.Enum):
@@ -222,23 +218,6 @@ def sanitize_path(path: str) -> str:
 def check_argv(
     argv: Sequence[str],
     *,
-<<<<<<< HEAD
-    stdin: str | None = None,
-    timeout: float | None = None,
-    env: Mapping[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Run ``argv`` without a shell and capture its text output. ``env`` replaces the whole
-    environment of the child (None: inherit this process's environment)."""
-    return subprocess.run(
-        argv,
-        input=stdin,
-        env=None if env is None else dict(env),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-=======
     env: Mapping[str, str] | None,
     extra_env: Mapping[str, str] | None,
 ) -> None:
@@ -658,27 +637,3 @@ class SystemGateway:
                 raise
         assert popen is not None  # start() returned or raised
         return _PopenChild(popen)
->>>>>>> 0f4a6cbfa103309023813b922fbf6c8b6e6b6594
-
-
-# TODO(#15): kinds.git_origin_url still calls this module-level ``run`` (the pre-#51 helper);
-# move it to ``SystemGateway.run`` and delete this function when headless supervision (#15)
-# wires the gateway into the callers. Kept here so the merge of #52 onto #51 behaves as before.
-def run(
-    argv: list[str],
-    *,
-    stdin: str | None = None,
-    timeout: float | None = None,
-    env: Mapping[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Run ``argv`` without a shell and capture its text output. ``env`` replaces the whole
-    environment of the child (None: inherit this process's environment)."""
-    return subprocess.run(
-        argv,
-        input=stdin,
-        env=None if env is None else dict(env),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )

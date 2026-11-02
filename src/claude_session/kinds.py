@@ -17,6 +17,7 @@ Never imported by the hook path: it needs ``config`` (Pydantic and PyYAML).
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import cache
@@ -99,6 +100,7 @@ GIT_HARDENING = (
     "-c",
     "core.pager=cat",
 )
+GATEWAY: gateway.Gateway = gateway.SystemGateway()
 GIT_TIMEOUT = 10.0
 
 
@@ -254,12 +256,15 @@ def _check_repo(value: str, where: str) -> None:
 def git_origin_url(cwd: str) -> str | None:
     """The URL of the ``origin`` remote of the repository at ``cwd`` (hardened, read-only git),
     or None when there is none or git fails. Only git's trailing newline is removed."""
-    # TODO(#15): run git through the #51 gateway: the absolute git resolved at launch and the
-    # cwd set by the gateway; the environment cleanup below (git_env) moves there too.
-    argv = ["git", *GIT_HARDENING, "-C", os.fspath(cwd), "remote", "get-url", "origin"]
+    # TODO(#15): run git as the absolute git resolved at launch and with the cwd set by the
+    # gateway; the environment cleanup below (git_env) moves there too.
+    git = shutil.which("git", path=gateway.sanitize_path(os.environ.get("PATH", "")))
+    if git is None:
+        return None
+    argv = [git, *GIT_HARDENING, "-C", os.fspath(cwd), "remote", "get-url", "origin"]
     try:
-        result = gateway.run(argv, timeout=GIT_TIMEOUT, env=git_env(os.environ))
-    except (OSError, ValueError, gateway.subprocess.SubprocessError):
+        result = GATEWAY.run(argv, timeout=GIT_TIMEOUT, env=git_env(os.environ))
+    except (OSError, ValueError, gateway.GatewayTimeout):
         return None
     if result.returncode != 0:
         return None
