@@ -381,6 +381,48 @@ def _stop(args: argparse.Namespace) -> int:
     return stopped.exit_code
 
 
+def _forget(args: argparse.Namespace) -> int:
+    """``forget <id>`` and ``forget --older-than`` (interface.md, forget): hide sessions;
+    ``reconcile`` deletes them ``retention_days`` later."""
+    from . import forgetting, launch
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    actor = launch.default_actor(args.actor, cfg)
+    common: dict[str, Any] = {
+        "gateway": SystemGateway(),
+        "environ": os.environ,
+        "actor": actor,
+        "decision_ids": args.decision_id or [],
+        "dry_run": args.dry_run,
+    }
+    with store.open_state() as st:
+        if args.id is not None:
+            sid = ids.lookup_session_id(args.id, st.session_id_candidates)
+            result = forgetting.forget_session(st, cfg, sid, **common)
+        else:
+            result = forgetting.forget_older_than(
+                st,
+                cfg,
+                durations.parse(args.older_than),
+                states=args.state or [],
+                kind=args.kind,
+                labels=[ids.parse_label(text) for text in args.label or []],
+                **common,
+            )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+        return 0
+    verb = "would forget" if result["dry_run"] else "forgot"
+    for item in result["forgotten"]:
+        print(f"{verb} {item['csession_id']} (deleted after {item['delete_after']})")
+    for item in result["skipped"]:
+        print(f"skipped {item['csession_id']}: {item['reason']}")
+    if not (result["forgotten"] or result["skipped"]):
+        print("nothing to forget")
+    return 0
+
+
 def _wait(args: argparse.Namespace) -> int:
     """``wait <id> [--run n] [--timeout d] [--outcome-file p]`` (interface.md, wait): the
     run's outcome code, or 22 when ``--timeout`` expired first. Ctrl-C ends it by the signal,
@@ -722,7 +764,7 @@ HANDLERS: dict[str, Handler] = {
     "label add": _not_implemented,
     "label remove": _not_implemented,
     "transcript": _not_implemented,
-    "forget": _not_implemented,
+    "forget": _forget,
     "reconcile": _reconcile,
     "export": _not_implemented,
     "cron install": _not_implemented,

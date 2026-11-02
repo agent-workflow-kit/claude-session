@@ -57,8 +57,8 @@ the #65 line) call ``check_session`` (and ``sessions_with_open_runs`` for ``list
 delivering; ended runs keep their ``Store.known_liveness`` display.
 ``stop`` (``stopper``) runs ``check_session`` first (cause ``liveness``) and again, with cause
 ``stop``, to finalize a run whose wrapper it found gone or SIGKILLed.
-TODO(#34): ``forget`` runs ``check_session`` (cause ``forget`` for its own changes,
-``liveness`` for this check's) and delivers what it changed.
+``forget`` runs ``check_session`` (cause ``forget`` for its own changes, ``liveness`` for this
+check's) and delivers what it changed.
 TODO(#36): ``verify-secret`` keeps its fail-closed reading (a run is live only when its
 wrapper or child is confirmed alive by a non-empty token) and its constant-work probes; it may
 reuse ``open_run_live`` only with that reading.
