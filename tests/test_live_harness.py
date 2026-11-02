@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -463,53 +465,189 @@ def test_tool_calls_ignore_results_without_a_matching_use() -> None:
     assert harness.tool_calls([orphan]) == []
 
 
+def test_tool_calls_skip_blocks_without_an_id() -> None:
+    """Blocks without an id cannot be paired: they are skipped, not merged under one key."""
+    stream = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "/a"}},
+            {"type": "tool_use", "id": "", "name": "Grep", "input": {}},
+            {"type": "tool_use", "id": "k", "name": "Glob", "input": {"pattern": "*"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "orphan"},
+            {"type": "tool_result", "tool_use_id": "k", "content": "x.txt"},
+        ]}},
+    ]  # fmt: skip
+    calls = harness.tool_calls(stream)
+    assert [(c.name, c.output) for c in calls] == [("Glob", "x.txt")]
+
+
+def _call(name: str, output: str = "", error: bool = False, **inp: object) -> harness.ToolCall:
+    return harness.ToolCall(name, inp, output, error)
+
+
+def test_probe_calls_select_the_calls_that_name_the_target() -> None:
+    calls = [
+        _call("Read", file_path="/w/plain.txt"),
+        _call("Read", file_path="/w/link.txt"),
+        _call("Grep", pattern="S", path="/w/link.txt"),
+        _call("Grep", pattern="S", path="/w"),
+        _call("Glob", pattern="dirlink/*", path="/w"),
+        _call("Bash", command="cat /proc/42/environ"),
+        _call("Bash", command="ls /proc"),
+    ]
+    assert harness.probe_calls(calls, "/w/link.txt", "Read") == [calls[1]]
+    assert harness.probe_calls(calls, "/w/link.txt", "Read", "Grep") == calls[1:3]
+    assert harness.probe_calls(calls, "dirlink", "Glob") == [calls[4]]
+    assert harness.probe_calls(calls, "/proc/42/environ", "Bash") == [calls[5]]
+    assert harness.probe_calls(calls, "/w/other.txt", "Read", "Grep") == []
+
+
+def test_a_leak_is_the_marker_or_a_named_file_in_a_successful_result() -> None:
+    content = _call("Grep", "/w/link.txt:F1-SECRET-7782")
+    paths_only = _call("Grep", "Found 1 file\n/w/link.txt")
+    relative = _call("Grep", "link.txt")
+    other = _call("Grep", "Found 1 file\n/w/plain.txt\n/w/unlink.txt.bak")
+    denied = _call("Grep", "Permission denied: /w/link.txt", error=True)
+    read = _call("Read", "1\tF1-SECRET-7782")
+    assert harness.leaked([content], "F1-SECRET-7782", ("link.txt",)) == [content]
+    assert harness.leaked([paths_only, relative], "F1-SECRET-7782", ("link.txt",)) == [
+        paths_only,
+        relative,
+    ]
+    assert harness.leaked([other, denied], "F1-SECRET-7782", ("link.txt",)) == []
+    assert harness.leaked([read], "F1-SECRET-7782") == [read]
+
+
+def test_a_control_accepts_the_text_or_a_listed_file() -> None:
+    assert harness.found([_call("Grep", "plain.txt:CONTROL")], "CONTROL")
+    assert harness.found([_call("Grep", "Found 1 file\n/w/plain.txt")], "CONTROL", ("plain.txt",))
+    assert not harness.found([_call("Grep", "No files found")], "CONTROL", ("plain.txt",))
+    assert not harness.found([_call("Grep", "/w/plain.txt", error=True)], "X", ("plain.txt",))
+
+
+@pytest.mark.parametrize(
+    ("output", "missing"),
+    [
+        ("File does not exist.", True),
+        ("Path does not exist: /w/link.txt", True),
+        ("ENOENT: no such file or directory", True),
+        ("Permission denied", False),
+        ("No files found", False),
+    ],
+)
+def test_missing_file_errors_are_recognized(output: str, missing: bool) -> None:
+    assert harness.missing_file(_call("Read", output, error=True)) is missing
+
+
+@pytest.mark.parametrize(
+    ("command", "listing"),
+    [
+        ("ls /proc", True),
+        ("  ls /proc/ ", True),
+        ("ls -1 /proc", True),
+        ("ls -la /proc 2>&1", True),
+        ("ls /proc/self", False),
+        ("ls /procfs", False),
+        ("cat /proc/1/cmdline", False),
+        ("ls /proc; cat /etc/passwd", False),
+    ],
+)
+def test_proc_listing_commands(command: str, listing: bool) -> None:
+    assert harness.is_proc_listing(command) is listing
+
+
+def test_proc_entries_parses_a_listing_and_rejects_a_failed_one() -> None:
+    ok = _call("Bash", "1\n2\n7\nacpi\nself\nthread-self\nuptime")
+    assert harness.proc_entries(ok) == {"1", "2", "7"}
+    columns = _call("Bash", "1    7    acpi\n12   self uptime\n")
+    assert harness.proc_entries(columns) == {"1", "7", "12"}
+    long = _call(
+        "Bash",
+        "total 0\ndr-xr-xr-x 9 root root 0 Jan 1 00:00 1\n"
+        "lrwxrwxrwx 1 root root 0 Jan 1 00:00 self -> 9\n",
+    )
+    assert harness.proc_entries(long) == {"1"}
+    assert harness.proc_entries(_call("Bash", "", error=False)) is None
+    assert harness.proc_entries(_call("Bash", "ls: cannot open directory '/proc'", True)) is None
+    assert harness.proc_entries(_call("Bash", "1\n2\n")) is None  # no `self`: not a /proc
+
+
 ELICIT_SERVER = REPO / "tests" / "live" / "mcp_elicit_server.py"
 
 
-def _elicit_session(tmp_path: Path, answer: dict[str, object] | None) -> tuple[list[dict], str]:
-    """Drive the server like a client: initialize, list tools, call `ask`, answer the
-    elicitation with `answer` (None: close stdin instead). Returns the server's messages."""
-    log = tmp_path / "server.log"
-    proc = subprocess.Popen(
-        [sys.executable, "-I", str(ELICIT_SERVER)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-        env={"ELICIT_SERVER_LOG": str(log), "PATH": os.environ["PATH"]},
-    )
-    assert proc.stdin and proc.stdout
-    seen: list[dict] = []
+class _Server:
+    """The elicitation server driven like a client, with a deadline on every read."""
 
-    def send(message: dict[str, object]) -> None:
-        proc.stdin.write(json.dumps(message) + "\n")  # type: ignore[union-attr]
-        proc.stdin.flush()  # type: ignore[union-attr]
+    def __init__(self, tmp_path: Path) -> None:
+        self.log = tmp_path / "server.log"
+        self.proc = subprocess.Popen(
+            [sys.executable, "-I", str(ELICIT_SERVER)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            env={"ELICIT_SERVER_LOG": str(self.log), "PATH": os.environ["PATH"]},
+        )
+        assert self.proc.stdin is not None and self.proc.stdout is not None
+        self.stdin, stdout = self.proc.stdin, self.proc.stdout
+        self.lines: queue.Queue[str] = queue.Queue()
+        self.seen: list[dict] = []
+        self.reader = threading.Thread(target=lambda: [self.lines.put(x) for x in stdout])
+        self.reader.start()
 
-    def receive() -> dict:
-        message = json.loads(proc.stdout.readline())  # type: ignore[union-attr]
-        seen.append(message)
+    def send(self, message: dict[str, object]) -> None:
+        self.stdin.write(json.dumps(message) + "\n")
+        self.stdin.flush()
+
+    def receive(self, timeout: float = 10) -> dict:
+        try:
+            line = self.lines.get(timeout=timeout)
+        except queue.Empty:
+            raise AssertionError("the server did not answer in time") from None
+        message = json.loads(line)
+        self.seen.append(message)
         return message
 
-    params = {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}}
-    send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params})
-    receive()
-    send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-    send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    receive()
-    send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "ask"}})
-    asked = receive()
-    if answer is None:
-        proc.stdin.close()
-    else:
-        send({"jsonrpc": "2.0", "id": asked["id"], "result": answer})
-        receive()
-        proc.stdin.close()
-    proc.wait(10)
-    proc.stdout.close()
-    return seen, log.read_text(encoding="utf-8")
+    def start_question(self) -> dict:
+        params = {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}}
+        self.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params})
+        self.receive()
+        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        self.receive()
+        self.send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "ask"}})
+        return self.receive()
+
+    def finish(self) -> str:
+        self.stdin.close()
+        self.proc.wait(10)
+        return self.log.read_text(encoding="utf-8")
+
+    def close(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait(10)
+        self.reader.join(10)  # the server's stdout is at its end once the process is gone
+        for stream in (self.proc.stdin, self.proc.stdout):
+            if stream is not None and not stream.closed:
+                stream.close()
 
 
-def test_the_elicit_server_asks_and_reports_the_users_action(tmp_path: Path) -> None:
-    seen, log = _elicit_session(tmp_path, {"action": "cancel"})
+@pytest.fixture
+def server(tmp_path: Path) -> Iterator[_Server]:
+    srv = _Server(tmp_path)
+    try:
+        yield srv
+    finally:
+        srv.close()
+
+
+def test_the_elicit_server_asks_and_reports_the_users_action(server: _Server) -> None:
+    asked = server.start_question()
+    server.send({"jsonrpc": "2.0", "id": asked["id"], "result": {"action": "cancel"}})
+    server.receive()
+    log = server.finish()
+    seen = server.seen
     assert seen[0]["result"]["capabilities"] == {"tools": {}}
     assert [t["name"] for t in seen[1]["result"]["tools"]] == ["ask"]
     assert seen[2]["method"] == "elicitation/create"
@@ -519,7 +657,28 @@ def test_the_elicit_server_asks_and_reports_the_users_action(tmp_path: Path) -> 
     assert '"elicitation": {}' in log  # the client's capabilities are recorded
 
 
-def test_the_elicit_server_exits_when_the_client_goes_away_mid_question(tmp_path: Path) -> None:
-    seen, log = _elicit_session(tmp_path, None)
-    assert seen[-1]["method"] == "elicitation/create"
+def test_the_elicit_server_exits_when_the_client_goes_away_mid_question(server: _Server) -> None:
+    server.start_question()
+    log = server.finish()
+    assert server.seen[-1]["method"] == "elicitation/create"
     assert "answered closed" in log
+
+
+def test_the_elicit_server_answers_ping_outside_a_question(server: _Server) -> None:
+    server.send({"jsonrpc": "2.0", "id": 7, "method": "ping"})
+    assert server.receive() == {"jsonrpc": "2.0", "id": 7, "result": {}}
+
+
+def test_the_elicit_server_handles_requests_while_a_question_is_pending(server: _Server) -> None:
+    asked = server.start_question()
+    server.send({"jsonrpc": "2.0", "id": 8, "method": "ping"})
+    assert server.receive() == {"jsonrpc": "2.0", "id": 8, "result": {}}
+    server.send({"jsonrpc": "2.0", "id": 9, "method": "tools/list"})
+    assert [t["name"] for t in server.receive()["result"]["tools"]] == ["ask"]
+    cancel = {"requestId": 3, "reason": "user pressed Esc"}
+    server.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": cancel})
+    server.send({"jsonrpc": "2.0", "id": asked["id"], "result": {"action": "decline"}})
+    assert "decline" in server.receive()["result"]["content"][0]["text"]
+    log = server.finish()
+    assert "cancelled" in log and "user pressed Esc" in log
+    assert "answered decline" in log

@@ -262,7 +262,7 @@ def test_an_mcp_elicitation_fires_the_elicitation_dialog_notification(session: S
             "mcpServers": {
                 "elicit": {
                     "command": sys.executable,
-                    "args": [str(Path(__file__).with_name("mcp_elicit_server.py"))],
+                    "args": ["-I", str(Path(__file__).with_name("mcp_elicit_server.py"))],
                     "env": {"ELICIT_SERVER_LOG": str(server_log)},
                 }
             }
@@ -286,6 +286,14 @@ def test_an_mcp_elicitation_fires_the_elicitation_dialog_notification(session: S
     )
     session.live.observe(
         "MCP server log before the answer", server_log.read_text(encoding="utf-8").splitlines()
+    )
+    initialize = [
+        line for line in server_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("initialize capabilities=")
+    ]  # fmt: skip
+    assert initialize and "elicitation" in initialize[0], (
+        "the client did not advertise elicitation support, so no dialog can be expected",
+        initialize,
     )
     fired = wait_for(lambda: bool(read_log(session.notify["elicitation_dialog"])), 30)
     session.live.observe("elicitation screen", session.tmux.capture()[-600:])

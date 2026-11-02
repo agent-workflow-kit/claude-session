@@ -134,18 +134,30 @@ Not covered, with the reason:
 
 ### Open items (issue #42)
 
-None of these tests has been run against a real Claude Code. They are queued for the first human `make live`; until then the findings columns of design.md (F1, F2) and interface.md (residual risks, home-directory Read denies) are unchanged. After the run, read the observations (`CSESSION_LIVE_OBSERVATIONS`) and update those rows, and open a follow-up issue for any required change.
+None of these tests has been run against a real Claude Code. They are queued for the first human `make live`; until then the rows that call these items open or untested are unchanged. After the run, read the observations (`CSESSION_LIVE_OBSERVATIONS`) and update every one of these rows, and open a follow-up issue for any required change:
+
+- design.md, the live-verification table: AskUserQuestion (B4), whose consequence column calls `elicitation_dialog` untested without an MCP server; search tools under the review profile (D3); the safety re-review check (F1); and the "Still to verify" line below the table (MCP elicitation, F1, F2).
+- design.md, Testing: the open entries for Glob, Grep and LS under the review profile and for MCP elicitation detection.
+- interface.md: `needs_input_reason` `elicitation` ("not live-tested without an MCP server"), the residual risks and the home-directory Read denies.
 
 | Item | Test | What it asserts and records |
 |---|---|---|
-| F1 Read, Grep, Glob on a symlink planted by sandboxed Bash | `test_open_items.py::test_f1_...[Read\|Grep\|Glob]` (needs a sandbox) | Bash plants a file symlink and a directory symlink to a private `outside/` dir; Read and Grep must not return the secret (assert, with a plain file in the cwd as the control that the tool works); what Glob lists behind the directory link is recorded. If this fails, the home Read denies in the isolated settings must stay. |
-| F2 `/proc` isolation | `test_open_items.py::test_f2_...` (needs a sandbox, Linux) | A host child (exact PID, killed at teardown) holds a marker in its environment; sandboxed `cat /proc/<pid>/environ` must not show it, and `ls /proc` must list fewer processes than the host. `/proc/<pid>/root` and `/proc/1/cmdline` are recorded only. |
+| F1 Read, Grep, Glob on a symlink to a file outside | `test_open_items.py::test_f1_...[Read\|Grep\|Glob]` (needs a sandbox) | The test plants (before the run, so no tool call can race it) a file symlink and a directory symlink in the cwd to a private `outside/` dir, as sandboxed Bash could. Controls: the tool works on a plain file in the cwd, and a direct read of the outside file is blocked (else the result is inconclusive, not a symlink finding). Read and Grep must probe the link, must not find it missing, and must not return the secret nor, for Grep's paths-only mode, list the link. Grep is asked for `output_mode: "content"`; the mode used is recorded. What Glob lists behind the directory link is recorded. If this fails, the home Read denies in the isolated settings must stay. |
+| F2 `/proc` isolation | `test_open_items.py::test_f2_...` (needs a sandbox, Linux) | A host child (exact PID, killed at teardown, environment only `PATH` and a marker) must not appear in the sandbox's `ls /proc`, which must succeed and list `self` (else the namespace is unverified and the test fails); the agent must run `cat /proc/<pid>/environ` and not see the marker. `/proc/<pid>/root`, `/proc/1/cmdline` and the process counts are recorded; environ text never is. |
 | MCP elicitation | `test_interactive.py::test_an_mcp_elicitation_...` | A stdlib stdio MCP server (`tests/live/mcp_elicit_server.py`) sends `elicitation/create` from its tool; the `elicitation_dialog` Notification hook must fire. Records the payload, any `PermissionRequest`, the screen, and what Esc does to the pending request. |
-| Search tools and the home Read denies (#59 12) | `test_open_items.py::test_search_tools_...[block-reads\|read-deny\|both]` | A planted `~/.ssh/id_test` in the private home; Read, Grep and Glob under `blockReadsOutsideWorkingDirectories` only, a `Read(//<home>/.ssh/**)` deny only, and both. Records which tools return the key or its name; asserts only for `both` and only for Read and Grep content. |
+| Search tools and the home Read denies (#59 12) | `test_open_items.py::test_search_tools_...[block-reads\|read-deny\|both]` | A planted `~/.ssh/id_test` in the private home; Read, Grep and Glob under `blockReadsOutsideWorkingDirectories` only, a `Read(//<home>/.ssh/**)` deny only, and both. Each tool must probe `~/.ssh` (controls in the cwd first). Records which tools return the key or its name (a Grep result listing `id_test` counts as a leak); asserts only for `both` and only for Read and Grep. |
 | `--strict-mcp-config` drops plugin MCP servers | already covered: `test_headless.py::test_strict_mcp_config_...` | The issue's scope lists it; no new test. |
+
+### Comments on issue #42
+
+| Comment | Test or status |
+|---|---|
+| PR #59: F1 still gates the home and credential Read denies | `test_open_items.py::test_f1_...` (above) |
+| PR #59: system dirs, `/bin/sh` and the ELF loader under deny-root on a usr-merged distro | `test_sandbox.py::test_deny_root_...` runs `/bin/sh` (dynamically linked) by its literal path under deny-root with the system dirs and their realpaths; it proves the usr-merged case only on a usr-merged host, so whether `/bin` is a symlink is recorded |
+| PR #59: ancestors of the tmpdir in `read_dirs` | Refused by the code (`pathrules`); no live test |
 
 Planted files and symlinks live only under the test's private root (`live.root`); the private `HOME` is the only home used.
 
 ### Tests of the suite itself
 
-`tests/test_live_harness.py` covers the helpers (environment allowlist, credentials, ledger, stream parsing, tool-call pairing, the elicitation MCP server driven by a fake client, tmux driver, recorded-PID kill, `headless` against the fake claude) and the gating: a default run deselects every live test, `-m live` without the opt-in skips them all, `make live` sets the opt-in and `verify` does not depend on it.
+`tests/test_live_harness.py` covers the helpers (environment allowlist, credentials, ledger, stream parsing, tool-call pairing, the probe-call and leak checks of the open-item tests, the `/proc` listing parser, the elicitation MCP server driven by a fake client (including `ping` while a question is pending), tmux driver, recorded-PID kill, `headless` against the fake claude) and the gating: a default run deselects every live test, `-m live` without the opt-in skips them all, `make live` sets the opt-in and `verify` does not depend on it.

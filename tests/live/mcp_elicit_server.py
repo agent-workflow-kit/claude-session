@@ -1,9 +1,11 @@
 """A minimal MCP server for the elicitation live test (stdio, standard library only).
 
 It offers one tool, `ask`. Calling it sends the client an `elicitation/create` request and
-waits for the answer; the tool result reports the action the user took (`accept`, `decline`,
-`cancel`). Nothing else is implemented: no resources, no prompts, no logging. It writes one line
-per event to the file named by `ELICIT_SERVER_LOG` (if set) so a test can see what happened.
+waits for the answer, still answering the client's own requests (`ping`) meanwhile; the tool
+result reports the action the user took (`accept`, `decline`, `cancel`). Nothing else is
+implemented: no resources, no prompts, no logging. It opens no socket, starts no process and
+writes no file other than its log: one line per event to the file named by `ELICIT_SERVER_LOG`
+(if set) so a test can see what happened.
 
 Run as `python mcp_elicit_server.py`; `tests/test_live_harness.py` drives it with a fake client.
 """
@@ -67,7 +69,9 @@ def elicit(request_id: int) -> str:
     )
     log("elicitation sent")
     while (message := read()) is not None:
-        if message.get("id") == f"elicit-{request_id}":
+        if "method" in message:  # a request or notification of the client: answer it meanwhile
+            handle(message)
+        elif message.get("id") == f"elicit-{request_id}":
             result = message.get("result")
             action = result.get("action") if isinstance(result, dict) else None
             return str(action or "error")
@@ -77,8 +81,12 @@ def elicit(request_id: int) -> str:
 def handle(message: dict[str, Any]) -> None:
     method, ident = message.get("method"), message.get("id")
     if ident is None:  # a notification (initialized, cancelled): no answer
+        if method == "notifications/cancelled":
+            log(f"cancelled {json.dumps(message.get('params'), sort_keys=True)}")
         return
-    if method == "initialize":
+    if method == "ping":
+        send({"jsonrpc": "2.0", "id": ident, "result": {}})
+    elif method == "initialize":
         params = message.get("params") or {}
         version = params.get("protocolVersion") or PROTOCOL_VERSION
         log(f"initialize capabilities={json.dumps(params.get('capabilities'), sort_keys=True)}")

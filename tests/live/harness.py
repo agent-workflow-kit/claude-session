@@ -269,6 +269,8 @@ def tool_calls(events: Sequence[Mapping[str, Any]]) -> list[ToolCall]:
             if not isinstance(block, dict):
                 continue
             ident = str(block.get("id") or block.get("tool_use_id") or "")
+            if not ident:  # cannot be paired: skipped rather than merged under one key
+                continue
             if block.get("type") == "tool_use":
                 raw = block.get("input")
                 uses[ident] = (str(block.get("name")), raw if isinstance(raw, dict) else {})
@@ -276,6 +278,80 @@ def tool_calls(events: Sequence[Mapping[str, Any]]) -> list[ToolCall]:
             elif block.get("type") == "tool_result":
                 outputs[ident] = (_result_text(block.get("content")), bool(block.get("is_error")))
     return [ToolCall(uses[i][0], uses[i][1], *outputs.get(i, ("", False))) for i in order]
+
+
+# The input fields that name what a tool call looked at.
+PROBE_FIELDS = {"Read": ("file_path",), "Grep": ("path", "pattern"), "Glob": ("path", "pattern"),
+                "Bash": ("command",)}  # fmt: skip
+
+
+def probe_calls(calls: Sequence[ToolCall], target: str, *tools: str) -> list[ToolCall]:
+    """The calls of ``tools`` whose input names ``target`` (Read: ``file_path``; Grep and Glob:
+    ``path`` or ``pattern``; Bash: ``command``). A leak check runs on these, after asserting
+    there is one: a check over calls that never probed the target passes vacuously."""
+    return [
+        c for c in calls
+        if c.name in tools
+        and any(target in str(c.input.get(key, "")) for key in PROBE_FIELDS.get(c.name, ()))
+    ]  # fmt: skip
+
+
+def _names_file(text: str, name: str) -> bool:
+    """Whether ``text`` names the file ``name`` as a path component (``/w/link.txt``,
+    ``link.txt``), not as part of a longer name (``unlink.txt.bak``)."""
+    return re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", text) is not None
+
+
+def leaked(calls: Sequence[ToolCall], marker: str, names: Sequence[str] = ()) -> list[ToolCall]:
+    """The calls whose result holds ``marker``, or, for a result that is not an error, names
+    one of the files ``names``: Grep's default ``files_with_matches`` mode lists only paths, and
+    a path listed for a pattern found only in the secret means the content was read."""
+    return [
+        c for c in calls
+        if marker in c.output or (not c.is_error and any(_names_file(c.output, n) for n in names))
+    ]  # fmt: skip
+
+
+def found(calls: Sequence[ToolCall], text: str, names: Sequence[str] = ()) -> bool:
+    """A control: some call returned ``text``, or (a paths-only Grep) listed one of ``names``
+    in a result that is not an error."""
+    return bool(leaked(calls, text, names))
+
+
+MISSING_FILE = re.compile(r"does not exist|no such file|enoent", re.IGNORECASE)
+
+
+def missing_file(call: ToolCall) -> bool:
+    """Whether the call failed because its target was not there (nothing was tested)."""
+    return MISSING_FILE.search(call.output) is not None
+
+
+PROC_LISTING = re.compile(r"ls(\s+-\w+)*\s+/proc/?(\s+2>&1)?")
+
+
+def is_proc_listing(command: str) -> bool:
+    """Whether a Bash command is a plain listing of ``/proc`` (options and ``2>&1`` allowed)."""
+    return PROC_LISTING.fullmatch(command.strip()) is not None
+
+
+LONG_LISTING = re.compile(r"[-bcdlps][-rwxsStT]{9}")
+
+
+def proc_entries(call: ToolCall) -> set[str] | None:
+    """The PIDs a ``/proc`` listing showed, or ``None`` when the listing failed: an error, no
+    output, or no ``self`` entry (every ``/proc`` has one). Reads every word of a short listing
+    (one or several columns) and the name of each ``ls -l`` line."""
+    words: list[str] = []
+    for line in call.output.splitlines():
+        if re.fullmatch(r"total \d+", line.strip()):  # the header of a long listing
+            continue
+        if LONG_LISTING.match(line):
+            words += line.split(" -> ")[0].split()[-1:]
+        else:
+            words += line.split()
+    if call.is_error or "self" not in words:
+        return None
+    return {w for w in words if w.isdigit()}
 
 
 def total_cost(events: Sequence[Mapping[str, Any]]) -> float:

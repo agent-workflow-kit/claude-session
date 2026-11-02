@@ -1,5 +1,5 @@
-"""The design's open items (issue #42): the Read, Grep and Glob tools on a symlink planted by
-sandboxed Bash (F1), `/proc` isolation inside the sandbox (F2), and the search tools under the
+"""The design's open items (issue #42): the Read, Grep and Glob tools on a symlink in the cwd
+that points outside (F1), `/proc` isolation inside the sandbox (F2), and the search tools under the
 home-directory Read denies the isolated settings generate (#59 item 12). MCP elicitation is in
 `test_interactive.py` (it needs a terminal).
 
@@ -16,6 +16,7 @@ settings by hand, like `test_sandbox.py`."""
 
 from __future__ import annotations
 
+import os
 import sys
 import uuid
 from collections.abc import Sequence
@@ -24,7 +25,18 @@ from typing import Any
 
 import pytest
 
-from .harness import LiveEnv, ToolCall, init_event, tool_calls
+from .harness import (
+    LiveEnv,
+    ToolCall,
+    found,
+    init_event,
+    is_proc_listing,
+    leaked,
+    missing_file,
+    probe_calls,
+    proc_entries,
+    tool_calls,
+)
 from .test_sandbox import needs_sandbox, sandbox_settings
 
 F1_SECRET = "F1-SECRET-7782"
@@ -33,70 +45,88 @@ CONTROL = "CONTROL-WORD-3141"
 SEARCH_TOOLS = "Read,Grep,Glob"
 
 
-def outputs(calls: Sequence[ToolCall], *names: str) -> list[str]:
-    return [c.output for c in calls if c.name in names]
-
-
 def shown(calls: Sequence[ToolCall], *names: str) -> list[str]:
     """A short rendering of what the named tools returned, for observations."""
     return [f"{c.name}{'!' if c.is_error else ''}: {c.output[:160]!r}" for c in calls
             if c.name in names]  # fmt: skip
 
 
+GREP_CONTENT = 'with output_mode "content"'
+
+
+def grep_modes(calls: Sequence[ToolCall]) -> list[str]:
+    """The `output_mode` each Grep call used (Claude Code's default is `files_with_matches`)."""
+    return [str(c.input.get("output_mode", "default")) for c in calls if c.name == "Grep"]
+
+
 @pytest.mark.live
 @needs_sandbox
 @pytest.mark.parametrize("tool", ["Read", "Grep", "Glob"])
-def test_f1_a_symlink_planted_by_sandboxed_bash_does_not_open_a_file_outside(
-    live: LiveEnv, tool: str
-) -> None:
-    """F1: sandboxed Bash plants `link.txt` (or `dirlink`) in the cwd pointing at a file (or
-    directory) outside the allowed directories. Read and Grep must not return the file's content
-    (`blockReadsOutsideWorkingDirectories` must check the resolved path). Glob returns names
-    only: what it lists through `dirlink` is recorded. A plain file in the cwd is the control
-    that the tool works at all."""
+def test_f1_a_symlink_in_the_cwd_does_not_open_a_file_outside(live: LiveEnv, tool: str) -> None:
+    """F1: `link.txt` (and `dirlink`) in the cwd point at a file (and a directory) outside the
+    allowed directories, as sandboxed Bash could plant them. The test plants them itself before
+    the run, so no probe can race the planting. Read and Grep must not return the file's content
+    or, for Grep's paths-only mode, list the link (`blockReadsOutsideWorkingDirectories` must
+    check the resolved path). A direct read of the outside file is the control that the block
+    is in force; a plain file in the cwd is the control that the tool works. Glob returns names
+    only: what it lists through `dirlink` is recorded."""
     work, outside = live.dir("work"), live.dir("outside")
-    (outside / "secret.txt").write_text(F1_SECRET + "\n", encoding="utf-8")
+    secret, link = outside / "secret.txt", work / "link.txt"
+    secret.write_text(F1_SECRET + "\n", encoding="utf-8")
     (work / "plain.txt").write_text(CONTROL + "\n", encoding="utf-8")
-    settings = sandbox_settings(live, work, allow=["Bash(ln:*)"], auto_allow=True)
+    os.symlink(secret, link)
+    os.symlink(outside, work / "dirlink")
+    settings = sandbox_settings(live, work, auto_allow=True)
     settings["permissions"]["allow"] += ["Read", "Grep", "Glob"]
     settings["permissions"]["blockReadsOutsideWorkingDirectories"] = True
     path = live.write_json("s.json", settings)
-    plant = (
-        f"With the Bash tool run `ln -s {outside / 'secret.txt'} link.txt` and then "
-        f"`ln -s {outside} dirlink`."
-    )
     steps = {
-        "Read": f"Use the Read tool on {work / 'link.txt'}, then on {work / 'plain.txt'}.",
+        "Read": f"Use the Read tool on {work / 'plain.txt'}, then on {secret}, then on {link}.",
         "Grep": (
-            f"Use the Grep tool with pattern F1-SECRET and path {work / 'link.txt'}; then with "
-            f"pattern F1-SECRET and path {work}; then with pattern CONTROL-WORD and path {work}."
+            f"Use the Grep tool {GREP_CONTENT} each time: pattern CONTROL-WORD and path {work}; "
+            f"then pattern F1-SECRET and path {secret}; then pattern F1-SECRET and path {link}; "
+            f"then pattern F1-SECRET and path {work}."
         ),
-        "Glob": f"Use the Glob tool with pattern `dirlink/*` and path {work}; then with pattern "
-        f"`*.txt` and path {work}.",
+        "Glob": f"Use the Glob tool with pattern `*.txt` and path {work}; then with pattern "
+        f"`dirlink/*` and path {work}.",
     }
     run = live.headless(
-        f"{plant} {steps[tool]} Do not retry a failure and use no other tool. Then reply DONE.",
-        "--setting-sources", "", "--settings", str(path), "--tools", f"Bash,{SEARCH_TOOLS}",
-        cwd=work,
+        f"{steps[tool]} One call each, in this order. Do not retry a failure and use no other "
+        "tool. Then reply DONE.",
+        "--setting-sources", "", "--settings", str(path), "--tools", SEARCH_TOOLS, cwd=work,
     )  # fmt: skip
-    assert (work / "link.txt").is_symlink() and (work / "dirlink").is_symlink(), (
-        "control failed: sandboxed Bash did not plant the symlinks, so nothing was tested"
-    )
-    calls = tool_calls(run.events)
+    calls = [c for c in tool_calls(run.events) if c.name == tool]
     live.observe(f"F1 {tool} results", shown(calls, tool))
-    assert any(c.name == tool for c in calls), f"the agent never used {tool}"
-    control = CONTROL if tool != "Glob" else "plain.txt"
-    assert any(control in out for out in outputs(calls, tool)), (
-        f"control failed: {tool} did not return the plain file in the cwd"
-    )
+    if tool == "Grep":
+        live.observe("F1 Grep output_mode used", grep_modes(calls))
+    assert calls, f"the agent never used {tool}"
+    names = ("plain.txt",) if tool != "Read" else ()
+    assert found(calls, CONTROL, names), f"control failed: {tool} did not return the plain file"
     if tool == "Glob":
+        probes = probe_calls(calls, "dirlink", "Glob")
+        assert probes, "the agent never probed dirlink with Glob"
         live.observe(
             "F1 Glob lists the names behind a symlinked directory",
-            any("secret.txt" in out for out in outputs(calls, "Glob")),
+            any("secret.txt" in c.output for c in probes),
         )
-    else:
-        leaked = [out for out in outputs(calls, tool) if F1_SECRET in out]
-        assert leaked == [], f"{tool} returned the content behind the planted symlink"
+        return
+    direct = probe_calls(calls, str(secret), tool)
+    assert direct, f"the agent never probed {secret} directly with {tool}"
+    assert leaked(direct, F1_SECRET, ("secret.txt",)) == [], (
+        f"control failed: {tool} read the outside file directly, so the read block is not in "
+        "force and F1 is inconclusive (this is not a symlink finding)"
+    )
+    probes = probe_calls(calls, str(link), tool)
+    assert probes, f"the agent never probed {link} with {tool}"
+    assert not [c for c in probes if missing_file(c)], (
+        f"{tool} reported the planted link missing, so nothing was tested",
+        shown(probes, tool),
+    )
+    # Every call counts: Grep on the cwd also reaches the link.
+    names = ("link.txt",) if tool == "Grep" else ()
+    assert leaked(calls, F1_SECRET, names) == [], (
+        f"{tool} returned the content behind the planted symlink (or listed the link)"
+    )
 
 
 @pytest.mark.live
@@ -104,14 +134,14 @@ def test_f1_a_symlink_planted_by_sandboxed_bash_does_not_open_a_file_outside(
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc is Linux only")
 def test_f2_the_sandbox_hides_host_processes(live: LiveEnv) -> None:
     """F2: inside the sandbox `/proc` shows only the sandbox's own processes (private PID
-    namespace). A host process the test started (exact PID, killed at teardown) holds a marker
-    in its environment: the sandbox must not read it through `/proc/<pid>/environ`, and
-    `/proc` must list fewer processes than the host's. Whether `/proc/<pid>/root` is reachable
-    is recorded."""
+    namespace). A host process the test started (exact PID, killed at teardown; a minimal
+    environment of `PATH` and a marker) must not be listed in `/proc`, and the sandbox must not
+    read the marker through `/proc/<pid>/environ`. A `/proc` listing that fails or lacks `self`
+    fails the test: the namespace is then unverified, not verified. Whether `/proc/<pid>/root`
+    is reachable and the host's process count are recorded; environ text never is."""
     marker = f"F2-ENV-{uuid.uuid4().hex}"
-    sleeper = live.gw.spawn(
-        ["sleep", "600"], env=live.env({"F2_ENV_MARKER": marker}, auth=False), cwd=str(live.root)
-    )
+    child_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "F2_ENV_MARKER": marker}
+    sleeper = live.gw.spawn(["sleep", "600"], env=child_env, cwd=str(live.root))
     live.children.append(sleeper)
     pid = sleeper.pid
     host_pids = {p.name for p in Path("/proc").iterdir() if p.name.isdigit()}
@@ -129,13 +159,21 @@ def test_f2_the_sandbox_hides_host_processes(live: LiveEnv) -> None:
         "--setting-sources", "", "--settings", str(settings), cwd=work,
     )  # fmt: skip
     calls = [c for c in tool_calls(run.events) if c.name == "Bash"]
-    live.observe("F2 Bash results", shown(calls, "Bash"))
-    listing = [c for c in calls if str(c.input.get("command", "")).strip() == "ls /proc"]
+    reads = probe_calls(calls, f"/proc/{pid}/environ", "Bash")
+    others = [c for c in calls if c not in reads]
+    live.observe("F2 Bash results (environ reads omitted)", shown(others, "Bash"))
+    live.observe(
+        "F2 environ reads (error, marker leaked)",
+        [(c.is_error, marker in c.output) for c in reads],
+    )
+    listing = [c for c in calls if is_proc_listing(str(c.input.get("command", "")))]
     assert listing, "the agent never listed /proc"
-    inside = {w for w in listing[0].output.split() if w.isdigit()}
+    inside = proc_entries(listing[0])
+    assert inside is not None, "/proc unreadable under deny-root; PID namespace unverified"
     live.observe("F2 processes visible in /proc (sandbox, host)", [len(inside), len(host_pids)])
+    assert str(pid) not in inside, "/proc in the sandbox lists the host child"
+    assert reads, f"the agent never read /proc/{pid}/environ"
     assert marker not in "\n".join(c.output for c in calls), "the host process's environ was read"
-    assert len(inside) < len(host_pids), "/proc lists as many processes as the host has"
 
 
 def search_settings(live: LiveEnv, variant: str) -> dict[str, Any]:
@@ -163,26 +201,36 @@ def test_search_tools_and_the_home_read_denies(live: LiveEnv, variant: str) -> N
     work = live.dir("work")
     (work / "plain.txt").write_text(CONTROL + "\n", encoding="utf-8")
     path = live.write_json("s.json", search_settings(live, variant))
+    secret = ssh / "id_test"
     run = live.headless(
-        f"Use these tools, one per call, with no other tool and no retry of a failure: Read "
-        f"{work / 'plain.txt'}; Read {ssh / 'id_test'}; Grep pattern SSH-MARKER path {ssh}; "
-        f"Glob pattern `*` path {ssh}; Grep pattern CONTROL-WORD path {work}; Glob pattern "
-        f"`*.txt` path {work}. Then reply DONE.",
+        f"Use these tools, one per call, in this order, with no other tool and no retry of a "
+        f"failure: Read {work / 'plain.txt'}; Grep pattern CONTROL-WORD path {work} "
+        f"{GREP_CONTENT}; Glob pattern `*.txt` path {work}; Read {secret}; Grep pattern "
+        f"SSH-MARKER path {ssh} {GREP_CONTENT}; Glob pattern `*` path {ssh}. Then reply DONE.",
         "--setting-sources", "", "--settings", str(path), "--tools", SEARCH_TOOLS, cwd=work,
     )  # fmt: skip
     live.observe(f"tools in init ({variant})", init_event(run.events).get("tools"))
     calls = tool_calls(run.events)
     live.observe(f"{variant} results", shown(calls, "Read", "Grep", "Glob"))
-    for tool in ("Read", "Grep", "Glob"):
-        used = [c for c in calls if c.name == tool]
+    live.observe(f"Grep output_mode used ({variant})", grep_modes(calls))
+    by_tool = {tool: [c for c in calls if c.name == tool] for tool in ("Read", "Grep", "Glob")}
+    for tool, used in by_tool.items():
         assert used, f"the agent never used {tool}"
-    assert any(CONTROL in out for out in outputs(calls, "Read")), "control failed: Read"
-    assert any(CONTROL in out for out in outputs(calls, "Grep")), "control failed: Grep"
-    assert any("plain.txt" in out for out in outputs(calls, "Glob")), "control failed: Glob"
-    leaks = {
-        tool: any(SSH_MARKER in out for out in outputs(calls, tool)) for tool in ("Read", "Grep")
+    assert found(by_tool["Read"], CONTROL), "control failed: Read"
+    assert found(by_tool["Grep"], CONTROL, ("plain.txt",)), "control failed: Grep"
+    assert found(by_tool["Glob"], "plain.txt"), "control failed: Glob"
+    probes = {
+        "Read": probe_calls(calls, str(secret), "Read"),
+        "Grep": probe_calls(calls, str(ssh), "Grep"),
+        "Glob": probe_calls(calls, str(ssh), "Glob"),
     }
-    leaks["Glob (name listed)"] = any("id_test" in out for out in outputs(calls, "Glob"))
+    for tool, used in probes.items():
+        assert used, f"the agent never probed {ssh} with {tool}"
+    leaks = {
+        "Read": bool(leaked(probes["Read"], SSH_MARKER)),
+        "Grep": bool(leaked(probes["Grep"], SSH_MARKER, ("id_test",))),
+        "Glob (name listed)": bool(leaked(probes["Glob"], "id_test")),
+    }
     live.observe(f"search tools that returned the planted key or its name ({variant})", leaks)
     if variant == "both":
         assert not leaks["Read"] and not leaks["Grep"], leaks
