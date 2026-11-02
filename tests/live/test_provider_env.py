@@ -2,7 +2,8 @@
 as true. No API cost: a truthy value sends the run to a cloud provider without credentials
 (fails locally or at the provider); a falsy one sends it to the first-party API with an invalid
 key (rejected with 401). The two failures are told apart by `provider_of_error`; its patterns
-are guesses, so a mismatch fails with the text seen (and records it)."""
+are guesses, so a mismatch fails with the text seen (and records it). The `cheap` fixture has no
+credentials at all (no login file either), so only the planted invalid key can be used."""
 
 from __future__ import annotations
 
@@ -43,7 +44,10 @@ def test_cloud_provider_switch_values(cheap: LiveEnv, variable: str, value: str)
         "ANTHROPIC_API_KEY": "sk-ant-live-test-invalid-key",  # rejected, never billed
     }
     proc = cheap.claude_run(
-        ["-p", "--model", cheap.model, "--", "Reply OK."], extra_env=env, auth=False, timeout=180
+        ["-p", "--model", cheap.model, *cheap.budget(), "--", "Reply OK."],
+        extra_env=env,
+        auth=False,
+        timeout=180,
     )
     text = proc.stdout + proc.stderr
     seen = provider_of_error(text)

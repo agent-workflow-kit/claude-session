@@ -1,11 +1,14 @@
 """Signals and timing of headless (`-p`) runs, for the end mapping and auto-exit (#64, #67, #57).
 
-Signals go to the exact child these tests spawned (`LiveEnv.spawn_headless`); a child still
-running at teardown is killed through its own handle."""
+Signals go to the exact child these tests spawned (`LiveEnv.spawn_headless`, its own process
+group); the group is killed at teardown while the leader is still unreaped, and the run is
+charged its reported cost (or the estimate)."""
 
 from __future__ import annotations
 
+import shlex
 import signal
+import sys
 
 import pytest
 
@@ -34,8 +37,8 @@ def test_signals_end_a_headless_run_with_128_plus_n_or_by_the_signal(
     child = live.spawn_headless(SLOW, out=out, err=err)
     assert wait_for(lambda: out.exists() and out.stat().st_size > 0, 60), err.read_text()
     child.send_signal(sig)
-    assert wait_for(lambda: child.poll() is not None, 30), "claude ignored the signal for 30 s"
-    code = child.poll()
+    assert wait_for(lambda: child.returncode() is not None, 30), "claude ignored the signal"
+    code = child.returncode()
     live.observe(f"claude -p after {sig.name}", code)
     assert code in accepted, code
 
@@ -45,12 +48,13 @@ def test_the_final_result_line_follows_a_stop_within_the_auto_exit_delay(live: L
     """#67 item 4: `exec` SIGTERMs claude `auto_exit_delay` (2 s) after a qualifying Stop, so
     `claude -p` must have written its `result` line by then, or `cost_usd` would be null."""
     stamp = live.root / "stop-time"
-    hooks = {"Stop": [hook_group(f"date +%s.%N > {stamp}")]}
+    now = shlex.join([sys.executable, "-I", "-c", "import time; print(time.time())"])
+    hooks = {"Stop": [hook_group(f"{now} > {shlex.quote(str(stamp))}")]}  # portable (#43)
     settings = live.write_json("s.json", {"hooks": hooks})
     out, err = live.root / "out.jsonl", live.root / "err.txt"
     child = live.spawn_headless("Reply OK.", "--settings", str(settings), out=out, err=err)
-    assert wait_for(lambda: child.poll() is not None, 120), "claude -p did not finish"
-    assert child.poll() == 0, err.read_text()
+    assert wait_for(lambda: child.returncode() is not None, 120), "claude -p did not finish"
+    assert child.returncode() == 0, err.read_text()
     stopped = float(stamp.read_text(encoding="utf-8"))
     last_write = out.stat().st_mtime
     live.observe("seconds from Stop to the last output write", round(last_write - stopped, 2))

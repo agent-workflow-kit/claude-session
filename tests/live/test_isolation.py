@@ -1,5 +1,6 @@
 """Permission and project-config behaviour isolated runs rely on that needs no sandbox:
-planted skills (E2), report command forms under `dontAsk` (A8), read-only plugin dirs (C6).
+planted skills (E2), skills in `--add-dir` directories (#59 item 10), report command forms
+under `dontAsk` (A8), read-only plugin dirs (C6).
 The sandbox rows are in test_sandbox.py."""
 
 from __future__ import annotations
@@ -27,17 +28,47 @@ def plant_skill(directory: Path, name: str, token: str) -> None:
 def test_planted_project_and_nested_skills_do_not_load_without_setting_sources(
     live: LiveEnv,
 ) -> None:
-    """E2. The control run (`--setting-sources project`) proves the planted skill is loadable."""
+    """E2. The control run (`--setting-sources project`, trusted) proves the planted skill is
+    loadable. For the nested skill, whether the control loads it from the subdirectory is
+    observed; its absence under `--setting-sources ""` is asserted only when it does."""
     work = live.dir("work")
     plant_skill(work, "planted", "PLANTED-TOP")
     nested = work / "sub"
     nested.mkdir()
     plant_skill(nested, "planted-nested", "PLANTED-NESTED")
+    live.trust(work)
     control = live.headless("/planted", "--setting-sources", "project", cwd=work)
     assert "PLANTED-TOP" in control.text, "control: the planted skill should load"
-    for command, token in (("/planted", "PLANTED-TOP"), ("/planted-nested", "PLANTED-NESTED")):
-        run = live.headless(command, "--setting-sources", "", cwd=work)
-        assert token not in run.text
+    run = live.headless("/planted", "--setting-sources", "", cwd=work)
+    assert "PLANTED-TOP" not in run.text
+    nested_control = live.headless("/planted-nested", "--setting-sources", "project", cwd=nested)
+    loadable = "PLANTED-NESTED" in nested_control.text
+    live.observe("E2: a nested skill loads with --setting-sources project", loadable)
+    nested_run = live.headless("/planted-nested", "--setting-sources", "", cwd=nested)
+    if loadable:
+        assert "PLANTED-NESTED" not in nested_run.text
+    else:
+        live.observe(
+            'E2: nested skill under --setting-sources "" (control did not load it)',
+            "PLANTED-NESTED" in nested_run.text,
+        )
+
+
+@pytest.mark.live
+def test_skills_in_an_add_dir_directory_under_empty_setting_sources(live: LiveEnv) -> None:
+    """#59 item 10: does `.claude/skills` in an `--add-dir` directory load under
+    `--setting-sources ""`? An open question, so the answer is recorded; the control (the same
+    directory as the trusted cwd with `--setting-sources project`) proves the skill loadable."""
+    extra = live.dir("extra")
+    plant_skill(extra, "addskill", "ADD-DIR-SKILL")
+    live.trust(extra)
+    control = live.headless("/addskill", "--setting-sources", "project", cwd=extra)
+    assert "ADD-DIR-SKILL" in control.text, "control: the skill should load from its project"
+    run = live.headless(
+        "/addskill", "--setting-sources", "", "--add-dir", str(extra), cwd=live.dir("work")
+    )
+    live.observe('#59 10: a skill in --add-dir loads under --setting-sources ""',
+                 "ADD-DIR-SKILL" in run.text)  # fmt: skip
 
 
 @pytest.mark.live

@@ -17,6 +17,7 @@ settings by hand, like `test_sandbox.py`."""
 from __future__ import annotations
 
 import os
+import signal
 import sys
 import uuid
 from collections.abc import Sequence
@@ -24,6 +25,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from claude_session.gateway import Child
 
 from .harness import (
     LiveEnv,
@@ -129,10 +132,17 @@ def test_f1_a_symlink_in_the_cwd_does_not_open_a_file_outside(live: LiveEnv, too
     )
 
 
+def end_child(child: Child) -> None:
+    """Kill a host child the test started, through its own handle (never by PID or pattern)."""
+    if child.poll() is None:
+        child.send_signal(signal.SIGKILL)
+        child.wait(10)
+
+
 @pytest.mark.live
 @needs_sandbox
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc is Linux only")
-def test_f2_the_sandbox_hides_host_processes(live: LiveEnv) -> None:
+def test_f2_the_sandbox_hides_host_processes(live: LiveEnv, request: pytest.FixtureRequest) -> None:
     """F2: inside the sandbox `/proc` shows only the sandbox's own processes (private PID
     namespace). A host process the test started (exact PID, killed at teardown; a minimal
     environment of `PATH` and a marker) must not be listed in `/proc`, and the sandbox must not
@@ -142,7 +152,7 @@ def test_f2_the_sandbox_hides_host_processes(live: LiveEnv) -> None:
     marker = f"F2-ENV-{uuid.uuid4().hex}"
     child_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "F2_ENV_MARKER": marker}
     sleeper = live.gw.spawn(["sleep", "600"], env=child_env, cwd=str(live.root))
-    live.children.append(sleeper)
+    request.addfinalizer(lambda: end_child(sleeper))
     pid = sleeper.pid
     host_pids = {p.name for p in Path("/proc").iterdir() if p.name.isdigit()}
     environ = Path(f"/proc/{pid}/environ").read_bytes()
