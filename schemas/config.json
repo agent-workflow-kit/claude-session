@@ -217,7 +217,7 @@
           },
           "sandbox": {
             "type": "object",
-            "description": "Claude Code sandbox settings (network, filesystem). enabled, failIfUnavailable, allowUnsandboxedCommands, excludedCommands and autoAllowBashIfSandboxed: true are refused for third-party-reading or sandboxed runs (the generated autoAllowBashIfSandboxed is false); generated isolation keys always override profile content."
+            "description": "Claude Code sandbox settings (network, filesystem). For third-party-reading or sandboxed runs only an allowlist is accepted: filesystem.allowRead, filesystem.denyRead, filesystem.allowWrite, filesystem.denyWrite, network.allowedDomains, network.deniedDomains and autoAllowBashIfSandboxed: false; any other key (enabled, failIfUnavailable, excludedCommands, enableWeakerNestedSandbox, enableWeakerNetworkIsolation, allowNestedUserNamespaces, allowAppleEvents, filesystem.disabled, network.allowUnixSockets, network.allowMachLookup, ...) is refused. Generated isolation keys always override profile content."
           }
         },
         "required": [],

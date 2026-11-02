@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -9,13 +10,18 @@ from typing import Any
 import pytest
 
 from claude_session import config, envbuild, kinds, secretindex
-from claude_session.errors import UsageError
+from claude_session.errors import LaunchValidationError, UsageError
 
 SID = "cs-k3v7q2xa"
 SDIR = "/state/claude-session/sessions/cs-k3v7q2xa"
 CWD = "/work/repo"
 EXE_DIR = "/opt/claude-session/bin"
 SECRET = "s3cr3t-value-never-echoed"
+
+
+def NOTHING_WRITABLE(_path: str) -> bool:  # noqa: N802 - a constant-like predicate
+    return False
+
 
 CALLER: dict[str, str] = {
     "PATH": "/usr/local/bin:/usr/bin:/bin",
@@ -66,6 +72,7 @@ def build(
     kw.setdefault("csession_dir", SDIR)
     kw.setdefault("cwd", CWD)
     kw.setdefault("exe_dir", EXE_DIR)
+    kw.setdefault("session_writable", NOTHING_WRITABLE)
     return envbuild.build(resolution, cfg, CALLER if environ is None else environ, **kw)
 
 
@@ -165,7 +172,14 @@ def test_malformed_allow_patterns_match_nothing_beyond_the_literal(
     )
     environ = {"EDITOR": "vi", "AXB": "1", "AFOO": "1", "1BAD_X": "1", "BAD-X": "1"}
     env = envbuild.build(
-        resolution, cfg, environ, csession_id=SID, csession_dir=SDIR, cwd=CWD, exe_dir=EXE_DIR
+        resolution,
+        cfg,
+        environ,
+        csession_id=SID,
+        csession_dir=SDIR,
+        cwd=CWD,
+        exe_dir=EXE_DIR,
+        session_writable=NOTHING_WRITABLE,
     ).env
     assert set(env) - {"PATH"} == {"CSESSION_ID", "CSESSION_DIR", "CSESSION_KIND"}
 
@@ -579,6 +593,7 @@ def test_carried_env_allow_never_unlocks_secret(cfg_dir: Path) -> None:
         csession_dir=SDIR,
         cwd=CWD,
         exe_dir=EXE_DIR,
+        session_writable=NOTHING_WRITABLE,
     )
     assert "WEBHOOK_URL" not in result.env
 
@@ -1091,3 +1106,355 @@ def test_secret_values_feed_an_index_that_catches_them(tmp_path: Path) -> None:
     for value in (AUTH_PASSED, VAULT, RUN_SECRET):
         assert index.contains(f"x {value} y".encode())
     assert not index.contains(AUTH_CALLER.encode())
+
+
+# 7. Git hardening (third-party-reading runs)
+
+HARDENING = [
+    ("core.fsmonitor", ""),
+    ("core.hooksPath", "/dev/null"),
+    ("core.sshCommand", ""),
+    ("credential.helper", ""),
+    ("diff.external", ""),
+    ("core.pager", "cat"),
+]
+GIT_INHERIT = """
+kinds:
+  review:
+    env: {inherit: true, allow: [], set: {}, path_prepend: []}
+"""
+
+
+def git_entries(env: dict[str, str]) -> list[tuple[str, str]]:
+    count = int(env["GIT_CONFIG_COUNT"])
+    return [(env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"]) for i in range(count)]
+
+
+def git_names(env: dict[str, str]) -> set[str]:
+    return {name for name in env if name.startswith("GIT_CONFIG_") and name[11:12] in "KVC"}
+
+
+@pytest.mark.parametrize("kind", ["review", "gate-check", "respond"])
+def test_third_party_runs_get_git_hardening(cfg_dir: Path, kind: str) -> None:
+    env = env_of(load(cfg_dir), kind)
+    assert git_entries(env) == HARDENING
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+def test_reads_third_party_flag_adds_git_hardening(cfg_dir: Path) -> None:
+    env = env_of(load(cfg_dir), "implement", flags={"reads_third_party": True})
+    assert git_entries(env) == HARDENING
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+@pytest.mark.parametrize("kind", ["implement", "rank"])
+def test_runs_that_do_not_read_third_party_content_get_no_git_hardening(
+    cfg_dir: Path, kind: str
+) -> None:
+    env = env_of(load(cfg_dir), kind, {**CALLER, "GIT_OPTIONAL_LOCKS": "1"})
+    assert "GIT_CONFIG_COUNT" not in env
+    assert env.get("GIT_OPTIONAL_LOCKS", "1") == "1"
+
+
+def test_git_hardening_is_appended_after_existing_entries(cfg_dir: Path) -> None:
+    environ = {
+        **CALLER,
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "user.name",
+        "GIT_CONFIG_VALUE_0": "n",
+        "GIT_CONFIG_KEY_1": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_1": "/planted/monitor",
+    }
+    env = env_of(load(cfg_dir, GIT_INHERIT), "review", environ)
+    entries = git_entries(env)
+    assert entries[:2] == [("user.name", "n"), ("core.fsmonitor", "/planted/monitor")]
+    # Later entries win in git: the hardening comes last.
+    assert entries[2:] == HARDENING
+    assert env["GIT_CONFIG_COUNT"] == "8"
+
+
+def test_git_hardening_wins_over_env_set(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir,
+        """
+        kinds:
+          review:
+            env:
+              inherit: false
+              allow: []
+              set: {GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: core.hooksPath,
+                    GIT_CONFIG_VALUE_0: /evil, GIT_OPTIONAL_LOCKS: "1"}
+              path_prepend: []
+        """,
+    )
+    env = env_of(cfg, "review")
+    assert git_entries(env) == [("core.hooksPath", "/evil"), *HARDENING]
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+def test_git_hardening_applies_with_a_flag_on_a_kind_with_env_set(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir,
+        """
+        kinds:
+          implement:
+            env: {inherit: true, allow: [], set: {GIT_OPTIONAL_LOCKS: "1"}, path_prepend: []}
+        """,
+    )
+    env = env_of(cfg, "implement", flags={"reads_third_party": True, "env_allowlist_only": []})
+    assert git_entries(env) == HARDENING
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        {"GIT_CONFIG_COUNT": "x"},
+        {"GIT_CONFIG_COUNT": ""},
+        {"GIT_CONFIG_COUNT": "-1"},
+        {"GIT_CONFIG_COUNT": " 1"},
+        {"GIT_CONFIG_COUNT": "1\n"},
+        {"GIT_CONFIG_COUNT": "١"},  # a non-ASCII digit
+        {"GIT_CONFIG_COUNT": "99999999999999999999"},
+        {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "a.b", "GIT_CONFIG_VALUE_0": "c"},
+        {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "a.b"},
+        {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_VALUE_0": "c"},
+    ],
+)
+def test_malformed_existing_git_config_is_replaced_by_the_hardening(
+    cfg_dir: Path, existing: dict[str, str]
+) -> None:
+    environ = {
+        **CALLER,
+        **existing,
+        "GIT_CONFIG_KEY_7": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_7": "x",
+    }
+    env = env_of(load(cfg_dir, GIT_INHERIT), "review", environ)
+    assert git_entries(env) == HARDENING
+    # No leftover entry from the malformed set survives.
+    assert git_names(env) == {"GIT_CONFIG_COUNT"} | {
+        f"GIT_CONFIG_{part}_{i}" for part in ("KEY", "VALUE") for i in range(len(HARDENING))
+    }
+
+
+def test_stray_entries_beyond_the_count_are_dropped(cfg_dir: Path) -> None:
+    environ = {
+        **CALLER,
+        "GIT_CONFIG_COUNT": "0",
+        "GIT_CONFIG_KEY_9": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_9": "x",
+    }
+    env = env_of(load(cfg_dir, GIT_INHERIT), "review", environ)
+    assert git_entries(env) == HARDENING
+    assert "GIT_CONFIG_KEY_9" not in env and "GIT_CONFIG_VALUE_9" not in env
+
+
+def test_git_hardening_keeps_unrelated_git_variables(cfg_dir: Path) -> None:
+    env = env_of(load(cfg_dir), "respond")
+    assert env["GIT_CONFIG_GLOBAL"] == f"{SDIR}/empty-gitconfig"
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert git_entries(env) == HARDENING
+
+
+@pytest.mark.parametrize("name", ["GIT_CONFIG_KEY_x", "GIT_CONFIG_VALUE_01", "GIT_CONFIG_KEY_"])
+def test_git_config_names_git_never_reads_are_dropped(cfg_dir: Path, name: str) -> None:
+    env = env_of(load(cfg_dir, GIT_INHERIT), "review", {**CALLER, name: "core.fsmonitor"})
+    assert name not in env
+    assert git_entries(env) == HARDENING
+
+
+# Git overrides and loader variables (review round 1, R7 and R8)
+
+GIT_OVERRIDES = (
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_ASKPASS",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+
+
+def env_set_config(cfg_dir: Path, kind: str, names: tuple[str, ...]) -> config.Config:
+    pairs = ", ".join(f"{name}: /x" for name in names)
+    return load(
+        cfg_dir,
+        f"""
+        kinds:
+          {kind}:
+            env: {{inherit: true, allow: [], set: {{{pairs}}}, path_prepend: []}}
+        """,
+    )
+
+
+@pytest.mark.parametrize("name", GIT_OVERRIDES)
+def test_git_overrides_set_by_env_set_are_removed_on_third_party_runs(
+    cfg_dir: Path, name: str
+) -> None:
+    env = env_of(env_set_config(cfg_dir, "review", (name,)), "review")
+    assert name not in env
+    assert git_entries(env) == HARDENING
+
+
+@pytest.mark.parametrize("name", GIT_OVERRIDES)
+def test_inherited_git_overrides_are_removed_on_third_party_runs(cfg_dir: Path, name: str) -> None:
+    env = env_of(load(cfg_dir, GIT_INHERIT), "review", {**CALLER, name: "/x"})
+    assert name not in env
+    assert git_entries(env) == HARDENING
+
+
+def test_git_overrides_are_kept_on_other_runs(cfg_dir: Path) -> None:
+    env = env_of(env_set_config(cfg_dir, "implement", GIT_OVERRIDES), "implement")
+    assert all(env[name] == "/x" for name in GIT_OVERRIDES)
+
+
+LOADER = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_X")
+
+
+@pytest.mark.parametrize(
+    ("kind", "flags"),
+    [("review", None), ("rank", None), ("implement", {"sandbox": "preferred"})],
+)
+def test_loader_variables_are_removed_on_isolated_runs(
+    cfg_dir: Path, kind: str, flags: dict[str, Any] | None
+) -> None:
+    environ = {**CALLER, **dict.fromkeys(LOADER, "/x")}
+    inherited = env_of(load(cfg_dir, GIT_INHERIT), kind, environ, flags=flags)
+    assert not set(LOADER) & set(inherited)
+    configured = env_of(env_set_config(cfg_dir, kind, LOADER), kind, flags=flags)
+    assert not set(LOADER) & set(configured)
+
+
+def test_loader_variables_are_kept_on_trusted_runs(cfg_dir: Path) -> None:
+    inherited = env_of(load(cfg_dir), "implement", {**CALLER, **dict.fromkeys(LOADER, "/x")})
+    assert set(LOADER) <= set(inherited)
+    configured = env_of(env_set_config(cfg_dir, "implement", LOADER), "implement")
+    assert set(LOADER) <= set(configured)
+
+
+# 6. PATH sanitizing (interface.md, Path rules: PATH)
+
+DIRTY_PATH = "::/usr/bin:.:bin:/repo/node_modules/.bin::../x:/bin:"
+
+
+@pytest.mark.parametrize(
+    ("kind", "flags"),
+    [("review", None), ("respond", None), ("rank", None), ("implement", {"sandbox": "preferred"})],
+)
+def test_isolated_path_drops_empty_and_relative_entries(
+    cfg_dir: Path, kind: str, flags: dict[str, Any] | None
+) -> None:
+    env = env_of(load(cfg_dir), kind, {**CALLER, "PATH": DIRTY_PATH}, flags=flags)
+    real_bin = os.path.realpath("/bin")  # PATH holds realpaths (usr-merged: /usr/bin)
+    assert path_of(env) == [EXE_DIR, "/usr/bin", "/repo/node_modules/.bin", real_bin]
+
+
+def test_isolated_path_keeps_exe_dir_first_after_sanitizing(cfg_dir: Path) -> None:
+    cfg = load(
+        cfg_dir,
+        """
+        kinds:
+          review:
+            env: {inherit: false, allow: [], set: {PATH: ":rel:/k/bin"}, path_prepend: [/p]}
+        """,
+    )
+    assert path_of(env_of(cfg, "review")) == [EXE_DIR, "/p", "/k/bin"]
+
+
+def test_trusted_path_is_not_sanitized(cfg_dir: Path) -> None:
+    env = env_of(load(cfg_dir), "implement", {**CALLER, "PATH": DIRTY_PATH})
+    assert env["PATH"] == f"{EXE_DIR}:{DIRTY_PATH}"
+
+
+def test_isolated_path_entry_inside_a_session_writable_path_fails(cfg_dir: Path) -> None:
+    def writable(path: str) -> bool:
+        return path.startswith("/repo/")
+
+    with pytest.raises(LaunchValidationError) as info:
+        env_of(load(cfg_dir), "respond", {**CALLER, "PATH": DIRTY_PATH}, session_writable=writable)
+    assert info.value.end_reason == "unsafe_path"
+    assert "node_modules" in info.value.message
+
+
+def test_isolated_path_check_sees_only_kept_entries(cfg_dir: Path) -> None:
+    seen: list[str] = []
+
+    def writable(path: str) -> bool:
+        seen.append(path)
+        return False
+
+    env_of(load(cfg_dir), "review", {**CALLER, "PATH": DIRTY_PATH}, session_writable=writable)
+    # Each kept entry is checked hop by hop (its literal prefixes too); dropped ones never.
+    assert {"/usr/bin", "/repo/node_modules/.bin", "/bin", EXE_DIR} <= set(seen)
+    assert not [path for path in seen if path.endswith(("/x", "/bin/bin")) or path == "bin"]
+
+
+def test_exe_dir_inside_a_session_writable_path_fails(cfg_dir: Path) -> None:
+    with pytest.raises(LaunchValidationError) as info:
+        env_of(load(cfg_dir), "review", session_writable=lambda path: path == EXE_DIR)
+    assert info.value.end_reason == "unsafe_path"
+
+
+def test_isolated_runs_need_the_session_writable_check(cfg_dir: Path) -> None:
+    with pytest.raises(ValueError, match="session_writable"):
+        env_of(load(cfg_dir), "review", session_writable=None)
+    env_of(load(cfg_dir), "implement", session_writable=None)  # trusted: not needed
+
+
+def writable_under(root: Path) -> Any:
+    def check(path: str) -> bool:
+        return path == str(root) or path.startswith(str(root) + "/")
+
+    return check
+
+
+def test_isolated_path_entries_are_realpaths(cfg_dir: Path, tmp_path: Path) -> None:
+    real = tmp_path.resolve() / "real-bin"
+    real.mkdir()
+    link = tmp_path.resolve() / "link-bin"
+    link.symlink_to(real)
+    env = env_of(load(cfg_dir), "review", {**CALLER, "PATH": str(link)})
+    assert path_of(env) == [EXE_DIR, str(real)]
+
+
+def test_path_entry_through_a_symlink_hop_in_a_writable_path_fails(
+    cfg_dir: Path, tmp_path: Path
+) -> None:
+    root = tmp_path.resolve()
+    (root / "real-bin").mkdir()
+    (root / "cwd").mkdir()
+    (root / "cwd" / "hop").symlink_to(root / "real-bin")
+    (root / "entry").symlink_to(root / "cwd" / "hop")
+    with pytest.raises(LaunchValidationError) as info:
+        env_of(
+            load(cfg_dir),
+            "review",
+            {**CALLER, "PATH": str(root / "entry")},
+            session_writable=writable_under(root / "cwd"),
+        )
+    assert info.value.end_reason == "unsafe_path"
+
+
+def test_exe_dir_through_a_symlink_hop_in_a_writable_path_fails(
+    cfg_dir: Path, tmp_path: Path
+) -> None:
+    root = tmp_path.resolve()
+    (root / "real-bin").mkdir()
+    (root / "cwd").mkdir()
+    (root / "cwd" / "hop").symlink_to(root / "real-bin")
+    (root / "exe").symlink_to(root / "cwd" / "hop")
+    with pytest.raises(LaunchValidationError) as info:
+        env_of(
+            load(cfg_dir),
+            "review",
+            exe_dir=str(root / "exe"),
+            session_writable=writable_under(root / "cwd"),
+        )
+    assert info.value.end_reason == "unsafe_path"
