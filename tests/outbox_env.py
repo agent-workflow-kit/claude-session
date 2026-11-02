@@ -1,6 +1,6 @@
 """A real session layout for the report and ingestion tests: the session and private
 directories as ``exec`` prepares them (``SessionDirs``), ``run.json``, the secret, the run row
-with its secret digest and directory identities, and ``hookconf.json``."""
+with its secret digest and directory identities, ``hookconf.json`` and ``secret-index``."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from claude_session import hookevent, outbox, sessiondir
+from claude_session import hookevent, outbox, secretindex, sessiondir
 from claude_session.fsutil import write_private_file
 from claude_session.store import Store
 
@@ -38,15 +38,29 @@ class Run(Env):
         summary_max: int = SUMMARY_MAX,
         artifact_max: int = ARTIFACT_MAX,
         record: bool = True,
+        secrets: tuple[str, ...] = (),
         **kwargs: Any,
     ) -> Run:
+        """``secrets``: the configured secret values indexed with the run secret."""
         self.run_no = run_no
         self.add(run_no=run_no, state=state, activity=activity, started=True, **kwargs)
-        self.prepare(run_no, summary_max=summary_max, artifact_max=artifact_max, record=record)
+        self.prepare(
+            run_no,
+            summary_max=summary_max,
+            artifact_max=artifact_max,
+            record=record,
+            secrets=secrets,
+        )
         return self
 
     def prepare(
-        self, run_no: int, *, summary_max: int, artifact_max: int, record: bool = True
+        self,
+        run_no: int,
+        *,
+        summary_max: int,
+        artifact_max: int,
+        record: bool = True,
+        secrets: tuple[str, ...] = (),
     ) -> None:
         with sessiondir.SessionDirs.open(str(self.root), SID) as dirs:
             layout = dirs.prepare_run(run_no)
@@ -59,6 +73,7 @@ class Run(Env):
             )
         self.secret = secret.value
         self.write_conf(run_no, summary_max=summary_max, artifact_max=artifact_max)
+        self.write_index(run_no, (*secrets, self.secret))
         if record:
             with Store.open(self.db) as store:
                 store.record_run_files(
@@ -75,6 +90,11 @@ class Run(Env):
             [], summary_max_bytes=summary_max, artifact_max_bytes=artifact_max
         )
         write_private_file(str(run_dir / "hookconf.json"), data)
+
+    def write_index(self, run_no: int, values: tuple[str, ...]) -> None:
+        """What exec writes at launch (#15): the run's secret-index."""
+        run_dir = Path(self.private_dir) / "runs" / str(run_no)
+        write_private_file(str(run_dir / secretindex.INDEX_NAME), secretindex.build(values))
 
     # Paths
 
