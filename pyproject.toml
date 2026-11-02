@@ -28,6 +28,7 @@ dev = [
     "pymarkdownlnt>=0.9.41",
     "jsonschema>=4.26.0",
     "referencing>=0.37.0",
+    "rfc3339-validator>=0.1.4",
     "types-pyyaml>=6.0.12.20261030",
 ]
 
