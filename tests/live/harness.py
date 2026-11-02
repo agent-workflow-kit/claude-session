@@ -385,12 +385,15 @@ class Headless:
         return value if isinstance(value, str) else ""
 
 
-def _unreaped(pid: int) -> bool:
-    """Whether ``pid`` is our child not yet reaped (running or a zombie), so neither its PID nor
-    the process group it leads can have been reused. Without ``waitid`` (macOS) only a running
-    child counts, checked by the caller."""
+def _unreaped(child: Child) -> bool:
+    """Whether ``child`` is our child not yet reaped (running or a zombie), so neither its PID
+    nor the process group it leads can have been reused. Without ``os.waitid`` (macOS before
+    Python 3.13) only a running child counts. Plain sys.platform and version checks (not
+    hasattr) let pyright narrow ``os.waitid`` for each platform."""
+    if sys.platform == "win32" or (sys.platform == "darwin" and sys.version_info < (3, 13)):
+        return child.poll() is None
     try:
-        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
     except ChildProcessError:
         return False
     return True
@@ -411,8 +414,8 @@ class Spawned:
 
     def returncode(self) -> int | None:
         """The exit code (negative signal number if killed), or ``None`` while running."""
-        if not hasattr(os, "waitid"):
-            return self.child.poll()
+        if sys.platform == "win32" or (sys.platform == "darwin" and sys.version_info < (3, 13)):
+            return self.child.poll()  # no os.waitid (see _unreaped)
         try:
             info = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
         except ChildProcessError:
@@ -427,11 +430,7 @@ class Spawned:
     def end(self) -> None:
         """SIGKILL the run's process group while the leader is still our unreaped child (its
         group ID then names no other group), then reap the leader."""
-        if hasattr(os, "waitid"):
-            leader_ours = _unreaped(self.pid)
-        else:
-            leader_ours = self.child.poll() is None
-        if leader_ours:
+        if _unreaped(self.child):
             try:
                 os.killpg(self.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):

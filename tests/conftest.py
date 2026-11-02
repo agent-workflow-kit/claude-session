@@ -115,9 +115,10 @@ def _stat(pid: int) -> tuple[int, int, int] | None:
 def _unreaped_child(pid: int) -> bool:
     """Whether ``pid`` is a child of this process not yet reaped (running or a zombie), so the
     PID, and the group ID it leads, cannot have been reused."""
-    # A plain sys.platform check (not hasattr) lets pyright narrow os.waitid for macOS.
-    if sys.platform != "linux":
-        return True  # macOS: no os.waitid; only Popen's own bookkeeping (returncode) is available
+    # os.waitid: POSIX, but on macOS only from Python 3.13 on, never on Windows. Plain
+    # sys.platform and version checks (not hasattr) let pyright narrow it for each platform.
+    if sys.platform == "win32" or (sys.platform == "darwin" and sys.version_info < (3, 13)):
+        return True  # no os.waitid: only Popen's own bookkeeping (returncode) is available
     try:
         os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
     except ChildProcessError:

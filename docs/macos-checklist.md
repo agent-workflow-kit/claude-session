@@ -212,10 +212,10 @@ The lists are text until Claude Code's Seatbelt profile enforces them. Enforceme
 
 | ID | Item (live test) | Expected / to be observed |
 |---|---|---|
-| M4.10 | Deny-root reads, allowlist, TMPDIR in `allowWrite` (`test_sandbox.py::test_deny_root_hides_files_outside_the_allowlist_and_tools_still_work`, `test_e2e.py::test_a_review_run_...`) | A marker outside the allowlist is not readable from Bash; `ls`, `cat`, `sh -c` and a write in the cwd work. **To be observed**: that a Unix socket can be bound in a TMPDIR listed only in `allowWrite` (the network bridge needs it) and that `/usr`, `/bin`, `/sbin`, `/etc` are enough for `ls`, `cat`, `sh`, `git` and `python3`. If a tool fails with "operation not permitted" or "no such file", note the path: the allowlist has no `/System`, `/Library` or `/private/var/db`, and a missing system directory would be a real finding. That is a hypothesis from reading the code, not an observation. |
+| M4.10 | Deny-root reads, allowlist, TMPDIR in `allowWrite` (`test_sandbox.py::test_deny_root_hides_files_outside_the_allowlist_and_tools_still_work`, `test_e2e.py::test_a_review_run_in_the_sandbox_...`) | A marker outside the allowlist is not readable from Bash; `ls`, `cat`, `sh -c` and a write in the cwd work. **To be observed**: that a Unix socket can be bound in a TMPDIR listed only in `allowWrite` (the network bridge needs it) and that `/usr`, `/bin`, `/sbin`, `/etc` are enough for `ls`, `cat`, `sh`, `git` and `python3`. If a tool fails with "operation not permitted" or "no such file", note the path: the allowlist has no `/System`, `/Library` or `/private/var/db`, and a missing system directory would be a real finding. That is a hypothesis from reading the code, not an observation. |
 | M4.11 | Probe fidelity | If M4.1 passes but M4.10 shows Claude Code failing to start its sandbox, the probe passes while the sandbox does not work: record it; `sandbox_active` would then be true when it should not be. |
 | M4.12 | Git directory read-only, main checkout and linked worktree (`test_sandbox.py::test_a_denied_git_dir_is_read_only_for_sandboxed_git`) | `git status` works; `git branch` and `git commit` fail; the repository keeps one commit. **To be observed**: that `/usr/bin/git`, an Xcode shim that execs the real binary under `/Library/Developer/CommandLineTools`, runs under deny-root reads. |
-| M4.13 | Missing-path denies (by hand, billed: the commands below the table) | No existing test checks this on macOS. The settings have the deny-root shape of `sandbox_settings` in `tests/live/test_sandbox.py`, with a `denyWrite` entry for `<work>/CLAUDE.md`, which does not exist yet (as M4.7 generates for `.claude` and `CLAUDE.md`); the prompt asks Bash to create it. Expected: `denied` (design.md: Claude Code's sandbox blocks these on Linux). **To be observed** on Seatbelt; also record what `claude` printed. |
+| M4.13 | Missing-path and nested denies (`test_sandbox.py::test_a_deny_write_of_a_missing_path_...` (C1), `test_a_nested_deny_inside_an_allowed_parent_...` (C3); or by hand, billed: the commands below the table) | The tests: the control file is written; the denied paths are not created (an empty placeholder is tolerated), and the nested protected file keeps its content. The by-hand step uses the deny-root shape of `sandbox_settings` in `tests/live/test_sandbox.py`, with a `denyWrite` entry for `<work>/CLAUDE.md`, which does not exist yet (as M4.7 generates for `.claude` and `CLAUDE.md`); the prompt asks Bash to create `ok.txt` (the positive control: it shows the command ran) and then `CLAUDE.md`. Expected: `denied` (design.md: Claude Code's sandbox blocks these on Linux). `INCONCLUSIVE-OR-FAIL` means either `ok.txt` is missing (nothing ran: not a pass, rerun or record why) or `CLAUDE.md` exists (a finding; an empty one is a placeholder: record it). **To be observed** on Seatbelt; also record what `claude` printed. |
 | M4.14 | Plugin dir via `--add-dir` (`test_isolation.py::test_a_plugin_dir_is_readable_...`) | Readable by the Read tool, not writable. The suite's root is under `/tmp`, a symlinked ancestor: note whether the realpath form is what Seatbelt matched. |
 | M4.15 | `autoAllowBashIfSandboxed` (`test_sandbox.py::test_auto_allow_bash_...`) | With `false`, `echo hi > out.txt` is denied; with the default, it is written. As on Linux. |
 
@@ -240,8 +240,8 @@ settings = {
 }
 json.dump(settings, open(w + "/settings.json", "w"), indent=1)
 EOF
-(cd "$W/work" && TMPDIR="$W/tmp" claude -p --model haiku --max-budget-usd 0.25 --settings "$W/settings.json" -- 'Use the Bash tool to run exactly this command: echo x > CLAUDE.md')
-test ! -e "$W/work/CLAUDE.md" && echo denied
+(cd "$W/work" && TMPDIR="$W/tmp" claude -p --model haiku --max-budget-usd 0.25 --settings "$W/settings.json" -- 'Use the Bash tool (not the Write tool) to run exactly this one command: echo x > ok.txt; echo x > CLAUDE.md')
+test -e "$W/work/ok.txt" && test ! -e "$W/work/CLAUDE.md" && echo denied || echo INCONCLUSIVE-OR-FAIL
 ```
 
 ## M5. BSD and GNU tool differences
@@ -275,7 +275,7 @@ Requires credentials and API budget (billed; `CSESSION_LIVE_MAX_USD` caps a run,
 | ID | Step | Expected |
 |---|---|---|
 | M7.1 | `make live PYTEST_ARGS='-k sandbox'` | Passes, or fails for a reason you record under M4.10 to M4.15. |
-| M7.2 | `make live PYTEST_ARGS='-k interactive'` (needs `tmux`) | Passes; the test that reads `/proc/<pid>/cmdline` skips (it is marked Linux-only). |
+| M7.2 | `make live PYTEST_ARGS='-k interactive'` (needs `tmux`) | Passes; `test_interactive.py::test_signals_end_interactive_claude_cleanly` skips (Linux-only: it checks the pane process through `/proc/<pid>/exe` and `cmdline`). |
 | M7.3 | `make live` | Everything else as on Linux. Compare the recorded observations with [live-tests.md](live-tests.md#observations). |
 | M7.4 | While M7.1 runs, in a second shell: `lsof -U -a -c claude 2>/dev/null \| grep -o '/[^ ]*\.sock' \| sort -u; ls -la /private/tmp/cs-live-*/tmp; find /private/var/folders -name 'claude-*.sock' 2>/dev/null` | **To be observed**: where Claude Code creates its `claude-*.sock` files. Expected from the code: under the run's `TMPDIR` (`/private/tmp/cs-live-.../tmp` here; `/private/tmp/csession-<uid>/cs-xxxxxxxx` for a `claude-session` run), none under `/var/folders`. Record the socket names and their length in bytes against the 40 bytes `selfcheck` reserves (`SOCKET_NAME_RESERVE`). |
 
