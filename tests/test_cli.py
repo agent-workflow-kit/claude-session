@@ -16,10 +16,10 @@ from claude_session import __version__, cli
 from claude_session.cli import build_parser, main
 from claude_session.errors import AmbiguousError, NotFoundError, RefusedError, UsageError
 
+from .golden import assert_golden
 from .schemas import validate
 
 ROOT = Path(__file__).resolve().parent.parent
-GOLDEN = Path(__file__).resolve().parent / "golden"
 SID = "cs-abcd2345"
 ERROR_SCHEMA = "claude-session/cli/error.json"
 
@@ -340,8 +340,7 @@ def test_unimplemented_command_is_internal_not_implemented(
 ) -> None:
     code, envelope, err = run_json(["kinds", "--json"], capsys)
     assert code == 1
-    validate(envelope, ERROR_SCHEMA)
-    assert envelope == json.loads((GOLDEN / "error-not-implemented.json").read_text())
+    assert_golden(envelope, "error-not-implemented")
     assert "not implemented" in err
 
 
@@ -389,8 +388,7 @@ def test_error_envelope_golden(
     monkeypatch.setitem(cli.HANDLERS, "status", raising(error))
     code, envelope, err = run_json(["status", "abcd", "--json"], capsys)
     assert code == exit_code
-    validate(envelope, ERROR_SCHEMA)
-    assert envelope == json.loads((GOLDEN / f"error-{golden}.json").read_text())
+    assert_golden(envelope, f"error-{golden}")
     assert envelope["error"]["message"] in err
 
 
