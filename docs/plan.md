@@ -46,7 +46,7 @@ The plan splits five modules out of design.md's module list to keep files focuse
 **Success Criteria**: `claude-session --version` works; `list --json` on an empty store prints `{"sessions": []}`; invalid config fails with a message naming the key (exit 2); schema-newer databases are refused with `schema_newer` (exit 12); `make verify` green.
 **Tests**:
 
-- config: defaults equal `config.example.yaml`; drop-in merge (maps deep-merged, lists replaced, hook lists appended); env overrides only for the documented scalar keys; precedence flags > repo > env > config > built-in.
+- config: defaults equal `config.example.yaml`; drop-in merge (maps deep-merged, lists replaced, hook lists appended); env overrides only for the documented scalar keys; precedence for top-level scalars: flags > env > config > built-in; for kind settings: flags > previous run's flags > repo > config kind > built-in.
 - ids: allocation format and collision retry; prefix matching (≥4 chars, ambiguous → 21, forgotten excluded); label, kind, repo-id, skill grammars (valid and invalid cases).
 - store: migrations apply in order under the `migrate` lease; leases (take, renew, expiry, dead-holder takeover by PID + start time); `BEGIN IMMEDIATE` with busy timeout.
 - procinfo: start time on Linux; PID-reuse detection.

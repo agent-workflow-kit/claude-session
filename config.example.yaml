@@ -1,18 +1,19 @@
 # claude-session example config: every key with its built-in default.
-# Location: ~/.config/claude-session/config.yaml (drop-ins: config.d/*.yaml, merged after it).
+# Location: ~/.config/claude-session/config.yaml (drop-ins: config.d/*.yaml next to it, merged after
+# it in byte order of file name). --config <path> reads only that file, without drop-ins.
 # Environment overrides: CSESSION_<KEY>, e.g. CSESSION_CLAUDE_BIN, CSESSION_RETENTION_DAYS. They apply
 # only to these top-level scalar keys: claude_bin, default_kind, min_claude_version,
 # summary_max_bytes, artifact_max_bytes, input_max_bytes, notes_context_timeout, notes_context_max_bytes,
 # retention_days, lost_grace, auto_exit_delay, kill_grace, poll_interval, session_start_timeout
-# (durations accept bare numbers of seconds, e.g. CSESSION_KILL_GRACE=15). Everything else (kinds,
-# permission_profiles, repos, hooks, secret_env, claude_auth_env, claude_args, notes_context_cmd,
-# notes_context_sources, me) cannot be set from the environment.
+# (durations accept bare numbers of seconds, e.g. CSESSION_KILL_GRACE=15; an empty value is
+# invalid). Everything else (kinds, permission_profiles, repos, hooks, secret_env, claude_auth_env,
+# claude_args, notes_context_cmd, notes_context_sources, me) cannot be set from the environment.
 # Precedence for top-level scalars: flags > environment > config > built-in defaults.
 # Precedence for kind settings: flags > previous run's stored flags > per-repo override > config kind
 # > built-in kind.
 # Merging: maps are deep-merged; lists are replaced, except hooks.* lists, which append.
 # Durations: seconds as a non-negative number, or <number><unit> with unit ms, s, m, h or d
-# ("90s", "10m", "0.5s"); null or "none" means no bound where allowed.
+# ("90s", "10m", "0.5s"; ASCII digits), at most 36500d; null or "none" means no bound where allowed.
 # Quote "off" (YAML 1.1 parsers read a bare off as false).
 
 # The claude executable, resolved on the session's PATH (set an absolute path for cron).
