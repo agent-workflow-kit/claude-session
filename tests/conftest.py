@@ -40,7 +40,8 @@ This module is test-only; nothing under ``src/`` imports it.
 
 The other autouse fixtures keep every test off the user's real directories: its own
 ``XDG_STATE_HOME`` (``_private_state_dir``), ``HOME`` and ``XDG_CONFIG_HOME``
-(``_private_home``; not for ``live`` tests, which need the real Claude Code login) and
+(``_private_home``; ``live`` tests too: they build their own private environment for the real
+``claude`` and copy a login in only when asked, see ``tests/live/harness.py``) and
 temporary-directory root (``private_tmp_root``: ``pathrules.TMP_ROOT``, so no run creates
 anything under the real ``/tmp/csession-<uid>``).
 """
@@ -344,15 +345,13 @@ def _private_state_dir(
 
 @pytest.fixture(autouse=True)
 def _private_home(
-    request: pytest.FixtureRequest,
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every test (and every subprocess it starts) gets its own empty ``HOME`` and
     ``XDG_CONFIG_HOME``, so no test reads or writes the user's real configuration. ``live``
-    tests keep the real ones: real Claude Code needs its login."""
-    if request.node.get_closest_marker("live") is not None:
-        return
+    tests too: ``tests/live/conftest.py`` read the real ``HOME`` at import, only to find a login
+    file the user asked to copy, and the real ``claude`` runs in a private home of its own."""
     home = tmp_path_factory.mktemp("home")
     (home / ".config").mkdir()
     monkeypatch.setenv("HOME", str(home))

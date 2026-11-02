@@ -5,9 +5,11 @@ verify: lint fmt-check typecheck test mdlint
 test:
 	uv run pytest
 
-# Real Claude Code; run locally after every Claude Code upgrade, never in CI.
+# Real Claude Code; run locally after every Claude Code upgrade, never in CI. It costs API
+# usage (capped by CSESSION_LIVE_MAX_USD, default 3) and needs credentials: see docs/live-tests.md.
+# `pytest -m live` alone only skips: CSESSION_LIVE=1 is the opt-in.
 live:
-	uv run pytest -m live
+	CSESSION_LIVE=1 uv run pytest -m live tests/live $(PYTEST_ARGS)
 
 lint:
 	uv run ruff check .
