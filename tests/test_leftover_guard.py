@@ -154,7 +154,7 @@ def test_a_pidfd_is_available_on_x86_64_and_aarch64_linux() -> None:
 @linux_only
 @pytest.mark.skipif(not conftest.PIDFD, reason="needs a pidfd")
 def test_signalling_a_reaped_process_through_its_pidfd_raises_process_lookup_error() -> None:
-    proc = subprocess.Popen(["/bin/true"])
+    proc = subprocess.Popen([conftest.TRUE_BIN])
     fd = conftest._pidfd_open(proc.pid)  # pyright: ignore[reportPrivateUsage]
     try:
         proc.wait(timeout=5)
@@ -265,7 +265,7 @@ def test_a_record_whose_start_ticks_differ_signals_nothing(
 
 
 def test_a_recorded_fake_that_already_exited_is_no_leftover(tmp_path: Path) -> None:
-    proc = subprocess.Popen(["/bin/true"])
+    proc = subprocess.Popen([conftest.TRUE_BIN])
     proc.wait(timeout=5)
     (tmp_path / f"{proc.pid}.1").touch()
     assert conftest._end_leftover_fakes(str(tmp_path)) == []  # pyright: ignore[reportPrivateUsage]
@@ -275,3 +275,16 @@ def test_the_fixture_points_the_fake_at_a_directory_of_its_own() -> None:
     directory = os.environ.get(conftest.STARTED_ENV)
     assert directory is not None
     assert os.path.isdir(directory)
+
+
+def test_true_bin_names_an_executable_true_that_exits_0() -> None:
+    """Tests spawn ``conftest.TRUE_BIN``, not ``/bin/true``: macOS has only ``/usr/bin/true``."""
+    assert os.path.isabs(conftest.TRUE_BIN)
+    assert os.path.basename(conftest.TRUE_BIN) == "true"
+    assert subprocess.run([conftest.TRUE_BIN], check=False).returncode == 0
+
+
+def test_linux_only_skips_exactly_off_linux() -> None:
+    (mark,) = conftest.linux_only.mark.args
+    assert mark is (not sys.platform.startswith("linux"))
+    assert conftest.linux_only.mark.name == "skipif"

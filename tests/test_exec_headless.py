@@ -25,7 +25,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 from claude_session import pathrules
 
-from .conftest import REAL_TMP_ROOT
+from .conftest import REAL_TMP_ROOT, linux_only
 from .fakeclaude import claude_bin, read_jsonl, wait_for, write_json
 from .test_schemas import registry
 
@@ -1347,6 +1347,7 @@ def ignored_signals(status: Path) -> int:
     return int(line.split()[1], 16)
 
 
+@linux_only  # reads /proc/<pid>/status
 @pytest.mark.parametrize("ignored", [1, 2], ids=["SIGHUP", "SIGINT"])
 def test_a_signal_ignored_when_exec_starts_stays_ignored_and_claude_inherits_it(
     tmp_path: Path, state: Path, work: Path, ignored: int

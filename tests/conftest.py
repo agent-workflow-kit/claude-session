@@ -73,6 +73,20 @@ from claude_session import pathrules
 pytest_plugins = ["pytester"]  # test_leftover_guard.py runs the guard in a pytest of its own
 
 LINUX = sys.platform.startswith("linux")
+# Marks a test that needs Linux (/proc, pidfd, PR_SET_PDEATHSIG, bwrap): it skips elsewhere.
+linux_only = pytest.mark.skipif(not LINUX, reason="Linux only (/proc and other Linux APIs)")
+
+
+def _true_bin() -> str:
+    """``/bin/true`` on Linux; macOS has only ``/usr/bin/true``."""
+    found = shutil.which("true", path="/bin:/usr/bin")
+    if found is None:
+        raise RuntimeError("no `true` executable in /bin or /usr/bin; the tests need one")
+    return found
+
+
+# The `true` executable the tests spawn (never a hard-coded /bin/true).
+TRUE_BIN = _true_bin()
 # A test still running after this long is reported as hung and its pidfd processes killed.
 WATCHDOG_SECONDS = 60.0
 # The production base of the per-uid temporary-directory root, read before any test patches it.
@@ -97,8 +111,9 @@ def _stat(pid: int) -> tuple[int, int, int] | None:
 def _unreaped_child(pid: int) -> bool:
     """Whether ``pid`` is a child of this process not yet reaped (running or a zombie), so the
     PID, and the group ID it leads, cannot have been reused."""
-    if not hasattr(os, "waitid"):
-        return True  # macOS: only Popen's own bookkeeping (returncode) is available
+    # A plain sys.platform check (not hasattr) lets pyright narrow os.waitid for macOS.
+    if sys.platform != "linux":
+        return True  # macOS: no os.waitid; only Popen's own bookkeeping (returncode) is available
     try:
         os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
     except ChildProcessError:
@@ -141,6 +156,8 @@ def _check(result: int) -> int:
 
 def _pidfd_open(pid: int) -> int:
     if _SYSCALL is None:
+        if sys.platform != "linux":  # unreachable: PIDFD is False off Linux (narrows pyright)
+            raise OSError(errno.ENOSYS, "no pidfd off Linux")
         return os.pidfd_open(pid)
     ctypes.set_errno(0)
     return _check(
@@ -154,6 +171,8 @@ def _pidfd_open(pid: int) -> int:
 
 def _pidfd_send_signal(fd: int, sig: int) -> None:
     if _SYSCALL is None:
+        if sys.platform != "linux":  # unreachable: PIDFD is False off Linux (narrows pyright)
+            raise OSError(errno.ENOSYS, "no pidfd off Linux")
         signal.pidfd_send_signal(fd, sig)
         return
     ctypes.set_errno(0)
