@@ -78,6 +78,8 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     (["exec", "--input-file", "a/x.txt", "--input-file", "b/x.txt"], "duplicate --input-file"),
     (["exec", "--input-file", "a b.txt"], "--input-file name 'a b.txt' must match"),
     (["start", "--json", "--input-file", "dir/"], "--input-file name '' must match"),
+    (["exec", "--input-file", "x.txt\n"], "--input-file name 'x.txt\\n' must match"),
+    (["exec", "--input-file", "a/.."], "--input-file name '..' must match"),
     # setting sources
     (["exec", "--setting-sources", "user,global"], "unknown source 'global'"),
     # report
@@ -98,6 +100,47 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     (["forget", "--state", "lost", "--kind", "review"], "forget needs a session id or"),
     # export
     (["export", "--action", "launch"], "--action: unknown action 'launch'"),
+    # session id prefixes: at least 4 characters after cs-
+    (["status", "abc"], "session id 'abc' is too short"),
+    (["status", "cs-abc", "--json"], "session id 'cs-abc' is too short"),
+    (["resume", "cs-"], "session id 'cs-' is too short"),
+    (["status", "CS-AB"], "session id 'CS-AB' is too short"),
+    (["stop", "ab"], "at least 4 characters"),
+    (["wait", "abc"], "at least 4 characters"),
+    (["label", "add", "abc", "a=b"], "at least 4 characters"),
+    (["label", "remove", "abc", "a=b"], "at least 4 characters"),
+    (["transcript", "abc"], "at least 4 characters"),
+    (["forget", "abc"], "at least 4 characters"),
+    (["exec", "--session-id", "abc"], "--session-id: session id 'abc' is too short"),
+    (["start", "--json", "--resume", "abc"], "--resume: session id 'abc' is too short"),
+    (["list", "--forked-from", "cs-ab"], "--forked-from: session id 'cs-ab' is too short"),
+    # kind names
+    (["exec", "--kind", "Review"], "--kind: invalid kind name 'Review'"),
+    (["start", "--json", "--kind=-x"], "--kind: invalid kind name '-x'"),
+    (["resume", SID, "--kind", "a b"], "--kind: invalid kind name"),
+    (["list", "--kind", "a.b"], "--kind: invalid kind name"),
+    (["list", "--launch-kind", "A"], "--launch-kind: invalid kind name"),
+    (["list", "--run-kind", "A"], "--run-kind: invalid kind name"),
+    (["kinds", "--kind", "k" * 65], "--kind: invalid kind name"),
+    (["forget", "--older-than", "7d", "--kind", "_k"], "--kind: invalid kind name"),
+    # skill names
+    (["exec", "--skill", ":plan"], "--skill: invalid skill name ':plan'"),
+    (["start", "--json", "--skill", "a b"], "--skill: invalid skill name"),
+    (["resume", SID, "--skill", "/review"], "--skill: invalid skill name"),
+    # repo ids
+    (["exec", "--repo", "https://example.org/r"], "--repo: invalid repo id"),
+    (["start", "--json", "--repo", "Example.org/r"], "--repo: invalid repo id"),
+    (["resume", SID, "--repo", "example.org"], "--repo: invalid repo id"),
+    (["list", "--repo", "example.org/../r"], "--repo: invalid repo id"),
+    (["kinds", "--repo", "example.org/r/"], "--repo: invalid repo id"),
+    # labels
+    (["exec", "--label", "novalue"], "--label: invalid label 'novalue'"),
+    (["start", "--json", "--label", "Key=v"], "--label: invalid label 'Key=v'"),
+    (["resume", SID, "--label", "k=a b"], "--label: invalid label"),
+    (["list", "--label", "k=$(x)"], "--label: invalid label"),
+    (["forget", "--older-than", "7d", "--label", "=v"], "--label: invalid label"),
+    (["label", "add", SID, "a=b", "c d=e"], "invalid label 'c d=e'"),
+    (["label", "remove", SID, "k"], "invalid label 'k'"),
 ]
 
 
@@ -112,6 +155,15 @@ def test_violation_exits_2(
     else:
         assert captured.out == ""
     assert message in captured.err
+
+
+def test_short_prefix_with_json_prints_golden_shaped_usage_envelope(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["status", "abc", "--json"]) == 2
+    envelope = json.loads(capsys.readouterr().out)
+    validate(envelope, "claude-session/cli/error.json")
+    assert envelope["error"]["code"] == "usage"
 
 
 def test_violation_with_json_prints_usage_envelope(capsys: pytest.CaptureFixture[str]) -> None:
@@ -149,6 +201,21 @@ ALLOWED: list[list[str]] = [
     ["cron", "install", "--interval", "1"],
     ["cron", "install", "--interval", "59"],
     ["export", "--action", "resume_tainted", "--action", "sandbox_lowered"],
+    ["status", "abcd"],
+    ["status", "cs-abcd"],
+    ["status", "CS-ABCD"],
+    ["status", "zzzzzzzzzz"],  # malformed but long enough: unknown (exit 10) at lookup
+    ["resume", "abcd", "--kind", "review-respond", "--skill", "plan:make"],
+    ["exec", "--session-id", "abcd"],
+    ["start", "--json", "--resume", "cs-abcd", "--label", "pr=example.org/g/r#42"],
+    ["list", "--forked-from", "abcd", "--launch-kind", "k_1", "--run-kind", "0"],
+    ["list", "--label", "a=", "--label", "expr=a=b", "--repo", "example.org:8443/g/r"],
+    ["kinds", "--kind", "review", "--repo", "example.org/g/r"],
+    ["exec", "--repo", "localhost/r", "--label", "owner=me@example.org"],
+    ["label", "add", "abcd", "a=b", "c="],
+    ["label", "remove", SID, "x.y_z-1=A,b+c:d"],
+    ["forget", "abcd"],
+    ["verify-secret", "abc"],  # needs the full id; mismatch is the handler's exit 11
 ]
 
 
