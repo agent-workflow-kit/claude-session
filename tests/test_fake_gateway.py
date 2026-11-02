@@ -259,12 +259,10 @@ def test_a_release_error_needs_a_gated_spawn() -> None:
     assert child.wait() == 0
 
 
-def test_keep_raw_stdout_returns_the_scripted_bytes_only_on_request() -> None:
+def test_the_scripted_raw_bytes_are_stdout_bytes() -> None:
     fake = FakeGateway()
     fake.on(["/opt/tool", "raw"], raw_stdout=b"a\r\nb\xff\n")
     fake.on(["/opt/tool", "text"], stdout="t\n")
-    raw = fake.run(["/opt/tool", "raw"], keep_raw_stdout=True)
-    assert raw.raw_stdout == b"a\r\nb\xff\n" and raw.stdout == "a\nb\ufffd\n"
-    assert fake.run(["/opt/tool", "raw"]).raw_stdout is None
-    assert fake.run(["/opt/tool", "text"], keep_raw_stdout=True).raw_stdout == b"t\n"
-    assert [c.keep_raw_stdout for c in fake.calls] == [True, False, True]
+    raw = fake.run(["/opt/tool", "raw"])
+    assert raw.stdout_bytes == b"a\r\nb\xff\n" and raw.stdout == "a\nb\ufffd\n"
+    assert fake.run(["/opt/tool", "text"]).stdout_bytes == b"t\n"

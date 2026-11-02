@@ -252,8 +252,9 @@ class Gateway(Protocol):
         and ``canceled``: see the module docs. ``on_spawn`` is called with the child's PID
         once it exists, before its stdin is written (with ``new_process_group``, the PID is
         its process group ID); an exception it raises ends the child like any other.
-        The raw bytes kept of each stream are ``Result.stdout_bytes`` and ``stderr_bytes``, for a
-        caller that must decode strictly or keep carriage returns (``crontab -l``). Raises ``GatewayTimeout``, ``GatewayCanceled``, and ``OSError``
+        The raw bytes kept of each stream are ``Result.stdout_bytes`` and ``stderr_bytes``, for
+        a caller that must decode strictly or keep carriage returns (``crontab -l``). Raises
+        ``GatewayTimeout``, ``GatewayCanceled``, and ``OSError``
         when the program cannot be started."""
         ...
 

@@ -677,7 +677,7 @@ def test_retention_keeps_the_taint_of_a_deleted_source_on_its_unforked_forks(
     ).fetchone()
     assert tuple(row) == (1, "2021-01-01T00:00:00.000000Z", None)
     with pytest.raises(RefusedError):
-        st.recheck_fork_taint(fork, src, reads_third_party=False)
+        st.recheck_fork_taint(fork, 1, src)
     assert st.fork_source_taints(fork)  # the adoption dry run agrees
     # A fork that captured its own Claude id never consults its source again.
     assert (

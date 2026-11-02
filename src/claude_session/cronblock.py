@@ -236,9 +236,7 @@ class Crontab:
 
     def _run(self, *args: str, stdin: str | None = None) -> Any:
         try:
-            return self.gateway.run(
-                [self.program, *args], stdin=stdin, timeout=CRONTAB_TIMEOUT
-            )
+            return self.gateway.run([self.program, *args], stdin=stdin, timeout=CRONTAB_TIMEOUT)
         except GatewayTimeout:
             raise FailedError(f"crontab {' '.join(args)} timed out") from None
         except OSError as exc:

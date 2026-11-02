@@ -732,7 +732,6 @@ def test_crontab_is_called_with_absolute_path_and_the_text_on_stdin(tmp_path: Pa
     ]
     assert os.path.isabs(program)
     assert fake.calls[2].stdin == after
-    assert all(c.keep_raw_stdout for c in fake.calls if c.argv[1] == "-l")
 
 
 def test_read_back_without_the_expected_block_exits_12(tmp_path: Path) -> None:

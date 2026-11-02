@@ -47,7 +47,6 @@ import argparse
 import dataclasses
 import json
 import os
-import sys
 import uuid
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass

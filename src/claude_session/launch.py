@@ -206,11 +206,6 @@ def default_actor(given: str | None, cfg: Config) -> str:
     return _actor(given, cfg)
 
 
-def default_actor(given: str | None, cfg: Config) -> str:
-    """The actor of an audited command (``stop``, ``forget``): see ``_actor``."""
-    return _actor(given, cfg)
-
-
 def _actor(given: str | None, cfg: Config) -> str:
     """``--actor``, else ``human:<me.name>`` with a TTY stdin, else ``auto:unknown``."""
     if given is not None:

@@ -309,7 +309,7 @@ def _cron_report(args: argparse.Namespace, result: dict[str, Any]) -> int:
     print(f"crontab block {result['action']}" + (" (dry run)" if result["dry_run"] else ""))
     if result["block"] is not None:
         for line in result["block"].split("\n"):
-            print(sanitize(line))
+            print(display(line))
     return 0
 
 
@@ -411,7 +411,7 @@ def _stop(args: argparse.Namespace) -> int:
         line += f"{output['outcome']} ({output['end_reason']}), exit {output['run_exit_code']}"
     else:
         line += f"still {output['state']}"
-    print(sanitize(line))
+    print(display(line))
     return stopped.exit_code
 
 

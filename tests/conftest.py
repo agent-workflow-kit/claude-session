@@ -38,7 +38,8 @@ Should a test run past its watchdog limit (``watchdog_seconds``: ``WATCHDOG_SECO
 watchdog writes the live tracked PIDs to stderr, SIGKILLs every tracked process that has a
 pidfd (exact: a pidfd never names a reused PID, so this cannot race the test's own wait), and
 the test fails at teardown. It sends no other signal: without pidfds it only reports, and a
-test hung on something else stays hung. This module is test-only; nothing under ``src/`` imports it (it imports ``gateway``).
+test hung on something else stays hung. This module is test-only; nothing under ``src/``
+imports it (it imports ``gateway``).
 
 The same ``Popen`` wrapper refuses, before anything starts, to run a ``crontab`` program
 that is not a fake under the pytest base temporary directory (``crontab_guard``), and
