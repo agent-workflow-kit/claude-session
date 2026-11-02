@@ -15,7 +15,11 @@ Runs and supervises Claude Code sessions (terminal-agnostic). Layer 1 (primitive
 | `bubblewrap`, `socat` (Linux, WSL2) | system packages | Needed by Claude Code's sandbox for sandboxed kinds; checked before launch. |
 | `git` | A, read-only | Only `git rev-parse --git-common-dir`/`--git-dir` for `${GIT_DIR}` and a linked worktree's gitdir, and the `origin` URL for the derived `--repo`, always hardened (section [Git calls](#git-calls)). claude-session never writes a repository. |
 
+<<<<<<< HEAD
 Python dependencies: `pyyaml` and `pydantic` (both required by the design guide for config). Nothing else: process start times come from `/proc` (Linux) or `/bin/ps -o stat= -o lstart= -p` (macOS) rather than `psutil`; the secret scan uses the standard library's keyed BLAKE2b. Test-only (dev group): `jsonschema` and `referencing`, to validate every `--json` golden output against `schemas/` with a registry keyed by `$id`.
+=======
+Python dependencies: `pyyaml` and `pydantic` (both required by the design guide for config). Nothing else: process start times come from `/proc` (Linux) or `/bin/ps -o stat= -o lstart= -p` (macOS) rather than `psutil`; the secret scan uses the standard library's keyed BLAKE2b. Test-only (dev group): `jsonschema` and `referencing`, to validate every `--json` golden output against `schemas/` with a registry keyed by `$id`; `rfc3339-validator`, which `jsonschema` needs to check `format: date-time`; and `types-pyyaml`, the type stubs pyright needs for `pyyaml`.
+>>>>>>> dc689e3397efd4a7adb7b4a282a34024f3a089a2
 
 Minimum Claude Code version: `exec` runs `claude --version` at launch and compares it with the built-in `min_claude_version` (2.1.312, the version the spike verified; overridable in config); an older version fails the launch with `claude_too_old`.
 
@@ -204,17 +208,19 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 
 | Module | Responsibility |
 |---|---|
-| `__main__` | Entry point of `python -m claude_session` and the `claude-session` script. Standard library only; dispatches `hook-event` before importing `cli`, and contains its errors (exit 0, no output). |
+| `__main__` | Entry point of `python -m claude_session` and the `claude-session` script. Standard library only; dispatches `hook-event` before importing `cli`. `hook-event` always exits 0: while it runs, fds 1 and 2 point at `/dev/null` and `sys.stdout` is captured, written only after a normal return; errors are contained (no output), each logged as `hook_event_failed` through the stdlib-only `logs` and `fsutil`. |
 | `cli` | argparse surface, argv-only flag rules, dispatch of every other command, printing of error envelopes (stdout with `--json`, and to `--outcome-file` for usage errors and refusals), human output sanitization. |
 | `errors` | Standard library only: one error class per error code, with its exit code and envelope fields. |
-| `config` | YAML and `config.d/` merge (maps deep-merged, lists replaced, `hooks.*` lists appended), Pydantic models, `CSESSION_*` overrides (top-level scalar keys only: `claude_bin`, `default_kind`, caps, durations, `retention_days`; `kinds`, `permission_profiles`, `repos`, `hooks`, `secret_env`, `claude_auth_env`, `claude_args`, `notes_context_cmd`, `notes_context_sources` and `me` cannot be set from the environment; reserved names ignored), precedence (built-in → config files → environment → flags for those scalars). Never imported by the hook path. |
+| `config` | YAML and `config.d/` merge (maps deep-merged, lists replaced, `hooks.*` lists appended), Pydantic models, `CSESSION_*` overrides (top-level scalar keys only: `claude_bin`, `default_kind`, `min_claude_version`, caps, durations, `retention_days`; `kinds`, `permission_profiles`, `repos`, `hooks`, `secret_env`, `claude_auth_env`, `claude_args`, `notes_context_cmd`, `notes_context_sources` and `me` cannot be set from the environment; reserved names ignored), precedence (built-in → config files → environment → flags for those scalars). Never imported by the hook path. |
+| `defaults` | Standard library only: the built-in config values (every key of `config.example.yaml`, raw form), including the built-in kinds and permission profiles; `config` merges over it. |
+| `durations` | Standard library only: the duration syntax ([Identifiers, labels and durations](#identifiers-labels-and-durations)) for flags, config and environment overrides; returns seconds. |
 | `kinds` | Effective profile and its origins: built-in kind → config kind → per-repo override → previous run's explicit flags → flags given now (section [Resume](#resume-and-fork)); unknown-kind fallback; profile validation. |
 | `settings_builder` | Pure function: effective profile + session paths → generated settings JSON, `claude` argv, sandbox lists. The security boundary; exhaustively unit-tested. |
 | `envbuild` | Session environment (section [Environment](#environment)). |
 | `sessiondir` | Both session directories, secret rotation, prompt and `--input-file` staging and placement, instructions file, `run.json`, directory inode pinning, no-follow writes relative to directory descriptors, private tmpdir (fd-based removal). |
 | `gitinfo` | Hardened, read-only git calls: git dir and linked-worktree gitdir (or the "no git dir" marker), origin lookup (through `gateway`). |
 | `store` | SQLite access, migrations, schema-version check, leases (including the per-session delivery lease), compare-and-set adoption and finalization. |
-| `hookevent` | The injected-hook fast path: state transitions, outbox drain, Stop backstop, notes context. Imports only the standard library, `store`, `outbox`'s ingestion side and `gateway` (itself stdlib-only), which runs the notes command. |
+| `hookevent` | The injected-hook fast path: state transitions, outbox drain, Stop backstop, notes context. Imports only the standard library, `store`, `outbox`'s ingestion side and `gateway` (itself stdlib-only), which runs the notes command; it imports nothing for logging (`__main__` logs its contained errors). |
 | `outbox` | `report`'s write side and the ingestion side. |
 | `supervisor` | `exec`/`resume`: version check, spawn, signals, polling, bounds, auto-exit, end mapping, lifecycle hook worker, `--outcome-file`, headless `stderr.log`. |
 | `liveness` | The single-session liveness check shared by the inline callers (`status`, `list`, `wait`, `resume`, `start --resume`, `stop`, `forget`) and `reconcile`. |
@@ -223,9 +229,15 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 | `reconcile` | Liveness repair for all sessions, salvage, retention sweep. |
 | `procinfo` | Process start time and liveness (Linux `/proc/<pid>/stat`, macOS `/bin/ps -o stat= -o lstart= -p`). A start time is an opaque token compared only for equality (Linux: boot id plus start ticks; macOS: `lstart` with `LC_ALL=C` and `TZ=UTC`); a zombie counts as dead. |
 | `gateway` | The only module that starts subprocesses: `claude`, `git`, the notes command, lifecycle hooks (`sh -c`, own process group; on timeout SIGTERM, `kill_grace`, SIGKILL to the group; the notes command also runs in its own process group; on timeout the group gets SIGKILL), sandbox prerequisite checks, `crontab`, and `ps` for `procinfo` on macOS. Standard library only; runs every child with an absolute path and, on Linux, `PR_SET_PDEATHSIG(SIGTERM)` for headless `claude`. With no explicit environment, the child gets this process's environment (plus extra variables) with empty and relative `PATH` entries dropped; if none remain, `/usr/bin:/bin`; a complete environment passed by its builder (session, hooks, notes command) is used unchanged and the builder applies [Path rules](interface.md#path-rules). Tests replace it. |
+<<<<<<< HEAD
 | `audit`, `logs` | `audit.jsonl` and `log.jsonl` writers. |
 | `clock` | Standard library only: the injectable clock (UTC wall time, monotonic time, sleep); tests drive time with a fake. |
 | `fsutil` | Standard library only: atomic private-file writes (temporary file plus rename relative to a parent-directory descriptor opened with `O_NOFOLLOW`, mode 0600), used for `--outcome-file`. |
+=======
+| `audit`, `logs` | `audit.jsonl` and `log.jsonl` writers: one `O_APPEND` write per record through `fsutil`; text fields only are redacted against the `contains_secret` values (8 or more characters), with bounded work for long messages (pre-cut, then redacted, then truncated to 4096 characters ending with `[truncated]`, never splitting a `[redacted]` marker); identifiers (including kind names), enums and timestamps are validated by hand (no `jsonschema`). `logs` is standard library only (`__main__` uses it on the hook path). |
+| `clock` | Standard library only: the injectable clock (UTC wall time, monotonic time, sleep); tests drive time with a fake. |
+| `fsutil` | Standard library only: atomic private-file writes (temporary file plus rename relative to a parent-directory descriptor opened with `O_NOFOLLOW`, mode 0600), used for `--outcome-file`; `append_private_line` (one `O_APPEND` write, no-follow, regular single-link file owned by the user and still named by its path, checked under the lock, torn last line terminated first, an unreadable mode-0200 file tightened before reopening, `flock` waited for at most `LOCK_TIMEOUT` = 1 s) for `log.jsonl` and `audit.jsonl`. |
+>>>>>>> dc689e3397efd4a7adb7b4a282a34024f3a089a2
 
 ### Session directories
 
@@ -295,7 +307,7 @@ events      id PK, csession_id, run_no, event_ts, from_state, to_state, from_act
             to_activity, needs_input_reason, cause, final, labels_json, delivered_at
 requests    request_id PK (UNIQUE), csession_id, run_no, result, ingested_at
 deleted_ids csession_id PK, deleted_at
-leases      name PK, holder_pid, holder_start, expires_at
+leases      name PK, holder_pid, holder_start, holder_token, expires_at
 meta        key PK, value            (schema_version)
 ```
 
@@ -316,6 +328,7 @@ meta        key PK, value            (schema_version)
 - Migrations are numbered functions applied at open under the lease `migrate`, forward only, and additive within a schema major version (`meta.schema_version` is `<major>.<minor>`). `hook-event` never migrates: with older code and a newer additive schema it keeps working, and it only reads and writes the columns it knows. Every other command checks the schema version first, before any allocation, and refuses a newer one with the error envelope `code: schema_newer`, exit 12 (dry runs too); it is never a run end reason.
 - Concurrency: every write is one `BEGIN IMMEDIATE` transaction with a busy timeout of 5 s; the per-session lock of the architecture is that transaction. `reconcile`, `migrate` and per-session delivery take a lease (holder PID + start time + `expires_at`): a lease expires 60 s after its last renewal, the holder renews it every 20 s while it works (hook delivery renews during long hooks), and a dead holder's lease may be taken over immediately.
 - Timestamps are UTC ISO 8601; durations inside `exec` use the monotonic clock.
+- `PRAGMA application_id` is `0x43536573` ("CSes"); a database with another id, or id 0 and a non-empty schema, is refused before claude-session writes any data to it (it may only tighten the modes of the state directory and `state.db`, which it already checked are the user's own). `holder_token` is random per open store, so two stores of one process never share a lease.
 
 ### Generated settings
 
@@ -452,7 +465,7 @@ The SessionStart hook always adds a trusted context line for every source (`star
 
 ### Hook-event fast path
 
-`python -I -m claude_session hook-event --state-dir <dir> <Event>` is the latency-critical path: `__main__` dispatches it before importing `cli`, `config`, Pydantic or argparse. It reads the payload, opens `<dir>/state.db`, claims and pre-checks outbox requests (claim by rename, secret scan and artifact copy, outside any transaction; PostToolUse and Stop only, see below), and in one transaction: loads the session by `CSESSION_ID`, appends `claude_ids` rows on SessionStart (setting `session_started_at` on the first), records the claimed requests, applies the transition table, appends an `events` row (with the session's labels) if the state or activity changed, and decides the Stop backstop. All of it runs within the hook's own budget, below the injected timeout (section [Generated settings](#generated-settings)). It reads the notes command settings from `private/<id>/runs/<n>/hookconf.json`, never from config or any agent-writable file. It never migrates the database (section [Data model](#data-model-statedb-sqlite-wal)). It imports only the standard library, `store`, `outbox`'s ingestion side and the stdlib-only `gateway`, which runs the notes command with cwd = the state root, the sanitized `PATH` and argv `<cmd> [--repo=<id>] [--label=<k>=<v>]...` (each label one token; `--repo` omitted when the run has no repo).
+`python -I -m claude_session hook-event --state-dir <dir> <Event>` is the latency-critical path: `__main__` dispatches it before importing `cli`, `config`, Pydantic or argparse. It reads the payload, opens `<dir>/state.db`, claims and pre-checks outbox requests (claim by rename, secret scan and artifact copy, outside any transaction; PostToolUse and Stop only, see below), and in one transaction: loads the session by `CSESSION_ID`, appends `claude_ids` rows on SessionStart (setting `session_started_at` on the first), records the claimed requests, applies the transition table, appends an `events` row (with the session's labels) if the state or activity changed, and decides the Stop backstop. All of it runs within the hook's own budget, below the injected timeout (section [Generated settings](#generated-settings)). It reads the notes command settings from `private/<id>/runs/<n>/hookconf.json`, never from config or any agent-writable file. It never migrates the database (section [Data model](#data-model-statedb-sqlite-wal)). It imports only the standard library, `store`, `outbox`'s ingestion side and the stdlib-only `gateway`, which runs the notes command with cwd = the state root, the sanitized `PATH` and argv `<cmd> [--repo=<id>] [--label=<k>=<v>]...` (each label one token; `--repo` omitted when the run has no repo). A contained error is logged by `__main__`, which loads the stdlib-only `logs` and `fsutil` only then.
 
 **Failure handling.** On an internal error (e.g. a busy timeout) `hook-event` logs at `error` and exits 0 with no output, so a claude-session bug never blocks a session. Unprocessed outbox requests stay for the next drain. `exec` re-derives the final state at child exit (it drains the outbox and applies the end mapping regardless of the last recorded activity), so a dropped Stop cannot leave a wrong final state. A missed auto-exit trigger is retried on the next qualifying Stop.
 
@@ -609,7 +622,7 @@ What is carried, reset and refused on resume and fork is normative in [interface
 - Label key `^[a-z0-9][a-z0-9_.-]{0,63}$`; value 0 to 256 characters from `[A-Za-z0-9._:/#@+=,-]`, split at the first `=`; empty values allowed; enforced at every entry point (exit 2).
 - `--skill` matches `^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$`.
 - Kind names match `^[a-z0-9][a-z0-9_-]{0,63}$` (`--kind`, config `kinds` keys, repo-override kind keys); permission-profile names match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` and may not end in `.json`, `.yaml` or `.yml`; repo ids follow the grammar in section [Git calls](#git-calls).
-- Duration: a non-negative number of seconds (fractions allowed) or `^\d+(\.\d+)?(ms|s|m|h|d)$`; `none` (or null in config) means no bound where allowed.
+- Duration: a non-negative number of seconds (fractions allowed) or `^[0-9]+(\.[0-9]+)?(ms|s|m|h|d)$` (full grammar and cap: interface.md, Identifiers); `none` (or null in config) means no bound where allowed.
 
 ### Transcripts
 
@@ -633,7 +646,7 @@ Requests for other runs are discarded and logged; nothing is ingested for a run 
 ### Error handling
 
 - Invalid config fails fast naming the key: exit 2 with `code: usage` and a `detail`; at adoption the run ends `not-started` with `config_invalid` (exit 12).
-- Launch-phase failures exit 12 with `phase: launch`, an end reason and a hint (install command for bubblewrap/socat; `claude_bin`; minimum Claude Code version). Non-launch operational failures (cron install without `crontab`, transcript errors) exit 12 with error code `failed`.
+- Launch-phase failures exit 12 with `phase: launch`, an end reason and a hint (install command for bubblewrap/socat; `claude_bin`; minimum Claude Code version). Non-launch operational failures (cron install without `crontab`, transcript errors, an unusable, unsafe or foreign `state.db`) exit 12 with error code `failed`.
 - An unknown `--kind` gets the full review profile under the given name, with a warning on stderr and in `--json` `warnings`.
 - Post-hook and notes-context failures are logged and warned, never fatal (notes exit codes 0 and 10 are success).
 - `hook-event` never fails a session (see above).
@@ -642,7 +655,7 @@ Requests for other runs are discarded and logged; nothing is ingested for a run 
 
 - The sandbox is the boundary for third-party-reading kinds; permission rules are defense in depth only. Permission-layer isolation still applies to every third-party-reading or sandboxed run, and a third-party-reading run without an active sandbox produces a warning and `sandbox_active: false`.
 - In an isolated run sandboxed Bash reads only an allowlist under deny-root reads (cwd, `$CSESSION_DIR`, system dirs, resolved tool dirs, `read_dirs`, plugin dirs); the agent sees only its own `$CSESSION_DIR`; everything that configures or records the run (settings, hook configuration, results, profile snapshots, frozen artifacts, `state.db`) lives where it can neither read nor write. A trusted, unsandboxed run can reach them through Bash.
-- Secrets never enter state, logs, audit records, hook payloads or `--json` output; `exec --dry-run` prints environment variable names, never values. Reports containing a passed secret value are rejected; the check uses a per-run keyed q-gram index, so no secret plaintext is stored. Headless stderr stays in the private run dir.
+- Secrets never enter state, logs, audit records, hook payloads or `--json` output (in logs and audit records: the `contains_secret` values of 8 or more characters, redacted as in [interface.md, Audit and log](interface.md#audit-and-log)); `exec --dry-run` prints environment variable names, never values. Reports containing a passed secret value are rejected; the check uses a per-run keyed q-gram index, so no secret plaintext is stored. Headless stderr stays in the private run dir.
 - Untrusted text (prompts, summaries, reasons, notes output, transcript content) never goes into argv or environment variables. Label values are restricted identifiers, so passing them as argv to `notes_context_cmd` carries no free text.
 - Process signals go only to exact verified PIDs (checked by start time), plus the process groups of hooks and notes commands this tool spawned. Processes the agent started itself are not signaled.
 - Git: for every third-party-reading run the git dir (and a linked worktree's gitdir) is read-only, so the agent cannot plant config, hooks or refs for a later git call; respond's commit happens outside the sandbox, by review-respond on confirm, in a clean checkout (never in the agent-touched one). `GIT_CONFIG_COUNT` hardening is defense in depth for the agent's own git commands. A cwd without a git dir cannot gain one unnoticed.

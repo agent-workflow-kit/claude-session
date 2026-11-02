@@ -41,6 +41,7 @@ import sys
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -236,3 +237,15 @@ def no_leftover_processes() -> Iterator[list[_Started]]:
             proc.close()
     if fired.is_set():
         pytest.fail(f"watchdog fired: the test was still running after {WATCHDOG_SECONDS} s")
+
+
+@pytest.fixture(autouse=True)
+def _private_state_dir(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Every test (and every subprocess it starts) gets its own ``XDG_STATE_HOME``, so no
+    test ever touches the real state directory. Kept outside ``tmp_path``, which tests may
+    expect to stay empty; not created up front."""
+    state_home = tmp_path_factory.mktemp("xdg") / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    return state_home
