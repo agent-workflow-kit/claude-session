@@ -28,6 +28,8 @@ PERMISSION_PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}")
 ARTIFACT_NAME = re.compile(r"[A-Za-z0-9._-]{1,128}")
 LABEL_KEY = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
+# Environment variable names (--env-allow, --env-allowlist-only); ASCII only.
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 LABEL_VALUE = re.compile(r"[A-Za-z0-9._:/#@+=,-]{0,256}")
 # Prefix input after `cs-`: what any id prefix of at least MIN_PREFIX_LENGTH can look like.
 ID_PREFIX_BODY = re.compile(r"[a-z2-7]{4,8}")
@@ -144,6 +146,10 @@ def is_permission_profile_name(name: str) -> bool:
     return PERMISSION_PROFILE_NAME.fullmatch(name) is not None
 
 
+def is_env_name(name: str) -> bool:
+    return ENV_NAME.fullmatch(name) is not None
+
+
 def is_skill_name(name: str) -> bool:
     return SKILL_NAME.fullmatch(name) is not None
 
@@ -173,7 +179,6 @@ def is_repo_id(text: str) -> bool:
 def repo_id_from_origin(origin: str) -> str | None:
     """Normalize an ``origin`` URL to a repo id, or None when it does not yield a valid one
     (local paths, ``file://``, unknown schemes, no path)."""
-    # TODO(#9): call from the --repo derivation (git calls go through the gateway).
     if not origin.isascii() or _ORIGIN_UNSAFE.search(origin):
         return None  # a repo id is ASCII; str.lower would fold e.g. KELVIN SIGN into k
     if "://" in origin:

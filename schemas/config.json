@@ -22,7 +22,7 @@
       "type": "string",
       "default": "implement",
       "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
-      "description": "Kind used when --kind is omitted; must match the kind-name grammar."
+      "description": "Kind used when --kind is omitted; must match the kind-name grammar and name a built-in or configured kind."
     },
     "kinds": {
       "type": "object",
@@ -543,6 +543,7 @@
         "properties": {
           "kinds": {
             "type": "object",
+            "description": "Per-repo kind overrides; each key must name a built-in or configured kind (else invalid config).",
             "additionalProperties": {
               "type": "object",
               "properties": {

@@ -14,11 +14,15 @@ import re
 import sys
 import traceback
 from collections.abc import Callable, Sequence
-from typing import Any, NoReturn
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, NoReturn
 
-from . import fsutil, ids, store
+from . import durations, fsutil, ids, store
 from .defaults import MAX_INTEGER
 from .errors import CliError, InternalError, RefusedError, UsageError
+
+if TYPE_CHECKING:
+    from .config import Config
 
 PROG = "claude-session"
 DESCRIPTION = "Runs and supervises Claude Code sessions (terminal-agnostic)."
@@ -76,7 +80,6 @@ SESSION_ID_ARGS: dict[str, str | None] = {
 KIND_ARGS = ("kind", "launch_kind", "run_kind")
 # argparse takes a token like this as an option value, not as an option.
 NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
-NUMBER_WITH_UNIT = re.compile(r"^(-?\d+(?:\.\d+)?)(ms|s|m|h|d)?$")
 
 
 class _Parser(argparse.ArgumentParser):
@@ -364,16 +367,47 @@ def _flag(dest: str) -> str:
     return "--" + dest.replace("_", "-")
 
 
-def _is_nonpositive_duration(text: str) -> bool:
-    """True for durations such as ``0``, ``0s`` or ``-5m``."""
-    # TODO(#3): validate with durations.parse once feat/config is merged.
-    match = NUMBER_WITH_UNIT.match(text)
-    return match is not None and float(match.group(1)) <= 0
+def _check_duration(flag: str, text: str, *, bound: bool = False, positive: bool = False) -> None:
+    """The duration grammar (interface.md, Identifiers); ``bound`` also accepts ``none`` and
+    refuses zero (use ``none``), ``positive`` refuses zero."""
+    if bound and text == durations.NONE:
+        return
+    try:
+        seconds = durations.parse(text)
+    except ValueError as exc:
+        raise UsageError(f"{flag}: {exc}") from None
+    if seconds <= 0 and (bound or positive):
+        hint = " (use 'none')" if bound else ""
+        raise UsageError(f"{flag} must be positive, got {text!r}{hint}")
 
 
 def _check_timeout(args: argparse.Namespace) -> None:
-    if args.timeout is not None and _is_nonpositive_duration(args.timeout):
-        raise UsageError(f"--timeout must be positive, got {args.timeout!r} (use 'none')")
+    if args.timeout is not None:
+        _check_duration("--timeout", args.timeout, bound=True)
+
+
+def since_threshold(text: str, *, now: datetime | None = None) -> datetime:
+    """The time ``--since`` stands for (timezone-aware). A duration (that long before ``now``)
+    is tried first, so bare digits such as ``20240101`` are seconds; then an ISO 8601 time,
+    UTC when it has no offset."""
+    try:
+        seconds = durations.parse(text)
+    except ValueError:
+        pass
+    else:
+        return (now or datetime.now(UTC)) - timedelta(seconds=seconds)
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        raise UsageError(
+            "--since: expected an ISO 8601 time or a duration (seconds or <number><unit> "
+            "with unit ms, s, m, h or d)"
+        ) from None
+    return when if when.tzinfo is not None else when.replace(tzinfo=UTC)
+
+
+def _check_since(text: str) -> None:
+    since_threshold(text)
 
 
 def _split_hook(flag: str, entry: str) -> str:
@@ -391,6 +425,7 @@ def _check_launch_flags(args: argparse.Namespace) -> None:
         name = _split_hook("--hook-timeout", entry)
         if name not in hooks:
             raise UsageError(f"--hook-timeout {name}=... needs a --hook {name}=... too")
+        _check_duration(f"--hook-timeout {name}", entry.partition("=")[2], positive=True)
     _check_timeout(args)
     if args.max_turns is not None and not 1 <= args.max_turns <= MAX_INTEGER:
         raise UsageError(f"--max-turns must be between 1 and {MAX_INTEGER}")
@@ -407,6 +442,14 @@ def _check_launch_flags(args: argparse.Namespace) -> None:
         if name in basenames:
             raise UsageError(f"duplicate --input-file name {name!r}")
         basenames.add(name)
+    for dest in ("env_allow", "env_allowlist_only"):
+        for name in getattr(args, dest) or []:
+            if name == "" and dest == "env_allowlist_only":
+                continue  # `--env-allowlist-only ''`: an empty list
+            if not ids.is_env_name(name):
+                raise UsageError(
+                    f"{_flag(dest)}: invalid variable name {name!r} (^{ids.ENV_NAME.pattern}$)"
+                )
     if args.setting_sources:
         for source in args.setting_sources.split(","):
             if source not in SETTING_SOURCES:
@@ -464,9 +507,16 @@ def _check_report(args: argparse.Namespace) -> None:
         raise UsageError(f"report {args.status} requires --reason-file")
 
 
+def _check_stop(args: argparse.Namespace) -> None:
+    if args.grace is not None:
+        _check_duration("--grace", args.grace)
+
+
 def _check_list(args: argparse.Namespace) -> None:
     if args.limit is not None and args.limit < 1:
         raise UsageError("--limit must be at least 1")
+    if args.since is not None:
+        _check_since(args.since)
 
 
 def _check_transcript(args: argparse.Namespace) -> None:
@@ -480,9 +530,13 @@ def _check_forget(args: argparse.Namespace) -> None:
         raise UsageError(f"{_flag(bulk[0])} is for bulk mode and cannot be used with an id")
     if args.id is None and args.older_than is None:
         raise UsageError("forget needs a session id or --older-than")
+    if args.older_than is not None:
+        _check_duration("--older-than", args.older_than)
 
 
 def _check_export(args: argparse.Namespace) -> None:
+    if args.since is not None:
+        _check_since(args.since)
     for action in args.action or []:
         if action not in AUDIT_ACTIONS:
             known = ", ".join(AUDIT_ACTIONS)
@@ -498,6 +552,7 @@ FLAG_RULES: dict[str, Callable[[argparse.Namespace], None]] = {
     "exec": _check_exec,
     "start": _check_start,
     "resume": _check_launch_flags,
+    "stop": _check_stop,
     "wait": _check_wait,
     "report": _check_report,
     "list": _check_list,
@@ -548,6 +603,17 @@ def check_flag_rules(args: argparse.Namespace) -> None:
     rule = FLAG_RULES.get(args.handler)
     if rule is not None:
         rule(args)
+
+
+# Config
+
+
+def load_config(args: argparse.Namespace) -> Config:
+    """The config for a command: ``--config`` names the only file read (it must exist);
+    without it, the default ``config.yaml`` and its ``config.d/`` drop-ins."""
+    from . import config  # Pydantic and PyYAML: only for commands that need the config
+
+    return config.load(args.config)
 
 
 # Output

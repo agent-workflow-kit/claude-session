@@ -470,7 +470,7 @@ VALID = [
     # the only nulls the schema allows
     "kinds: {implement: {model: null, max_turns: null, interactive_timeout: null}}\n",
     "repos: {example.com/x: {kinds: {respond: {timeout: null, max_turns: null, model: null}}}}\n",
-    "default_kind: x_1-y\nkill_grace: 36500d\n",
+    "default_kind: x_1-y\nkinds: {x_1-y: {}}\nkill_grace: 36500d\n",
     # integer bounds (2^53 - 1; retention_days 36500)
     "retention_days: 36500\nsummary_max_bytes: 9007199254740991\n",
     "artifact_max_bytes: 9007199254740991\ninput_max_bytes: 9007199254740991\n",

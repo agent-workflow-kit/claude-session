@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from claude_session import cli
 from claude_session.cli import main
+from claude_session.errors import UsageError
 
 from .schemas import validate
 
@@ -65,9 +68,58 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     (["exec", "--timeout", "0"], "--timeout must be positive"),
     (["exec", "--timeout", "0s"], "--timeout must be positive"),
     (["resume", SID, "--timeout", "0.0m"], "--timeout must be positive"),
-    (["start", "--json", "--timeout", "-5"], "--timeout must be positive"),
+    (["start", "--json", "--timeout", "-5"], "--timeout: invalid duration"),
     (["wait", SID, "--timeout", "0"], "--timeout must be positive"),
     (["wait", SID, "--timeout", "0ms"], "--timeout must be positive"),
+    # the full duration grammar (interface.md, Identifiers: Durations)
+    (["exec", "--timeout", ".5"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "5."], "--timeout: invalid duration"),
+    (["exec", "--timeout", "1e3"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "+5"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "1_000"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "5 m"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "5M"], "--timeout: invalid duration"),
+    (["exec", "--timeout", "\u0665s"], "--timeout: invalid duration"),  # ARABIC-INDIC FIVE
+    (["exec", "--timeout", "NONE"], "--timeout: invalid duration"),
+    (["exec", "--timeout", ""], "--timeout: invalid duration"),
+    (["exec", "--timeout", "36501d"], "--timeout: invalid duration: must be at most 36500d"),
+    (["exec", "--timeout", "9" * 400], "--timeout: invalid duration: must be at most 36500d"),
+    (["resume", SID, "--timeout", "soon"], "--timeout: invalid duration"),
+    (["wait", SID, "--timeout", "5x"], "--timeout: invalid duration"),
+    (
+        ["exec", "--hook", "pre-launch=x", "--hook-timeout", "pre-launch=0"],
+        "--hook-timeout pre-launch must be positive",
+    ),
+    (
+        ["exec", "--hook", "pre-launch=x", "--hook-timeout", "pre-launch=none"],
+        "--hook-timeout pre-launch: invalid duration",
+    ),
+    (
+        ["exec", "--hook", "pre-launch=x", "--hook-timeout", "pre-launch="],
+        "--hook-timeout pre-launch: invalid duration",
+    ),
+    (["stop", SID, "--grace", "-1"], "--grace: invalid duration"),
+    (["stop", SID, "--grace", "none"], "--grace: invalid duration"),
+    (["stop", SID, "--grace", "1w"], "--grace: invalid duration"),
+    (["forget", "--older-than", "7 days"], "--older-than: invalid duration"),
+    (["forget", "--older-than", "none"], "--older-than: invalid duration"),
+    (["list", "--since", "yesterday"], "--since: expected an ISO 8601 time or a duration"),
+    (["list", "--since", "1e3"], "--since: expected an ISO 8601 time or a duration"),
+    (["list", "--since", "2026-13-01"], "--since: expected an ISO 8601 time or a duration"),
+    (["export", "--since", "5 m"], "--since: expected an ISO 8601 time or a duration"),
+    (["exec", "--env-allow", "*"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allow", "GH_*"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allow", "a b"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allow", "1X"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allow", "é"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allow", "A=B"], "--env-allow: invalid variable name"),
+    (["exec", "--env-allowlist-only", "*"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allowlist-only", "GH_*"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allowlist-only", "a b"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allowlist-only", "1X"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allowlist-only", "é"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allowlist-only", "A=B"], "--env-allowlist-only: invalid variable name"),
+    (["exec", "--env-allow", ""], "--env-allow: invalid variable name"),
     # bounds
     (["exec", "--max-turns", "0"], "--max-turns must be between 1 and 9007199254740991"),
     (
@@ -198,6 +250,23 @@ ALLOWED: list[list[str]] = [
     ["resume", SID, "--fork", "--allow-tainted"],
     ["resume", SID, "--override-escalation"],
     ["wait", SID, "--timeout", "none"],
+    ["wait", SID, "--timeout", "90"],
+    ["exec", "--timeout", "36500d"],
+    ["exec", "--timeout", "500ms"],
+    ["exec", "--hook", "pre-launch=a", "--hook-timeout", "pre-launch=0.5"],
+    ["stop", SID, "--grace", "0"],
+    ["stop", SID, "--grace", "2.5s"],
+    ["forget", "--older-than", "0"],
+    ["forget", "--older-than", "30d"],
+    ["list", "--since", "2h"],
+    ["list", "--since", "3600"],
+    ["list", "--since", "2026-10-30"],
+    ["list", "--since", "2026-10-30T10:00:00+00:00"],
+    ["export", "--since", "2026-10-30T10:00:00Z"],
+    ["export", "--since", "7d"],
+    ["exec", "--env-allow", "GH_TOKEN", "--env-allow", "_x1"],
+    ["exec", "--env-allowlist-only", ""],
+    ["exec", "--env-allowlist-only", "A", "--env-allowlist-only", ""],
     ["report", "done", "--summary-file", "-"],
     ["report", "blocked", "--reason-file", "r.md"],
     ["transcript", SID, "--raw"],
@@ -230,8 +299,28 @@ ALLOWED: list[list[str]] = [
 def test_allowed_combination_reaches_the_handler(
     argv: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from claude_session import cli
-
     handler = cli.parse(cli.build_parser(), argv).handler
     monkeypatch.setitem(cli.HANDLERS, handler, lambda args: 77)
     assert main(argv) == 77, capsys.readouterr().err
+
+
+# --since threshold (interface.md, list): the duration grammar first, then an ISO 8601 time
+
+
+def test_since_threshold_reads_digits_as_seconds() -> None:
+    now = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
+    assert cli.since_threshold("20240101", now=now) == now - timedelta(seconds=20240101)
+    assert cli.since_threshold("2h", now=now) == now - timedelta(hours=2)
+
+
+def test_since_threshold_reads_iso_times() -> None:
+    now = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
+    offset = cli.since_threshold("2026-10-30T10:00:00+02:00", now=now)
+    assert offset == datetime(2026, 10, 30, 8, 0, tzinfo=UTC)
+    assert cli.since_threshold("2026-10-30", now=now) == datetime(2026, 10, 30, tzinfo=UTC)
+    assert cli.since_threshold("2026-10-30T10:00:00Z", now=now).utcoffset() == timedelta(0)
+
+
+def test_since_threshold_rejects_other_text() -> None:
+    with pytest.raises(UsageError):
+        cli.since_threshold("yesterday")
