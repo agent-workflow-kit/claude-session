@@ -5,7 +5,10 @@ description = "Runs and supervises Claude Code sessions"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = []
+dependencies = [
+    "pydantic>=2.7",
+    "pyyaml>=6",
+]
 
 [project.scripts]
 claude-session = "claude_session.__main__:main"
@@ -25,6 +28,7 @@ dev = [
     "pymarkdownlnt>=0.9.41",
     "jsonschema>=4.26.0",
     "referencing>=0.37.0",
+    "types-pyyaml>=6.0.12.20261030",
 ]
 
 [tool.ruff]

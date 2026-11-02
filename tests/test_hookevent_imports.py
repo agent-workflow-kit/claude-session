@@ -110,3 +110,25 @@ def test_checker_flags_cli() -> None:
     assert "import attempted: claude_session.cli" in found
     assert "import attempted: argparse" in found
     assert "unexpected module: claude_session.cli" in found
+
+
+# `cli` validates flags and dispatches; config loading (pydantic, yaml) happens later, on demand.
+CLI_IMPORT_PROBE = """
+import json, sys
+{extra}
+import claude_session.cli
+heavy = ("pydantic", "yaml", "claude_session.config")
+print(json.dumps(sorted(m for m in sys.modules if any(m == h or m.startswith(h) for h in heavy))))
+"""
+
+
+def test_cli_import_loads_no_config_stack() -> None:
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", CLI_IMPORT_PROBE.format(extra="")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == []

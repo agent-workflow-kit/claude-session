@@ -15,7 +15,7 @@ Runs and supervises Claude Code sessions (terminal-agnostic). Layer 1 (primitive
 | `bubblewrap`, `socat` (Linux, WSL2) | system packages | Needed by Claude Code's sandbox for sandboxed kinds; checked before launch. |
 | `git` | A, read-only | Only `git rev-parse --git-common-dir`/`--git-dir` for `${GIT_DIR}` and a linked worktree's gitdir, and the `origin` URL for the derived `--repo`, always hardened (section [Git calls](#git-calls)). claude-session never writes a repository. |
 
-Python dependencies: `pyyaml` and `pydantic` (both required by the design guide for config). Nothing else: process start times come from `/proc` (Linux) or `ps -o lstart=` (macOS) rather than `psutil`; the secret scan uses the standard library's keyed BLAKE2b. Test-only (dev group): `jsonschema` and `referencing`, to validate every `--json` golden output against `schemas/` with a registry keyed by `$id`.
+Python dependencies: `pyyaml` and `pydantic` (both required by the design guide for config). Nothing else: process start times come from `/proc` (Linux) or `ps -o lstart=` (macOS) rather than `psutil`; the secret scan uses the standard library's keyed BLAKE2b. Test-only (dev group): `jsonschema` and `referencing`, to validate every `--json` golden output against `schemas/` with a registry keyed by `$id`; `types-pyyaml`, the type stubs pyright needs for `pyyaml`.
 
 Minimum Claude Code version: `exec` runs `claude --version` at launch and compares it with the built-in `min_claude_version` (2.1.312, the version the spike verified; overridable in config); an older version fails the launch with `claude_too_old`.
 
@@ -207,7 +207,9 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 | `__main__` | Entry point of `python -m claude_session` and the `claude-session` script. Standard library only; dispatches `hook-event` before importing `cli`, and contains its errors (exit 0, no output). |
 | `cli` | argparse surface, argv-only flag rules, dispatch of every other command, printing of error envelopes (stdout with `--json`, and to `--outcome-file` for usage errors and refusals), human output sanitization. |
 | `errors` | Standard library only: one error class per error code, with its exit code and envelope fields. |
-| `config` | YAML and `config.d/` merge (maps deep-merged, lists replaced, `hooks.*` lists appended), Pydantic models, `CSESSION_*` overrides (top-level scalar keys only: `claude_bin`, `default_kind`, caps, durations, `retention_days`; `kinds`, `permission_profiles`, `repos`, `hooks`, `secret_env`, `claude_auth_env`, `claude_args`, `notes_context_cmd`, `notes_context_sources` and `me` cannot be set from the environment; reserved names ignored), precedence (built-in → config files → environment → flags for those scalars). Never imported by the hook path. |
+| `config` | YAML and `config.d/` merge (maps deep-merged, lists replaced, `hooks.*` lists appended), Pydantic models, `CSESSION_*` overrides (top-level scalar keys only: `claude_bin`, `default_kind`, `min_claude_version`, caps, durations, `retention_days`; `kinds`, `permission_profiles`, `repos`, `hooks`, `secret_env`, `claude_auth_env`, `claude_args`, `notes_context_cmd`, `notes_context_sources` and `me` cannot be set from the environment; reserved names ignored), precedence (built-in → config files → environment → flags for those scalars). Never imported by the hook path. |
+| `defaults` | Standard library only: the built-in config values (every key of `config.example.yaml`, raw form), including the built-in kinds and permission profiles; `config` merges over it. |
+| `durations` | Standard library only: the duration syntax ([Identifiers, labels and durations](#identifiers-labels-and-durations)) for flags, config and environment overrides; returns seconds. |
 | `kinds` | Effective profile and its origins: built-in kind → config kind → per-repo override → previous run's explicit flags → flags given now (section [Resume](#resume-and-fork)); unknown-kind fallback; profile validation. |
 | `settings_builder` | Pure function: effective profile + session paths → generated settings JSON, `claude` argv, sandbox lists. The security boundary; exhaustively unit-tested. |
 | `envbuild` | Session environment (section [Environment](#environment)). |
@@ -608,7 +610,7 @@ What is carried, reset and refused on resume and fork is normative in [interface
 - Label key `^[a-z0-9][a-z0-9_.-]{0,63}$`; value 0 to 256 characters from `[A-Za-z0-9._:/#@+=,-]`, split at the first `=`; empty values allowed; enforced at every entry point (exit 2).
 - `--skill` matches `^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$`.
 - Kind names match `^[a-z0-9][a-z0-9_-]{0,63}$` (`--kind`, config `kinds` keys, repo-override kind keys); permission-profile names match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` and may not end in `.json`, `.yaml` or `.yml`; repo ids follow the grammar in section [Git calls](#git-calls).
-- Duration: a non-negative number of seconds (fractions allowed) or `^\d+(\.\d+)?(ms|s|m|h|d)$`; `none` (or null in config) means no bound where allowed.
+- Duration: a non-negative number of seconds (fractions allowed) or `^[0-9]+(\.[0-9]+)?(ms|s|m|h|d)$` (full grammar and cap: interface.md, Identifiers); `none` (or null in config) means no bound where allowed.
 
 ### Transcripts
 
