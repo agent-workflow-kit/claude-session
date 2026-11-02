@@ -20,7 +20,8 @@ from claude_session.settings_builder import Isolation, Launch, Paths, Tools
 ROOT = Path(__file__).resolve().parent.parent
 DRY_RUN_SCHEMA = ROOT / "schemas" / "cli" / "exec-dry-run.json"
 AUDIT_SCHEMA = ROOT / "schemas" / "audit.json"
-GOLDEN = Path(__file__).resolve().parent / "golden"
+# Generated settings, not CLI output: kept apart from tests/golden (validated against schemas/cli).
+GOLDEN = Path(__file__).resolve().parent / "golden_settings"
 
 HOME = "/home/user"
 STATE = f"{HOME}/.local/state/claude-session"
