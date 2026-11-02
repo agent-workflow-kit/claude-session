@@ -1,0 +1,14 @@
+{
+  "already_final": true,
+  "canceled": false,
+  "csession_id": "cs-aaaaaaaa",
+  "dry_run": true,
+  "end_reason": "lost",
+  "ended": true,
+  "outcome": "lost",
+  "recorded_by_stop": false,
+  "run": 1,
+  "run_exit_code": 17,
+  "signals": [],
+  "state": "lost"
+}

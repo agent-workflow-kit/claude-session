@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "<claude-session>",
+    "exec",
+    "--session-id",
+    "cs-aaaaaaaa",
+    "--run",
+    "1"
+  ],
+  "csession_dir": "<state>/sessions/cs-aaaaaaaa",
+  "csession_id": "cs-aaaaaaaa",
+  "env_inherit": true,
+  "expires_at": "2026-01-01T00:00:00.000000Z",
+  "forked_from": null,
+  "required_env_names": [],
+  "run": 1,
+  "warnings": []
+}

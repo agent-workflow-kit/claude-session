@@ -1,0 +1,48 @@
+{
+  "actor": "auto:ci",
+  "allow_tainted": false,
+  "auto_exit": true,
+  "cwd": "<cwd>",
+  "decision_ids": [],
+  "env_inherit": true,
+  "env_names": [
+    "CSESSION_DIR",
+    "CSESSION_ID",
+    "CSESSION_KIND"
+  ],
+  "fork": false,
+  "forked_from": null,
+  "has_prompt": true,
+  "hook": "pre-launch",
+  "implicit_done": true,
+  "input_files": [],
+  "labels": [
+    "kind=implement"
+  ],
+  "launch_kind": "implement",
+  "mcp": "inherit",
+  "mode": "headless",
+  "model": null,
+  "object_id": "cs-aaaaaaaa",
+  "object_type": "session",
+  "override_escalation": false,
+  "pending": false,
+  "permission_profile": "default",
+  "plugin_dirs": [],
+  "previous_run_kind": null,
+  "reads_third_party": false,
+  "repo": null,
+  "resume": false,
+  "run": 1,
+  "run_kind": "implement",
+  "sandbox": "off",
+  "setting_sources": [
+    "user",
+    "project",
+    "local"
+  ],
+  "skill": null,
+  "tainted": false,
+  "tool": "claude-session",
+  "ts": "2026-01-01T00:00:00.000000Z"
+}

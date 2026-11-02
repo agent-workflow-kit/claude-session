@@ -1,0 +1,11 @@
+{
+  "dry_run": true,
+  "forgotten": [
+    {
+      "csession_id": "cs-aaaaaaaa",
+      "delete_after": "2026-01-01T00:00:00.000000Z",
+      "forgotten_at": "2026-01-01T00:00:00.000000Z"
+    }
+  ],
+  "skipped": []
+}
