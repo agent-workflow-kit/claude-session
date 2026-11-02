@@ -2,7 +2,7 @@
 
 ``__main__`` dispatches here before importing ``cli``, so this module and everything it
 imports must stay standard library only (plus ``store``, ``outbox`` and ``gateway`` once they
-exist): never ``config``, Pydantic or YAML.
+exist): never ``config``, Pydantic or YAML. Contained errors are logged by ``__main__``.
 """
 
 from __future__ import annotations
