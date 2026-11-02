@@ -52,9 +52,9 @@ The check never delivers ``post-state-change`` events itself: the caller deliver
 changed (``status`` and ``list`` never run hooks; ``reconcile`` delivers later), and writes
 nothing in a dry run (``dry_run``: the changes it would make, not applied).
 
-TODO(#16): ``views.check_liveness`` and ``views.check_liveness_all`` (``status``/``list``, on
-the #65 line) call ``check_session`` (and ``sessions_with_open_runs`` for ``list``) without
-delivering; ended runs keep their ``Store.known_liveness`` display.
+``views.check_liveness`` and ``views.check_liveness_all`` (``status``/``list``) call
+``check_session`` (and ``sessions_with_open_runs`` for ``list``) without delivering;
+ended runs keep their ``Store.known_liveness`` display.
 ``stop`` (``stopper``) runs ``check_session`` first (cause ``liveness``) and again, with cause
 ``stop``, to finalize a run whose wrapper it found gone or SIGKILLed.
 ``forget`` runs ``check_session`` (cause ``forget`` for its own changes, ``liveness`` for this
