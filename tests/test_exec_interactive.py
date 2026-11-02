@@ -407,6 +407,16 @@ def test_no_auto_exit_without_a_done_report_and_a_qualifying_stop(
     assert run_row_of(state)["pending_cause"] == "forwarded_term"
 
 
+# The delay and the second Stop's wait of the re-check test below. The UserPromptSubmit event
+# reaches state.db through a ``hook-event`` process (a Python start-up, hundreds of
+# milliseconds on a loaded machine); exec may only be trusted to reset the wait if that event
+# lands before the first Stop's delay runs out, so the delay is many times that latency. The
+# second Stop comes later than the first Stop's delay, or a missing re-check (SIGTERM at the
+# first Stop's delay) could not be told from a correct one.
+RECHECK_DELAY = 2.0
+RECHECK_SECOND_STOP_AFTER = 2.6
+
+
 def test_auto_exit_rechecks_the_latest_event_before_sigterm(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
@@ -422,11 +432,12 @@ def test_auto_exit_rechecks_the_latest_event_before_sigterm(
             report("done"),
             STOP,
             {"do": "user_prompt_submit", "prompt": "one more thing"},
-            {"do": "sleep", "seconds": 1.0},
+            {"do": "sleep", "seconds": RECHECK_SECOND_STOP_AFTER},
             touch(marker),
             STOP,
             HANG,
         ],
+        config=f"poll_interval: 0.05s\nauto_exit_delay: {RECHECK_DELAY}s\nkill_grace: 2s\n",
     )
     code, outcome, err = term.finish()
     outcome = check_outcome(code, outcome, err)
@@ -594,6 +605,14 @@ def test_a_child_ignoring_sigterm_is_sigkilled_after_kill_grace_and_signaled_onc
         term.proc.send_signal(signal.SIGTERM)
         wait_for(tmp_path / "fake.jsonl", lambda r: r["event"] == "signal_ignored")
         term.proc.send_signal(signal.SIGHUP)  # during the grace: not forwarded
+        # The second signal goes out only once exec has recorded the first: two signals sent
+        # back to back may be handled in either order by a multi-threaded process (the kernel
+        # hands each to whichever thread is ready), so the order of the records is only
+        # defined for signals that do not overlap.
+        wait_for(
+            state / "log.jsonl",
+            lambda r: r["event"] == "signal_not_sent" and r["signal"] == "SIGHUP",
+        )
         term.proc.send_signal(signal.SIGTERM)
     finally:
         code, outcome, err = term.finish()
