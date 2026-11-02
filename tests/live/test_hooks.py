@@ -166,7 +166,8 @@ def test_a_timed_out_hook_gets_sigterm_and_one_that_ignores_it_is_observed(live:
     recorded = read_pids(stubborn)
     assert recorded, "the SIGTERM-ignoring hook did not record itself"
     ((pid, token),) = recorded
-    gone = wait_for(lambda: token is None or not info.is_alive(pid, token), 10)
+    assert token is not None, "the hook recorded its pid without a start-time token"
+    gone = wait_for(lambda: not info.is_alive(pid, token), 10)
     live.observe("a SIGTERM-ignoring hook is SIGKILLed by claude", gone)
     if not gone:
         kill_recorded(pid, token)

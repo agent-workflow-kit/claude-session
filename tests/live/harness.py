@@ -641,20 +641,42 @@ class LiveEnv:
         )
 
     # teardown
+    def end_runs(self) -> None:
+        """End every spawned run (charging it) and kill the recorded hook processes. Each is
+        handled once, so a later ``close`` neither ends nor charges it again."""
+        while self.spawned:
+            run = self.spawned.pop(0)
+            run.end()
+            try:
+                text = run.out.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            self.charge(cost_of_output(text))
+        while self.pid_files:
+            for pid, token in read_pids(self.pid_files.pop(0)):
+                signal_recorded(pid, token, signal.SIGKILL)
+
+    def remove(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
+
     def close(self) -> None:
         try:
-            for run in self.spawned:
-                run.end()
-                try:
-                    text = run.out.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    text = ""
-                self.charge(cost_of_output(text))
-            for path in self.pid_files:
-                for pid, token in read_pids(path):
-                    signal_recorded(pid, token, signal.SIGKILL)
+            self.end_runs()
         finally:
-            shutil.rmtree(self.root, ignore_errors=True)
+            self.remove()
+
+
+def teardown(live: LiveEnv, login: LoginCache | None) -> None:
+    """End a test's runs, then collect its login (a run still going could rotate the token
+    after the snapshot), then remove its root; each step runs even if an earlier one failed."""
+    try:
+        live.end_runs()
+    finally:
+        try:
+            if login is not None:
+                login.collect(live.home)
+        finally:
+            live.remove()
 
 
 def wait_for(predicate: Any, timeout: float, interval: float = 0.2) -> bool:

@@ -481,6 +481,43 @@ def test_a_spawned_run_without_a_result_is_killed_with_its_group_and_charged_the
     assert live_env.ledger.spent_usd == pytest.approx(live_env.run_usd)
 
 
+def test_teardown_collects_the_login_only_after_the_spawned_runs_end(
+    live_env: harness.LiveEnv, tmp_path: Path
+) -> None:
+    source = tmp_path / "creds.json"
+    source.write_text('{"token": "old"}', encoding="utf-8")
+    run_state: list[int | None] = []
+
+    class Spy(harness.LoginCache):
+        def collect(self, home: Path) -> None:
+            run_state.append(run.returncode())  # still running here = a rotation could be lost
+            super().collect(home)
+
+    directory = tmp_path / "cache"
+    directory.mkdir()
+    cache = Spy(source, directory)
+    cache.install(live_env.home)
+    started = tmp_path / "started"
+    script = tmp_path / "claude"
+    script.write_text(
+        "#!/bin/sh\n"
+        """printf '{"token": "rotated"}' > "$HOME/.claude/.credentials.json"\n"""
+        f"touch {started}\nexec sleep 300\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    live_env.claude = str(script)
+    run = live_env.spawn_headless("hi", out=tmp_path / "out.jsonl", err=tmp_path / "err.txt")
+    assert harness.wait_for(started.exists, 10)
+    harness.teardown(live_env, cache)
+    assert run_state == [-signal.SIGKILL]  # the run had ended before the snapshot
+    assert cache.path.read_text(encoding="utf-8") == '{"token": "rotated"}'
+    assert live_env.ledger.spent_usd == pytest.approx(live_env.run_usd)  # charged once
+    assert not live_env.root.exists()
+    live_env.close()  # the fixture's close after teardown neither recharges nor fails
+    assert live_env.ledger.spent_usd == pytest.approx(live_env.run_usd)
+
+
 # --- tmux --------------------------------------------------------------------------------------
 
 

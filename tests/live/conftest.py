@@ -84,11 +84,7 @@ def _make(*, needs_auth: bool) -> Iterator[harness.LiveEnv]:
         yield live
     finally:
         _observations.extend(live.observations)
-        try:
-            if login is not None:
-                login.collect(root / "home")
-        finally:
-            live.close()
+        harness.teardown(live, login)
 
 
 @pytest.fixture
