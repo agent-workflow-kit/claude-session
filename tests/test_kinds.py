@@ -4,6 +4,7 @@ carry-over)."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import textwrap
 from pathlib import Path
@@ -917,6 +918,8 @@ class FakeRun:
             raise self.result
         return self.result
 
+    run = __call__
+
 
 def completed(code: int, out: str) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess([], code, stdout=out, stderr="")
@@ -924,10 +927,11 @@ def completed(code: int, out: str) -> subprocess.CompletedProcess[str]:
 
 def test_git_origin_url_runs_hardened_read_only_git(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeRun(completed(0, "git@example.com:a/b.git\n"))
-    monkeypatch.setattr(gateway, "run", fake)
+    monkeypatch.setattr(kinds, "GATEWAY", fake)
     assert kinds.git_origin_url("/work/-dir") == "git@example.com:a/b.git"
     ((argv, timeout),) = fake.calls
-    assert argv[0] == "git"
+    assert os.path.isabs(argv[0])
+    assert os.path.basename(argv[0]) == "git"
     assert argv[-5:] == ["-C", "/work/-dir", "remote", "get-url", "origin"]
     for setting in (
         "core.fsmonitor=",
@@ -969,7 +973,7 @@ def test_git_origin_url_ignores_the_callers_git_environment(
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "0")
     monkeypatch.setenv("CSESSION_KEEP_ME", "1")
     fake = FakeRun(completed(0, "https://example.com/a/b\n"))
-    monkeypatch.setattr(gateway, "run", fake)
+    monkeypatch.setattr(kinds, "GATEWAY", fake)
     kinds.git_origin_url("/w")
     (env,) = fake.envs
     assert env is not None
@@ -998,7 +1002,7 @@ def test_real_git_lookup_ignores_git_dir(
 
 
 def test_git_origin_url_trims_only_one_newline(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gateway, "run", FakeRun(completed(0, "https://example.com/a\n\n")))
+    monkeypatch.setattr(kinds, "GATEWAY", FakeRun(completed(0, "https://example.com/a\n\n")))
     assert kinds.git_origin_url("/w") == "https://example.com/a\n"
 
 
@@ -1008,13 +1012,13 @@ def test_git_origin_url_trims_only_one_newline(monkeypatch: pytest.MonkeyPatch) 
         completed(2, ""),
         completed(128, "fatal: not a git repository\n"),
         FileNotFoundError("git"),
-        subprocess.TimeoutExpired(["git"], 10),
+        gateway.GatewayTimeout(["git"], 10),
     ],
 )
 def test_git_origin_url_failures_give_none(
     monkeypatch: pytest.MonkeyPatch, result: subprocess.CompletedProcess[str] | Exception
 ) -> None:
-    monkeypatch.setattr(gateway, "run", FakeRun(result))
+    monkeypatch.setattr(kinds, "GATEWAY", FakeRun(result))
     assert kinds.git_origin_url("/w") is None
 
 
