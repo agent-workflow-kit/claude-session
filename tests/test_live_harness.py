@@ -547,6 +547,8 @@ def test_missing_file_errors_are_recognized(output: str, missing: bool) -> None:
         ("  ls /proc/ ", True),
         ("ls -1 /proc", True),
         ("ls -la /proc 2>&1", True),
+        ("ls --color=never /proc", True),
+        ("ls -1 --color=never /proc/ 2>&1", True),
         ("ls /proc/self", False),
         ("ls /procfs", False),
         ("cat /proc/1/cmdline", False),
@@ -682,3 +684,16 @@ def test_the_elicit_server_handles_requests_while_a_question_is_pending(server: 
     log = server.finish()
     assert "cancelled" in log and "user pressed Esc" in log
     assert "answered decline" in log
+
+
+def test_the_elicit_server_refuses_a_second_tool_call_while_a_question_is_pending(
+    server: _Server,
+) -> None:
+    asked = server.start_question()
+    server.send({"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {"name": "ask"}})
+    busy = server.receive()
+    assert busy["id"] == 10 and "busy" in busy["error"]["message"]
+    server.send({"jsonrpc": "2.0", "id": asked["id"], "result": {"action": "accept"}})
+    done = server.receive()
+    assert done["id"] == 3 and "accept" in done["result"]["content"][0]["text"]
+    assert "answered accept" in server.finish()

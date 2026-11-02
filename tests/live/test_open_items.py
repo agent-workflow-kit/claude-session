@@ -160,11 +160,15 @@ def test_f2_the_sandbox_hides_host_processes(live: LiveEnv) -> None:
     )  # fmt: skip
     calls = [c for c in tool_calls(run.events) if c.name == "Bash"]
     reads = probe_calls(calls, f"/proc/{pid}/environ", "Bash")
-    others = [c for c in calls if c not in reads]
+    # any call that names environ or printed the marker is recorded only as (error, leaked)
+    hidden = [
+        c for c in calls if "environ" in str(c.input.get("command", "")) or marker in c.output
+    ]
+    others = [c for c in calls if c not in hidden]
     live.observe("F2 Bash results (environ reads omitted)", shown(others, "Bash"))
     live.observe(
         "F2 environ reads (error, marker leaked)",
-        [(c.is_error, marker in c.output) for c in reads],
+        [(c.is_error, marker in c.output) for c in hidden],
     )
     listing = [c for c in calls if is_proc_listing(str(c.input.get("command", "")))]
     assert listing, "the agent never listed /proc"

@@ -1,9 +1,10 @@
 """A minimal MCP server for the elicitation live test (stdio, standard library only).
 
 It offers one tool, `ask`. Calling it sends the client an `elicitation/create` request and
-waits for the answer, still answering the client's own requests (`ping`) meanwhile; the tool
-result reports the action the user took (`accept`, `decline`, `cancel`). Nothing else is
-implemented: no resources, no prompts, no logging. It opens no socket, starts no process and
+waits for the answer, still answering the client's own requests (`ping`) meanwhile; a second
+`tools/call` meanwhile gets a "busy" error. The tool result reports the action the user took
+(`accept`, `decline`, `cancel`). Nothing else is implemented: no resources, no prompts, no
+logging. It opens no socket, starts no process and
 writes no file other than its log: one line per event to the file named by `ELICIT_SERVER_LOG`
 (if set) so a test can see what happened.
 
@@ -69,7 +70,10 @@ def elicit(request_id: int) -> str:
     )
     log("elicitation sent")
     while (message := read()) is not None:
-        if "method" in message:  # a request or notification of the client: answer it meanwhile
+        if message.get("method") == "tools/call" and "id" in message:  # one question at a time
+            busy = {"code": -32000, "message": "busy: a question is pending"}
+            send({"jsonrpc": "2.0", "id": message["id"], "error": busy})
+        elif "method" in message:  # a request or notification of the client: answer it meanwhile
             handle(message)
         elif message.get("id") == f"elicit-{request_id}":
             result = message.get("result")

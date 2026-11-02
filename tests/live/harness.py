@@ -326,7 +326,7 @@ def missing_file(call: ToolCall) -> bool:
     return MISSING_FILE.search(call.output) is not None
 
 
-PROC_LISTING = re.compile(r"ls(\s+-\w+)*\s+/proc/?(\s+2>&1)?")
+PROC_LISTING = re.compile(r"ls(\s+--?[\w=-]+)*\s+/proc/?(\s+2>&1)?")
 
 
 def is_proc_listing(command: str) -> bool:
