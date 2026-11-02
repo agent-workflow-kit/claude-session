@@ -397,11 +397,11 @@ def test_error_envelope_golden(
 def test_error_without_json_goes_to_stderr_only(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setitem(cli.HANDLERS, "status", raising(NotFoundError("unknown session: x")))
-    assert main(["status", "x"]) == 10
+    monkeypatch.setitem(cli.HANDLERS, "status", raising(NotFoundError("unknown session: xxxx")))
+    assert main(["status", "xxxx"]) == 10
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "claude-session: error: unknown session: x\n"
+    assert captured.err == "claude-session: error: unknown session: xxxx\n"
 
 
 # Internal errors
@@ -439,7 +439,7 @@ def test_human_error_message_is_sanitized(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setitem(cli.HANDLERS, "status", raising(NotFoundError("unknown: x\x1b[2J")))
-    code, envelope, err = run_json(["status", "x", "--json"], capsys)
+    code, envelope, err = run_json(["status", "xxxx", "--json"], capsys)
     assert code == 10
     assert envelope["error"]["message"] == "unknown: x\x1b[2J"
     assert "\x1b" not in err
