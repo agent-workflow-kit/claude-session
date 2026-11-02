@@ -15,11 +15,7 @@ Runs and supervises Claude Code sessions (terminal-agnostic). Layer 1 (primitive
 | `bubblewrap`, `socat` (Linux, WSL2) | system packages | Needed by Claude Code's sandbox for sandboxed kinds; checked before launch. |
 | `git` | A, read-only | Only `git rev-parse --git-common-dir`/`--git-dir` for `${GIT_DIR}` and a linked worktree's gitdir, and the `origin` URL for the derived `--repo`, always hardened (section [Git calls](#git-calls)). claude-session never writes a repository. |
 
-<<<<<<< HEAD
-Python dependencies: `pyyaml` and `pydantic` (both required by the design guide for config). Nothing else: process start times come from `/proc` (Linux) or `/bin/ps -o stat= -o lstart= -p` (macOS) rather than `psutil`; the secret scan uses the standard library's keyed BLAKE2b. Test-only (dev group): `jsonschema` and `referencing`, to validate every `--json` golden output against `schemas/` with a registry keyed by `$id`.
-=======
 Python dependencies: `pyyaml` and `pydantic` (both required by the design guide for config). Nothing else: process start times come from `/proc` (Linux) or `/bin/ps -o stat= -o lstart= -p` (macOS) rather than `psutil`; the secret scan uses the standard library's keyed BLAKE2b. Test-only (dev group): `jsonschema` and `referencing`, to validate every `--json` golden output against `schemas/` with a registry keyed by `$id`; `rfc3339-validator`, which `jsonschema` needs to check `format: date-time`; and `types-pyyaml`, the type stubs pyright needs for `pyyaml`.
->>>>>>> dc689e3397efd4a7adb7b4a282a34024f3a089a2
 
 Minimum Claude Code version: `exec` runs `claude --version` at launch and compares it with the built-in `min_claude_version` (2.1.312, the version the spike verified; overridable in config); an older version fails the launch with `claude_too_old`.
 
@@ -229,15 +225,9 @@ Still to verify (live tests): MCP elicitation detection; the manual macOS checkl
 | `reconcile` | Liveness repair for all sessions, salvage, retention sweep. |
 | `procinfo` | Process start time and liveness (Linux `/proc/<pid>/stat`, macOS `/bin/ps -o stat= -o lstart= -p`). A start time is an opaque token compared only for equality (Linux: boot id plus start ticks; macOS: `lstart` with `LC_ALL=C` and `TZ=UTC`); a zombie counts as dead. |
 | `gateway` | The only module that starts subprocesses: `claude`, `git`, the notes command, lifecycle hooks (`sh -c`, own process group; on timeout SIGTERM, `kill_grace`, SIGKILL to the group; the notes command also runs in its own process group; on timeout the group gets SIGKILL), sandbox prerequisite checks, `crontab`, and `ps` for `procinfo` on macOS. Standard library only; runs every child with an absolute path and, on Linux, `PR_SET_PDEATHSIG(SIGTERM)` for headless `claude`. With no explicit environment, the child gets this process's environment (plus extra variables) with empty and relative `PATH` entries dropped; if none remain, `/usr/bin:/bin`; a complete environment passed by its builder (session, hooks, notes command) is used unchanged and the builder applies [Path rules](interface.md#path-rules). Tests replace it. |
-<<<<<<< HEAD
-| `audit`, `logs` | `audit.jsonl` and `log.jsonl` writers. |
-| `clock` | Standard library only: the injectable clock (UTC wall time, monotonic time, sleep); tests drive time with a fake. |
-| `fsutil` | Standard library only: atomic private-file writes (temporary file plus rename relative to a parent-directory descriptor opened with `O_NOFOLLOW`, mode 0600), used for `--outcome-file`. |
-=======
 | `audit`, `logs` | `audit.jsonl` and `log.jsonl` writers: one `O_APPEND` write per record through `fsutil`; text fields only are redacted against the `contains_secret` values (8 or more characters), with bounded work for long messages (pre-cut, then redacted, then truncated to 4096 characters ending with `[truncated]`, never splitting a `[redacted]` marker); identifiers (including kind names), enums and timestamps are validated by hand (no `jsonschema`). `logs` is standard library only (`__main__` uses it on the hook path). |
 | `clock` | Standard library only: the injectable clock (UTC wall time, monotonic time, sleep); tests drive time with a fake. |
 | `fsutil` | Standard library only: atomic private-file writes (temporary file plus rename relative to a parent-directory descriptor opened with `O_NOFOLLOW`, mode 0600), used for `--outcome-file`; `append_private_line` (one `O_APPEND` write, no-follow, regular single-link file owned by the user and still named by its path, checked under the lock, torn last line terminated first, an unreadable mode-0200 file tightened before reopening, `flock` waited for at most `LOCK_TIMEOUT` = 1 s) for `log.jsonl` and `audit.jsonl`. |
->>>>>>> dc689e3397efd4a7adb7b4a282a34024f3a089a2
 
 ### Session directories
 
