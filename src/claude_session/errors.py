@@ -124,3 +124,28 @@ class LaunchFailedError(CliError):
             "end_reason": self.end_reason,
             "hint": self.hint,
         }
+
+
+class LaunchValidationError(Exception):
+    """A launch validation failed (interface.md, Launch order, step 5): the run ends
+    ``not-started`` with ``end_reason`` and the command exits 12 (``start``: as
+    ``LaunchFailedError``). Not a ``CliError``: the launch path maps it, since only it knows
+    the session id and run. ``message`` and ``detail`` never hold values from profile content;
+    they may name file paths, profile names and key paths."""
+
+    # TODO(#15): the launch path maps LaunchValidationError to a not-started run (end_reason,
+    # exit 12; start: LaunchFailedError).
+
+    end_reason: ClassVar[str]
+
+    def __init__(self, message: str, *, detail: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.detail = detail
+
+
+class InvalidPermissionProfile(LaunchValidationError):
+    """A permission profile that cannot be used for the run (interface.md, Permission
+    profiles)."""
+
+    end_reason = "invalid_permission_profile"
