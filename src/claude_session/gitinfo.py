@@ -20,7 +20,6 @@ import os
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from subprocess import CompletedProcess
 
 from . import gateway, kinds
 from .errors import FailedError, LaunchValidationError
@@ -41,7 +40,8 @@ NOT_A_REPOSITORY = "fatal: not a git repository"
 STDERR_EXCERPT = 200
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
-Runner = Callable[..., CompletedProcess[str]]
+Runner = Callable[..., gateway.Result]
+_GATEWAY_RUN: Runner = gateway.SystemGateway().run
 
 
 @dataclass(frozen=True)
@@ -53,7 +53,7 @@ class GitDirs:
 
 
 def resolve(
-    cwd: str, *, git: str, environ: Mapping[str, str], run: Runner = gateway.run
+    cwd: str, *, git: str, environ: Mapping[str, str], run: Runner = _GATEWAY_RUN
 ) -> GitDirs | None:
     """The git directories of ``cwd`` (``git rev-parse --git-common-dir --git-dir``, made
     absolute against ``cwd`` and resolved), or None when ``cwd`` is not in a repository:
@@ -152,7 +152,7 @@ def check_git_cwd(kind: str, current: GitDirs | None) -> None:
 
 
 def credential_warnings(
-    cwd: str, *, git: str, environ: Mapping[str, str], run: Runner = gateway.run
+    cwd: str, *, git: str, environ: Mapping[str, str], run: Runner = _GATEWAY_RUN
 ) -> list[str]:
     """Warnings for credentials in the repository config of ``cwd`` (local and worktree
     scopes, includes followed; read-only). A warning names the key (a subsection holding
@@ -244,11 +244,11 @@ def _masked(key: str) -> str:
     return "".join(char if char.isprintable() else "?" for char in key)
 
 
-def _run(run: Runner, argv: list[str], environ: Mapping[str, str]) -> CompletedProcess[str]:
+def _run(run: Runner, argv: list[str], environ: Mapping[str, str]) -> gateway.Result:
     try:
         # LC_ALL=C: "not a git repository" is matched in git's (untranslated) stderr.
-        # stdin from /dev/null: git never reads claude-session's own stdin.
+        # The gateway gives the child stdin from /dev/null: git never reads our own stdin.
         env = {**kinds.git_env(environ), "LC_ALL": "C"}
-        return run(argv, timeout=GIT_TIMEOUT, env=env, devnull_stdin=True)
-    except (OSError, ValueError, gateway.subprocess.SubprocessError) as exc:
+        return run(argv, timeout=GIT_TIMEOUT, env=env)
+    except (OSError, ValueError, gateway.GatewayTimeout) as exc:
         raise FailedError("git could not be run", detail=type(exc).__name__) from exc

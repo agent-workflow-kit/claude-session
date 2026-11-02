@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import gitinfo
+from claude_session import gateway, gitinfo
 from claude_session.errors import FailedError, LaunchValidationError
 from claude_session.gitinfo import GitDirs
 
@@ -81,9 +81,9 @@ def test_resolve_linked_worktree(repo: Path, tmp_path: Path) -> None:
 def fake(returncode: int, stdout: str = "", stderr: str = "") -> Any:
     calls: list[dict[str, Any]] = []
 
-    def run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+    def run(argv: list[str], **kw: Any) -> gateway.Result:
         calls.append({"argv": argv, **kw})
-        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+        return gateway.Result(tuple(argv), returncode, stdout, stderr)
 
     run.calls = calls  # type: ignore[attr-defined]
     return run
@@ -101,7 +101,6 @@ def test_resolve_is_hardened_and_absolute(tmp_path: Path) -> None:
     assert "GIT_DIR" not in call["env"] and call["env"]["GIT_CONFIG_NOSYSTEM"] == "1"
     assert call["env"]["LC_ALL"] == "C"
     assert call["timeout"] == gitinfo.GIT_TIMEOUT
-    assert call["devnull_stdin"] is True
 
 
 @pytest.mark.parametrize(
@@ -385,25 +384,11 @@ def test_not_a_repository_with_a_git_entry_above_is_a_failure(tmp_path: Path) ->
 
 
 def test_credential_warning_wording() -> None:
-    def run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(argv, 0, listing(("local", "imap.pass", TOKEN)), "")
+    def run(argv: list[str], **kw: Any) -> gateway.Result:
+        return gateway.Result(tuple(argv), 0, listing(("local", "imap.pass", TOKEN)), "")
 
     warnings = gitinfo.credential_warnings("/w", git="/g", environ={}, run=run)
     assert warnings == [
         "the repository git config may hold a credential in imap.pass; the session can read it"
         " (use a credential helper instead)"
     ]
-
-
-def test_gateway_runs_with_stdin_from_devnull(monkeypatch: pytest.MonkeyPatch) -> None:
-    from claude_session import gateway
-
-    seen: dict[str, Any] = {}
-
-    def run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
-        seen.update(kw)
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    monkeypatch.setattr(gateway.subprocess, "run", run)
-    gateway.run(["true"], devnull_stdin=True)
-    assert seen["stdin"] is subprocess.DEVNULL and "input" not in seen
