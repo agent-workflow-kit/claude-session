@@ -271,6 +271,26 @@ def test_permission_profile_name_invalid(name: str) -> None:
     assert not ids.is_permission_profile_name(name)
 
 
+# --permission-profile values: a file when it contains / or ends in .json, .yaml or .yml
+
+
+@pytest.mark.parametrize(
+    "value", ["/x/p.json", "p.json", "p.yaml", "p.yml", "dir/p", "./p", "a/b", ".json", "/"]
+)
+def test_permission_profile_file_values(value: str) -> None:
+    assert ids.is_permission_profile_file(value)
+
+
+@pytest.mark.parametrize("value", ["review", "p.JSON", "p.json.bak", "p.txt", "", "p\\q"])
+def test_permission_profile_name_values(value: str) -> None:
+    assert not ids.is_permission_profile_file(value)
+
+
+def test_permission_profile_file_needs_a_string() -> None:
+    assert not ids.is_permission_profile_file(5)
+    assert not ids.is_permission_profile_file(None)
+
+
 # Skill names: ^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$
 
 
