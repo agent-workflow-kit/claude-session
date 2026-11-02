@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "claude-session/log.json",
   "title": "claude-session log.jsonl record",
-  "description": "Never contains secrets, summaries, reasons written by the agent, or prompt text.",
+  "description": "Never contains secrets (the contains_secret values of 8 or more characters; text fields are redacted, see interface.md, Audit and log), summaries, reasons written by the agent, or prompt text.",
   "type": "object",
   "properties": {
     "ts": {

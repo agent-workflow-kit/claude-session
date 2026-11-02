@@ -9,7 +9,7 @@ Status: planned, 2026-10-29. Implements [interface.md](interface.md) (normative)
 - Every `--json` output gets a golden-file test validated against its schema in `schemas/` (with a `referencing` registry keyed by `$id`).
 - Real-Claude tests are marked `live`, are deselected by default, and never run in CI (`make live` runs them locally).
 - `make verify` passes before every commit. PR titles are Conventional Commit headers; no `!` before 1.0.
-- New runtime dependencies: only `pyyaml` and `pydantic` (design guide section 3). Test-only: `jsonschema`, `referencing`.
+- New runtime dependencies: only `pyyaml` and `pydantic` (design guide section 3). Test-only: `jsonschema`, `referencing`, `rfc3339-validator`, `pyyaml` (for `config.example.yaml`).
 
 ## Module map
 
@@ -46,7 +46,7 @@ The plan splits five modules out of design.md's module list to keep files focuse
 **Success Criteria**: `claude-session --version` works; `list --json` on an empty store prints `{"sessions": []}`; invalid config fails with a message naming the key (exit 2); schema-newer databases are refused with `schema_newer` (exit 12); `make verify` green.
 **Tests**:
 
-- config: defaults equal `config.example.yaml`; drop-in merge (maps deep-merged, lists replaced, hook lists appended); env overrides only for the documented scalar keys; precedence flags > repo > env > config > built-in.
+- config: defaults equal `config.example.yaml`; drop-in merge (maps deep-merged, lists replaced, hook lists appended); env overrides only for the documented scalar keys; precedence for top-level scalars: flags > env > config > built-in; for kind settings: flags > previous run's flags > repo > config kind > built-in.
 - ids: allocation format and collision retry; prefix matching (≥4 chars, ambiguous → 21, forgotten excluded); label, kind, repo-id, skill grammars (valid and invalid cases).
 - store: migrations apply in order under the `migrate` lease; leases (take, renew, expiry, dead-holder takeover by PID + start time); `BEGIN IMMEDIATE` with busy timeout.
 - procinfo: start time on Linux; PID-reuse detection.

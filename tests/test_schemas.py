@@ -1,0 +1,196 @@
+"""The schema harness: every schema is valid and registered, and the fixtures match them."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+from jsonschema import Draft202012Validator, ValidationError
+from referencing.exceptions import Unresolvable
+
+from .golden import GOLDEN_ROOT, assert_golden, golden_name, schema_id_for
+from .schemas import SCHEMA_ROOT, registry, validate
+
+ROOT = SCHEMA_ROOT.parent
+SCHEMA_FILES = sorted(SCHEMA_ROOT.rglob("*.json"))
+GOLDEN_FILES = sorted(GOLDEN_ROOT.rglob("*.json"))
+
+
+def load(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def rel(path: Path) -> str:
+    return path.relative_to(SCHEMA_ROOT).as_posix()
+
+
+def test_schemas_exist() -> None:
+    names = {rel(p) for p in SCHEMA_FILES}
+    assert {"config.json", "log.json", "audit.json", "cli/error.json"} <= names
+
+
+@pytest.mark.parametrize("path", SCHEMA_FILES, ids=rel)
+def test_schema_is_valid_draft_2020_12(path: Path) -> None:
+    schema = load(path)
+    assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    Draft202012Validator.check_schema(schema)
+
+
+@pytest.mark.parametrize("path", SCHEMA_FILES, ids=rel)
+def test_schema_id_names_its_path(path: Path) -> None:
+    assert load(path)["$id"] == f"claude-session/{rel(path)}"
+
+
+@pytest.mark.parametrize("path", SCHEMA_FILES, ids=rel)
+def test_registry_is_keyed_by_id(path: Path) -> None:
+    schema = load(path)
+    assert registry().contents(schema["$id"]) == schema
+
+
+def refs(node: object) -> Iterator[str]:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str):
+                yield value
+            else:
+                yield from refs(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from refs(item)
+
+
+@pytest.mark.parametrize("path", SCHEMA_FILES, ids=rel)
+def test_every_ref_resolves(path: Path) -> None:
+    schema = load(path)
+    resolver = registry().resolver(base_uri=schema["$id"])
+    for ref in refs(schema):
+        try:
+            resolver.lookup(ref)
+        except Unresolvable as exc:
+            pytest.fail(f"{rel(path)}: unresolvable $ref {ref!r}: {exc}")
+
+
+def test_validate_rejects_a_bad_instance() -> None:
+    with pytest.raises(ValidationError):
+        validate({"ts": "x", "level": "loud", "event": "launch"}, "claude-session/log.json")
+
+
+def test_config_example_validates_against_the_config_schema() -> None:
+    config = yaml.safe_load((ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    validate(config, "claude-session/config.json")
+
+
+def test_config_schema_rejects_an_unknown_key() -> None:
+    config = yaml.safe_load((ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    config["no_such_key"] = 1
+    with pytest.raises(ValidationError):
+        validate(config, "claude-session/config.json")
+
+
+def test_golden_files_exist() -> None:
+    assert GOLDEN_FILES
+
+
+@pytest.mark.parametrize("path", GOLDEN_FILES, ids=golden_name)
+def test_golden_file_validates_against_its_schema(path: Path) -> None:
+    validate(load(path), schema_id_for(golden_name(path)))
+
+
+@pytest.mark.parametrize(
+    ("name", "schema_id"),
+    [
+        ("error-usage", "claude-session/cli/error.json"),
+        ("label-add-two-pairs", "claude-session/cli/label-add.json"),
+        ("exec-dry-run-review", "claude-session/cli/exec-dry-run.json"),
+        ("exec-done", "claude-session/cli/exec.json"),
+        ("list", "claude-session/cli/list.json"),
+        ("hooks/pre-launch-resume", "claude-session/hooks/pre-launch.json"),
+        ("hooks/post-state-change", "claude-session/hooks/post-state-change.json"),
+    ],
+)
+def test_golden_name_picks_the_longest_schema(name: str, schema_id: str) -> None:
+    assert schema_id_for(name) == schema_id
+
+
+@pytest.mark.parametrize("name", ["nonsense-case", "hooks/label-add-x", "nodir/error-x"])
+def test_golden_name_without_a_schema_is_an_error(name: str) -> None:
+    with pytest.raises(LookupError):
+        schema_id_for(name)
+
+
+def test_assert_golden_validates_before_comparing() -> None:
+    golden = load(GOLDEN_ROOT / "error-usage.json")
+    assert_golden(golden, "error-usage")
+    with pytest.raises(ValidationError):
+        assert_golden({"error": {"code": "usage"}}, "error-usage")
+    with pytest.raises(AssertionError):
+        assert_golden({"error": {"code": "usage", "message": "other"}}, "error-usage")
+
+
+ERROR = {"error": {"code": "usage", "message": "bad", "detail": None}}
+
+
+def test_assert_golden_normalizes_after_validating_and_before_comparing(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "error-norm.json").write_text(json.dumps(ERROR), encoding="utf-8")
+    volatile = {"error": {"code": "usage", "message": "bad /tmp/x123", "detail": None}}
+
+    def normalize(value: Any) -> Any:
+        value["error"]["message"] = value["error"]["message"].split(" ")[0]
+        return value
+
+    assert_golden(volatile, "error-norm", normalize=normalize, root=tmp_path)
+    with pytest.raises(AssertionError):
+        assert_golden(
+            {"error": {"code": "usage", "message": "bad /tmp/x123", "detail": None}},
+            "error-norm",
+            root=tmp_path,
+        )
+
+
+def test_assert_golden_validates_the_raw_output_not_the_normalized_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "error-norm.json").write_text(json.dumps(ERROR), encoding="utf-8")
+    invalid = {"error": {"code": "usage", "message": 3, "detail": None}}
+
+    def normalize(value: Any) -> Any:
+        return {"error": {**value["error"], "message": "bad"}}
+
+    with pytest.raises(ValidationError):
+        assert_golden(invalid, "error-norm", normalize=normalize, root=tmp_path)
+    monkeypatch.setenv("UPDATE_GOLDEN", "1")
+    with pytest.raises(ValidationError):
+        assert_golden(invalid, "error-new", normalize=normalize, root=tmp_path)
+    assert not (tmp_path / "error-new.json").exists()
+
+
+def test_update_golden_writes_indented_sorted_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UPDATE_GOLDEN", "1")
+    assert_golden(ERROR, "error-new", root=tmp_path)
+    text = (tmp_path / "error-new.json").read_text(encoding="utf-8")
+    assert text == json.dumps(ERROR, indent=2, sort_keys=True) + "\n"
+    assert text.index('"code"') < text.index('"detail"') < text.index('"message"')
+
+
+def test_assert_golden_uses_a_hooks_schema_for_a_hooks_golden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UPDATE_GOLDEN", "1")
+    with pytest.raises(ValidationError):  # an error envelope is not a pre-launch payload
+        assert_golden(ERROR, "hooks/pre-launch-case", root=tmp_path)
+    assert not (tmp_path / "hooks").exists()
+
+
+def test_validate_checks_formats() -> None:
+    record = {"ts": "not-a-time", "level": "info", "event": "launch"}
+    with pytest.raises(ValidationError, match="date-time"):
+        validate(record, "claude-session/log.json")
+    validate({**record, "ts": "2026-10-30T12:00:00.123Z"}, "claude-session/log.json")
