@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import __version__, cli, outcomefile
+from claude_session import __version__, cli, outcomefile, terminal
 from claude_session.cli import build_parser, main
 from claude_session.errors import (
     AmbiguousError,
@@ -480,8 +480,8 @@ def test_internal_error_traceback_only_with_verbose(
 # Human output sanitization
 
 
-def test_sanitize_escapes_c0_and_c1_controls() -> None:
-    assert cli.sanitize("a\x1b[31mb\x85c\td\x7f") == "a\\x1b[31mb\\x85c\\x09d\\x7f"
+def test_display_escapes_c0_and_c1_controls() -> None:
+    assert terminal.display("a\x1b[31mb\x85c\td\x7f") == "a\\x1b[31mb\\x85c\\x09d\\x7f"
 
 
 def test_human_error_message_is_sanitized(

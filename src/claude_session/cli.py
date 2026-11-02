@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 from . import durations, ids, outbox, outcomefile, store
 from .defaults import MAX_INTEGER
 from .errors import CliError, InternalError, OutcomeFileRejected, RefusedError, UsageError
+from .terminal import display
 
 if TYPE_CHECKING:
     import threading
@@ -129,18 +130,51 @@ def _not_implemented(args: argparse.Namespace) -> int:
     raise InternalError(f"{args.handler} is not implemented yet", detail="not_implemented")
 
 
-def _list(args: argparse.Namespace) -> int:
+def _status(args: argparse.Namespace) -> int:
+    """``status <id> [--run n]`` (interface.md, status)."""
+    from . import views
+
     with store.open_state() as state:
-        sessions = state.list_sessions()
-    if sessions:
-        # TODO(#16): list items (current run, labels, liveness) and the list filters.
-        raise InternalError(
-            "list of existing sessions is not implemented yet", detail="not_implemented"
-        )
+        obj = views.status_object(state, args.id, args.run)
     if args.json:
-        print(json.dumps({"sessions": []}))
+        print(json.dumps(obj, allow_nan=False))
     else:
-        print("No sessions.")
+        print("\n".join(views.status_lines(obj)))
+    return 0
+
+
+def _list(args: argparse.Namespace) -> int:
+    """``list`` with its filters (interface.md, list)."""
+    from . import views
+
+    with store.open_state() as state:
+        forked_from = None
+        if args.forked_from is not None:
+            forked_from = ids.lookup_session_id(args.forked_from, state.session_id_candidates)
+        flt = views.ListFilter(
+            labels=tuple(ids.parse_label(text) for text in args.label or []),
+            states=tuple(args.state or ()),
+            kind=args.kind,
+            launch_kind=args.launch_kind,
+            run_kind=args.run_kind,
+            mode=args.mode,
+            needs_input=args.needs_input,
+            pending=args.pending,
+            repo=args.repo,
+            since=None if args.since is None else since_threshold(args.since),
+            limit=args.limit,
+            forked_from=forked_from,
+            report_statuses=tuple(
+                None if status == "none" else status for status in args.report_status or ()
+            ),
+            live=args.live,
+            tainted=args.tainted,
+        )
+        items = views.list_items(state, flt)
+    if args.json:
+        print(json.dumps({"sessions": items}, allow_nan=False))
+    else:
+        print("\n".join(views.list_lines(items)))
     return 0
 
 
@@ -293,16 +327,16 @@ def _reconcile(args: argparse.Namespace) -> int:
             line += f" -> {change['outcome']} ({change['end_reason']})"
         if change["detail"]:
             line += f"; {change['detail']}"
-        print(sanitize(line))
+        print(display(line))
     for orphan in result["orphans"]:
         print(
-            sanitize(
+            display(
                 f"{orphan['csession_id']} run {orphan['run']}: orphaned child"
                 f" {orphan['child_pid']} (wrapper gone; end it with stop)"
             )
         )
     for warning in result["warnings"]:
-        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
     if not (result["changes"] or result["orphans"] or result["already_running"]):
         print("nothing to repair")
     return 0
@@ -366,7 +400,7 @@ def _wait(args: argparse.Namespace) -> int:
             f"{output['csession_id']} run {output['run']}: timed out, still {output['state']}"
             f" (exit {waiter.TIMED_OUT})"
         )
-        print(f"{PROG}: {sanitize(line)}", file=sys.stderr)
+        print(f"{PROG}: {display(line)}", file=sys.stderr)
     else:
         _print_outcome(output, False)
     return waited.exit_code
@@ -515,7 +549,7 @@ def _print_plan(plan: dict[str, Any], message: str | None) -> None:
         lines.append("result: a launch would pass the launch validations")
     lines += [f"warning: {w}" for w in plan["warnings"] if not w.startswith("a launch would fail")]
     for line in lines:
-        print(sanitize(line))
+        print(display(line))
 
 
 def _kinds(args: argparse.Namespace) -> int:
@@ -548,7 +582,7 @@ def _kinds(args: argparse.Namespace) -> int:
         lines += [f"  warning: {w}" for w in profile["warnings"]]
     lines += [f"warning: {w}" for w in [*report["state_dir_warnings"], *report["warnings"]]]
     for line in lines:
-        print(sanitize(line))
+        print(display(line))
     return 0
 
 
@@ -630,9 +664,9 @@ def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
     )
     if outcome["message"]:
         line += f": {outcome['message']}"
-    print(f"{PROG}: {sanitize(line)}", file=sys.stderr)
+    print(f"{PROG}: {display(line)}", file=sys.stderr)
     for warning in outcome["warnings"]:
-        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
 
 
 # Command name (as typed, nested commands joined by a space) -> handler.
@@ -643,7 +677,7 @@ HANDLERS: dict[str, Handler] = {
     "stop": _not_implemented,
     "wait": _wait,
     "report": _report,
-    "status": _not_implemented,
+    "status": _status,
     "list": _list,
     "kinds": _kinds,
     "label add": _not_implemented,
@@ -1123,16 +1157,6 @@ def load_config(args: argparse.Namespace) -> Config:
 # Output
 
 
-def sanitize(text: str) -> str:
-    """Escape C0 and C1 control characters for human-readable output."""
-    return "".join(f"\\x{ord(c):02x}" if _is_control(c) else c for c in text)
-
-
-def _is_control(char: str) -> bool:
-    code = ord(char)
-    return code < 0x20 or 0x7F <= code <= 0x9F
-
-
 def _given(argv: Sequence[str], flag: str) -> bool:
     """Whether ``flag`` (or ``flag=...``) is in ``argv`` before any ``--``; used when parsing
     failed, so the error can still honor ``--json`` and ``--verbose``."""
@@ -1195,14 +1219,14 @@ def _write_outcome_file(path: str, error: CliError, writable: Callable[[str], bo
     except OSError as exc:  # no cwd to make the path absolute against
         warning = f"{outcomefile.NOT_WRITTEN}: {exc.strerror or type(exc).__name__}"
     if warning is not None:
-        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
         outcomefile.log_failure(state_root, warning)
 
 
 def _print_error(error: CliError, json_mode: bool) -> None:
-    message = sanitize(error.message)
+    message = display(error.message)
     if error.detail is not None:
-        message = f"{message} ({sanitize(error.detail)})"
+        message = f"{message} ({display(error.detail)})"
     print(f"{PROG}: error: {message}", file=sys.stderr)
     if json_mode:
         print(json.dumps(error.envelope()))
@@ -1272,7 +1296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_error_outcome_file(args, argv, error)
         try:
             if args.verbose if args else _given(argv, "--verbose"):
-                traceback.print_exc(file=sys.stderr)
+                _print_traceback()
         except BrokenPipeError:
             pass
         _emit_error(error, args.json if args else _given(argv, "--json"))
@@ -1298,6 +1322,30 @@ def _write_error_outcome_file(
     except (OSError, ValueError):  # no cwd to refuse: fail closed
         writable = None
     _write_outcome_file(path, error, writable)
+
+
+# Traceback chunks laid out by the traceback module itself (headers, frames, the messages
+# between chained exceptions): their own newlines separate lines.
+_TRACEBACK_LAYOUT = ("Traceback ", "  File ", "\n", "  [Previous line repeated")
+# The margin of a chunk inside an exception group ("  | ", "  + ", deeper: "    | ").
+_GROUP_MARGIN = re.compile(r"(?: *[|+] )*")
+
+
+def _print_traceback() -> None:
+    """The current exception's traceback on stderr, every line through ``display``. An
+    exception's message (which may carry untrusted text) stays one line: a newline in it is
+    escaped, so it cannot fake a line of output."""
+    exc = sys.exc_info()[1]
+    if exc is None:
+        return
+    lines: list[str] = []
+    for chunk in traceback.TracebackException.from_exception(exc).format():
+        text = chunk.removesuffix("\n")
+        if _GROUP_MARGIN.sub("", chunk, count=1).startswith(_TRACEBACK_LAYOUT):
+            lines += [display(line) for line in text.split("\n")]
+        else:
+            lines.append(display(text))
+    print("\n".join(lines), file=sys.stderr)
 
 
 def _emit_error(error: CliError, json_mode: bool) -> None:

@@ -64,8 +64,19 @@ def test_list_json_creates_the_store_in_the_state_dir(
 
 
 def test_list_json_with_filters_on_an_empty_store(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(FULL_INVOCATIONS["list"]) == 0
+    argv = FULL_INVOCATIONS["list"]
+    at = argv.index("--forked-from")
+    assert main(argv[:at] + argv[at + 2 :]) == 0
     assert json.loads(capsys.readouterr().out) == {"sessions": []}
+
+
+def test_list_forked_from_an_unknown_session_exits_10(capsys: pytest.CaptureFixture[str]) -> None:
+    # --forked-from takes session id input, which resolves like any id (interface.md,
+    # Identifiers): an unknown id exits 10.
+    assert main(FULL_INVOCATIONS["list"]) == 10
+    envelope = json.loads(capsys.readouterr().out)
+    validate(envelope, ERROR_SCHEMA)
+    assert envelope["error"]["code"] == "not_found"
 
 
 def test_list_human_on_an_empty_store(capsys: pytest.CaptureFixture[str]) -> None:
