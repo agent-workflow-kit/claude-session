@@ -12,16 +12,20 @@ Isolation. Every test gets a ``LiveEnv``: a private root directory (short, direc
 allowlist, never from the whole parent environment, so nothing of the user's real
 configuration, tmux, ssh agent or git-host login leaks in. The user's real ``~/.claude`` is
 never written; it is read only when ``CSESSION_LIVE_COPY_LOGIN=1`` asks for the login file to
-be copied into the private home (see ``resolve_auth``).
+be copied (once per pytest session, see ``LoginCache``) into the private homes of the tests that
+need credentials. A run without credentials (``auth=False``) gets a home of its own without it.
 
-Cost. Each headless run passes ``--model`` (``CSESSION_LIVE_MODEL``, default ``haiku``) and
-``--max-budget-usd``; a session-wide ``Ledger`` adds up the reported cost and skips the rest of
-the suite once ``CSESSION_LIVE_MAX_USD`` is passed.
+Cost. Every path that starts ``claude`` first passes ``LiveEnv.spend_gate`` (the test skips
+once the session's ``Ledger`` has reached ``CSESSION_LIVE_MAX_USD``) and is then charged: the
+cost the run reported, or the per-run estimate ``CSESSION_LIVE_RUN_USD`` when the cost is
+unknown (a timeout, unparsable output, a killed run, an interactive session). Every ``-p`` argv
+carries ``--max-budget-usd`` (``LiveEnv.budget``); interactive sessions cannot take it.
 
-Processes. A ``claude`` run goes through the gateway, so a timeout ends exactly the process (or
-process group) it started. Spawned children are recorded and, at teardown, a child still running
-is killed through its own handle. A hook child that outlives ``claude`` is killed by exact PID
-only while its start-time token still matches the one recorded when the hook reported it.
+Processes. A ``claude`` run goes through the gateway, so a timeout ends exactly the process
+group it started. A spawned headless run gets its own process group, killed at teardown while
+its leader is still our unreaped child. A hook child that outlives ``claude`` is signalled by
+exact PID only while its start-time token still matches the one the hook recorded itself
+(``LiveEnv.pid_record_command``).
 """
 
 from __future__ import annotations
@@ -29,8 +33,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
+import sys
 import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -75,15 +81,25 @@ PASS_THROUGH = (
     "NODE_EXTRA_CA_CERTS",
 )
 AUTH_VARS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
-# Variables whose value never leaves the parent: even a test's `extra_env` may not set these,
-# so a test cannot point claude back at the real configuration.
+# Variables a test's `extra_env` may not set: every name `build_env` sets except `PATH`, plus
+# every `XDG_*` name, `GIT_CONFIG_GLOBAL` and `CLAUDE_CONFIG_DIR` (see `forbidden_extra`), so a
+# test cannot point claude back at the real configuration or undo the private environment.
 FORBIDDEN_EXTRA = (
     "HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
+    "TMPDIR",
+    "GH_CONFIG_DIR",
+    "GLAB_CONFIG_DIR",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
     "CLAUDE_CONFIG_DIR",
+    "DISABLE_AUTOUPDATER",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
 )
+
+
+def forbidden_extra(name: str) -> bool:
+    """Whether a test's ``extra_env`` may not set ``name``."""
+    return name in FORBIDDEN_EXTRA or name.startswith("XDG_")
 
 
 def opted_in(environ: Mapping[str, str]) -> bool:
@@ -95,8 +111,15 @@ def claude_path(environ: Mapping[str, str]) -> str | None:
     """The ``claude`` to test: ``CSESSION_LIVE_CLAUDE``, else the first one on ``PATH``."""
     explicit = environ.get(CLAUDE_ENV)
     if explicit:
-        return explicit if os.access(explicit, os.X_OK) else None
-    return shutil.which("claude", path=environ.get("PATH"))
+        return os.path.abspath(explicit) if os.access(explicit, os.X_OK) else None
+    return tool_path("claude", environ)
+
+
+def tool_path(name: str, environ: Mapping[str, str]) -> str | None:
+    """``name`` found on ``environ``'s ``PATH``, as an absolute path (the gateway refuses a
+    relative one, which a relative ``PATH`` entry would give)."""
+    found = shutil.which(name, path=environ.get("PATH"))
+    return os.path.abspath(found) if found else None
 
 
 @dataclass(frozen=True)
@@ -104,9 +127,13 @@ class Auth:
     """How a private home logs in: environment variables, or a login file copied from
     ``source`` to ``<home>/.claude/.credentials.json``."""
 
-    env: Mapping[str, str]
+    env: Mapping[str, str] = field(repr=False)
     source: Path | None
     description: str
+
+    @property
+    def api_key(self) -> str | None:
+        return self.env.get("ANTHROPIC_API_KEY")
 
 
 def resolve_auth(environ: Mapping[str, str], real_home: Path) -> Auth | None:
@@ -134,9 +161,11 @@ def build_env(
     root: Path,
     auth: Auth | None,
     extra: Mapping[str, str] | None = None,
+    home: Path | None = None,
 ) -> dict[str, str]:
-    """The complete environment for a ``claude`` child, from the allowlist only."""
-    home = root / "home"
+    """The complete environment for a ``claude`` child, from the allowlist only; ``home``
+    defaults to ``<root>/home``."""
+    home = home or root / "home"
     env: dict[str, str] = {k: environ[k] for k in PASS_THROUGH if k in environ}
     env["PATH"] = environ.get("PATH", "/usr/bin:/bin")
     env.update(
@@ -157,21 +186,26 @@ def build_env(
     if auth is not None:
         env.update(auth.env)
     for name, value in (extra or {}).items():
-        if name in FORBIDDEN_EXTRA:
+        if forbidden_extra(name):
             raise ValueError(f"a live test may not set {name}")
         env[name] = value
     return env
 
 
-def claude_json(trusted: Iterable[Path]) -> dict[str, Any]:
+def claude_json(trusted: Iterable[Path], *, api_key: str | None = None) -> dict[str, Any]:
     """The private ``~/.claude.json``: onboarding done, the given directories trusted (an
-    interactive session shows the trust dialog otherwise). Test B2 builds its own without."""
-    return {
+    interactive session shows the trust dialog otherwise) and, with ``api_key``, that key
+    approved (interactive Claude Code asks about a custom ``ANTHROPIC_API_KEY`` otherwise; it
+    stores the key's last 20 characters). Test B2 passes no directory."""
+    data: dict[str, Any] = {
         "hasCompletedOnboarding": True,
         "projects": {
             str(path): {"hasTrustDialogAccepted": True, "allowedTools": []} for path in trusted
         },
     }
+    if api_key:
+        data["customApiKeyResponses"] = {"approved": [api_key.strip()[-20:]], "rejected": []}
+    return data
 
 
 class Ledger:
@@ -234,12 +268,34 @@ def init_event(events: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
 
 def total_cost(events: Sequence[Mapping[str, Any]]) -> float:
     """The cost of all ``result`` objects (one per turn with background tasks)."""
-    total = 0.0
-    for event in results(events):
-        value = event.get("total_cost_usd")
-        if isinstance(value, int | float) and not isinstance(value, bool):
-            total += float(value)
-    return total
+    return reported_cost(events) or 0.0
+
+
+def reported_cost(events: Sequence[Mapping[str, Any]]) -> float | None:
+    """The summed cost of the ``result`` objects, or ``None`` when none reports one (the cost
+    is then unknown, and the ledger charges the estimate)."""
+    costs = [
+        float(value)
+        for event in results(events)
+        if isinstance(value := event.get("total_cost_usd"), int | float)
+        and not isinstance(value, bool)
+    ]
+    return sum(costs) if costs else None
+
+
+def cost_of_output(text: str) -> float | None:
+    """The reported cost of a run's ``stream-json`` output; ``None`` when the output is not
+    ``stream-json`` or reports no cost."""
+    try:
+        return reported_cost(parse_stream(text))
+    except ValueError:  # json.JSONDecodeError included
+        return None
+
+
+def check_budget(args: Sequence[str]) -> None:
+    """Refuse a ``-p`` argv without ``--max-budget-usd`` (only ``--print`` runs can take it)."""
+    if ("-p" in args or "--print" in args) and "--max-budget-usd" not in args:
+        raise ValueError("a -p run needs --max-budget-usd (LiveEnv.budget())")
 
 
 def read_log(path: Path) -> list[dict[str, Any]]:
@@ -329,6 +385,82 @@ class Headless:
         return value if isinstance(value, str) else ""
 
 
+def _unreaped(pid: int) -> bool:
+    """Whether ``pid`` is our child not yet reaped (running or a zombie), so neither its PID nor
+    the process group it leads can have been reused. Without ``waitid`` (macOS) only a running
+    child counts, checked by the caller."""
+    try:
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        return False
+    return True
+
+
+@dataclass
+class Spawned:
+    """A headless run started without waiting (``LiveEnv.spawn_headless``), in its own process
+    group. ``returncode`` never reaps the leader, so teardown can still end its whole group."""
+
+    child: Child = field(repr=False)
+    out: Path
+    err: Path
+
+    @property
+    def pid(self) -> int:
+        return self.child.pid
+
+    def returncode(self) -> int | None:
+        """The exit code (negative signal number if killed), or ``None`` while running."""
+        if not hasattr(os, "waitid"):
+            return self.child.poll()
+        try:
+            info = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            return self.child.poll()  # reaped already: the handle knows the code
+        if info is None:
+            return None
+        return info.si_status if info.si_code == os.CLD_EXITED else -info.si_status
+
+    def send_signal(self, sig: int) -> None:
+        self.child.send_signal(sig)
+
+    def end(self) -> None:
+        """SIGKILL the run's process group while the leader is still our unreaped child (its
+        group ID then names no other group), then reap the leader."""
+        if hasattr(os, "waitid"):
+            leader_ours = _unreaped(self.pid)
+        else:
+            leader_ours = self.child.poll() is None
+        if leader_ours:
+            try:
+                os.killpg(self.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        self.child.wait(10)
+
+
+RECORD_PID = """\
+import sys
+from claude_session import gateway, procinfo
+pid = int(sys.argv[1])
+token = procinfo.ProcInfo(gateway.SystemGateway()).start_time(pid)
+with open(sys.argv[2], "a", encoding="utf-8") as fh:
+    fh.write(f"{pid} {token or ''}\\n")
+"""
+
+
+def read_pids(path: Path) -> list[tuple[int, str | None]]:
+    """The ``(pid, start-time token)`` records a ``pid_record_command`` wrote."""
+    if not path.exists():
+        return []
+    out: list[tuple[int, str | None]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        pid, _, token = line.strip().partition(" ")
+        if pid.isdigit():
+            out.append((int(pid), token or None))
+    return out
+
+
 @dataclass
 class LiveEnv:
     root: Path
@@ -336,16 +468,23 @@ class LiveEnv:
     model: str
     run_usd: float
     ledger: Ledger
-    base_environ: Mapping[str, str]
-    auth: Auth | None
-    gw: gateway.SystemGateway = field(default_factory=gateway.SystemGateway)
-    children: list[Child] = field(default_factory=list)
-    observations: list[tuple[str, Any]] = field(default_factory=list)
+    # Environment-holding fields stay out of the repr: pytest prints it on a failure.
+    base_environ: Mapping[str, str] = field(repr=False)
+    auth: Auth | None = field(repr=False)
+    gw: gateway.SystemGateway = field(default_factory=gateway.SystemGateway, repr=False)
+    spawned: list[Spawned] = field(default_factory=list, repr=False)
+    pid_files: list[Path] = field(default_factory=list, repr=False)
+    observations: list[tuple[str, Any]] = field(default_factory=list, repr=False)
 
     # layout
     @property
     def home(self) -> Path:
         return self.root / "home"
+
+    @property
+    def noauth_home(self) -> Path:
+        """The home of runs without credentials: never holds a copied login file."""
+        return self.root / "home-noauth"
 
     @property
     def projects(self) -> Path:
@@ -363,18 +502,39 @@ class LiveEnv:
         return path
 
     def trust(self, *paths: Path) -> None:
-        """Mark directories trusted in the private ``~/.claude.json``."""
-        self.write_json("home/.claude.json", claude_json(paths))
+        """Mark directories trusted in the private ``~/.claude.json`` (and approve the API key
+        in use, so an interactive session asks nothing about it)."""
+        api_key = self.auth.api_key if self.auth else None
+        self.write_json("home/.claude.json", claude_json(paths, api_key=api_key))
 
     def env(self, extra: Mapping[str, str] | None = None, *, auth: bool = True) -> dict[str, str]:
+        if auth:
+            return build_env(self.base_environ, root=self.root, auth=self.auth, extra=extra)
+        for name in (".config", ".claude", ".cache", ".local/share", ".local/state"):
+            (self.noauth_home / name).mkdir(parents=True, exist_ok=True)
         return build_env(
-            self.base_environ, root=self.root, auth=self.auth if auth else None, extra=extra
+            self.base_environ, root=self.root, auth=None, extra=extra, home=self.noauth_home
         )
 
     def observe(self, key: str, value: Any) -> None:
         """Record a measured value (an exit code, a payload shape) for the human reading the
         run: written to ``CSESSION_LIVE_OBSERVATIONS`` and printed in the terminal summary."""
         self.observations.append((key, value))
+
+    # cost
+    def budget(self) -> list[str]:
+        """The ``--max-budget-usd`` flag every ``-p`` run carries."""
+        return ["--max-budget-usd", f"{self.run_usd:g}"]
+
+    def spend_gate(self) -> None:
+        """Skip the test once the session's cost cap is reached; every path that starts a
+        billed ``claude`` calls this first."""
+        if self.ledger.exhausted:
+            raise LiveSkip(f"live cost cap of {self.ledger.cap_usd} USD reached")
+
+    def charge(self, cost: float | None) -> None:
+        """Charge a run: its reported cost, or the per-run estimate when it is unknown."""
+        self.ledger.charge(self.run_usd if cost is None else cost)
 
     # running claude
     def claude_run(
@@ -387,11 +547,14 @@ class LiveEnv:
         extra_env: Mapping[str, str] | None = None,
         auth: bool = True,
     ) -> Result:
-        """Run ``claude <args>`` to completion with the private environment (no flags added)."""
-        if self.ledger.exhausted:
-            raise LiveSkip(f"live cost cap of {self.ledger.cap_usd} USD reached")
+        """Run ``claude <args>`` to completion with the private environment (no flags added).
+        A run with credentials is billed: gated, then charged its reported cost or the
+        estimate. A ``-p`` argv must carry ``--max-budget-usd``."""
+        check_budget(args)
+        if auth:
+            self.spend_gate()
         try:
-            return self.gw.run(
+            proc = self.gw.run(
                 [self.claude, *args],
                 env=self.env(extra_env, auth=auth),
                 cwd=str(cwd or self.dir("work")),
@@ -401,7 +564,12 @@ class LiveEnv:
                 kill_grace=5,
             )
         except GatewayTimeout as exc:
+            if auth:
+                self.charge(None)
             raise AssertionError(f"claude timed out: {exc}") from exc
+        if auth:
+            self.charge(cost_of_output(proc.stdout))
+        return proc
 
     def headless(
         self,
@@ -420,24 +588,20 @@ class LiveEnv:
             "--verbose",
             "--model",
             self.model,
-            "--max-budget-usd",
-            f"{self.run_usd:g}",
+            *self.budget(),
             *flags,
             "--",
             prompt,
         ]
         proc = self.claude_run(argv, cwd=cwd, stdin=stdin, timeout=timeout, extra_env=extra_env)
-        events = parse_stream(proc.stdout)
-        self.ledger.charge(total_cost(events))
-        return Headless(proc, events)
+        return Headless(proc, parse_stream(proc.stdout))
 
     def spawn_headless(
         self, prompt: str, *flags: str, cwd: Path | None = None, out: Path, err: Path
-    ) -> Child:
-        """Start a headless run without waiting (signal tests); output goes to files. The child
-        is recorded and killed at teardown if still running."""
-        if self.ledger.exhausted:
-            raise LiveSkip(f"live cost cap of {self.ledger.cap_usd} USD reached")
+    ) -> Spawned:
+        """Start a headless run without waiting (signal tests), in its own process group;
+        output goes to files. At teardown its group is killed and it is charged."""
+        self.spend_gate()
         argv = [
             self.claude,
             "-p",
@@ -446,8 +610,7 @@ class LiveEnv:
             "--verbose",
             "--model",
             self.model,
-            "--max-budget-usd",
-            f"{self.run_usd:g}",
+            *self.budget(),
             *flags,
             "--",
             prompt,
@@ -459,17 +622,61 @@ class LiveEnv:
                 cwd=str(cwd or self.dir("work")),
                 stdout=fout.fileno(),
                 stderr=ferr.fileno(),
+                new_process_group=True,
             )
-        self.children.append(child)
-        return child
+        run = Spawned(child, out, err)
+        self.spawned.append(run)
+        return run
+
+    def pid_record_command(self, pid_expr: str, path: Path) -> str:
+        """A shell command a hook runs to record ``pid_expr`` (``$$``, ``$!``) with its
+        start-time token into ``path``; teardown SIGKILLs each recorded process that still
+        carries its token."""
+        script = self.root / "record_pid.py"
+        if not script.exists():
+            script.write_text(RECORD_PID, encoding="utf-8")
+        self.pid_files.append(path)
+        return f"{shlex.quote(sys.executable)} -I {shlex.quote(str(script))} {pid_expr} " + (
+            shlex.quote(str(path))
+        )
 
     # teardown
-    def close(self) -> None:
-        for child in self.children:
-            if child.poll() is None:
-                child.send_signal(signal.SIGKILL)
-                child.wait(10)
+    def end_runs(self) -> None:
+        """End every spawned run (charging it) and kill the recorded hook processes. Each is
+        handled once, so a later ``close`` neither ends nor charges it again."""
+        while self.spawned:
+            run = self.spawned.pop(0)
+            run.end()
+            try:
+                text = run.out.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            self.charge(cost_of_output(text))
+        while self.pid_files:
+            for pid, token in read_pids(self.pid_files.pop(0)):
+                signal_recorded(pid, token, signal.SIGKILL)
+
+    def remove(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
+
+    def close(self) -> None:
+        try:
+            self.end_runs()
+        finally:
+            self.remove()
+
+
+def teardown(live: LiveEnv, login: LoginCache | None) -> None:
+    """End a test's runs, then collect its login (a run still going could rotate the token
+    after the snapshot), then remove its root; each step runs even if an earlier one failed."""
+    try:
+        live.end_runs()
+    finally:
+        try:
+            if login is not None:
+                login.collect(live.home)
+        finally:
+            live.remove()
 
 
 def wait_for(predicate: Any, timeout: float, interval: float = 0.2) -> bool:
@@ -483,16 +690,49 @@ def wait_for(predicate: Any, timeout: float, interval: float = 0.2) -> bool:
         time.sleep(interval)
 
 
-def kill_recorded(pid: int, start: str | None) -> bool:
-    """SIGKILL ``pid`` only if it still carries the start-time token ``start`` recorded when
-    its owner reported it. Returns whether a signal was sent."""
+def signal_recorded(pid: int, start: str | None, sig: int) -> bool:
+    """Send ``sig`` to ``pid`` only if it still carries the start-time token ``start`` recorded
+    when its owner reported it. A process that is gone (also between the check and the send)
+    is not an error. Returns whether the signal was delivered."""
     if not start:
         return False
     info = procinfo.ProcInfo(gateway.SystemGateway())
     if not info.is_alive(pid, start):
         return False
-    os.kill(pid, signal.SIGKILL)
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return False
     return True
+
+
+def kill_recorded(pid: int, start: str | None) -> bool:
+    """SIGKILL ``pid`` only while it carries the recorded start-time token."""
+    return signal_recorded(pid, start, signal.SIGKILL)
+
+
+def runs_executable(pid: int, path: str) -> bool:
+    """Whether the process ``pid`` runs the program ``path`` (Linux: by the realpath of
+    ``/proc/<pid>/exe``, or of the script an interpreter runs, its first argument)."""
+    want = os.path.realpath(path)
+    try:
+        if os.path.realpath(f"/proc/{pid}/exe") == want:
+            return True
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    return len(argv) > 1 and os.path.realpath(argv[1].decode(errors="replace")) == want
+
+
+def gone(pid: int) -> bool:
+    """Whether no process ``pid`` exists (portable: ``kill(pid, 0)``)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
 
 
 def new_root() -> Path:
@@ -512,13 +752,51 @@ def new_root() -> Path:
     return root
 
 
-def install_login(root: Path, auth: Auth | None) -> None:
-    """Copy the login file into the private home (``CSESSION_LIVE_COPY_LOGIN=1``), mode 0600."""
-    if auth is None or auth.source is None:
-        return
-    target = root / "home" / ".claude" / ".credentials.json"
-    target.write_bytes(auth.source.read_bytes())
-    target.chmod(0o600)
+CREDENTIALS = Path(".claude") / ".credentials.json"
+
+
+class LoginCache:
+    """The one copy of the user's login file a pytest session uses (``CSESSION_LIVE_COPY_LOGIN``).
+
+    It is copied from the real home once, into a private directory of its own; each test that
+    needs credentials gets it installed into its private home, and what that test's ``claude``
+    left there (a refreshed token) is collected back into this copy, so the next test starts
+    from the newest one instead of each test refreshing the original independently. Nothing is
+    ever written to the real home."""
+
+    def __init__(self, source: Path, directory: Path) -> None:
+        self.directory = directory
+        self.path = directory / "credentials.json"
+        self._write(source.read_bytes())
+
+    def _write(self, data: bytes) -> None:
+        tmp = self.directory / ".credentials.tmp"
+        tmp.write_bytes(data)
+        tmp.chmod(0o600)
+        tmp.replace(self.path)
+
+    def install(self, home: Path) -> None:
+        target = home / CREDENTIALS
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(self.path.read_bytes())
+        target.chmod(0o600)
+
+    def collect(self, home: Path) -> None:
+        target = home / CREDENTIALS
+        if target.is_symlink() or not target.is_file():
+            return
+        data = target.read_bytes()
+        if data and data != self.path.read_bytes():
+            self._write(data)
+
+    def remove(self) -> None:
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+
+def new_login_cache(source: Path) -> LoginCache:
+    directory = Path(tempfile.mkdtemp(prefix="cs-login-", dir="/tmp"))
+    directory.chmod(0o700)
+    return LoginCache(source, directory)
 
 
 # --- transcripts -----------------------------------------------------------------------------
@@ -561,10 +839,54 @@ def transcript_text(projects: Path, session_id: str) -> str:
     return files[0].read_text(encoding="utf-8")
 
 
+def tool_result_text(records: Iterable[Mapping[str, Any]]) -> str:
+    """The text of every ``tool_result`` block of a transcript, one block per line: what the
+    tools returned, never the prompt or the model's own words."""
+    parts: list[str] = []
+    for record in records:
+        for block in content_blocks(record):
+            if block.get("type") != "tool_result":
+                continue
+            content = block.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                parts.extend(
+                    str(item.get("text", ""))
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                )
+    return "\n".join(parts)
+
+
+def session_tool_results(projects: Path, session_id: str) -> str:
+    """``tool_result_text`` of the session's main transcript."""
+    files = find_transcripts(projects, session_id)
+    assert len(files) == 1, files
+    return tool_result_text(transcript_records(files[0]))
+
+
+def tool_uses_by_message(records: Iterable[Mapping[str, Any]]) -> list[list[Mapping[str, Any]]]:
+    """The ``tool_use`` blocks of each assistant message, in order. Claude Code may write one
+    message as several records (one per block) sharing ``message.id``; they are joined."""
+    order: list[str] = []
+    by_id: dict[str, list[Mapping[str, Any]]] = {}
+    for index, record in enumerate(records):
+        if record.get("type") != "assistant":
+            continue
+        message = record.get("message")
+        key = message.get("id") if isinstance(message, dict) else None
+        key = str(key) if key else f"#{index}"
+        uses = [b for b in content_blocks(record) if b.get("type") == "tool_use"]
+        if key not in by_id:
+            order.append(key)
+            by_id[key] = []
+        by_id[key].extend(uses)
+    return [by_id[key] for key in order if by_id[key]]
+
+
 def sandbox_available() -> bool:
     """Whether the sandbox can run here: bubblewrap and socat on Linux, always on macOS."""
-    import sys
-
     if sys.platform == "darwin":
         return True
     return shutil.which("bwrap") is not None and shutil.which("socat") is not None

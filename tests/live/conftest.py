@@ -3,7 +3,7 @@
 Every test collected from this directory is marked ``live`` here (a test cannot forget the
 marker and leak into CI), and is skipped unless ``CSESSION_LIVE=1`` (``make live`` sets it) and
 a ``claude`` with usable credentials exists. Zero-cost tests (no API call) use the ``cheap``
-fixture, which needs only the binary.
+fixture, which needs only the binary and never gets credentials (no variable, no login file).
 """
 
 from __future__ import annotations
@@ -44,18 +44,33 @@ def _real_home() -> Path:
     return _REAL_HOME
 
 
+_login: harness.LoginCache | None = None
+
+
+def _login_cache(auth: harness.Auth) -> harness.LoginCache | None:
+    """The session's one copy of the login file, made the first time a test needs it."""
+    global _login
+    if auth.source is None:
+        return None
+    if _login is None:
+        _login = harness.new_login_cache(auth.source)
+    return _login
+
+
 def _make(*, needs_auth: bool) -> Iterator[harness.LiveEnv]:
     claude = harness.claude_path(os.environ)
     if claude is None:
         pytest.skip("claude is not on PATH")
-    auth = harness.resolve_auth(os.environ, _real_home())
+    auth = harness.resolve_auth(os.environ, _real_home()) if needs_auth else None
     if needs_auth and auth is None:
         pytest.skip(
             "no credentials: set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, or "
             f"{harness.COPY_LOGIN_ENV}=1 to copy the login file into the private home"
         )
     root = harness.new_root()
-    harness.install_login(root, auth)
+    login = _login_cache(auth) if auth is not None else None
+    if login is not None:
+        login.install(root / "home")
     live = harness.LiveEnv(
         root=root,
         claude=claude,
@@ -69,7 +84,7 @@ def _make(*, needs_auth: bool) -> Iterator[harness.LiveEnv]:
         yield live
     finally:
         _observations.extend(live.observations)
-        live.close()
+        harness.teardown(live, login)
 
 
 @pytest.fixture
@@ -85,6 +100,8 @@ def cheap() -> Iterator[harness.LiveEnv]:
 
 
 def pytest_sessionfinish(session: pytest.Session) -> None:
+    if _login is not None:
+        _login.remove()
     path = os.environ.get(harness.OBSERVATIONS_ENV)
     if path and _observations:
         import json

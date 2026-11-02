@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import pytest
 
 from ..fakeclaude import recorder
 from .harness import (
+    Headless,
     LiveEnv,
     events_named,
     find_transcripts,
@@ -91,11 +93,20 @@ def test_double_dash_keeps_the_prompt_out_of_variadic_options(
 
 @pytest.mark.live
 def test_without_double_dash_a_variadic_option_swallows_the_prompt(live: LiveEnv) -> None:
-    """The control for the test above: why the `--` exists."""
+    """The control for the test above: why the `--` exists. The prompt becomes a second
+    `--allowedTools` value, so `-p` has no prompt and must fail for that reason (no input),
+    not for any other."""
     proc = live.claude_run(
-        ["-p", "--model", live.model, "--allowedTools", "Read", PONG], stdin="", timeout=120
+        ["-p", "--model", live.model, *live.budget(), "--allowedTools", "Read", PONG],
+        stdin="",
+        timeout=120,
     )
+    live.observe(
+        "-p with a swallowed prompt: exit and stderr", (proc.returncode, proc.stderr[:300])
+    )
+    assert proc.returncode != 0
     assert "PONG" not in proc.stdout
+    assert re.search(r"\binput\b|\bprompt\b", proc.stderr, re.IGNORECASE), proc.stderr[:500]
 
 
 @pytest.mark.live
@@ -156,9 +167,9 @@ def test_a_preassigned_session_id_is_used_and_names_the_transcript(live: LiveEnv
 def test_resume_keeps_the_id_and_the_transcript_and_fork_makes_a_new_one(live: LiveEnv) -> None:
     """Design: resume appends to the same transcript and keeps the id; `--session-id` is rejected
     next to a plain `--resume`; a fork has a new id and transcript and leaves the original
-    byte-identical; a resume from another cwd works (A6); a fork into another cwd records the
-    transcript path from its SessionStart payload (B1). SessionStart sources: startup, resume,
-    fork (#76)."""
+    byte-identical; a resume from another cwd works (A6); a fork into another cwd reports its
+    transcript's real path in its SessionStart payload (B1; where that file lies is observed).
+    SessionStart sources: startup, resume, fork (#76)."""
     log = live.root / "starts.jsonl"
     settings = str(session_start_settings(live, log))
     first = str(uuid.uuid4())
@@ -190,7 +201,18 @@ def test_resume_keeps_the_id_and_the_transcript_and_fork_makes_a_new_one(live: L
     assert original.stat().st_size > size_before
 
     bad = live.claude_run(
-        ["-p", "--model", live.model, "--resume", first, "--session-id", first, "--", "hi"],
+        [
+            "-p",
+            "--model",
+            live.model,
+            *live.budget(),
+            "--resume",
+            first,
+            "--session-id",
+            first,
+            "--",
+            "hi",
+        ],
         cwd=base,
         timeout=120,
     )
@@ -205,7 +227,11 @@ def test_resume_keeps_the_id_and_the_transcript_and_fork_makes_a_new_one(live: L
     assert forked.session_id == fork and "PERSIMMON" in forked.text.upper()
     assert hashlib.sha256(original.read_bytes()).hexdigest() == digest
     (fork_file,) = find_transcripts(live.projects, fork)
-    assert fork_file != original and fork_file.parent != original.parent  # the new cwd's project
+    assert fork_file != original
+    # Unverified: whether the fork's transcript lands in the new cwd's project directory. The
+    # design does not depend on it (the path is taken from SessionStart, asserted below).
+    live.observe("fork transcript in another project dir than the original",
+                 fork_file.parent != original.parent)  # fmt: skip
 
     again = live.headless(PONG, "--resume", fork, "--settings", settings, cwd=elsewhere)
     assert again.session_id == fork
@@ -282,13 +308,24 @@ def test_strict_mcp_config_drops_the_mcp_servers_a_plugin_declares(live: LiveEnv
     assert wait_for(marker.exists, 10), "control failed: the plugin's server was not started"
 
 
+def plugin_loaded(run: Headless, name: str) -> bool:
+    """Whether the run's init event lists the plugin ``name`` or one of its slash commands."""
+    init = init_event(run.events)
+    plugins = init.get("plugins") or []
+    names = {str(p.get("name")) for p in plugins if isinstance(p, dict)}
+    commands = [str(c) for c in init.get("slash_commands") or []]
+    return name in names or any(c.lstrip("/").startswith(f"{name}:") for c in commands)
+
+
 @pytest.mark.live
 def test_resume_does_not_remember_plugin_dirs(live: LiveEnv) -> None:
+    """Judged from the init event (the plugin and its commands), not from the model's text."""
     plugin = write_plugin(live.dir("plug-r"), "plug", "hello", "REMEMBER-OK")
     first = live.headless("/plug:hello a", "--setting-sources", "", "--plugin-dir", str(plugin))
-    assert "REMEMBER-OK" in first.text
-    again = live.headless("/plug:hello b", "--setting-sources", "", "--resume", first.session_id)
-    assert "REMEMBER-OK" not in again.text
+    live.observe("init plugins with --plugin-dir", init_event(first.events).get("plugins"))
+    assert plugin_loaded(first, "plug"), "control: the plugin is not in the init event"
+    again = live.headless("Reply OK.", "--setting-sources", "", "--resume", first.session_id)
+    assert not plugin_loaded(again, "plug")
 
 
 @pytest.mark.live
@@ -311,10 +348,14 @@ def test_system_prompt_snapshot_off_applies_to_one_run_and_keeps_the_stored_snap
 
 @pytest.mark.live
 def test_in_default_mode_headless_denies_a_tool_no_rule_allows(live: LiveEnv) -> None:
-    """A9: with no permission settings everything that needs permission is denied in `-p`."""
+    """A9: in `default` mode, with no rule, everything that needs permission is denied in `-p`.
+    The mode is set explicitly: `--setting-sources ""` alone starts in `auto` (design.md,
+    Permission mode)."""
+    settings = live.write_json("s.json", {"permissions": {"defaultMode": "default"}})
     run = live.headless(
         "Run `echo hi > denied.txt` with the Bash tool. Do not retry. Then reply DONE.",
-        "--setting-sources", "",
+        "--setting-sources", "", "--settings", str(settings),
     )  # fmt: skip
+    assert init_event(run.events)["permissionMode"] == "default"
     assert not (live.dir("work") / "denied.txt").exists()
     assert run.final["permission_denials"]

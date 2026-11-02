@@ -5,11 +5,14 @@ signals and Ctrl-C (#41 comments from #56, #57, #58, #67).
 Each test starts `claude` directly as the pane's process (no shell), so the pane PID is the exact
 PID of `claude` and signals go to it alone. The tmux server uses `-f /dev/null`, a private socket
 and the private environment; the user's real tmux is never touched. Directories are trusted
-through the private `~/.claude.json` unless a test is about the dialog itself."""
+through the private `~/.claude.json` unless a test is about the dialog itself.
+
+The settings set `defaultMode: default`: with `--setting-sources ""` alone Claude Code starts in
+`auto` and asks for nothing (design.md, Permission mode). An interactive session cannot take
+`--max-budget-usd` (a `--print` option), so each one is charged the per-run estimate."""
 
 from __future__ import annotations
 
-import os
 import signal
 import sys
 import time
@@ -19,8 +22,19 @@ from typing import Any
 
 import pytest
 
+from claude_session import gateway, procinfo
+
 from ..fakeclaude import recorder
-from .harness import LiveEnv, events_named, hook_group, read_log, wait_for
+from .harness import (
+    LiveEnv,
+    events_named,
+    hook_group,
+    read_log,
+    runs_executable,
+    signal_recorded,
+    tool_path,
+    wait_for,
+)
 from .tmux_driver import Tmux
 
 ALL_EVENTS = (
@@ -52,9 +66,12 @@ class Session:
             hook_group(recorder(path, args=["Notification"]), matcher=kind)
             for kind, path in self.notify.items()
         ]
-        return self.live.write_json("settings.json", {"hooks": hooks})
+        settings = {"hooks": hooks, "permissions": {"defaultMode": "default"}}
+        return self.live.write_json("settings.json", settings)
 
     def start(self, *extra: str, trusted: bool = True) -> None:
+        self.live.spend_gate()
+        self.live.charge(None)  # no --max-budget-usd interactively: the estimate
         self.live.trust(*([self.work] if trusted else []))
         argv = [self.live.claude, "--model", self.live.model, "--setting-sources", "",
                 "--settings", str(self.settings()), *extra]  # fmt: skip
@@ -82,7 +99,7 @@ def session(live: LiveEnv) -> Iterator[Session]:
 
     if shutil.which("tmux") is None:
         pytest.skip("tmux is not installed")
-    tmux = Tmux(live.env(), live.root / "t.sock")
+    tmux = Tmux(live.env(), live.root / "t.sock", tmux=tool_path("tmux", live.env()))
     try:
         yield Session(live, tmux)
     finally:
@@ -113,7 +130,8 @@ def test_permission_prompt_notifications_matchers_and_denial(session: Session) -
     fires `PostToolUse`, a denial fires nothing; each matcher sees only its own type."""
     session.start()
     session.ready()
-    session.submit("Run `echo first` with the Bash tool.")
+    # A command that writes: a read-only one may be auto-allowed in the cwd (live D3).
+    session.submit("Run `echo first > first.txt` with the Bash tool.")
     assert session.wait_event("PermissionRequest", 90), session.tmux.capture()
     asked = session.events("PermissionRequest")[0]
     session.live.observe("PermissionRequest keys", sorted(asked))
@@ -121,6 +139,7 @@ def test_permission_prompt_notifications_matchers_and_denial(session: Session) -
     assert wait_for(lambda: bool(read_log(session.notify["permission_prompt"])), 30)
     session.tmux.send_keys("Enter")  # the first option: yes
     assert session.wait_event("PostToolUse", 60), session.tmux.capture()
+    assert (session.work / "first.txt").exists()
     done = session.events("PostToolUse")[0]
     assert isinstance(done.get("tool_use_id"), str)
     session.live.observe("PostToolUse matches PermissionRequest tool_use_id",
@@ -128,11 +147,12 @@ def test_permission_prompt_notifications_matchers_and_denial(session: Session) -
     assert session.wait_event("Stop", 90)
     stopped = time.monotonic()
 
-    session.submit("Run `echo second` with the Bash tool.")
+    session.submit("Run `echo second > second.txt` with the Bash tool. Do not retry.")
     assert session.wait_event("PermissionRequest", 90, count=2), session.tmux.capture()
     session.tmux.send_keys("Escape")  # deny
     time.sleep(5)
     assert len(session.events("PostToolUse")) == 1, "a denial fired PostToolUse"
+    assert not (session.work / "second.txt").exists()
 
     assert wait_for(lambda: bool(read_log(session.notify["idle_prompt"])), 150)
     live_gap = time.monotonic() - stopped
@@ -212,36 +232,44 @@ def test_double_ctrl_c_exit_code(session: Session) -> None:
 @pytest.mark.live
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
 @pytest.mark.parametrize(
-    ("sig", "count", "accepted"),
+    ("sig", "count", "accepted", "end_reason"),
     [
-        (signal.SIGTERM, 1, {143}),
-        (signal.SIGHUP, 1, {129, 0}),
-        (signal.SIGHUP, 2, {129, 0}),
+        (signal.SIGTERM, 1, {143}, "other"),
+        (signal.SIGHUP, 1, {129, 0}, None),
+        (signal.SIGHUP, 2, {129, 0}, None),
     ],
     ids=["sigterm", "sighup", "two-sighups"],
 )
 def test_signals_end_interactive_claude_cleanly(
-    session: Session, sig: signal.Signals, count: int, accepted: set[int]
+    session: Session, sig: signal.Signals, count: int, accepted: set[int], end_reason: str | None
 ) -> None:
-    """B (SIGTERM exits 143, SessionEnd reason `other`, SIGHUP 129), #57 (does SIGHUP fire
-    SessionEnd; exit code or death by signal) and #67 item 2 (two SIGHUPs end it cleanly). The
-    signal goes to the exact pane PID, which is `claude` itself."""
+    """B (SIGTERM exits 143 with SessionEnd reason `other`, and the session resumes; SIGHUP
+    129), #57 (does SIGHUP fire SessionEnd; exit code or death by signal) and #67 item 2 (two
+    SIGHUPs end it cleanly). The signal goes to the exact pane PID, checked to run `claude`
+    and pinned by its start-time token before the first signal; a process that is already
+    gone ends the sending, it is not an error."""
     session.start()
     session.ready()
     pid = session.tmux.state().pid
-    argv0 = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[0].decode()
-    assert argv0 == session.live.claude, "the pane process is not claude itself"
+    assert runs_executable(pid, session.live.claude), "the pane process is not claude itself"
+    token = procinfo.ProcInfo(gateway.SystemGateway()).start_time(pid)
+    assert token is not None
     for _ in range(count):
-        os.kill(pid, sig)
+        if not signal_recorded(pid, token, sig):
+            break
         time.sleep(0.2)
     state = session.tmux.wait_dead(30)
     assert state is not None, session.tmux.capture()
+    reasons = [e.get("reason") for e in session.events("SessionEnd")]
     session.live.observe(
         f"{sig.name} x{count}: (exit, signal, SessionEnd)",
-        (
-            state.exit_status,
-            state.exit_signal,
-            [e.get("reason") for e in session.events("SessionEnd")],
-        ),
+        (state.exit_status, state.exit_signal, reasons),
     )
     assert state.exit_status in accepted or state.exit_signal == sig
+    if end_reason is not None:
+        assert reasons == [end_reason], reasons
+        sid = session.events("SessionStart")[0]["session_id"]
+        resumed = session.live.headless(
+            "Reply OK.", "--resume", sid, "--setting-sources", "", cwd=session.work
+        )
+        assert resumed.session_id == sid
