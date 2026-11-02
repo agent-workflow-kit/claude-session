@@ -16,10 +16,10 @@ from claude_session import __version__, cli
 from claude_session.cli import build_parser, main
 from claude_session.errors import AmbiguousError, NotFoundError, RefusedError, UsageError
 
+from .golden import assert_golden
 from .schemas import validate
 
 ROOT = Path(__file__).resolve().parent.parent
-GOLDEN = Path(__file__).resolve().parent / "golden"
 SID = "cs-abcd2345"
 ERROR_SCHEMA = "claude-session/cli/error.json"
 
@@ -340,8 +340,7 @@ def test_unimplemented_command_is_internal_not_implemented(
 ) -> None:
     code, envelope, err = run_json(["kinds", "--json"], capsys)
     assert code == 1
-    validate(envelope, ERROR_SCHEMA)
-    assert envelope == json.loads((GOLDEN / "error-not-implemented.json").read_text())
+    assert_golden(envelope, "error-not-implemented")
     assert "not implemented" in err
 
 
@@ -389,8 +388,7 @@ def test_error_envelope_golden(
     monkeypatch.setitem(cli.HANDLERS, "status", raising(error))
     code, envelope, err = run_json(["status", "abcd", "--json"], capsys)
     assert code == exit_code
-    validate(envelope, ERROR_SCHEMA)
-    assert envelope == json.loads((GOLDEN / f"error-{golden}.json").read_text())
+    assert_golden(envelope, f"error-{golden}")
     assert envelope["error"]["message"] in err
 
 
@@ -553,3 +551,16 @@ def test_outcome_file_prescan_accepts_a_negative_number(
     monkeypatch.chdir(tmp_path)
     assert main(["exec", "--bogus", "--outcome-file", "-1"]) == 2
     assert read_envelope(tmp_path / "-1")["error"]["code"] == "usage"
+
+
+@pytest.mark.parametrize("value", [".", "sub/.."])
+def test_outcome_file_naming_a_directory_is_a_warning(
+    value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "sub").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert main(["exec", "--timeout", "0", "--outcome-file", value, "--json"]) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"]["code"] == "usage"
+    assert "warning: could not write --outcome-file" in captured.err
+    assert "Traceback" not in captured.err

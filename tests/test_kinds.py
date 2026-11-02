@@ -4,6 +4,7 @@ carry-over)."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import textwrap
 from pathlib import Path
@@ -465,7 +466,6 @@ def test_setting_sources_flag_forms(cfg_dir: Path, value: Any, expected: list[st
 
 
 def test_permission_profile_flag(cfg_dir: Path) -> None:
-    # TODO(#22): profile existence and files are validated by the permission-profile work.
     result = resolve(load(cfg_dir), "implement", flags={"permission_profile": "readonly"})
     assert result.profile.permission_profile == "readonly"
     assert result.origins["permission_profile"] == "flag"
@@ -499,6 +499,74 @@ def test_permission_profile_name_now_replaces_a_carried_file(cfg_dir: Path) -> N
         "readonly",
         "flag",
     )
+
+
+def test_permission_profile_file_now_replaces_a_carried_name(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"permission_profile": "readonly"})
+    result = resolve(
+        load(cfg_dir), "implement", previous=previous, flags={"permission_profile": "/x/p.json"}
+    )
+    assert result.permission_profile_file == "/x/p.json"
+    assert result.origins["permission_profile_file"] == "flag"
+    assert (result.profile.permission_profile, result.origins["permission_profile"]) == (
+        "default",
+        "builtin",
+    )
+
+
+def test_permission_profile_flag_may_name_a_configured_profile(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "permission_profiles: {Mine_1: {permissions: {allow: [Read]}}}\n")
+    result = resolve(cfg, "implement", flags={"permission_profile": "Mine_1"})
+    assert result.profile.permission_profile == "Mine_1"
+
+
+@pytest.mark.parametrize(
+    ("previous", "flags", "layer"),
+    [
+        ({}, {"permission_profile": "missing"}, "flags"),
+        ({"permission_profile": "missing"}, {}, "the previous run's flags"),
+    ],
+)
+def test_permission_profile_name_must_exist(
+    cfg_dir: Path, previous: dict[str, Any], flags: dict[str, Any], layer: str
+) -> None:
+    with pytest.raises(UsageError) as info:
+        resolve(
+            load(cfg_dir),
+            "implement",
+            previous=kinds.Previous(repo=None, flags=previous),
+            flags=flags,
+        )
+    text = f"{info.value.message} {info.value.detail}"
+    assert "--permission-profile" in text
+    assert "no built-in or configured permission profile" in text
+    assert layer in text
+
+
+@pytest.mark.parametrize("value", ["", "-x", "p q", "p.txt", "P" * 65, "p\n", "rév", "p\\q"])
+def test_permission_profile_name_grammar_is_enforced(cfg_dir: Path, value: str) -> None:
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", flags={"permission_profile": value})
+    text = f"{info.value.message} {info.value.detail}"
+    assert "--permission-profile" in text
+    assert "permission-profile name" in text
+
+
+@pytest.mark.parametrize(
+    ("kind", "flags", "isolated"),
+    [
+        ("implement", {}, False),
+        ("rank", {}, True),  # sandbox preferred, not third-party-reading
+        ("review", {}, True),
+        ("respond", {}, True),
+        ("implement", {"sandbox": "preferred"}, True),
+        ("implement", {"reads_third_party": True}, True),
+        ("review", {"sandbox": "off"}, True),  # still third-party-reading
+        ("rank", {"sandbox": "off"}, False),
+    ],
+)
+def test_isolated_runs(cfg_dir: Path, kind: str, flags: dict[str, Any], isolated: bool) -> None:
+    assert resolve(load(cfg_dir), kind, flags=flags).isolated() is isolated
 
 
 # --env-allow / --env-allowlist-only
@@ -850,6 +918,8 @@ class FakeRun:
             raise self.result
         return self.result
 
+    run = __call__
+
 
 def completed(code: int, out: str) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess([], code, stdout=out, stderr="")
@@ -857,10 +927,11 @@ def completed(code: int, out: str) -> subprocess.CompletedProcess[str]:
 
 def test_git_origin_url_runs_hardened_read_only_git(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeRun(completed(0, "git@example.com:a/b.git\n"))
-    monkeypatch.setattr(gateway, "run", fake)
+    monkeypatch.setattr(kinds, "GATEWAY", fake)
     assert kinds.git_origin_url("/work/-dir") == "git@example.com:a/b.git"
     ((argv, timeout),) = fake.calls
-    assert argv[0] == "git"
+    assert os.path.isabs(argv[0])
+    assert os.path.basename(argv[0]) == "git"
     assert argv[-5:] == ["-C", "/work/-dir", "remote", "get-url", "origin"]
     for setting in (
         "core.fsmonitor=",
@@ -902,7 +973,7 @@ def test_git_origin_url_ignores_the_callers_git_environment(
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "0")
     monkeypatch.setenv("CSESSION_KEEP_ME", "1")
     fake = FakeRun(completed(0, "https://example.com/a/b\n"))
-    monkeypatch.setattr(gateway, "run", fake)
+    monkeypatch.setattr(kinds, "GATEWAY", fake)
     kinds.git_origin_url("/w")
     (env,) = fake.envs
     assert env is not None
@@ -931,7 +1002,7 @@ def test_real_git_lookup_ignores_git_dir(
 
 
 def test_git_origin_url_trims_only_one_newline(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gateway, "run", FakeRun(completed(0, "https://example.com/a\n\n")))
+    monkeypatch.setattr(kinds, "GATEWAY", FakeRun(completed(0, "https://example.com/a\n\n")))
     assert kinds.git_origin_url("/w") == "https://example.com/a\n"
 
 
@@ -941,13 +1012,13 @@ def test_git_origin_url_trims_only_one_newline(monkeypatch: pytest.MonkeyPatch) 
         completed(2, ""),
         completed(128, "fatal: not a git repository\n"),
         FileNotFoundError("git"),
-        subprocess.TimeoutExpired(["git"], 10),
+        gateway.GatewayTimeout(["git"], 10),
     ],
 )
 def test_git_origin_url_failures_give_none(
     monkeypatch: pytest.MonkeyPatch, result: subprocess.CompletedProcess[str] | Exception
 ) -> None:
-    monkeypatch.setattr(gateway, "run", FakeRun(result))
+    monkeypatch.setattr(kinds, "GATEWAY", FakeRun(result))
     assert kinds.git_origin_url("/w") is None
 
 
@@ -995,3 +1066,18 @@ def test_cli_load_config_requires_the_named_file(tmp_path: Path) -> None:
     with pytest.raises(UsageError) as info:
         cli.load_config(args)
     assert info.value.exit_code == 2
+
+
+def test_carried_profile_name_missing_from_config_hints_at_recovery(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"permission_profile": "gone"})
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", previous=previous)
+    detail = str(info.value.detail)
+    assert "previous run" in detail
+    assert "use --reset permission-profile or give --permission-profile" in detail
+
+
+def test_unknown_profile_name_given_now_has_no_reset_hint(cfg_dir: Path) -> None:
+    with pytest.raises(UsageError) as info:
+        resolve(load(cfg_dir), "implement", flags={"permission_profile": "gone"})
+    assert "--reset" not in str(info.value.detail)

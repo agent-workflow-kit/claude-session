@@ -20,7 +20,7 @@
             "schema_newer",
             "internal"
           ],
-          "description": "usage (exit 2; also an invalid config, with detail), not_found (10), ambiguous (21), refused (20), launch_failed (12; start, a launch-validation failure), failed (12; an operational failure outside a launch, e.g. cron install without crontab, transcript read errors; an outcome-file write failure is only a warning), schema_newer (12; the database schema is newer than this claude-session, checked first by every command), internal (1)."
+          "description": "usage (exit 2; also an invalid config, with detail), not_found (10), ambiguous (21), refused (20), launch_failed (12; start, a launch-validation failure), failed (12; an operational failure outside a launch, e.g. cron install without crontab, transcript read errors, an unusable, unsafe or foreign state.db; an outcome-file write failure is only a warning), schema_newer (12; the database schema is newer than this claude-session, checked first by every command), internal (1)."
         },
         "message": {
           "type": "string"
