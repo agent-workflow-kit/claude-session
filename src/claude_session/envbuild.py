@@ -23,13 +23,16 @@ caller's for ``exec``, the adopting process's for ``exec --session-id``); it nev
    ``GLAB_CONFIG_DIR`` point at ``$CSESSION_DIR/gh-empty``. Re-applied after step 5, so these
    win over ``env.set`` (``env.set`` may still set a ``secret_env`` name).
 5. ``env.set`` (``${CSESSION_DIR}``, ``${CWD}``, ``${HOME}``, ``${GIT_DIR}`` expanded once,
-   before step 2 reads the provider flags; any other ``${`` is refused), then ``PATH`` = the
-   executable directory, ``env.path_prepend``, the kind's ``PATH``. Config validation
-   already refuses invalid ``env.set``, ``env.allow`` and ``path_prepend`` entries; the checks
-   here are a backstop.
-6. (#24) PATH sanitizing for isolated runs. Isolated runs also lose the dynamic-loader
-   variables (``LD_PRELOAD``, ``LD_LIBRARY_PATH``, ``LD_AUDIT``, every ``DYLD_*``), also ones
-   ``env.set`` sets: they would reach the unsandboxed hook interpreter.
+   before step 2 reads the provider flags; any other ``${`` is refused), then ``PATH`` =
+   ``env.path_prepend``, the kind's ``PATH``. Config validation already refuses invalid
+   ``env.set``, ``env.allow`` and ``path_prepend`` entries; the checks here are a backstop.
+6. Isolated runs: ``PATH`` sanitized (empty and relative entries dropped; an entry inside a
+   session-writable path, checked hop by hop through its symlinks, fails the launch,
+   ``unsafe_path``; interface.md, Path rules; each kept entry is replaced by its realpath), and
+   the dynamic-loader variables (``LD_PRELOAD``, ``LD_LIBRARY_PATH``, ``LD_AUDIT``, every
+   ``DYLD_*``) removed, also ones ``env.set`` sets: they would reach the unsandboxed hook
+   interpreter. Then, for every run, the executable directory is prepended to ``PATH``
+   (after sanitizing; it is checked against the session-writable paths too, hop by hop).
 7. Third-party-reading runs: the git variables that override config or redirect git
    (``GIT_CONFIG_PARAMETERS``, ``GIT_SSH``, ``GIT_DIR``, ...; ``GIT_ENV_DROP``) removed, then
    the ``GIT_CONFIG_COUNT``/``KEY``/``VALUE`` hardening entries appended after the existing
@@ -45,11 +48,11 @@ itself be a valid variable-name start. Any other entry matches only the identica
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 
-from . import config, ids, kinds
-from .errors import UsageError
+from . import config, ids, kinds, pathrules
+from .errors import LaunchValidationError, UsageError
 
 # Step 1: passed in allowlist mode (design.md, Environment).
 BASE_ALLOWLIST = (
@@ -165,14 +168,19 @@ def build(
     exe_dir: str,
     git_dir: str | None = None,
     tmpdir: str | None = None,
+    session_writable: Callable[[str], bool] | None = None,
 ) -> SessionEnv:
     """Build the session environment from ``environ`` (never modified).
 
     ``exe_dir`` is the directory of the running ``claude-session`` executable, ``git_dir`` the
     cwd's git common directory (None: none), ``tmpdir`` the private temporary directory of a
-    sandboxed run (None: not sandboxed). Raises ``UsageError`` for an invalid ``env.set`` or
-    ``env.path_prepend`` entry (the message names the key, never a value) and ``ValueError``
-    for an ``exe_dir`` that is not one absolute path.
+    sandboxed run (None: not sandboxed). ``session_writable`` is the run's session-writable
+    path check (``pathrules.session_writable``); required for isolated runs (None raises
+    ``ValueError``). Raises ``UsageError`` for an invalid ``env.set`` or ``env.path_prepend``
+    entry (the message names the key, never a value), ``LaunchValidationError``
+    (``unsafe_path``) for an isolated run's ``PATH`` entry or ``exe_dir`` inside a
+    session-writable path, and ``ValueError`` for an ``exe_dir`` that is not one absolute
+    path.
     """
     # TODO(#15): exec passes exe_dir (from the absolute argv[0]), git_dir (from gitinfo) and
     # the private tmpdir (#25), and feeds auth_names and secret_names to logs.secret_values
@@ -180,6 +188,9 @@ def build(
     # come from env.set), the secret_env values from the input environment.
     _check_path_entry(exe_dir, ValueError, "the claude-session executable directory")
     profile = resolution.profile
+    isolated = resolution.isolated()
+    if isolated and session_writable is None:
+        raise ValueError("isolated runs need the session_writable path check")
 
     # 1. Base (entries execve cannot pass are dropped).
     environ = {name: value for name, value in environ.items() if _passable(name, value)}
@@ -224,24 +235,32 @@ def build(
     if profile.reads_third_party:
         _third_party(env, csession_dir)
 
-    # 5. env.set (expanded above), path_prepend, the executable directory.
+    # 5. env.set (expanded above), path_prepend (the executable directory: after step 6).
     env.update(set_values)
     for entry in profile.env.path_prepend:
         _check_path_entry(entry, UsageError, "env.path_prepend")
     kind_path = env.get("PATH", "")
-    env["PATH"] = ":".join(
-        [exe_dir, *profile.env.path_prepend, *([kind_path] if kind_path else [])]
-    )
+    path = [*profile.env.path_prepend, *([kind_path] if kind_path else [])]
     # Step 4 wins over env.set: a run can be third-party-reading by flag, so a token literal
     # in the kind's env.set must not reach it.
     if profile.reads_third_party:
         _third_party(env, csession_dir)
 
-    # 6. TODO(#24): sanitize PATH for isolated runs (drop empty and relative entries, refuse
-    #    entries inside session-writable paths with unsafe_path).
-    if resolution.isolated():
+    # 6. Isolated runs: PATH sanitized and checked, loader variables removed. The executable
+    #    directory is prepended after sanitizing (interface.md, Environment at adoption).
+    if isolated:
+        assert session_writable is not None
+        entries = pathrules.sanitize_path(":".join(path))
+        pathrules.check_path_entries(entries, session_writable)
+        if pathrules.writable_hop(exe_dir, session_writable) is not None:
+            raise LaunchValidationError(
+                "the claude-session executable directory is inside a session-writable path",
+                end_reason="unsafe_path",
+            )
+        path = [os.path.realpath(entry) for entry in entries]
         for name in [n for n in env if n in LOADER_DROP or n.startswith(LOADER_DROP_PREFIX)]:
             del env[name]
+    env["PATH"] = ":".join([exe_dir, *path])
     # 7. Git hardening (after step 5: it wins over env.set).
     if profile.reads_third_party:
         for name in GIT_ENV_DROP:
