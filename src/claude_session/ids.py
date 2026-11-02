@@ -60,8 +60,8 @@ def new_session_id(
     max_attempts: int = MAX_ALLOCATION_ATTEMPTS,
 ) -> str:
     """Allocate a ``cs-`` id that ``is_used`` rejects for none of: live, forgotten or deleted
-    sessions (the store checks ``sessions`` and ``deleted_ids``), retrying on collision."""
-    # TODO(#4): wire `is_used` to the store's sessions + deleted_ids lookup.
+    sessions, retrying on collision. Pass ``Store.session_id_used`` (it checks ``sessions``
+    and ``deleted_ids``) inside the transaction that inserts the session."""
     for _ in range(max_attempts):
         body = base64.b32encode(random_bytes(5)).decode("ascii").lower()
         candidate = ID_PREFIX + body
@@ -109,7 +109,6 @@ def resolve_session_id(text: str, candidates: Iterable[IdCandidate]) -> str:
     matches (forgotten sessions never do) and ``AmbiguousError`` (exit 21) listing the sorted
     candidates when several match.
     """
-    # TODO(#4): the store passes the sessions matching the prefix (or all of them).
     prefix = session_id_prefix(text)
     if ID_PREFIX_BODY.fullmatch(prefix.removeprefix(ID_PREFIX)) is None:
         raise NotFoundError(f"unknown session: {text}")  # can match no id; no lookup
@@ -121,6 +120,18 @@ def resolve_session_id(text: str, candidates: Iterable[IdCandidate]) -> str:
     if len(matches) > 1:
         raise AmbiguousError(f"ambiguous session id: {text}", matches=matches)
     return matches[0]
+
+
+def lookup_session_id(text: str, find: Callable[[str], Iterable[tuple[str, bool]]]) -> str:
+    """``resolve_session_id`` against a store: ``find`` (``Store.session_id_candidates``)
+    is called with the normalized ``cs-`` prefix only once the input can match an id, so a
+    short or malformed input never reaches a query."""
+    prefix = session_id_prefix(text)
+    if ID_PREFIX_BODY.fullmatch(prefix.removeprefix(ID_PREFIX)) is None:
+        raise NotFoundError(f"unknown session: {text}")
+    return resolve_session_id(
+        text, (IdCandidate(sid, forgotten) for sid, forgotten in find(prefix))
+    )
 
 
 # Name grammars
