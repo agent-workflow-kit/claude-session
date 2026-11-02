@@ -71,8 +71,10 @@ def _reset_open_lock() -> None:
     _OPEN_LOCK = threading.Lock()
 
 
-if hasattr(os, "register_at_fork"):
+try:
     os.register_at_fork(after_in_child=_reset_open_lock)
+except AttributeError:  # pragma: no cover - platforms without fork
+    pass
 
 Version = tuple[int, int]
 Clock = Callable[[], datetime]
