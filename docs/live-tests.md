@@ -42,7 +42,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 - New API-using tests take the `live` fixture, zero-cost ones `cheap`; both come from `tests/live/conftest.py`. Put helpers in `tests/live/harness.py` and unit-test them in `tests/test_live_harness.py`, with the fake claude or `sh`.
 - `LiveEnv.headless(prompt, *flags)` runs a small-model `-p` with `stream-json`, the prompt after `--`. `LiveEnv.claude_run` runs with exactly the given argv. `spawn_headless` and `tmux_driver.Tmux` are for signals and interactive sessions.
 - Probe hooks are `tests/fakeclaude.recorder(log, ...)` commands in a `--settings` file; read them with `harness.read_log` and `harness.events_named`.
-- Sandbox tests use `needs_sandbox` (`test_sandbox.py`); macOS-only checks belong in the manual checklist of #43.
+- Sandbox tests use `needs_sandbox` (`test_sandbox.py`); macOS-only checks belong in the [manual macOS checklist](macos-checklist.md) (#43), which also says what to read from this suite on a Mac.
 
 ## Coverage
 
@@ -99,7 +99,7 @@ Not covered, with the reason:
 | Respond isolation: network, tmux socket and SSH agent blocked | Needs an outside listener; manual. |
 | Sandbox: TMPDIR socket length; `excludedCommands` matching; `.bash_profile` placeholder | Unit-tested in `selfcheck`; the rest is informational. |
 | Search tools under the review profile (Glob, Grep, LS); symlink planted by sandboxed Bash and the Read tool (F1); `/proc` isolation (F2); MCP elicitation (`elicitation_dialog`) | Open items: issue #42. |
-| macOS Seatbelt checks | Manual checklist: issue #43. |
+| macOS Seatbelt checks, process start time, socket paths | Manual: [macos-checklist.md](macos-checklist.md) (issue #43). |
 
 ### Comments on issue #41
 
