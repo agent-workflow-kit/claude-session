@@ -32,11 +32,12 @@ SIGKILLed through a pidfd opened before its start ticks are checked again, so th
 that exact fake; and the test fails, so a leak is never silently cleaned up. Without a pidfd
 it is only reported.
 
-Should a test run past ``WATCHDOG_SECONDS``, the watchdog writes the live tracked PIDs to
-stderr, SIGKILLs every tracked process that has a pidfd (exact: a pidfd never names a reused
-PID, so this cannot race the test's own wait), and the test fails at teardown. It sends no
-other signal: without pidfds it only reports, and a test hung on something else stays hung.
-This module is test-only; nothing under ``src/`` imports it.
+Should a test run past its watchdog limit (``watchdog_seconds``: ``WATCHDOG_SECONDS``, or
+``LIVE_WATCHDOG_SECONDS`` for a test marked ``live``, which runs the real ``claude``), the
+watchdog writes the live tracked PIDs to stderr, SIGKILLs every tracked process that has a
+pidfd (exact: a pidfd never names a reused PID, so this cannot race the test's own wait), and
+the test fails at teardown. It sends no other signal: without pidfds it only reports, and a
+test hung on something else stays hung. This module is test-only; nothing under ``src/`` imports it.
 
 The other autouse fixtures keep every test off the user's real directories: its own
 ``XDG_STATE_HOME`` (``_private_state_dir``), ``HOME`` and ``XDG_CONFIG_HOME``
@@ -75,6 +76,9 @@ pytest_plugins = ["pytester"]  # test_leftover_guard.py runs the guard in a pyte
 LINUX = sys.platform.startswith("linux")
 # A test still running after this long is reported as hung and its pidfd processes killed.
 WATCHDOG_SECONDS = 60.0
+# The same for a `live` test (real claude, `make live`): its longest step is an end-to-end run
+# (900 s), and one test may chain several headless runs of up to 300 s each.
+LIVE_WATCHDOG_SECONDS = 3600.0
 # The production base of the per-uid temporary-directory root, read before any test patches it.
 REAL_TMP_ROOT = pathrules.TMP_ROOT
 # Where the fake claude writes its start records (tests/fakebin/fake_claude.py).
@@ -274,8 +278,14 @@ def _tracking_popen(started: list[_Started]) -> type[subprocess.Popen[Any]]:
     return TrackedPopen
 
 
+def watchdog_seconds(item: Any) -> float:
+    """The watchdog limit of a test item: longer for one marked ``live``."""
+    return LIVE_WATCHDOG_SECONDS if item.get_closest_marker("live") else WATCHDOG_SECONDS
+
+
 @pytest.fixture(autouse=True)
-def no_leftover_processes() -> Iterator[list[_Started]]:
+def no_leftover_processes(request: pytest.FixtureRequest) -> Iterator[list[_Started]]:
+    limit = watchdog_seconds(request.node)
     started: list[_Started] = []
     real = subprocess.Popen
     done, fired = threading.Event(), threading.Event()
@@ -283,7 +293,7 @@ def no_leftover_processes() -> Iterator[list[_Started]]:
     def watchdog() -> None:
         # Signals only through pidfds: a check-then-kill from here could race the test's own
         # wait (see the docstring). The pidfds stay open until this thread is joined.
-        if not done.wait(WATCHDOG_SECONDS):
+        if not done.wait(limit):
             fired.set()
             records = list(started)
             live = [p.popen.pid for p in records if p.is_ours()]  # never reaps
@@ -323,7 +333,7 @@ def no_leftover_processes() -> Iterator[list[_Started]]:
             else:
                 os.environ[STARTED_ENV] = previous_env
     if fired.is_set():
-        pytest.fail(f"watchdog fired: the test was still running after {WATCHDOG_SECONDS} s")
+        pytest.fail(f"watchdog fired: the test was still running after {limit} s")
     if leftover_fakes:
         pytest.fail(
             "fake claude processes outlived the test (started by a process the test started;"

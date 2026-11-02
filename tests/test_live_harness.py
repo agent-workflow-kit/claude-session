@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -130,19 +131,50 @@ def test_the_login_file_is_copied_only_when_asked_and_never_through_a_symlink(
     assert harness.resolve_auth({harness.COPY_LOGIN_ENV: "1"}, tmp_path) is None
 
 
-def test_install_login_copies_with_mode_0600_and_leaves_the_source_alone(tmp_path: Path) -> None:
+def test_the_login_cache_copies_once_installs_0600_and_collects_a_refresh(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "creds.json"
     source.write_text('{"a": 1}', encoding="utf-8")
     source.chmod(0o644)
-    root = harness.new_root()
+    cache = harness.new_login_cache(source)
     try:
-        harness.install_login(root, harness.Auth({}, source, "copy"))
-        target = root / "home" / ".claude" / ".credentials.json"
-        assert target.read_text(encoding="utf-8") == '{"a": 1}'
+        source.write_text('{"changed": "after the copy"}', encoding="utf-8")
+        home = tmp_path / "home"
+        cache.install(home)
+        target = home / ".claude" / ".credentials.json"
+        assert target.read_text(encoding="utf-8") == '{"a": 1}'  # the session copy, not a reread
         assert target.stat().st_mode & 0o777 == 0o600
+        target.write_text('{"a": 2}', encoding="utf-8")  # claude refreshed the token
+        cache.collect(home)
+        other = tmp_path / "other-home"
+        cache.install(other)
+        assert (other / ".claude" / ".credentials.json").read_text(encoding="utf-8") == '{"a": 2}'
+        assert source.read_text(encoding="utf-8") == '{"changed": "after the copy"}'
         assert source.stat().st_mode & 0o777 == 0o644
+        target.unlink()
+        target.symlink_to(tmp_path / "elsewhere")
+        cache.collect(home)  # a symlink is never followed
+        assert cache.path.read_text(encoding="utf-8") == '{"a": 2}'
     finally:
-        shutil.rmtree(root)
+        cache.remove()
+    assert not cache.directory.exists()
+
+
+def test_a_run_without_credentials_gets_a_home_without_the_login_file(
+    live_env: harness.LiveEnv,
+) -> None:
+    (live_env.home / ".claude" / ".credentials.json").write_text("{}", encoding="utf-8")
+    with_auth, without = live_env.env(), live_env.env(auth=False)
+    assert with_auth["HOME"] == str(live_env.home) and with_auth["ANTHROPIC_API_KEY"] == FAKE_LOGIN
+    assert without["HOME"] != with_auth["HOME"] and "ANTHROPIC_API_KEY" not in without
+    assert not (Path(without["HOME"]) / ".claude" / ".credentials.json").exists()
+    assert without["XDG_CONFIG_HOME"].startswith(without["HOME"])
+
+
+def test_the_cheap_fixture_never_resolves_credentials() -> None:
+    source = (REPO / "tests" / "live" / "conftest.py").read_text(encoding="utf-8")
+    assert "resolve_auth(os.environ, _real_home()) if needs_auth else None" in source
 
 
 def test_the_child_environment_is_an_allowlist_with_a_private_home(tmp_path: Path) -> None:
@@ -173,12 +205,23 @@ def test_the_child_environment_is_an_allowlist_with_a_private_home(tmp_path: Pat
     assert "/real/home" not in "".join(env.values())
 
 
-@pytest.mark.parametrize("name", list(harness.FORBIDDEN_EXTRA))
+FORBIDDEN_NAMES = [*harness.FORBIDDEN_EXTRA, "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME"]
+
+
+@pytest.mark.parametrize("name", FORBIDDEN_NAMES)
 def test_a_test_cannot_point_claude_back_at_the_real_configuration(
     tmp_path: Path, name: str
 ) -> None:
     with pytest.raises(ValueError, match=name):
         harness.build_env({}, root=tmp_path, auth=None, extra={name: "/real/home"})
+
+
+def test_every_name_the_private_environment_sets_is_forbidden_except_path(tmp_path: Path) -> None:
+    env = harness.build_env({}, root=tmp_path, auth=None)
+    assert sorted(n for n in env if n != "PATH" and not harness.forbidden_extra(n)) == []
+    for name in ("GIT_CONFIG_GLOBAL", "CLAUDE_CONFIG_DIR", "HOME", "TMPDIR"):
+        assert harness.forbidden_extra(name)
+    assert not harness.forbidden_extra("PATH") and not harness.forbidden_extra("CSESSION_ID")
 
 
 def test_extra_environment_is_added_after_the_allowlist(tmp_path: Path) -> None:
@@ -191,6 +234,52 @@ def test_claude_json_trusts_only_the_given_directories(tmp_path: Path) -> None:
     assert data["hasCompletedOnboarding"] is True
     assert list(data["projects"]) == [str(tmp_path / "a")]
     assert data["projects"][str(tmp_path / "a")]["hasTrustDialogAccepted"] is True
+    assert "customApiKeyResponses" not in data
+
+
+def test_claude_json_approves_the_api_key_by_its_last_20_characters() -> None:
+    key = "sk-ant-api03-" + "x" * 30 + "ABCDEFGHIJ0123456789"
+    data = harness.claude_json([], api_key=key + "\n")
+    assert data["customApiKeyResponses"] == {"approved": ["ABCDEFGHIJ0123456789"], "rejected": []}
+
+
+def test_trust_approves_the_api_key_in_use(live_env: harness.LiveEnv) -> None:
+    live_env.trust(live_env.dir("work"))
+    data = json.loads((live_env.home / ".claude.json").read_text(encoding="utf-8"))
+    assert data["customApiKeyResponses"]["approved"] == [FAKE_LOGIN[-20:]]
+    assert list(data["projects"]) == [str(live_env.root / "work")]
+
+
+def test_reprs_never_show_a_credential_or_the_parent_environment(tmp_path: Path) -> None:
+    secret = "sk-planted-secret-value-1234"
+    auth = harness.Auth({"ANTHROPIC_API_KEY": secret}, None, "test")
+    env = harness.LiveEnv(
+        root=tmp_path,
+        claude="/bin/true",
+        model="haiku",
+        run_usd=0.25,
+        ledger=harness.Ledger(1.0),
+        base_environ={"ANTHROPIC_API_KEY": secret, "OTHER_TOKEN": secret},
+        auth=auth,
+    )
+    for text in (repr(auth), repr(env), str(env)):
+        assert secret not in text
+
+
+def test_relative_claude_and_path_entries_resolve_to_absolute_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("claude", "tmux"):
+        (bin_dir / name).write_text("#!/bin/sh\n", encoding="utf-8")
+        (bin_dir / name).chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    explicit = harness.claude_path({harness.CLAUDE_ENV: "bin/claude"})
+    assert explicit == str(bin_dir / "claude")
+    assert harness.claude_path({"PATH": "bin"}) == str(bin_dir / "claude")
+    assert harness.tool_path("tmux", {"PATH": "bin"}) == str(bin_dir / "tmux")
+    assert harness.tool_path("no-such-tool", {"PATH": "bin"}) is None
 
 
 def test_the_private_root_is_short_and_private() -> None:
@@ -318,19 +407,78 @@ def test_headless_runs_in_the_private_environment_and_charges_the_ledger(
     assert argv.index("--setting-sources") < argv.index("--")  # test flags precede it
 
 
-def test_a_spent_ledger_skips_the_next_run(live_env: harness.LiveEnv, tmp_path: Path) -> None:
+def test_a_spent_ledger_skips_every_billed_path(live_env: harness.LiveEnv, tmp_path: Path) -> None:
     use_fake(live_env, tmp_path, [{"do": "result", "result": "OK"}])
     live_env.ledger.charge(5.0)
     with pytest.raises(pytest.skip.Exception):
         live_env.headless("hi")
+    with pytest.raises(pytest.skip.Exception):
+        live_env.claude_run(["-p", *live_env.budget(), "--", "hi"])
+    with pytest.raises(pytest.skip.Exception):
+        live_env.spawn_headless("hi", out=tmp_path / "o", err=tmp_path / "e")
+    with pytest.raises(pytest.skip.Exception):
+        live_env.spend_gate()
+    assert live_env.spawned == []
+    # A run without credentials costs nothing and is not gated.
+    proc = live_env.claude_run(["--version"], auth=False)
+    assert proc.returncode == 0
 
 
-def test_a_timeout_fails_the_test_and_ends_the_run(
+def test_a_print_run_without_a_budget_is_refused(live_env: harness.LiveEnv) -> None:
+    for argv in (["-p", "--", "hi"], ["--print", "hi"]):
+        with pytest.raises(ValueError, match="max-budget-usd"):
+            live_env.claude_run(argv)
+    assert live_env.ledger.runs == 0
+
+
+def test_a_timeout_fails_the_test_ends_the_run_and_charges_the_estimate(
     live_env: harness.LiveEnv, tmp_path: Path
 ) -> None:
     use_fake(live_env, tmp_path, [{"do": "hang"}])
     with pytest.raises(AssertionError, match="timed out"):
         live_env.headless("hi", timeout=1)
+    assert live_env.ledger.spent_usd == pytest.approx(live_env.run_usd)
+
+
+def test_output_without_a_cost_charges_the_estimate(
+    live_env: harness.LiveEnv, tmp_path: Path
+) -> None:
+    use_fake(live_env, tmp_path, [{"do": "emit", "line": "not json"}])
+    with pytest.raises(ValueError):
+        live_env.headless("hi")
+    assert live_env.ledger.spent_usd == pytest.approx(live_env.run_usd)
+    assert harness.cost_of_output("not json\n") is None
+    assert harness.cost_of_output('{"type": "result"}\n') is None
+    assert harness.cost_of_output('{"type": "result", "total_cost_usd": 0.1}\n') == 0.1
+
+
+def test_a_spawned_run_is_charged_its_reported_cost_at_close(
+    live_env: harness.LiveEnv, tmp_path: Path
+) -> None:
+    use_fake(live_env, tmp_path, [{"do": "result", "result": "OK", "total_cost_usd": 0.125}])
+    run = live_env.spawn_headless("hi", out=tmp_path / "out.jsonl", err=tmp_path / "err.txt")
+    assert harness.wait_for(lambda: run.returncode() is not None, 30)
+    assert run.returncode() == 0 and run.returncode() == 0  # peeking never reaps
+    live_env.close()
+    assert live_env.ledger.spent_usd == pytest.approx(0.125)
+
+
+def test_a_spawned_run_without_a_result_is_killed_with_its_group_and_charged_the_estimate(
+    live_env: harness.LiveEnv, tmp_path: Path
+) -> None:
+    pidfile = tmp_path / "bg.pid"
+    script = tmp_path / "claude"
+    script.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {pidfile}\nwait\n", encoding="utf-8")
+    script.chmod(0o755)
+    live_env.claude = str(script)
+    run = live_env.spawn_headless("hi", out=tmp_path / "out.jsonl", err=tmp_path / "err.txt")
+    assert harness.wait_for(lambda: pidfile.exists() and pidfile.read_text().strip() != "", 10)
+    background = int(pidfile.read_text(encoding="utf-8"))
+    assert os.getpgid(background) == run.pid  # the run leads its own group
+    assert run.returncode() is None
+    live_env.close()
+    assert harness.wait_for(lambda: harness.gone(background), 10)
+    assert live_env.ledger.spent_usd == pytest.approx(live_env.run_usd)
 
 
 # --- tmux --------------------------------------------------------------------------------------
@@ -392,19 +540,41 @@ def test_tmux_kill_stops_the_server_and_its_pane(live_env: harness.LiveEnv, tmux
     pid = tmux.state().pid
     tmux.kill()
     assert not tmux.started
-    assert harness.wait_for(lambda: not Path(f"/proc/{pid}").exists(), 10)
+    assert harness.wait_for(lambda: harness.gone(pid), 10)
 
 
-# --- recorded-PID kill -------------------------------------------------------------------------
+@needs_tmux
+def test_a_failed_start_leaves_no_tmux_server(live_env: harness.LiveEnv, tmux: Tmux) -> None:
+    with pytest.raises(RuntimeError, match="could not start"):
+        tmux.start(["sleep", "300"], cwd=live_env.dir("work"), width=0)
+    assert not tmux.started
+    tmux.kill()
+    probe = subprocess.run(
+        ["tmux", "-f", "/dev/null", "-S", str(live_env.root / "t.sock"), "list-sessions"],
+        env=live_env.env(),
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert probe.returncode != 0
+
+
+# --- recorded-PID signals -----------------------------------------------------------------------
+
+
+def _token(pid: int) -> str:
+    from claude_session import gateway, procinfo
+
+    token = procinfo.ProcInfo(gateway.SystemGateway()).start_time(pid)
+    assert token is not None
+    return token
 
 
 def test_kill_recorded_requires_the_matching_start_token() -> None:
     proc = subprocess.Popen(["sleep", "300"])
     try:
-        from claude_session import gateway, procinfo
-
-        token = procinfo.ProcInfo(gateway.SystemGateway()).start_time(proc.pid)
-        assert token is not None
+        token = _token(proc.pid)
         assert not harness.kill_recorded(proc.pid, None)
         assert not harness.kill_recorded(proc.pid, token + "0")
         assert proc.poll() is None
@@ -414,3 +584,105 @@ def test_kill_recorded_requires_the_matching_start_token() -> None:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+def test_signal_recorded_sends_any_signal_and_a_gone_process_only_stops_the_sending() -> None:
+    proc = subprocess.Popen(["sleep", "300"])
+    try:
+        token = _token(proc.pid)
+        assert harness.signal_recorded(proc.pid, token, signal.SIGTERM)
+        assert proc.wait(10) == -signal.SIGTERM
+        assert not harness.signal_recorded(proc.pid, token, signal.SIGTERM)  # reaped: no error
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_runs_executable_checks_the_program_of_the_exact_process(tmp_path: Path) -> None:
+    sleep = shutil.which("sleep")
+    assert sleep is not None
+    proc = subprocess.Popen([sleep, "300"])
+    script = tmp_path / "prog.py"
+    script.write_text("import time\ntime.sleep(300)\n", encoding="utf-8")
+    interpreted = subprocess.Popen([sys.executable, str(script)])
+    try:
+        assert harness.runs_executable(proc.pid, sleep)
+        assert not harness.runs_executable(proc.pid, "/bin/sh")
+        assert harness.runs_executable(interpreted.pid, str(script))  # a script's interpreter
+    finally:
+        for p in (proc, interpreted):
+            p.kill()
+            p.wait()
+    assert not harness.runs_executable(proc.pid, sleep)  # gone
+
+
+def test_a_hook_records_its_own_pid_and_token_and_teardown_kills_it(
+    live_env: harness.LiveEnv, tmp_path: Path
+) -> None:
+    pids = tmp_path / "pids"
+    command = live_env.pid_record_command("$$", pids)
+    proc = subprocess.Popen(["/bin/sh", "-c", f"{command}; exec sleep 300"], env=live_env.env())
+    try:
+        assert harness.wait_for(lambda: bool(harness.read_pids(pids)), 30)
+        ((pid, token),) = harness.read_pids(pids)
+        assert pid == proc.pid and token == _token(proc.pid)
+        live_env.close()
+        assert proc.wait(10) == -signal.SIGKILL
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_read_pids_skips_bad_lines(tmp_path: Path) -> None:
+    path = tmp_path / "pids"
+    path.write_text("12 boot:34\nnot a pid\n56 \n", encoding="utf-8")
+    assert harness.read_pids(path) == [(12, "boot:34"), (56, None)]
+    assert harness.read_pids(tmp_path / "missing") == []
+
+
+# --- transcripts -------------------------------------------------------------------------------
+
+
+def test_tool_result_text_holds_only_what_tools_returned() -> None:
+    records = [
+        {"type": "user", "message": {"content": "run sh -c 'echo shell-ok'"}},
+        {
+            "type": "assistant",
+            "message": {"id": "m1", "content": [{"type": "tool_use", "id": "t1", "name": "Bash"}]},
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "out-one"},
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t2",
+                        "content": [{"type": "text", "text": "out-two"}, {"type": "image"}],
+                    },
+                ]
+            },
+        },
+    ]
+    text = harness.tool_result_text(records)
+    assert "out-one" in text and "out-two" in text and "shell-ok" not in text
+
+
+def test_tool_uses_are_grouped_by_assistant_message() -> None:
+    def use(message_id: str, tool_id: str) -> dict[str, object]:
+        block = {"type": "tool_use", "id": tool_id, "name": "Read"}
+        return {"type": "assistant", "message": {"id": message_id, "content": [block]}}
+
+    records = [
+        use("m1", "a"),
+        use("m1", "b"),
+        {"type": "user", "message": {"content": "x"}},
+        use("m1", "c"),
+        use("m2", "d"),
+        {"type": "assistant", "message": {"id": "m3", "content": [{"type": "text"}]}},
+    ]
+    grouped = harness.tool_uses_by_message(records)
+    assert [[b["id"] for b in uses] for uses in grouped] == [["a", "b", "c"], ["d"]]

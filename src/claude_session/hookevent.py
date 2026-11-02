@@ -135,9 +135,10 @@ TABLE: dict[str, Rule] = {
     "elicitation": Rule(activity="working", prompt="elicitation", after_session_start=True),
     # A subagent's PostToolUse carries the parent's session id (spike A1/A2), so a background
     # subagent's tool clears a pending permission prompt of the main agent (design.md, State
-    # machine: accepted). The live suite records whether PermissionRequest carries agent_id /
+    # machine: accepted).
+    # TODO(#42): the live suite records whether PermissionRequest carries agent_id /
     # tool_use_id (docs/live-tests.md, #58 item 1); if it does, clear only on the matching
-    # PostToolUse.
+    # PostToolUse. Deferred: needs a human `make live` run to read the observation.
     "post_tool_use": Rule(activity="working", prompt=None, after_session_start=True),
     "stop_background": Rule(activity="working", after_session_start=True),
     # Stop without background tasks, Notification idle_prompt.

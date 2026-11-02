@@ -1,8 +1,9 @@
 """Hook behaviour the injected hooks rely on, probed with recorder commands in `--settings`.
 
 Covers: payload fields and the hook environment, omitted matchers, the `timeout` unit and the
-kill sequence (A10), PostToolUse payloads and `PostToolUseFailure` (#58), subagent
-`PostToolUse` (A2), parallel-tool hook ordering (A7) and the `Stop` payload (#57).
+SIGTERM at the timeout (A10; the SIGKILL escalation is observed), PostToolUse payloads and
+`PostToolUseFailure` (#58), subagent `PostToolUse` (A2), parallel-tool hook ordering (A7) and
+the `Stop` payload (#57).
 """
 
 from __future__ import annotations
@@ -11,7 +12,9 @@ import json
 import os
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -21,10 +24,14 @@ from ..fakeclaude import recorder
 from .harness import (
     LiveEnv,
     events_named,
+    find_transcripts,
     hook_group,
     kill_recorded,
     read_log,
+    read_pids,
     tool_names,
+    tool_uses_by_message,
+    transcript_records,
     wait_for,
 )
 
@@ -68,8 +75,10 @@ def test_hook_payload_environment_cwd_and_shell(live: LiveEnv) -> None:
     stop = by_event["Stop"]["payload"]
     assert stop.get("stop_hook_active") is False
     live.observe("Stop payload keys (no background tasks)", sorted(stop))
-    background = stop.get("background_tasks", [])
-    assert background in ([], None), background
+    # Open question (#57): is `background_tasks` omitted or an empty list without any?
+    live.observe(
+        "Stop background_tasks without background work", stop.get("background_tasks", "omitted")
+    )
     end = by_event.get("SessionEnd")
     live.observe("SessionEnd fires in -p", end is not None)
     if end is not None:
@@ -128,14 +137,23 @@ def test_hook_timeout_is_in_seconds(live: LiveEnv) -> None:
 
 
 @pytest.mark.live
-def test_a_timed_out_hook_gets_sigterm_and_one_that_ignores_it_is_killed(live: LiveEnv) -> None:
-    """A10 and #57: SIGTERM at the timeout, then SIGKILL. The first hook proves the SIGTERM; the
-    second ignores it and must not outlive `claude`."""
-    termed, pidfile = live.root / "termed", live.root / "stubborn.pid"
+def test_a_timed_out_hook_gets_sigterm_and_one_that_ignores_it_is_observed(live: LiveEnv) -> None:
+    """A10 and #57: SIGTERM at the timeout is asserted. Whether Claude Code escalates to SIGKILL
+    for a hook that ignores SIGTERM is an open question, so it is observed. Every process the
+    hooks leave behind records its own PID and start-time token as it starts and is killed by
+    that token only (here, or at teardown)."""
+    termed = live.root / "termed"
+    stubborn, background = live.root / "stubborn.pids", live.root / "background.pids"
+    record_self = live.pid_record_command("$$", stubborn)
+    record_background = live.pid_record_command("$!", background)
     hooks = {
         "SessionStart": [
-            hook_group(f"trap 'touch {termed}; exit 0' TERM; sleep 30 & wait", timeout=2),
-            hook_group(f"trap '' TERM; echo $$ > {pidfile}; while :; do sleep 1; done", timeout=2),
+            hook_group(
+                f"trap 'touch {termed}; kill $! 2>/dev/null; exit 0' TERM; "
+                f"sleep 30 & {record_background}; wait",
+                timeout=2,
+            ),
+            hook_group(f"trap '' TERM; {record_self}; while :; do sleep 1; done", timeout=2),
         ]
     }
     settings = live.write_json("settings.json", {"hooks": hooks})
@@ -144,15 +162,14 @@ def test_a_timed_out_hook_gets_sigterm_and_one_that_ignores_it_is_killed(live: L
     elapsed = time.monotonic() - started
     live.observe("seconds for claude to finish with a SIGTERM-ignoring 2 s hook", round(elapsed, 1))
     assert wait_for(termed.exists, 5), "the hook did not receive SIGTERM at its timeout"
-    pid = int(pidfile.read_text(encoding="utf-8").strip())
-    token = procinfo.ProcInfo(gateway.SystemGateway()).start_time(pid)
-    if token is not None:  # still alive: give a SIGKILL escalation a moment, then clean up
-        gone = wait_for(
-            lambda: procinfo.ProcInfo(gateway.SystemGateway()).start_time(pid) is None, 10
-        )
-        if not gone:
-            kill_recorded(pid, token)
-        assert gone, "a hook that ignores SIGTERM outlived its timeout and claude"
+    info = procinfo.ProcInfo(gateway.SystemGateway())
+    recorded = read_pids(stubborn)
+    assert recorded, "the SIGTERM-ignoring hook did not record itself"
+    ((pid, token),) = recorded
+    gone = wait_for(lambda: token is None or not info.is_alive(pid, token), 10)
+    live.observe("a SIGTERM-ignoring hook is SIGKILLed by claude", gone)
+    if not gone:
+        kill_recorded(pid, token)
 
 
 @pytest.mark.live
@@ -169,25 +186,26 @@ def test_post_tool_use_payload_and_the_event_after_a_failed_tool(live: LiveEnv) 
     work = note(live)
     live.headless(
         "Use the Read tool on ./note.txt. Then use the Read tool on ./missing.txt, which does "
-        "not exist. Then reply DONE.",
+        "not exist. Do not retry a failed call. Then reply DONE.",
         "--allowedTools", "Read", "--settings", settings, cwd=work,
     )  # fmt: skip
     posts = events_named(read_log(post), "PostToolUse")
     failures = events_named(read_log(failure), "PostToolUseFailure")
-    good = [p for p in posts if str(p["tool_input"].get("file_path", "")).endswith("note.txt")]
-    assert len(good) == 1
-    assert "tool_response" in good[0] and isinstance(good[0]["tool_use_id"], str)
-    ids_post = {
-        p["tool_use_id"] for p in posts if str(p["tool_input"]["file_path"]).endswith("missing.txt")
-    }
-    ids_fail = {
-        f["tool_use_id"]
-        for f in failures
-        if str(f["tool_input"]["file_path"]).endswith("missing.txt")
-    }
+
+    def path_of(payload: Mapping[str, Any]) -> str:
+        tool_input = payload.get("tool_input")
+        return str(tool_input.get("file_path", "")) if isinstance(tool_input, dict) else ""
+
+    good = [p for p in posts if path_of(p).endswith("note.txt")]
+    assert len(good) >= 1
+    assert "tool_response" in good[0] and isinstance(good[0].get("tool_use_id"), str)
+    ids_post = {p.get("tool_use_id") for p in posts if path_of(p).endswith("missing.txt")}
+    ids_fail = {f.get("tool_use_id") for f in failures if path_of(f).endswith("missing.txt")}
     live.observe("failed Read fires", "PostToolUseFailure" if ids_fail else "PostToolUse")
     live.observe("PostToolUseFailure payload keys", sorted(failures[0]) if failures else None)
-    assert len(ids_post) + len(ids_fail) == 1, (ids_post, ids_fail)
+    # Each failed call (the model may still retry) fires exactly one of the two events.
+    assert ids_post | ids_fail, "the failed Read fired neither event"
+    assert not ids_post & ids_fail, (ids_post, ids_fail)
 
 
 @pytest.mark.live
@@ -219,24 +237,40 @@ def test_a_subagents_tool_use_fires_post_tool_use_with_the_parents_session_id(
 
 @pytest.mark.live
 def test_parallel_tool_hooks_all_finish_before_the_next_turn_and_stop(live: LiveEnv) -> None:
-    """A7: every PostToolUse of a turn precedes Stop, in completion order."""
+    """A7: every PostToolUse hook of a turn has finished (its "end" record, written after a
+    sleep) before the Stop hook starts. The test is only meaningful when the three Reads were
+    one assistant message (parallel tool calls), which the model may not do: that is observed
+    from the transcript, and the ordering is asserted either way."""
     log = live.root / "order.jsonl"
+    post = (
+        f"{recorder(log, args=['PostToolUse', 'start'], sleep=1.0)} && "
+        f"{recorder(log, args=['PostToolUse', 'end'])}"
+    )
     hooks = {
-        "PostToolUse": [hook_group(recorder(log, args=["PostToolUse"], sleep=0.5))],
-        "Stop": [hook_group(recorder(log, args=["Stop"]))],
+        "PostToolUse": [hook_group(post)],
+        "Stop": [hook_group(recorder(log, args=["Stop", "start"]))],
     }
     settings = str(live.write_json("settings.json", {"hooks": hooks}))
     work = live.dir("work")
     for name in ("a", "b", "c"):
         (work / f"{name}.txt").write_text(name, encoding="utf-8")
-    live.headless(
+    run = live.headless(
         "In ONE message, call the Read tool on ./a.txt, ./b.txt and ./c.txt in parallel. "
         "Then reply DONE.",
         "--allowedTools", "Read", "--settings", settings, cwd=work,
     )  # fmt: skip
-    names = [r["args"][0] for r in read_log(log)]
-    assert names.count("PostToolUse") == 3 and names[-1] == "Stop", names
-    assert names.index("Stop") == len(names) - 1
+    (transcript,) = find_transcripts(live.projects, run.session_id)
+    batches = [
+        [b for b in uses if b.get("name") == "Read"]
+        for uses in tool_uses_by_message(transcript_records(transcript))
+    ]
+    parallel = any(len(batch) >= 3 for batch in batches)
+    live.observe("A7: the three Reads were one assistant message", parallel)
+    marks = [tuple(r["args"][:2]) for r in read_log(log)]
+    assert marks.count(("PostToolUse", "end")) == 3, marks
+    stop = marks.index(("Stop", "start"))
+    ends = [i for i, mark in enumerate(marks) if mark == ("PostToolUse", "end")]
+    assert max(ends) < stop, marks
 
 
 STOP_ONCE = """\

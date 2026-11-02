@@ -5,11 +5,13 @@ The server is isolated three ways: ``-f /dev/null`` (no tmux configuration), ``-
 (a socket inside the test's private root, never the user's default one) and the private
 environment the caller passes (``HOME``/``XDG_*``; ``TMUX`` is not in it). ``remain-on-exit``
 keeps the pane after its command ends, so the exit status is readable. ``kill`` stops only
-this server, by its socket.
+this server, by its socket, also after a failed ``start`` (the server may already be up).
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
 import shutil
 import time
 from collections.abc import Mapping, Sequence
@@ -52,7 +54,7 @@ class Tmux:
         found = tmux or shutil.which("tmux", path=self._env.get("PATH"))
         if found is None:
             raise FileNotFoundError("tmux is not installed")
-        self._tmux = found  # the gateway wants an absolute path
+        self._tmux = os.path.abspath(found)  # the gateway wants an absolute path
         self._gw = gateway.SystemGateway()
         self.started = False
 
@@ -111,7 +113,8 @@ class Tmux:
             time.sleep(interval)
 
     def kill(self) -> None:
-        """Stop this tmux server (identified by its private socket) and what it runs."""
-        if self.started:
+        """Stop this tmux server (identified by its private socket) and what it runs. Always
+        sent, errors ignored: a ``start`` that failed after ``start-server`` leaves a server."""
+        with contextlib.suppress(gateway.GatewayTimeout, OSError):
             self._run("kill-server")
-            self.started = False
+        self.started = False
