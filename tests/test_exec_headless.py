@@ -25,7 +25,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 from claude_session import pathrules
 
-from .conftest import REAL_TMP_ROOT
+from .conftest import REAL_TMP_ROOT, linux_only
 from .fakeclaude import claude_bin, read_jsonl, wait_for, write_json
 from .test_schemas import registry
 
@@ -1062,19 +1062,50 @@ def run_row_of(state: Path, run: int = 1) -> dict[str, Any]:
         db.close()
 
 
+# Whether gone() reads /proc (Linux); elsewhere it probes with signal 0. A test patches it.
+USE_PROC = sys.platform.startswith("linux")
+
+
+def _dead(pid: int) -> bool:
+    """Whether ``pid`` is gone, or (on Linux) a zombie, as in test_fake_claude._dead."""
+    if USE_PROC:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                return fh.read().rpartition(b")")[2].split()[0] == b"Z"
+        except (FileNotFoundError, ProcessLookupError):  # gone before open, or mid-read
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
 def gone(pid: int, timeout: float = 10.0) -> bool:
+    """Wait up to ``timeout`` seconds for ``pid`` to die."""
     import time
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            if "Z" not in Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0]:
-                time.sleep(0.05)
-                continue
-        except OSError:
-            pass
-        return True
+        if _dead(pid):
+            return True
+        time.sleep(0.05)
     return False
+
+
+@pytest.mark.parametrize("use_proc", [False, True] if sys.platform.startswith("linux") else [False])
+def test_gone_is_false_for_a_live_process_and_true_once_it_has_exited(
+    monkeypatch: pytest.MonkeyPatch, use_proc: bool
+) -> None:
+    """Off Linux there is no /proc: gone() must not read a missing /proc file as "gone"."""
+    monkeypatch.setattr(sys.modules[__name__], "USE_PROC", use_proc)
+    proc = subprocess.Popen(["/bin/sleep", "30"])
+    try:
+        assert not gone(proc.pid, timeout=0.3)
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+    assert gone(proc.pid, timeout=5)
 
 
 def test_a_second_signal_is_not_forwarded_and_the_child_is_killed_after_kill_grace(
@@ -1347,6 +1378,7 @@ def ignored_signals(status: Path) -> int:
     return int(line.split()[1], 16)
 
 
+@linux_only  # reads /proc/<pid>/status
 @pytest.mark.parametrize("ignored", [1, 2], ids=["SIGHUP", "SIGINT"])
 def test_a_signal_ignored_when_exec_starts_stays_ignored_and_claude_inherits_it(
     tmp_path: Path, state: Path, work: Path, ignored: int

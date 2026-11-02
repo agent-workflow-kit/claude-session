@@ -952,6 +952,7 @@ Retention: session and private directories of sessions that are not forgotten ar
 
 - Linux, WSL2 and macOS. The sandbox needs `bubblewrap` and `socat` on Linux and WSL2 (`sudo apt install bubblewrap socat`); macOS uses its built-in Seatbelt. WSL1 has no sandbox: kinds with sandbox `required` fail to launch there (`sandbox_unavailable`) unless the user sets `sandbox: preferred`.
 - `sandbox_active` is true when the sandbox mode is not `off` AND its prerequisites were present at launch (Linux/WSL2: `bwrap` and `socat` on `PATH` and user namespaces usable; macOS: `sandbox-exec` present) AND the socket path fits. The sandbox self-check is that test.
+- macOS behavior not yet observed on a Mac (Seatbelt enforcement, `ps` start times, socket path length, `/tmp` resolution) is listed in the [manual macOS checklist](macos-checklist.md).
 - Keep the state directory on the Linux file system under WSL (not under `/mnt/`); `kinds` reports it in `state_dir_warnings`.
 - Claude Code `min_claude_version` (default 2.1.312) or later.
 - An interactive session in a directory Claude Code has never trusted waits at Claude's trust dialog in state `starting`; trust is inherited from a trusted parent directory. The dialog fires no hooks; Esc exits 0 and "No, exit" exits 1, both before `SessionStart` (`exited-unreported`, `no_session_start`).

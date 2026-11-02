@@ -19,6 +19,8 @@ from claude_session import fsutil, sessiondir
 from claude_session.errors import FailedError, UsageError
 from claude_session.sessiondir import DirId, InputFile, SessionDirs
 
+from .conftest import linux_only
+
 SID = "cs-abcd2345"
 OTHER_SID = "cs-wxyz7777"
 CS_PATH = "/opt/claude-session/bin/claude-session"
@@ -849,6 +851,7 @@ def test_a_racing_linker_never_captures_a_run_file(
     assert (sdir(root) / "instructions.md").read_text() == sessiondir.render_instructions(CS_PATH)
 
 
+@linux_only  # /proc as the second file system
 def test_dirs_on_different_devices_are_refused(tmp_path: Path) -> None:
     """R1-1: a rename from the private directory needs both on one file system."""
     if os.stat("/proc").st_dev == os.stat(tmp_path).st_dev:

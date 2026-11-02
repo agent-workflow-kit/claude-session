@@ -52,7 +52,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 - New API-using tests take the `live` fixture, zero-cost ones `cheap`; both come from `tests/live/conftest.py`. Put helpers in `tests/live/harness.py` and unit-test them in `tests/test_live_harness.py`, with the fake claude or `sh`.
 - `LiveEnv.headless(prompt, *flags)` runs a small-model `-p` with `stream-json`, the prompt after `--`. `LiveEnv.claude_run` runs with exactly the given argv (add `*live.budget()` to a `-p` argv). `spawn_headless` and `tmux_driver.Tmux` are for signals and interactive sessions; a new path that starts `claude` must call `spend_gate()` and `charge()`.
 - Probe hooks are `tests/fakeclaude.recorder(log, ...)` commands in a `--settings` file; read them with `harness.read_log` and `harness.events_named`. Read what tools returned with `harness.session_tool_results`, never the whole transcript (it holds the prompt).
-- Sandbox tests use `needs_sandbox` (`test_sandbox.py`); macOS-only checks belong in the manual checklist of #43.
+- Sandbox tests use `needs_sandbox` (`test_sandbox.py`); macOS-only checks belong in the [manual macOS checklist](macos-checklist.md) (#43), which also says what to read from this suite on a Mac.
 - New rows go in the tables below, with an owner when not covered.
 
 ## Coverage
@@ -124,7 +124,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 | Deny-root reads (E1): markers hidden; Bash, interpreters work | `test_sandbox.py::test_deny_root_...`; git: `test_a_denied_git_dir_...`; the network bridge: #42 |
 | Planted project and nested skills (E2) | `test_isolation.py::test_planted_project_...` |
 | A fork with `--cwd` records the transcript path from its SessionStart payload | `test_e2e.py::test_a_respond_like_fork_...`, `test_headless.py::test_resume_keeps_the_id_...` |
-| Manual macOS checklist | #43 |
+| Manual macOS checklist | [macos-checklist.md](macos-checklist.md) (#43) |
 
 ### Not covered, with the owner
 
@@ -142,7 +142,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 | LS under the review profile | none | Not a tool in the Claude Code the design was verified against (design.md, D3); `test_open_items.py::test_search_tools_...` records the `init` tool list, so a later version that adds it shows up in the observations. Nothing asserts on it. |
 | Glob and Grep through the generated review settings end to end | none | Isolated runs refuse `--tools` in `claude_args` (`unsafe_claude_args`), and without it Glob and Grep are not offered, so the product cannot enable them. `test_open_items.py` builds the same permission keys by hand. |
 | Managed settings (#56 (b), #59 item 13) | #42 | Needs a root-owned managed settings file (procedure below). |
-| macOS Seatbelt checks | #43 | Manual checklist (macOS only). |
+| macOS Seatbelt checks, process start time, socket paths | #43 | Manual, macOS only: [macos-checklist.md](macos-checklist.md). |
 
 ### Comments on issue #41
 
