@@ -50,7 +50,8 @@ is applied and audited there.
 The adopting ``exec`` installs its signal handlers before the compare-and-set and defers
 them from just before it (a signal then acts once the run is its own, in the launch phase);
 an interactive run is handed the terminal as plain ``exec`` hands it.
-TODO(#32): ``stop`` canceling a pending run deletes its launch spec too (``discard_spec``).
+``stop`` canceling a pending run deletes its launch spec too (``discard_spec_at``, from
+``stopper``).
 """
 
 from __future__ import annotations
@@ -78,6 +79,7 @@ from . import (
     permission_profiles,
     sessiondir,
     store,
+    taint,
     tmpdir,
     toolhooks,
 )
@@ -93,6 +95,7 @@ from .errors import (
     RefusedError,
     UsageError,
 )
+from .kinds import Mode
 from .sessiondir import InputFile, SessionDirs
 from .signals import ExecSignals
 
@@ -369,6 +372,13 @@ def _texts(value: Any) -> list[str]:
     if not isinstance(value, list):
         raise TypeError("expected a list")
     return [_text(item) for item in value]
+
+
+def _mode(value: Any) -> Mode:
+    text = _text(value)
+    if text == "headless" or text == "interactive":
+        return text
+    raise ValueError("expected a run mode")
 
 
 def _bool(value: Any) -> bool:
@@ -885,7 +895,7 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
         inputs = tuple(InputFile(name=name, data=b"") for name in _texts(data["input_files"]))
         return launch.Request(
             kind=frozen.resolution.kind,
-            mode=launch.parse_mode(_text(data["mode"])),
+            mode=_mode(data["mode"]),
             skill=_optional_text(data["skill"]),
             prompt=b"" if _bool(data["has_prompt"]) else None,
             inputs=inputs,
@@ -901,6 +911,8 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
             outcome_file=record["outcome_file"],
             conversation=_conversation(data["conversation"], record),
             override_escalation=_bool(data.get("override_escalation", False)),
+            # From the run row, never the spec file: the store decides by the row too.
+            allow_tainted=taint.AllowTainted.from_invocation(_invocation(record)),
         )
     except (KeyError, TypeError, ValueError, AttributeError, UsageError) as exc:
         raise sessiondir.SessionDirUnsafe(
@@ -941,6 +953,17 @@ def _check_request(frozen: Frozen, data: Mapping[str, Any], record: Mapping[str,
         raise ValueError("the launch spec's mode is not the run's")
     if frozen.resolution.kind != record["run_kind"]:
         raise ValueError("the launch spec's kind is not the run's")
+    # The taint checks decide by the row's reads_third_party: a spec that launches the run
+    # with another profile would run a trusted profile where the store saw an isolated one.
+    if frozen.resolution.profile.reads_third_party != bool(record["reads_third_party"]):
+        raise ValueError("the launch spec's reads_third_party is not the run's")
+    # The audit records of the run (resume_tainted, sandbox_lowered) name the request's actor
+    # and decision ids: they must be those start recorded on the run row.
+    invocation = _invocation(record)
+    if _text(data["actor"]) != invocation.get("actor"):
+        raise ValueError("the launch spec's actor is not the run's")
+    if _texts(data["decision_ids"]) != invocation.get("decision_ids"):
+        raise ValueError("the launch spec's decision ids are not the run's")
     if _bool(data["has_prompt"]) != bool(record["has_prompt"]):
         raise ValueError("the launch spec's prompt presence is not the run's")
     flags = dict(_mapping(data["flags"]))
@@ -962,9 +985,9 @@ def _check_request(frozen: Frozen, data: Mapping[str, Any], record: Mapping[str,
     if args.override_escalation != (_invocation(record).get("override_escalation") is True):
         raise ValueError("the launch spec's --override-escalation is not the run's")
     if args.override_escalation:
-        from .resume import check_human_only  # resume imports this module
-
-        check_human_only("--override-escalation", args.actor, tty=False)
+        taint.check_frozen_actor("--override-escalation", args.actor)
+    if taint.AllowTainted.from_invocation(_invocation(record)) is not None:
+        taint.check_frozen_actor(taint.FLAG, args.actor)
     args.input_file = _texts(data["input_files"])
     args.prompt_file = SPEC_NAME if data["has_prompt"] else None  # any non-stdin name
     if _mapping(data["conversation"]).get("resume") is True:
@@ -1275,6 +1298,7 @@ def adoption_plan(
         sandbox=sandbox,
         preview=dryrun.plan_preview(cfg, resolution, process, found, writable),
         cwd=found.checked.cwd if found.checked is not None else adoption.frozen.cwd,
+        allow_tainted=req.allow_tainted is not None,
         csession_id=sid,
         run=record["run_no"],
         override_escalation=req.override_escalation,

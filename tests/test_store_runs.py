@@ -187,6 +187,19 @@ def test_start_time_of_a_missing_process_is_empty() -> None:
     assert store.start_time(2**22 + 5) == ""
 
 
+def test_session_labels_are_the_session_s_labels_in_order(st: Store) -> None:
+    sid = st.allocate(new_run(labels=("team=x", "a=1", "team=w")), new_id=ids.new_session_id)
+    other = st.allocate(new_run(labels=("z=9",)), new_id=ids.new_session_id)
+    assert st.session_labels(sid) == [
+        ("a", "1"),
+        ("kind", "implement"),
+        ("team", "w"),
+        ("team", "x"),
+    ]
+    assert st.session_labels(other) == [("kind", "implement"), ("z", "9")]
+    assert st.session_labels("cs-zzzzzzzz") == []
+
+
 # pending_cause and the auto-exit compare-and-set (design.md, Supervision)
 
 
