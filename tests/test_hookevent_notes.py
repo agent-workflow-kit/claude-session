@@ -164,7 +164,8 @@ def test_the_block_follows_the_context_line(env: Env) -> None:
     assert call.executable == EXE
     assert call.cwd == str(env.root)  # the state root
     assert call.env == {"PATH": "/usr/bin:/bin", "HOME": "/home/u"}
-    assert (call.timeout, call.kill_over_bytes, call.new_process_group) == (5.0, 16384, True)
+    assert (call.timeout, call.output_limit, call.new_process_group) == (5.0, 16385, True)
+    assert call.kill_over_bytes is None
     assert log_records(env) == []
 
 
@@ -304,7 +305,6 @@ def test_exit_10_shows_no_block_and_logs_nothing(env: Env, stdout: str) -> None:
     [
         ({"returncode": 3, "stdout": "half\n", "stderr": "secret-ish"}, "exit 3"),
         ({"timeout": True}, "timed out after 5 s"),
-        ({"stdout": "x" * 17}, "output over 16 bytes"),
         ({"error": FileNotFoundError(2, "gone")}, "could not start (FileNotFoundError)"),
     ],
 )
@@ -325,6 +325,17 @@ def test_a_failure_is_logged_at_warn_and_never_blocks(
         1,
     )
     assert record["message"] == message
+
+
+def test_output_over_the_cap_is_truncated_not_omitted(env: Env) -> None:
+    env.add()
+    write_conf(env, notes_conf(max_bytes=16))
+    gw = FakeGateway()
+    gw.on(["memoctl"], stdout="x" * 17)
+    context = context_of(start(env, gw))
+    assert context.endswith(f'\n{"x" * 16}\n[truncated]\n</untrusted id="{nonce_of(context)}">')
+    assert env.state() == ("working", None, "working")
+    assert log_records(env) == []  # not a failure: nothing is logged
 
 
 def test_an_unexpected_error_in_the_notes_run_is_contained(env: Env) -> None:

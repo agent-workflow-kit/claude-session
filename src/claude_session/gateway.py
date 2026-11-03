@@ -26,11 +26,10 @@ Rules every call follows:
   child never consumes the hook payload on ``hook-event``'s stdin.
 - Lifecycle hooks use ``run(..., new_process_group=True, kill_grace=...)``: on timeout the
   group gets SIGTERM, then SIGKILL after ``kill_grace`` (interface.md, Hooks). The notes command
-  uses ``run(..., new_process_group=True, kill_over_bytes=...)`` with no grace (interface.md
-  specifies none): on timeout, or once its stdout passes ``kill_over_bytes`` bytes
-  (``GatewayOutputLimit``), its group gets SIGKILL. Either way a timeout ends everything
-  still in the child's process group; a descendant that calls ``setsid``/``setpgid`` escapes
-  (see ``GatewayTimeout``).
+  uses ``run(..., new_process_group=True, output_limit=...)`` with no grace (interface.md
+  specifies none): on timeout its group gets SIGKILL (output past the cap is read and
+  discarded, not a reason to kill). A timeout ends everything still in the child's process
+  group; a descendant that calls ``setsid``/``setpgid`` escapes (see ``GatewayTimeout``).
 - The ``claude --version`` probe adds ``kill_group_on_exit=True``: its group also gets SIGKILL
   when ``claude`` exits normally (Linux: after the exit, before the leader is reaped, so the
   group ID still names that group), so no descendant outlives the probe. On Linux the leader's

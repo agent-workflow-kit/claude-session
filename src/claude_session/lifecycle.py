@@ -74,6 +74,7 @@ from . import (
     ids,
     kinds,
     launch,
+    notes,
     outcomefile,
     pathrules,
     permission_profiles,
@@ -103,15 +104,19 @@ SPEC_NAME = "launch-spec.json"
 SPEC_VERSION = 1
 SPEC_MAX_BYTES = 8 << 20
 # Config values frozen in the spec (the adopting exec reads the rest from the config again).
-# TODO(#38): decide whether notes_context_cmd, notes_context_max_bytes and
-# notes_context_sources are frozen at start (interface.md lists only the notes timeouts as
-# read again at adoption).
+# The notes-context settings are frozen with the rest of the launch: the command, its timeout,
+# its size cap and its sources are what ``start`` validated (interface.md, Flags at start and
+# adoption).
 FROZEN_CONFIG = (
     "claude_auth_env",
     "secret_env",
     "summary_max_bytes",
     "artifact_max_bytes",
     "input_max_bytes",
+    "notes_context_cmd",
+    "notes_context_timeout",
+    "notes_context_max_bytes",
+    "notes_context_sources",
 )
 NO_TTY_HINT = "place the start argv in a terminal (stdin and stdout must be TTYs)"
 SPEC_KEYS = frozenset(
@@ -846,6 +851,28 @@ def _invocation(record: Mapping[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _notes_values_ok(values: Mapping[str, Any]) -> bool:
+    """The frozen ``notes_context_*`` values, checked as the config checks them: a non-empty
+    argv of strings without control characters, a finite positive timeout, a size cap that is
+    a count and sources the notes code knows."""
+    cmd, timeout = values["notes_context_cmd"], values["notes_context_timeout"]
+    cap, sources = values["notes_context_max_bytes"], values["notes_context_sources"]
+    return (
+        isinstance(cmd, list)
+        and bool(cmd)
+        and all(
+            isinstance(item, str) and not any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in item)
+            for item in cmd
+        )
+        and type(timeout) in (int, float)
+        and 0 < timeout < float("inf")
+        and type(cap) is int
+        and 0 <= cap <= MAX_INTEGER
+        and isinstance(sources, list)
+        and all(isinstance(source, str) and source in notes.SOURCES for source in sources)
+    )
+
+
 def _frozen_config(frozen: Frozen) -> dict[str, Any]:
     """The config values ``start`` froze, checked as the config checks them."""
     values = frozen.config_values
@@ -858,7 +885,12 @@ def _frozen_config(frozen: Frozen) -> dict[str, Any]:
         type(values.get(key)) is int and 1 <= values[key] <= MAX_INTEGER
         for key in ("summary_max_bytes", "artifact_max_bytes", "input_max_bytes")
     )
-    if set(values) != set(FROZEN_CONFIG) or not names_ok or not caps_ok:
+    if (
+        set(values) != set(FROZEN_CONFIG)
+        or not names_ok
+        or not caps_ok
+        or not _notes_values_ok(values)
+    ):
         raise sessiondir.SessionDirUnsafe("the launch spec's config values are unusable")
     return {key: values[key] for key in FROZEN_CONFIG}
 

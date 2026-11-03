@@ -14,11 +14,14 @@ or from any agent-writable file.
 - Environment: complete and minimal (``command_env``): the sanitized ``PATH`` and a few
   identity, locale and XDG variables of ``exec``'s environment, never a credential, a
   ``secret_env`` value or a ``CSESSION_*`` variable.
-- cwd: the state root. Own process group; on timeout, or once stdout passes the size cap, the
-  group gets SIGKILL with no grace.
-- Exit 0 and 10 (nothing to show) are success; any other exit, a timeout, an output over the
-  cap or a command that cannot start is a ``NotesFailure`` (logged at ``warn`` by the hook,
-  never blocking: the session starts without notes).
+- cwd: the state root. Own process group; on timeout the group gets SIGKILL with no grace.
+  Output past the size cap is not a failure: one byte more than the cap is kept (to tell
+  "at the cap" from "over it") and the rest is read and discarded, so memory stays bounded and
+  the timeout bounds an endless writer.
+- Exit 0 and 10 (nothing to show) are success; any other exit, a timeout or a command that
+  cannot start is a ``NotesFailure`` (logged at ``warn`` by the hook, never blocking: the
+  session starts without notes). Output over the cap is cut to the cap, on a character
+  boundary, and shown with the ``[truncated]`` marker.
 - The output is fenced (``fence``): NFKC-normalized, format characters (Unicode category
   ``Cf``: zero-width, soft hyphen, bidi controls) and control characters stripped, line and
   paragraph separators turned into newlines, then every closing-tag look-alike
@@ -247,17 +250,26 @@ def _block(text: str, nonce: str, *, truncated: bool) -> str:
     return f'{HEADER}\n<untrusted source="notes" id="{nonce}">\n{text}</untrusted id="{nonce}">'
 
 
-def fence(output: str, *, max_bytes: int, nonce: str, max_chars: int | None = None) -> str | None:
+def fence(
+    output: str,
+    *,
+    max_bytes: int,
+    nonce: str,
+    max_chars: int | None = None,
+    cut: bool = False,
+) -> str | None:
     """The notes block for ``output``, or None when nothing printable remains. The text is
-    cut to ``max_bytes`` UTF-8 bytes; with ``max_chars``, the whole block is further cut to at
-    most that many characters (UTF-16 code units), or None when not even an empty truncated
-    block fits. Cuts are prefixes of the sanitized text, so they never form a closing tag."""
+    cut to ``max_bytes`` UTF-8 bytes (``cut``: ``output`` is already the prefix of a longer
+    output, so the marker is shown even when the text fits); with ``max_chars``, the whole
+    block is further cut to at most that many characters (UTF-16 code units), or None when
+    not even an empty truncated block fits. Cuts are prefixes of the sanitized text, so they
+    never form a closing tag."""
     text = sanitize(output)
     if not text.strip():
         return None
     data = text.encode("utf-8")
-    truncated = len(data) > max_bytes
-    if truncated:
+    truncated = cut or len(data) > max_bytes
+    if len(data) > max_bytes:
         text = data[:max_bytes].decode("utf-8", "ignore")
     block = _block(text, nonce, truncated=truncated)
     if max_chars is None or utf16_len(block) <= max_chars:
@@ -272,8 +284,9 @@ def fence(output: str, *, max_bytes: int, nonce: str, max_chars: int | None = No
 
 def run(gw: Gateway, conf: NotesConf, *, cwd: str, max_chars: int | None = None) -> str | None:
     """Run the notes command and fence its output (``fence``, with ``max_chars``); None when
-    it has nothing to show. Raises ``NotesFailure``."""
-    from .gateway import GatewayOutputLimit, GatewayTimeout  # lazy: only when notes run
+    it has nothing to show. Output over ``conf.max_bytes`` is truncated, not refused. Raises
+    ``NotesFailure``."""
+    from .gateway import GatewayTimeout  # lazy: only when notes run
 
     try:
         result = gw.run(
@@ -283,16 +296,21 @@ def run(gw: Gateway, conf: NotesConf, *, cwd: str, max_chars: int | None = None)
             cwd=cwd,
             timeout=conf.timeout,
             new_process_group=True,
-            kill_over_bytes=conf.max_bytes,
+            output_limit=conf.max_bytes + 1,
         )
     except GatewayTimeout:
         raise NotesFailure(f"timed out after {conf.timeout:g} s") from None
-    except GatewayOutputLimit:
-        raise NotesFailure(f"output over {conf.max_bytes} bytes") from None
     except OSError as exc:
         raise NotesFailure(f"could not start ({type(exc).__name__})") from None
     if result.returncode == NO_NOTES_EXIT:
         return None
     if result.returncode != 0:
         raise NotesFailure(f"exit {result.returncode}")
-    return fence(result.stdout, max_bytes=conf.max_bytes, nonce=new_nonce(), max_chars=max_chars)
+    output, over = result.stdout, False
+    data = output.encode("utf-8")
+    if len(data) > conf.max_bytes:
+        # More than the cap was written (the gateway kept one byte past it). Cut to the cap
+        # on a character boundary: a character split by the cut, or by the gateway's own cut
+        # (decoded as U+FFFD), is dropped, never shown half.
+        output, over = data[: conf.max_bytes].decode("utf-8", "ignore"), True
+    return fence(output, max_bytes=conf.max_bytes, nonce=new_nonce(), max_chars=max_chars, cut=over)
