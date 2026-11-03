@@ -20,6 +20,16 @@ from tests.conftest import _Started, _stat  # pyright: ignore[reportPrivateUsage
 linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc")
 
 
+class _Item:
+    """A test item stand-in for ``conftest.watchdog_seconds``."""
+
+    def __init__(self, *markers: str) -> None:
+        self._markers = markers
+
+    def get_closest_marker(self, name: str) -> object | None:
+        return name if name in self._markers else None
+
+
 def _alive(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat", "rb") as fh:
@@ -102,7 +112,8 @@ def test_the_tracking_popen_is_restored_when_the_setup_fails(
         raise RuntimeError("no thread")
 
     monkeypatch.setattr(conftest.threading, "Thread", failing)
-    guard = conftest.no_leftover_processes.__wrapped__(tmp_path_factory)  # pyright: ignore[reportAttributeAccessIssue]
+    request = SimpleNamespace(node=_Item())
+    guard = conftest.no_leftover_processes.__wrapped__(request, tmp_path_factory)  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(RuntimeError):
         next(guard)
     assert subprocess.Popen is real
@@ -142,6 +153,18 @@ def test_the_watchdog_kills_a_hung_test_s_processes_through_their_pidfds(
     result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
     result.assert_outcomes(passed=1, errors=1)
     result.stdout.fnmatch_lines(["*watchdog fired*"])
+
+
+def test_a_live_test_gets_the_live_watchdog_and_every_other_test_the_short_one() -> None:
+    assert conftest.watchdog_seconds(_Item()) == conftest.WATCHDOG_SECONDS
+    assert conftest.watchdog_seconds(_Item("slow")) == conftest.WATCHDOG_SECONDS
+    assert conftest.watchdog_seconds(_Item("live")) == conftest.LIVE_WATCHDOG_SECONDS
+    # Longer than the longest single live step (an end-to-end run's 900 s timeout).
+    assert conftest.LIVE_WATCHDOG_SECONDS > 900 > conftest.WATCHDOG_SECONDS
+
+
+def test_this_test_runs_under_the_short_watchdog(request: pytest.FixtureRequest) -> None:
+    assert conftest.watchdog_seconds(request.node) == conftest.WATCHDOG_SECONDS
 
 
 def test_a_pidfd_is_available_on_x86_64_and_aarch64_linux() -> None:
