@@ -170,6 +170,7 @@ def _no_nul(value: str) -> str:
     """No NUL character (a hook ``cmd``: it becomes an ``sh -c`` argument)."""
     if "\x00" in value:
         raise ValueError("must not contain a NUL character")
+    return value
 
 
 def _no_control_items(value: list[str]) -> list[str]:

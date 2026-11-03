@@ -715,7 +715,7 @@ def _exchange(
                 chunk = os.read(key.fd, _READ_SIZE)
                 if chunk:
                     if kill_over_bytes is not None:
-                        if key.fd == out_fd and kept[out_fd] + len(chunk) > kill_over_bytes:
+                        if key.fd == out_fd and kept[key.fd] + len(chunk) > kill_over_bytes:
                             raise _OutputLimit
                         chunk = chunk[: max(0, kill_over_bytes - kept[key.fd])]
                         kept[key.fd] += len(chunk)
