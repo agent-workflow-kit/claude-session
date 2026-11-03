@@ -2308,7 +2308,7 @@ def run(
                 st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
                 # TODO(#31): insert step 6 (pre-launch hooks) before this re-check.
                 recheck_fork_taint(st, alloc, resolution)
-                prepared = prepare(st, cfg, req, resolution, alloc, v, process, staged=staged)
+                prepared = prepare(st, cfg, req, resolution, alloc, v, process)
                 st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
                 signals.defer()  # the supervisor raises a signal from here before the spawn
             except LaunchValidationError as error:
