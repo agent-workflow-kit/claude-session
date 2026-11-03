@@ -273,7 +273,7 @@ def _print_plan(plan: dict[str, Any], message: str | None) -> None:
         lines.append("result: a launch would pass the launch validations")
     lines += [f"warning: {w}" for w in plan["warnings"] if not w.startswith("a launch would fail")]
     for line in lines:
-        print(sanitize(line))
+        print(display(line))
 
 
 def _kinds(args: argparse.Namespace) -> int:
@@ -306,7 +306,7 @@ def _kinds(args: argparse.Namespace) -> int:
         lines += [f"  warning: {w}" for w in profile["warnings"]]
     lines += [f"warning: {w}" for w in [*report["state_dir_warnings"], *report["warnings"]]]
     for line in lines:
-        print(sanitize(line))
+        print(display(line))
     return 0
 
 
