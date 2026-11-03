@@ -363,7 +363,7 @@ def _wait(args: argparse.Namespace) -> int:
             f"{output['csession_id']} run {output['run']}: timed out, still {output['state']}"
             f" (exit {waiter.TIMED_OUT})"
         )
-        print(f"{PROG}: {sanitize(line)}", file=sys.stderr)
+        print(f"{PROG}: {display(line)}", file=sys.stderr)
     else:
         _print_outcome(output, False)
     return waited.exit_code
