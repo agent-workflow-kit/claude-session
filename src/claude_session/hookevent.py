@@ -28,8 +28,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, BinaryIO
 
+from . import fsutil, outbox, secretindex
 from . import notes as notes_command  # "notes" is hookconf_bytes's keyword
-from . import outbox, secretindex
 from .notes import NotesConf
 from .store import BUSY_TIMEOUT, HookRun, Store, db_path
 
@@ -245,6 +245,8 @@ def parse_argv(argv: list[str]) -> tuple[str, str, int | None]:
     state_dir, event = argv[1], argv[2]
     if not os.path.isabs(state_dir) or "\0" in state_dir:
         raise HookEventError("--state-dir must be an absolute path")
+    if not fsutil.is_utf8(state_dir):  # launches never create such a state root
+        raise HookEventError("--state-dir is not valid UTF-8")
     if event not in EVENTS:
         raise HookEventError("unknown hook event")
     return state_dir, event, run

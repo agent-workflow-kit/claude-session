@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NoReturn
 
-from . import durations, ids, outbox, outcomefile, store
+from . import durations, fsutil, ids, outbox, outcomefile, store
 from .defaults import MAX_INTEGER
 from .errors import (
     CliError,
@@ -1444,11 +1444,51 @@ def check_schema(argv: Sequence[str]) -> None:
         store.open_state().close()
 
 
+def _value_options() -> frozenset[str]:
+    """Every option string, of every command, that takes a value."""
+    parser = build_parser()
+    return frozenset(
+        option
+        for each in (parser, *parser.leaves.values())
+        for action in each._actions
+        if action.nargs != 0
+        for option in action.option_strings
+    )
+
+
+def _argv_flag_label(argv: Sequence[str], index: int) -> str | None:
+    """The option whose value ``argv[index]`` is: only a known value-taking option string
+    (``--flag value`` or ``--flag=value``), never a token after a ``--`` separator, never a
+    ``--flag=value`` neighbour, so no other argv text is echoed."""
+    if "--" in argv[:index]:
+        return None
+    token = argv[index]
+    if token.startswith("--") and "=" in token:
+        name = token.partition("=")[0]
+        return name if fsutil.is_utf8(name) and name in _value_options() else None
+    previous = argv[index - 1] if index > 0 else None
+    return previous if previous is not None and previous in _value_options() else None
+
+
+def check_argv_utf8(argv: Sequence[str]) -> None:
+    """Refuse an argv token that is not valid UTF-8 (``UsageError``, exit 2), before the
+    schema check or anything else reads or writes. Every argv value is stored, logged, put
+    in JSON or echoed in an error, and none of those can carry such bytes. The message names
+    the token's position and, for a flag's value, the flag, never the value."""
+    for index, token in enumerate(argv):
+        if fsutil.is_utf8(token):
+            continue
+        flag = _argv_flag_label(argv, index)
+        where = f"argument {index + 1}" + (f" ({flag})" if flag else "")
+        raise UsageError(f"{where} is not valid UTF-8")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args: argparse.Namespace | None = None
     schema_checked = False
     try:
+        check_argv_utf8(argv)
         check_schema(argv)
         schema_checked = True
         args = parse(build_parser(), argv)
@@ -1519,6 +1559,8 @@ def _write_error_outcome_file(
     """Write ``error``'s envelope to the ``--outcome-file`` given, if any."""
     path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
     if not path:
+        return
+    if not fsutil.is_utf8(path):  # a refused undecodable argv: no file at such a path
         return
     try:
         writable = _envelope_writable(args, argv, store.state_dir())

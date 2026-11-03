@@ -633,15 +633,17 @@ def test_json_output_never_carries_a_lone_surrogate(
 def test_json_error_envelope_never_carries_a_lone_surrogate(
     seeded: Store, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # An argv byte that is not UTF-8 arrives surrogate-escaped.
+    # An argv byte that is not UTF-8 arrives surrogate-escaped; since #72 it is refused at
+    # the door (usage error, exit 2), and the refusal names its position, never the value.
     text = b"cs-aaaa\xff".decode("utf-8", errors="surrogateescape")
-    assert main(["status", text, "--json"]) == 10
+    assert main(["status", text, "--json"]) == 2
     captured = capsys.readouterr()
     envelope = json.loads(captured.out)
     validate(envelope, ERROR_SCHEMA)
-    assert envelope["error"]["message"] == "unknown session: cs-aaaa\ufffd"
+    assert envelope["error"]["code"] == "usage"
+    assert "\udcff" not in captured.out + captured.err
+    captured.out.encode("utf-8")
     captured.err.encode("utf-8")
-    assert "cs-aaaa\\udcff" in captured.err
 
 
 def test_json_stays_valid_for_bytes_that_are_not_utf8(
