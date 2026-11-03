@@ -234,11 +234,9 @@ class Crontab:
                 return candidate
         raise FailedError("the crontab command was not found on PATH")
 
-    def _run(self, *args: str, stdin: str | None = None, raw: bool = False) -> Any:
+    def _run(self, *args: str, stdin: str | None = None) -> Any:
         try:
-            return self.gateway.run(
-                [self.program, *args], stdin=stdin, timeout=CRONTAB_TIMEOUT, keep_raw_stdout=raw
-            )
+            return self.gateway.run([self.program, *args], stdin=stdin, timeout=CRONTAB_TIMEOUT)
         except GatewayTimeout:
             raise FailedError(f"crontab {' '.join(args)} timed out") from None
         except OSError as exc:
@@ -246,14 +244,14 @@ class Crontab:
 
     def read(self) -> str:
         """The current crontab text ('' when the user has none)."""
-        result = self._run("-l", raw=True)
+        result = self._run("-l")
         if result.returncode != 0:
             if "no crontab" in result.stderr.lower():
                 return ""
             raise FailedError(
                 f"crontab -l failed (exit {result.returncode})", detail=_clean(result.stderr)
             )
-        raw = result.raw_stdout
+        raw = result.stdout_bytes
         if not isinstance(raw, bytes):  # never read as empty: that would overwrite it
             raise FailedError("crontab -l output was not captured")
         try:

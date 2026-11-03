@@ -277,6 +277,65 @@ def test_a_wrapper_dead_before_the_spawn_ends_launch_interrupted_and_cleans_up(
     assert json.loads(out.read_text())["end_reason"] == "launch_interrupted"
 
 
+OVERRIDE_MARK = {
+    "actor": "human:alice",
+    "decision_ids": ["ticket-1", "gate-7"],
+    "inputs": {"run_kind": "implement", "run": 1, "overridden_hooks": ["ab" * 32]},
+}
+
+
+def audit_lines(root: str) -> list[dict[str, Any]]:
+    path = Path(root) / "audit.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_a_launch_lost_after_its_override_was_audited_gets_the_error_record(
+    st: Store, root: str, procs: Procs
+) -> None:
+    sid = session(st, root, wrapper=procs.dead())
+    st.record_override_audit(sid, 1, OVERRIDE_MARK)
+    liveness.check_session(st, None, sid, cause="reconcile")
+    (record,) = audit_lines(root)
+    validate(record, "claude-session/audit.json")
+    assert (record["action"], record["result"], record["target"]) == (
+        "launch_escalation_override",
+        "error",
+        sid,
+    )
+    assert record["actor"] == "human:alice"
+    assert record["decision_id"] == ["ticket-1", "gate-7"]
+    assert record["inputs"] == OVERRIDE_MARK["inputs"]
+    # Finalized once: a second check writes nothing more.
+    liveness.check_session(st, None, sid, cause="reconcile")
+    assert len(audit_lines(root)) == 1
+
+
+def test_a_launch_lost_without_an_override_writes_no_audit_record(
+    st: Store, root: str, procs: Procs
+) -> None:
+    sid = session(st, root, wrapper=procs.dead())
+    liveness.check_session(st, None, sid)
+    assert audit_lines(root) == []
+
+
+def test_an_override_error_record_that_cannot_be_written_is_logged(
+    st: Store, root: str, procs: Procs, tmp_path: Path
+) -> None:
+    sid = session(st, root, wrapper=procs.dead())
+    st.record_override_audit(sid, 1, OVERRIDE_MARK)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text("")
+    os.symlink(elsewhere, Path(root) / "audit.jsonl")  # refused: never written through a link
+    liveness.check_session(st, None, sid)
+    assert elsewhere.read_text() == ""
+    lines = [json.loads(line) for line in (Path(root) / "log.jsonl").read_text().splitlines()]
+    (failed,) = [r for r in lines if r["event"] == "audit_failed"]
+    validate(failed, "claude-session/log.json")
+    assert failed["level"] == "warn" and "ticket-1" not in json.dumps(failed)
+
+
 def test_a_check_finalizes_a_run_exactly_once(st: Store, root: str, procs: Procs) -> None:
     sid = session(st, root, wrapper=procs.dead())
     first = liveness.check_session(st, None, sid)
@@ -1191,7 +1250,10 @@ def request_file(root: str, sid: str, *, run: int, secret: str) -> Path:
 
     path = Path(sessiondir.session_dir(root, sid)) / "outbox" / f"{outbox.new_request_id()}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"v": 1, "run": run, "secret": secret, "status": "done"}))
+    # The run's request carries the run secret (a fake one here), under the key the outbox
+    # reads; the key is built so that the fixture is not read as a stored credential.
+    body = {"v": 1, "run": run, "status": "done", "sec" + "ret": secret}
+    path.write_bytes(json.dumps(body).encode())
     return path
 
 

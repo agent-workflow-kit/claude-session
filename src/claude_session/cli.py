@@ -20,9 +20,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NoReturn
 
-from . import durations, ids, outbox, outcomefile, store
+from . import durations, fsutil, ids, outbox, outcomefile, store
 from .defaults import MAX_INTEGER
-from .errors import CliError, InternalError, OutcomeFileRejected, RefusedError, UsageError
+from .errors import (
+    CliError,
+    InternalError,
+    NotFoundError,
+    OutcomeFileRejected,
+    RefusedError,
+    UsageError,
+)
+from .terminal import display
 
 if TYPE_CHECKING:
     import threading
@@ -85,6 +93,13 @@ SESSION_ID_ARGS: dict[str, str | None] = {
     "forked_from": "--forked-from",
 }
 KIND_ARGS = ("kind", "launch_kind", "run_kind")
+# interface.md, Exit codes: a verify-secret mismatch (any reason).
+VERIFY_SECRET_MISMATCH = 11
+# Every verify-secret usage error: the arguments are never named (one may be a secret).
+VERIFY_SECRET_USAGE = (
+    "unexpected arguments (verify-secret takes only <full id> and --json; "
+    "the secret is read from stdin)"
+)
 # argparse takes a token like this as an option value, not as an option.
 NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
 
@@ -94,10 +109,13 @@ class _Parser(argparse.ArgumentParser):
 
     # Leaf command name -> its parser (set on the top-level parser only).
     leaves: dict[str, _Parser]
+    # When set, replaces every usage error message: for a command whose argv must never be
+    # echoed (verify-secret: a secret given there by mistake).
+    fixed_error: str | None = None
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
-        raise UsageError(message)
+        raise UsageError(self.fixed_error or message)
 
 
 class _VersionAction(argparse.Action):
@@ -129,18 +147,124 @@ def _not_implemented(args: argparse.Namespace) -> int:
     raise InternalError(f"{args.handler} is not implemented yet", detail="not_implemented")
 
 
-def _list(args: argparse.Namespace) -> int:
+def _status(args: argparse.Namespace) -> int:
+    """``status <id> [--run n]`` (interface.md, status)."""
+    from . import views
+
     with store.open_state() as state:
-        sessions = state.list_sessions()
-    if sessions:
-        # TODO(#16): list items (current run, labels, liveness) and the list filters.
-        raise InternalError(
-            "list of existing sessions is not implemented yet", detail="not_implemented"
+        obj = views.status_object(state, args.id, args.run)
+    if args.json:
+        print(json.dumps(obj, allow_nan=False))
+    else:
+        print("\n".join(views.status_lines(obj)))
+    return 0
+
+
+def _list(args: argparse.Namespace) -> int:
+    """``list`` with its filters (interface.md, list)."""
+    from . import views
+
+    with store.open_state() as state:
+        forked_from = None
+        if args.forked_from is not None:
+            forked_from = ids.lookup_session_id(args.forked_from, state.session_id_candidates)
+        flt = views.ListFilter(
+            labels=tuple(ids.parse_label(text) for text in args.label or []),
+            states=tuple(args.state or ()),
+            kind=args.kind,
+            launch_kind=args.launch_kind,
+            run_kind=args.run_kind,
+            mode=args.mode,
+            needs_input=args.needs_input,
+            pending=args.pending,
+            repo=args.repo,
+            since=None if args.since is None else since_threshold(args.since),
+            limit=args.limit,
+            forked_from=forked_from,
+            report_statuses=tuple(
+                None if status == "none" else status for status in args.report_status or ()
+            ),
+            live=args.live,
+            tainted=args.tainted,
+        )
+        items = views.list_items(state, flt)
+    if args.json:
+        print(json.dumps({"sessions": items}, allow_nan=False))
+    else:
+        print("\n".join(views.list_lines(items)))
+    return 0
+
+
+def _label(args: argparse.Namespace) -> int:
+    """``label add`` / ``label remove`` (interface.md, label add / label remove)."""
+    add = args.handler == "label add"
+    pairs = [ids.parse_label(text) for text in args.pairs]  # checked by the flag rules
+    with store.open_state() as st:
+        sid = ids.lookup_session_id(args.id, st.session_id_candidates)
+        change = st.change_labels(sid, pairs, add=add, dry_run=args.dry_run)
+    if change is None:  # forgotten (or deleted) since the id was resolved
+        raise NotFoundError(f"unknown session: {args.id}")
+    obj = {
+        "csession_id": sid,
+        "labels": [f"{key}={value}" for key, value in change.labels],
+        "added": [f"{key}={value}" for key, value in change.added],
+        "removed": [f"{key}={value}" for key, value in change.removed],
+        "dry_run": bool(args.dry_run),
+    }
+    if args.json:
+        print(json.dumps(obj))
+        return 0
+    action, done_key = ("add", "added") if add else ("remove", "removed")
+    changed = obj[done_key]
+    done = f"{done_key} {', '.join(changed)}" if changed else f"nothing to {action}"
+    prefix = "dry run: " if args.dry_run else ""
+    print(display(f"{sid}: {prefix}{done}"))
+    print(display(f"labels: {', '.join(obj['labels']) or '(none)'}"))
+    return 0
+
+
+def _verify_secret(args: argparse.Namespace) -> int:
+    """``verify-secret <full id>`` (interface.md, Internal commands): exit 0 on a match, 11
+    otherwise. The secret is read from stdin before the lookup, whatever the id; a terminal
+    on stdin is refused unread (the secret would be echoed), whatever the id."""
+    from . import secretcheck
+
+    if _is_terminal(sys.stdin.buffer):
+        raise UsageError("verify-secret reads the secret from a pipe; stdin is a terminal")
+    presented = secretcheck.read_secret(sys.stdin.buffer)
+    with store.open_state() as st:
+        match = secretcheck.matches(st, args.id, presented)
+    if args.json:
+        print(json.dumps({"match": match}))
+    return 0 if match else VERIFY_SECRET_MISMATCH
+
+
+def _is_terminal(stream: Any) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (OSError, ValueError):
+        return False
+
+
+def _export(args: argparse.Namespace) -> int:
+    """``export`` (interface.md, export): audit records, oldest first, filtered."""
+    from . import exporter
+
+    path = os.path.join(store.state_dir(), exporter.AUDIT_NAME)
+    since = None if args.since is None else since_threshold(args.since)
+    read = exporter.read_records(path, since=since, actions=frozenset(args.action or ()))
+    records = read.records
+    if read.skipped and not args.quiet:
+        lines = "line" if read.skipped == 1 else "lines"
+        print(
+            f"{PROG}: warning: skipped {read.skipped} unreadable {lines} in {exporter.AUDIT_NAME}",
+            file=sys.stderr,
         )
     if args.json:
-        print(json.dumps({"sessions": []}))
+        print(json.dumps([exporter.json_record(r) for r in records], allow_nan=False))
     else:
-        print("No sessions.")
+        for record in records:
+            print(exporter.encodable(exporter.record_line(record), sys.stdout.encoding))
     return 0
 
 
@@ -275,7 +399,7 @@ def _cron_report(args: argparse.Namespace, result: dict[str, Any]) -> int:
     print(f"crontab block {result['action']}" + (" (dry run)" if result["dry_run"] else ""))
     if result["block"] is not None:
         for line in result["block"].split("\n"):
-            print(sanitize(line))
+            print(display(line))
     return 0
 
 
@@ -327,18 +451,99 @@ def _reconcile(args: argparse.Namespace) -> int:
             line += f" -> {change['outcome']} ({change['end_reason']})"
         if change["detail"]:
             line += f"; {change['detail']}"
-        print(sanitize(line))
+        print(display(line))
     for orphan in result["orphans"]:
         print(
-            sanitize(
+            display(
                 f"{orphan['csession_id']} run {orphan['run']}: orphaned child"
                 f" {orphan['child_pid']} (wrapper gone; end it with stop)"
             )
         )
     for warning in result["warnings"]:
-        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
     if not (result["changes"] or result["orphans"] or result["already_running"]):
         print("nothing to repair")
+    return 0
+
+
+def _stop(args: argparse.Namespace) -> int:
+    """``stop <id> [--grace d] [--dry-run]`` (interface.md, stop): 0 when the run ended (or
+    was already final, or was canceled), 12 when it is still live after the wait."""
+    from . import launch, stopper
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    grace = None if args.grace is None else durations.parse(args.grace)
+    with store.open_state() as st:
+        stopped = stopper.Stop(
+            st,
+            cfg,
+            grace=grace,
+            actor=launch.default_actor(args.actor, cfg),
+            decision_ids=args.decision_id or [],
+            gateway=SystemGateway(),
+            environ=os.environ,
+        ).run(args.id, dry_run=args.dry_run)
+    output = stopped.as_json()
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False, allow_nan=False))
+        return stopped.exit_code
+    line = f"{output['csession_id']} run {output['run']}: "
+    if output["dry_run"]:
+        line += "dry run: "
+    if output["already_final"]:
+        line += "already final, "
+    elif output["canceled"]:
+        line += "canceled, "
+    for sent in output["signals"]:
+        line += f"{sent['signal']} to {sent['role']} {sent['pid']}, "
+    if output["ended"]:
+        line += f"{output['outcome']} ({output['end_reason']}), exit {output['run_exit_code']}"
+    else:
+        line += f"still {output['state']}"
+    print(display(line))
+    return stopped.exit_code
+
+
+def _forget(args: argparse.Namespace) -> int:
+    """``forget <id>`` and ``forget --older-than`` (interface.md, forget): hide sessions;
+    ``reconcile`` deletes them ``retention_days`` later."""
+    from . import forgetting, launch
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    actor = launch.default_actor(args.actor, cfg)
+    common: dict[str, Any] = {
+        "gateway": SystemGateway(),
+        "environ": os.environ,
+        "actor": actor,
+        "decision_ids": args.decision_id or [],
+        "dry_run": args.dry_run,
+    }
+    with store.open_state() as st:
+        if args.id is not None:
+            sid = ids.lookup_session_id(args.id, st.session_id_candidates)
+            result = forgetting.forget_session(st, cfg, sid, **common)
+        else:
+            result = forgetting.forget_older_than(
+                st,
+                cfg,
+                durations.parse(args.older_than),
+                states=args.state or [],
+                kind=args.kind,
+                labels=[ids.parse_label(text) for text in args.label or []],
+                **common,
+            )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+        return 0
+    verb = "would forget" if result["dry_run"] else "forgot"
+    for item in result["forgotten"]:
+        print(f"{verb} {item['csession_id']} (deleted after {item['delete_after']})")
+    for item in result["skipped"]:
+        print(f"skipped {item['csession_id']}: {item['reason']}")
+    if not (result["forgotten"] or result["skipped"]):
+        print("nothing to forget")
     return 0
 
 
@@ -400,7 +605,7 @@ def _wait(args: argparse.Namespace) -> int:
             f"{output['csession_id']} run {output['run']}: timed out, still {output['state']}"
             f" (exit {waiter.TIMED_OUT})"
         )
-        print(f"{PROG}: {sanitize(line)}", file=sys.stderr)
+        print(f"{PROG}: {display(line)}", file=sys.stderr)
     else:
         _print_outcome(output, False)
     return waited.exit_code
@@ -549,7 +754,7 @@ def _print_plan(plan: dict[str, Any], message: str | None) -> None:
         lines.append("result: a launch would pass the launch validations")
     lines += [f"warning: {w}" for w in plan["warnings"] if not w.startswith("a launch would fail")]
     for line in lines:
-        print(sanitize(line))
+        print(display(line))
 
 
 def _kinds(args: argparse.Namespace) -> int:
@@ -582,7 +787,7 @@ def _kinds(args: argparse.Namespace) -> int:
         lines += [f"  warning: {w}" for w in profile["warnings"]]
     lines += [f"warning: {w}" for w in [*report["state_dir_warnings"], *report["warnings"]]]
     for line in lines:
-        print(sanitize(line))
+        print(display(line))
     return 0
 
 
@@ -664,9 +869,47 @@ def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
     )
     if outcome["message"]:
         line += f": {outcome['message']}"
-    print(f"{PROG}: {sanitize(line)}", file=sys.stderr)
+    print(f"{PROG}: {display(line)}", file=sys.stderr)
     for warning in outcome["warnings"]:
-        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
+
+
+def _transcript(args: argparse.Namespace) -> int:
+    """``transcript <id>`` (interface.md, transcript): rendered text by default, ``--raw``
+    bytes, ``--paths`` or ``--json`` file lists. state.db is closed before any file is read."""
+    from . import transcripts
+
+    with store.open_state() as state:
+        sid = ids.lookup_session_id(args.id, state.session_id_candidates)
+        record = state.status_record(sid)
+    if record is None or record.session.get("forgotten_at") is not None:
+        raise NotFoundError(f"unknown session: {args.id}")
+    if args.run is not None and not 1 <= args.run <= record.runs:
+        raise NotFoundError(f"session {sid} has no run {args.run}")
+    reader = transcripts.Reader()
+    warnings: list[str] = []
+    roots = transcripts.projects_roots(os.environ, warnings)
+    listing = transcripts.discover(sid, record.claude_ids, roots, reader, run_no=args.run)
+    warnings += listing.warnings
+    if args.json:
+        print(json.dumps(listing.as_json(), allow_nan=False))
+    elif args.paths:
+        warnings += transcripts.missing_warnings(listing, subagents=True)
+        for line in transcripts.path_lines(listing):
+            print(line)
+    elif args.raw:
+        warnings += transcripts.missing_warnings(listing, subagents=args.subagents)
+        sys.stdout.flush()
+        transcripts.write_raw(listing, reader, sys.stdout.buffer, subagents=args.subagents)
+        sys.stdout.buffer.flush()
+    else:
+        renderer = transcripts.Renderer(reader, subagents=args.subagents)
+        for line in renderer.lines(listing):
+            print(line)
+        warnings += renderer.warnings
+    for warning in warnings:
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
+    return 0
 
 
 # Command name (as typed, nested commands joined by a space) -> handler.
@@ -674,21 +917,21 @@ HANDLERS: dict[str, Handler] = {
     "exec": _exec,
     "start": _start,
     "resume": _resume,
-    "stop": _not_implemented,
+    "stop": _stop,
     "wait": _wait,
     "report": _report,
-    "status": _not_implemented,
+    "status": _status,
     "list": _list,
     "kinds": _kinds,
-    "label add": _not_implemented,
-    "label remove": _not_implemented,
-    "transcript": _not_implemented,
-    "forget": _not_implemented,
+    "label add": _label,
+    "label remove": _label,
+    "transcript": _transcript,
+    "forget": _forget,
     "reconcile": _reconcile,
-    "export": _not_implemented,
+    "export": _export,
     "cron install": _cron_install,
     "cron uninstall": _cron_uninstall,
-    "verify-secret": _not_implemented,
+    "verify-secret": _verify_secret,
 }
 
 
@@ -714,11 +957,16 @@ def _command(
     handler: str,
     help_text: str | None,
 ) -> _Parser:
-    """Add a leaf command; ``help_text=None`` keeps it out of ``--help`` (internal commands)."""
-    kwargs: dict[str, Any] = {"parents": [_global_flags()], "allow_abbrev": False}
+    """Add a leaf command; ``help_text=None`` keeps it out of ``--help`` and leaves out the
+    global flags (internal commands take only their documented argv)."""
+    kwargs: dict[str, Any] = {"allow_abbrev": False}
+    if help_text is not None:
+        kwargs["parents"] = [_global_flags()]
     if help_text is not None:
         kwargs["help"] = help_text
     parser = subparsers.add_parser(name, **kwargs)
+    if help_text is None:  # the global flags' values, for the code paths that read them
+        parser.set_defaults(json=False, config=None, verbose=False, quiet=False, yes=False)
     parser.set_defaults(handler=handler)
     leaves[handler] = parser
     return parser
@@ -875,6 +1123,8 @@ def build_parser() -> _Parser:
     # Internal: run by agent-spawn, not listed in --help.
     p = _command(commands, leaves, "verify-secret", "verify-secret", None)
     p.add_argument("id")
+    p.add_argument("--json", action="store_true")
+    p.fixed_error = VERIFY_SECRET_USAGE
     return parser
 
 
@@ -882,8 +1132,13 @@ def parse(parser: _Parser, argv: Sequence[str]) -> argparse.Namespace:
     """Parse ``argv``; leftover arguments are reported with the chosen command's usage."""
     args, extras = parser.parse_known_args(argv)
     if extras and args.handler in ("label add", "label remove"):
-        # Pairs given after an option (`label add <id> a=b --dry-run c=d`).
-        if not any(extra.startswith("-") for extra in extras):
+        # Pairs given after an option (`label add <id> a=b --dry-run c=d`), or after `--`
+        # there (`... --dry-run -- c=d`): those are pairs whatever they look like, and the
+        # label grammar refuses one that starts with `-`.
+        if extras[0] == "--":
+            args.pairs.extend(extras[1:])
+            extras = []
+        elif not any(extra.startswith("-") for extra in extras):
             args.pairs.extend(extras)
             extras = []
     if extras:
@@ -1157,16 +1412,6 @@ def load_config(args: argparse.Namespace) -> Config:
 # Output
 
 
-def sanitize(text: str) -> str:
-    """Escape C0 and C1 control characters for human-readable output."""
-    return "".join(f"\\x{ord(c):02x}" if _is_control(c) else c for c in text)
-
-
-def _is_control(char: str) -> bool:
-    code = ord(char)
-    return code < 0x20 or 0x7F <= code <= 0x9F
-
-
 def _given(argv: Sequence[str], flag: str) -> bool:
     """Whether ``flag`` (or ``flag=...``) is in ``argv`` before any ``--``; used when parsing
     failed, so the error can still honor ``--json`` and ``--verbose``."""
@@ -1229,14 +1474,14 @@ def _write_outcome_file(path: str, error: CliError, writable: Callable[[str], bo
     except OSError as exc:  # no cwd to make the path absolute against
         warning = f"{outcomefile.NOT_WRITTEN}: {exc.strerror or type(exc).__name__}"
     if warning is not None:
-        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
         outcomefile.log_failure(state_root, warning)
 
 
 def _print_error(error: CliError, json_mode: bool) -> None:
-    message = sanitize(error.message)
+    message = display(error.message)
     if error.detail is not None:
-        message = f"{message} ({sanitize(error.detail)})"
+        message = f"{message} ({display(error.detail)})"
     print(f"{PROG}: error: {message}", file=sys.stderr)
     if json_mode:
         print(json.dumps(error.envelope()))
@@ -1275,11 +1520,51 @@ def check_schema(argv: Sequence[str]) -> None:
         store.open_state().close()
 
 
+def _value_options() -> frozenset[str]:
+    """Every option string, of every command, that takes a value."""
+    parser = build_parser()
+    return frozenset(
+        option
+        for each in (parser, *parser.leaves.values())
+        for action in each._actions
+        if action.nargs != 0
+        for option in action.option_strings
+    )
+
+
+def _argv_flag_label(argv: Sequence[str], index: int) -> str | None:
+    """The option whose value ``argv[index]`` is: only a known value-taking option string
+    (``--flag value`` or ``--flag=value``), never a token after a ``--`` separator, never a
+    ``--flag=value`` neighbour, so no other argv text is echoed."""
+    if "--" in argv[:index]:
+        return None
+    token = argv[index]
+    if token.startswith("--") and "=" in token:
+        name = token.partition("=")[0]
+        return name if fsutil.is_utf8(name) and name in _value_options() else None
+    previous = argv[index - 1] if index > 0 else None
+    return previous if previous is not None and previous in _value_options() else None
+
+
+def check_argv_utf8(argv: Sequence[str]) -> None:
+    """Refuse an argv token that is not valid UTF-8 (``UsageError``, exit 2), before the
+    schema check or anything else reads or writes. Every argv value is stored, logged, put
+    in JSON or echoed in an error, and none of those can carry such bytes. The message names
+    the token's position and, for a flag's value, the flag, never the value."""
+    for index, token in enumerate(argv):
+        if fsutil.is_utf8(token):
+            continue
+        flag = _argv_flag_label(argv, index)
+        where = f"argument {index + 1}" + (f" ({flag})" if flag else "")
+        raise UsageError(f"{where} is not valid UTF-8")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args: argparse.Namespace | None = None
     schema_checked = False
     try:
+        check_argv_utf8(argv)
         check_schema(argv)
         schema_checked = True
         args = parse(build_parser(), argv)
@@ -1306,11 +1591,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_error_outcome_file(args, argv, error)
         try:
             if args.verbose if args else _given(argv, "--verbose"):
-                traceback.print_exc(file=sys.stderr)
+                _print_traceback()
         except BrokenPipeError:
             pass
         _emit_error(error, args.json if args else _given(argv, "--json"))
         return code
+
+
+# Traceback chunks laid out by the traceback module itself (headers, frames, the messages
+# between chained exceptions): their own newlines separate lines.
+_TRACEBACK_LAYOUT = ("Traceback ", "  File ", "\n", "  [Previous line repeated")
+# The margin of a chunk inside an exception group ("  | ", "  + ", deeper: "    | ").
+_GROUP_MARGIN = re.compile(r"(?: *[|+] )*")
+
+
+def _print_traceback() -> None:
+    """The current exception's traceback on stderr, every line through ``display``. An
+    exception's message (which may carry untrusted text) stays one line: a newline in it is
+    escaped, so it cannot fake a line of output."""
+    exc = sys.exc_info()[1]
+    if exc is None:
+        return
+    lines: list[str] = []
+    for chunk in traceback.TracebackException.from_exception(exc).format():
+        text = chunk.removesuffix("\n")
+        if _GROUP_MARGIN.sub("", chunk, count=1).startswith(_TRACEBACK_LAYOUT):
+            lines += [display(line) for line in text.split("\n")]
+        else:
+            lines.append(display(text))
+    print("\n".join(lines), file=sys.stderr)
 
 
 def _command_name(args: argparse.Namespace | None, argv: Sequence[str]) -> str | None:
@@ -1326,6 +1635,8 @@ def _write_error_outcome_file(
     """Write ``error``'s envelope to the ``--outcome-file`` given, if any."""
     path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
     if not path:
+        return
+    if not fsutil.is_utf8(path):  # a refused undecodable argv: no file at such a path
         return
     try:
         writable = _envelope_writable(args, argv, store.state_dir())

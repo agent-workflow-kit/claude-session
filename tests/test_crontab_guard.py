@@ -79,7 +79,7 @@ def test_the_real_gateway_never_starts_a_crontab_elsewhere(private_tmp_root: Pat
     program, marker = recording_crontab(outside(private_tmp_root))
     # Failed is a BaseException: an ``except Exception`` in the code under test cannot hide it.
     with pytest.raises(pytest.fail.Exception):
-        SystemGateway().run([str(program), "-l"], keep_raw_stdout=True)
+        SystemGateway().run([str(program), "-l"])
     assert not marker.exists()
 
 

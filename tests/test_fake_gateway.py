@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import signal
 import sys
+from typing import Any
 
 import pytest
 
@@ -139,6 +140,25 @@ def test_kill_grace_contract_matches_the_real_gateway() -> None:
         fake.run(["/bin/sh"], new_process_group=True, kill_grace=-1)
 
 
+def test_output_limit_is_recorded_and_applied_like_the_real_gateway() -> None:
+    fake = FakeGateway()
+    fake.on(["/bin/sh"], stdout="abcdef", stderr="é" * 4)
+    result = fake.run(["/bin/sh"], output_limit=3)
+    assert fake.calls[0].output_limit == 3
+    # Bytes, as the real gateway counts them: a split character is replaced.
+    assert (result.stdout, result.stderr) == ("abc", "é\ufffd")
+    empty = fake.run(["/bin/sh"], output_limit=0)
+    assert (empty.stdout, empty.stderr) == ("", "")
+
+
+@pytest.mark.parametrize(
+    ("limit", "error"), [(-1, ValueError), (True, TypeError), (1.5, TypeError)]
+)
+def test_output_limit_contract_matches_the_real_gateway(limit: Any, error: type) -> None:
+    with pytest.raises(error, match="output_limit"):
+        FakeGateway().run(["/bin/sh"], output_limit=limit)
+
+
 def test_a_response_list_is_consumed_in_order_and_the_last_repeats() -> None:
     fake = FakeGateway()
     ps = ["/bin/ps", "-p", "42"]
@@ -259,12 +279,14 @@ def test_a_release_error_needs_a_gated_spawn() -> None:
     assert child.wait() == 0
 
 
-def test_keep_raw_stdout_returns_the_scripted_bytes_only_on_request() -> None:
+def test_kill_over_bytes_matches_the_real_gateway() -> None:
+    from claude_session.gateway import GatewayOutputLimit
+
     fake = FakeGateway()
-    fake.on(["/opt/tool", "raw"], raw_stdout=b"a\r\nb\xff\n")
-    fake.on(["/opt/tool", "text"], stdout="t\n")
-    raw = fake.run(["/opt/tool", "raw"], keep_raw_stdout=True)
-    assert raw.raw_stdout == b"a\r\nb\xff\n" and raw.stdout == "a\nb\ufffd\n"
-    assert fake.run(["/opt/tool", "raw"]).raw_stdout is None
-    assert fake.run(["/opt/tool", "text"], keep_raw_stdout=True).raw_stdout == b"t\n"
-    assert [c.keep_raw_stdout for c in fake.calls] == [True, False, True]
+    fake.on(["/bin/sh"], stdout="x" * 5, stderr="e" * 9)
+    assert fake.run(["/bin/sh"], kill_over_bytes=5).stderr == "e" * 5
+    assert fake.calls[0].kill_over_bytes == 5
+    with pytest.raises(GatewayOutputLimit):
+        fake.run(["/bin/sh"], kill_over_bytes=4)
+    with pytest.raises(ValueError):
+        fake.run(["/bin/sh"], kill_over_bytes=-1)
