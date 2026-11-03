@@ -24,7 +24,8 @@ had moved them) for the next run (interface.md, Prompts and inputs). A fork copi
 source's ``inputs/`` with ``copy_inputs`` (fd-based; symlinks, non-regular files and files
 with more than one link are refused), and a resume discards the previous run's outbox
 requests with ``discard_outbox``.
-TODO(#34): fd-based retention deletion of both directories.
+``delete_session_dirs`` deletes both directories of a session past its retention (fd-based,
+never following a symlink; ``reconcile``).
 """
 
 from __future__ import annotations
@@ -916,6 +917,90 @@ def remove_private_run_files(
     finally:
         os.close(run_fd)
     return deleted
+
+
+def delete_session_dirs(
+    state_root: str, csession_id: str, heartbeat: Callable[[], None] | None = None
+) -> None:
+    """Delete ``sessions/<id>/`` and ``private/<id>/`` (retention, after ``forget``), reached
+    through the no-follow walk from the state root and removed through directory descriptors
+    (``fsutil.remove_tree_at``): a symlink anywhere in either tree, the directory itself
+    included, is unlinked and never followed, so nothing outside the two directories is ever
+    touched. Nothing is created; a directory that is missing is skipped. Each entry directly
+    below a directory is removed on its own, with ``heartbeat`` called between them (a
+    long-running removal keeps the caller's lease). Raises ``SessionDirUnsafe`` when an entry
+    cannot be removed (some of it may already be gone); the caller retries on its next pass."""
+    if not ids.is_session_id(csession_id):
+        raise ValueError(f"not a session id: {csession_id!r}")
+    root = os.path.realpath(state_root)
+    try:
+        root_fd = fsutil.open_dir_nofollow(root)
+    except OSError as exc:
+        raise _failed(root, exc) from exc
+    try:
+        try:
+            fsutil.check_private_dir_fd(root_fd, root)
+        except OSError as exc:
+            raise _failed(root, exc) from exc
+        for top in (SESSIONS, PRIVATE):
+            _delete_session_tree(root_fd, os.path.join(root, top), top, csession_id, heartbeat)
+    finally:
+        os.close(root_fd)
+
+
+def _delete_session_tree(
+    root_fd: int,
+    top_path: str,
+    top: str,
+    csession_id: str,
+    heartbeat: Callable[[], None] | None,
+) -> None:
+    where = os.path.join(top_path, csession_id)
+    try:
+        exists, top_fd = fsutil.inspect_private_dir_at(root_fd, top)
+    except OSError as exc:
+        raise _failed(top_path, exc) from exc
+    if top_fd is None:
+        if exists:
+            raise SessionDirUnsafe(f"{top_path} cannot be searched (its mode denies it)")
+        return
+    try:
+        try:
+            info = os.stat(csession_id, dir_fd=top_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise _failed(where, exc) from exc
+        try:
+            if not stat.S_ISDIR(info.st_mode):  # a planted file or symlink: unlinked, not followed
+                os.unlink(csession_id, dir_fd=top_fd)
+                return
+            fd = fsutil.open_private_dir_at(top_fd, csession_id)
+        except OSError as exc:
+            raise _failed(where, exc) from exc
+        try:
+            names = os.listdir(fd)
+            for name in sorted(names):
+                if heartbeat is not None:
+                    heartbeat()
+                try:
+                    fsutil.remove_tree_at(fd, name)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise _failed(os.path.join(where, name), exc) from exc
+        except OSError as exc:
+            raise _failed(where, exc) from exc
+        finally:
+            os.close(fd)
+        try:
+            os.rmdir(csession_id, dir_fd=top_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise _failed(where, exc) from exc
+    finally:
+        os.close(top_fd)
 
 
 class SessionDirs:

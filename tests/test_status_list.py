@@ -639,15 +639,17 @@ def test_json_output_never_carries_a_lone_surrogate(
 def test_json_error_envelope_never_carries_a_lone_surrogate(
     seeded: Store, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # An argv byte that is not UTF-8 arrives surrogate-escaped.
+    # An argv byte that is not UTF-8 arrives surrogate-escaped; since #72 it is refused at
+    # the door (usage error, exit 2), and the refusal names its position, never the value.
     text = b"cs-aaaa\xff".decode("utf-8", errors="surrogateescape")
-    assert main(["status", text, "--json"]) == 10
+    assert main(["status", text, "--json"]) == 2
     captured = capsys.readouterr()
     envelope = json.loads(captured.out)
     validate(envelope, ERROR_SCHEMA)
-    assert envelope["error"]["message"] == "unknown session: cs-aaaa\ufffd"
+    assert envelope["error"]["code"] == "usage"
+    assert "\udcff" not in captured.out + captured.err
+    captured.out.encode("utf-8")
     captured.err.encode("utf-8")
-    assert "cs-aaaa\\udcff" in captured.err
 
 
 def test_json_stays_valid_for_bytes_that_are_not_utf8(
@@ -712,6 +714,18 @@ def test_display_escapes_controls_and_keeps_text() -> None:
         "\\ud800\\u2028\\u00ad\\U000e0001\\u3164"
     )
     assert terminal.display("a b,c", extra=" ,") == "a\\x20b\\x2cc"
+
+
+def test_display_keeps_one_variation_selector_after_a_base_character() -> None:
+    """A single variation selector after a base character (emoji presentation) stays; one
+    at the start, after an escape or after another selector (hidden data) is escaped."""
+    assert terminal.display("\u2764\ufe0f ok") == "\u2764\ufe0f ok"
+    assert terminal.display("a\U000e0100") == "a\U000e0100"
+    assert terminal.display("a" + "\ufe01" * 8) == "a\ufe01" + "\\ufe01" * 7
+    assert terminal.display("\ufe0fa") == "\\ufe0fa"
+    assert terminal.display("\x1b\ufe0f") == "\\x1b\\ufe0f"
+    assert terminal.display("a\U000e0100\U000e0101") == "a\U000e0100\\U000e0101"
+    assert terminal.display("\u180b") == "\\u180b"
 
 
 def test_display_width_counts_wide_characters_twice() -> None:

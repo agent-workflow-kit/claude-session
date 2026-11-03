@@ -3,8 +3,8 @@
 See design.md (Hook-event fast path, State machine) and interface.md (State transitions,
 Internal commands). ``__main__`` dispatches here before importing ``cli``, so this module and
 everything it imports stay standard library only, plus ``store``, ``outbox`` and
-``secretindex`` (both stdlib only) and, once it is needed, ``gateway``: never ``config``,
-Pydantic, YAML or argparse.
+``secretindex`` (both stdlib only), ``notes`` (stdlib only) and, once the notes command runs,
+``gateway``: never ``config``, Pydantic, YAML or argparse.
 
 ``PostToolUse`` and ``Stop`` drain the run's outbox: requests are claimed and pre-checked
 before the transaction (``prepare_drain``), recorded inside it after the hook's own row, and
@@ -26,10 +26,15 @@ import stat
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO
 
-from . import outbox, secretindex
+from . import fsutil, outbox, secretindex
+from . import notes as notes_command  # "notes" is hookconf_bytes's keyword
+from .notes import NotesConf
 from .store import BUSY_TIMEOUT, HookRun, Store, db_path
+
+if TYPE_CHECKING:
+    from .gateway import Gateway
 
 # The events the injected hooks pass (interface.md, Internal commands). Kept equal to
 # ``__main__.HOOK_EVENTS`` (tested): ``__main__`` must not import this module to log.
@@ -59,6 +64,12 @@ INPUT_NAME = re.compile(r"[A-Za-z0-9._-]{1,128}")
 # Bytes of the payload kept for parsing. stdin is always read to its end (so Claude Code never
 # sees a broken pipe); a longer payload is refused by the events that need its fields.
 PAYLOAD_MAX_BYTES = 16 * 1024 * 1024
+# The SessionStart sources claude-session knows (interface.md, State transitions). Any other
+# string source is recorded and matched as ``other`` (notes.SOURCES), and the startup row
+# applies, so a source added by a later Claude Code release never fails the hook. Its raw
+# value is logged escaped (``ascii``) and cut to SOURCE_LOG_MAX_CHARS characters first.
+SESSION_START_SOURCES = ("startup", "resume", "fork", "clear", "compact")
+SOURCE_LOG_MAX_CHARS = 64
 PATH_MAX_CHARS = 4096
 SESSION_END_REASON_MAX_CHARS = 256
 HOOKCONF_NAME = "hookconf.json"
@@ -133,10 +144,12 @@ TABLE: dict[str, Rule] = {
     ),
     "question": Rule(activity="working", prompt="question", after_session_start=True),
     "elicitation": Rule(activity="working", prompt="elicitation", after_session_start=True),
-    # TODO(#41): a subagent's PostToolUse carries the parent's session id (spike A1/A2), so a
-    # background subagent's tool clears a pending permission prompt of the main agent. Check
-    # live whether PermissionRequest carries agent_id / tool_use_id; if so, clear only on the
-    # matching PostToolUse (design.md, State machine: accepted until then).
+    # A subagent's PostToolUse carries the parent's session id (spike A1/A2), so a background
+    # subagent's tool clears a pending permission prompt of the main agent (design.md, State
+    # machine: accepted).
+    # TODO(#42): the live suite records whether PermissionRequest carries agent_id /
+    # tool_use_id (docs/live-tests.md, #58 item 1); if it does, clear only on the matching
+    # PostToolUse. Deferred: needs a human `make live` run to read the observation.
     "post_tool_use": Rule(activity="working", prompt=None, after_session_start=True),
     "stop_background": Rule(activity="working", after_session_start=True),
     # Stop without background tasks, Notification idle_prompt.
@@ -234,6 +247,8 @@ def parse_argv(argv: list[str]) -> tuple[str, str, int | None]:
     state_dir, event = argv[1], argv[2]
     if not os.path.isabs(state_dir) or "\0" in state_dir:
         raise HookEventError("--state-dir must be an absolute path")
+    if not fsutil.is_utf8(state_dir):  # launches never create such a state root
+        raise HookEventError("--state-dir is not valid UTF-8")
     if event not in EVENTS:
         raise HookEventError("unknown hook event")
     return state_dir, event, run
@@ -298,6 +313,7 @@ class Hook:
     transcript_path: str | None = None
     session_end_reason: str | None = None
     backstop_candidate: bool = False  # a Stop without background tasks
+    unknown_source: str | None = None  # the raw SessionStart source mapped to ``other``
 
 
 def classify(cause: str, data: bytes | None) -> Hook | None:
@@ -337,13 +353,14 @@ def classify(cause: str, data: bytes | None) -> Hook | None:
 
 
 def _session_start(payload: dict[str, Any]) -> Hook:
-    source = _text(payload, "source")
-    if source in ("startup", "resume", "fork"):
-        event = "session_start_new"
-    elif source in ("clear", "compact"):
-        event = "session_start_other"
-    else:
-        raise HookEventError("payload field source is not a SessionStart source")
+    raw_source = _text(payload, "source")
+    unknown = None
+    source = raw_source
+    if raw_source not in SESSION_START_SOURCES:
+        unknown, source = raw_source, "other"
+    # clear/compact keep the state; startup/resume/fork and other (it may be a new session's
+    # first SessionStart) move a starting run to its mode's activity.
+    event = "session_start_other" if source in ("clear", "compact") else "session_start_new"
     claude_id = _text(payload, "session_id")
     if CLAUDE_SESSION_ID.fullmatch(claude_id) is None:
         raise HookEventError("payload field session_id is not a Claude session id")
@@ -361,7 +378,18 @@ def _session_start(payload: dict[str, Any]) -> Hook:
         claude_session_id=claude_id,
         source=source,
         transcript_path=transcript,
+        unknown_source=unknown,
     )
+
+
+def unknown_source_message(source: str) -> str:
+    """The log message for an unknown SessionStart source: the payload's value cut to
+    ``SOURCE_LOG_MAX_CHARS`` characters, then escaped to printable ASCII (``ascii``), so the
+    message is bounded and holds no control, format or non-ASCII character."""
+    shown = ascii(source[:SOURCE_LOG_MAX_CHARS])
+    if len(source) > SOURCE_LOG_MAX_CHARS:
+        shown += " (truncated)"
+    return f"unknown SessionStart source {shown}; treated as other"
 
 
 # hookconf.json: hook-event's configuration, written by exec into the private run directory
@@ -369,11 +397,13 @@ def _session_start(payload: dict[str, Any]) -> Hook:
 
 @dataclass(frozen=True)
 class HookConf:
-    """``hookconf.json``: the run's input names and the report caps ingestion applies."""
+    """``hookconf.json``: the run's input names, the report caps ingestion applies and the
+    notes command (None: no notes for this run)."""
 
     input_files: list[str]
     summary_max_bytes: int
     artifact_max_bytes: int
+    notes: NotesConf | None = None
 
     @property
     def limits(self) -> outbox.Limits:
@@ -383,27 +413,44 @@ class HookConf:
         )
 
 
+class HookConfTooLarge(HookEventError):
+    """``hookconf_bytes``: the content would exceed ``HOOKCONF_MAX_BYTES``."""
+
+
 HOOKCONF_KEYS = frozenset({"v", "input_files", "summary_max_bytes", "artifact_max_bytes"})
+# Optional keys of v1: a run launched before they existed has none, and its hooks keep
+# working after an upgrade. ``notes`` absent or null: no notes command.
+HOOKCONF_OPTIONAL_KEYS = frozenset({"notes"})
 
 
 def hookconf_bytes(
-    input_files: list[str], *, summary_max_bytes: int, artifact_max_bytes: int
+    input_files: list[str],
+    *,
+    summary_max_bytes: int,
+    artifact_max_bytes: int,
+    notes: NotesConf | None = None,
 ) -> bytes:
     """The content of ``private/<id>/runs/<n>/hookconf.json`` for a run whose inputs are
-    ``input_files`` (basenames, in order) and whose report caps are the given ones (outbox
-    ingestion reads them here, never from config or an agent-writable file).
+    ``input_files`` (basenames, in order), whose report caps are the given ones (outbox
+    ingestion reads them here, never from config or an agent-writable file) and whose notes
+    command is ``notes`` (``launch.notes_conf``; written as null when there is none).
+    ``HookEventError`` when the result is invalid, ``HookConfTooLarge`` (a subclass) when it
+    is over ``HOOKCONF_MAX_BYTES``.
 
     ``exec`` writes it at launch step 7 (``SessionDirs.write_private_run_file``).
-    TODO(#38): add the notes command settings (``notes_context_cmd`` and its limits).
     """
     conf = {
         "v": 1,
         "input_files": list(input_files),
         "summary_max_bytes": summary_max_bytes,
         "artifact_max_bytes": artifact_max_bytes,
+        "notes": None if notes is None else notes.to_json(),
     }
     _check_hookconf(conf)
-    return json.dumps(conf, ensure_ascii=False).encode("utf-8")
+    data = json.dumps(conf, ensure_ascii=False).encode("utf-8")
+    if len(data) > HOOKCONF_MAX_BYTES:
+        raise HookConfTooLarge("hookconf.json would be too large")
+    return data
 
 
 def _cap(value: object) -> bool:
@@ -412,7 +459,11 @@ def _cap(value: object) -> bool:
 
 def _check_hookconf(conf: object) -> HookConf:
     """Validate a hookconf object."""
-    if not isinstance(conf, dict) or set(conf) != HOOKCONF_KEYS or conf["v"] != 1:
+    if (
+        not isinstance(conf, dict)
+        or set(conf) - HOOKCONF_OPTIONAL_KEYS != HOOKCONF_KEYS
+        or conf["v"] != 1
+    ):
         raise HookEventError("hookconf.json has an unknown shape")
     names = conf["input_files"]
     if not isinstance(names, list) or len(names) > HOOKCONF_MAX_INPUTS:
@@ -424,10 +475,17 @@ def _check_hookconf(conf: object) -> HookConf:
         raise HookEventError("hookconf.json has duplicate input names")
     if not _cap(conf["summary_max_bytes"]) or not _cap(conf["artifact_max_bytes"]):
         raise HookEventError("hookconf.json has an invalid size cap")
+    notes_conf = None
+    if conf.get("notes") is not None:
+        try:
+            notes_conf = NotesConf.from_json(conf["notes"])
+        except ValueError as exc:
+            raise HookEventError("hookconf.json has an invalid notes command") from exc
     return HookConf(
         input_files=names,
         summary_max_bytes=conf["summary_max_bytes"],
         artifact_max_bytes=conf["artifact_max_bytes"],
+        notes=notes_conf,
     )
 
 
@@ -517,13 +575,36 @@ def backstop_output() -> dict[str, Any]:
     return {"decision": "block", "reason": BACKSTOP_REASON}
 
 
-def session_start_output(csession_dir: str, run_no: int, inputs: list[str]) -> dict[str, Any]:
-    """The context line (interface.md, Launch order): input paths are relative to the session
-    directory, and the inputs part is omitted when the run has none."""
-    context = f"claude-session directory: {csession_dir}; run {run_no}"
+# Claude Code saves a hook's additionalContext of more than 10,000 characters to a file and
+# shows the model only its path and a short preview, with no override (Claude Code docs, Hooks:
+# JSON output). The notes block is cut so the whole SessionStart context stays within it
+# (counted in UTF-16 code units, as JavaScript counts characters: never more than the limit).
+CONTEXT_MAX_CHARS = 10_000
+
+
+def context_line(csession_dir: str, run_no: int, inputs: list[str]) -> str:
+    """The trusted context line (interface.md, Launch order): input paths are relative to the
+    session directory, and the inputs part is omitted when the run has none."""
+    line = f"claude-session directory: {csession_dir}; run {run_no}"
     if inputs:
-        context += "; inputs: " + ", ".join(f"inputs/{run_no}/{name}" for name in inputs)
-    # TODO(#38): append "\n<notes block>" when a notes command is configured.
+        line += "; inputs: " + ", ".join(f"inputs/{run_no}/{name}" for name in inputs)
+    return line
+
+
+def notes_budget(line: str) -> int:
+    """The most characters (UTF-16 code units) the notes block may take after ``line`` and
+    its newline within ``CONTEXT_MAX_CHARS``; negative when none fit. The line is never cut."""
+    return CONTEXT_MAX_CHARS - notes_command.utf16_len(line) - 1
+
+
+def session_start_output(
+    csession_dir: str, run_no: int, inputs: list[str], notes_block: str | None = None
+) -> dict[str, Any]:
+    """The context line (``context_line``) and, on the next line, the fenced notes block
+    (``notes.fence``, already bounded by ``notes_budget``) when there is one."""
+    context = context_line(csession_dir, run_no, inputs)
+    if notes_block is not None:
+        context += "\n" + notes_block
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
 
 
@@ -800,7 +881,7 @@ class _Log:
         event: str,
         level: str,
         csession_id: str,
-        run_no: int,
+        run_no: int | None,
         *,
         reason: str | None = None,
         message: str | None = None,
@@ -869,13 +950,75 @@ def log_drain(log: _Log, drain: outbox.Drain) -> None:
             log.write("report_rejected", "warn", sid, run_no, reason=item.result, message=request)
 
 
+def notes_block(
+    gw: Gateway | None,
+    conf: NotesConf,
+    *,
+    state_dir: str,
+    log: _Log,
+    csession_id: str,
+    run_no: int,
+    max_chars: int | None = None,
+) -> str | None:
+    """Run the notes command with cwd = the state root and return its fenced block, at most
+    ``max_chars`` characters (None when it does not fit). Never raises an ``Exception``: a
+    failure is logged as ``notes_failed`` at ``warn`` (a fixed phrase, or the exception type
+    only) and the session starts without notes.
+
+    While the command runs, SIGTERM raises ``SystemExit`` (``_TerminateOnSigterm``), so a
+    terminated hook still ends the command's process group (the gateway does on any exception
+    while waiting) instead of leaving it running."""
+    try:
+        if gw is None:
+            from .gateway import SystemGateway  # lazy: only hooks that run notes load it
+
+            gw = SystemGateway()
+        with _TerminateOnSigterm():
+            return notes_command.run(gw, conf, cwd=state_dir, max_chars=max_chars)
+    except notes_command.NotesFailure as exc:
+        log.write("notes_failed", "warn", csession_id, run_no, message=str(exc))
+    except Exception as exc:
+        log.write("notes_failed", "warn", csession_id, run_no, message=type(exc).__name__)
+    return None
+
+
+class _TerminateOnSigterm:
+    """While active (main thread only, else a no-op), SIGTERM raises ``SystemExit(143)``; the
+    previous handler is restored on exit."""
+
+    def __init__(self) -> None:
+        self._previous: Any = None
+        self._installed = False
+
+    def __enter__(self) -> None:
+        import signal  # lazy: only hooks that run notes load it
+        import threading
+
+        if threading.current_thread() is not threading.main_thread():
+            return
+        self._previous = signal.signal(signal.SIGTERM, _raise_exit)
+        self._installed = True
+
+    def __exit__(self, *exc: object) -> None:
+        if self._installed:
+            import signal
+
+            signal.signal(signal.SIGTERM, self._previous)
+
+
+def _raise_exit(signum: int, frame: object) -> None:
+    raise SystemExit(128 + signum)
+
+
 def main(
     argv: list[str],
     *,
     stdin: BinaryIO | None = None,
     environ: Mapping[str, str] | None = None,
+    gw: Gateway | None = None,
 ) -> int:
-    """Handle one injected hook event (``hook-event --state-dir <abs> --run <n> <Event>``)."""
+    """Handle one injected hook event (``hook-event --state-dir <abs> --run <n> <Event>``). ``gw``
+    runs the notes command (default: the real gateway, imported only then)."""
     data = read_payload(stdin)  # first: stdin is read to its end even for a rejected argv
     state_dir, cause, hook_run_no = parse_argv(argv)
     csession_id = session_id_from(os.environ if environ is None else environ)
@@ -915,6 +1058,10 @@ def main(
             raise
     run = applied.run
     output = applied.output
+    if hook.unknown_source is not None:
+        message = unknown_source_message(hook.unknown_source)
+        run_no = None if run is None else run.run_no
+        log.write("session_start_source_unknown", "warn", csession_id, run_no, message=message)
     if drain is not None:
         drain.finish(committed=applied.drained)
         if applied.drained:
@@ -930,7 +1077,20 @@ def main(
         if run.csession_dir is None or run.private_dir is None:
             raise HookEventError("session has no directories")
         conf = read_hookconf(run.private_dir, run.run_no)
-        output = session_start_output(run.csession_dir, run.run_no, conf.input_files)
+        block = None
+        budget = notes_budget(context_line(run.csession_dir, run.run_no, conf.input_files))
+        if conf.notes is not None and hook.source in conf.notes.sources:
+            # After the transaction: the write lock is never held while the command runs.
+            block = notes_block(
+                gw,
+                conf.notes,
+                state_dir=state_dir,
+                log=log,
+                csession_id=csession_id,
+                run_no=run.run_no,
+                max_chars=budget,
+            )
+        output = session_start_output(run.csession_dir, run.run_no, conf.input_files, block)
     if output is not None:
         sys.stdout.write(json.dumps(output) + "\n")
     return 0

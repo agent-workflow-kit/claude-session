@@ -1088,9 +1088,25 @@ def test_a_hook_leaving_a_process_in_the_background_finishes_when_sh_exits(
     finally:
         wait_until(lambda: pidfile.exists() and pidfile.read_text().strip() != "", 5)
         pid = int(pidfile.read_text())
-        with open(f"/proc/{pid}/cmdline", "rb") as fh:  # the exact sleep this test started
-            assert fh.read().split(b"\0")[0].endswith(b"sleep")
-        os.kill(pid, signal.SIGKILL)
+        try:
+            # sh writes $! as soon as it forks, so the child may still be the forked /bin/sh
+            # (or have an empty cmdline) when first read: wait until it has exec'd the sleep.
+            wait_until(lambda: _argv0(pid) == b"/bin/sleep", 5)
+        finally:
+            # The exact child this test started: the sleep (argv0 as written in cmd), or the
+            # fork of the hook's `sh -c` (argv0 "sh", toolhooks.run_entry) not yet exec'd. Exact
+            # values: a suffix match would also take bash, zsh or ssh behind a reused PID.
+            if _argv0(pid) in (b"/bin/sleep", b"sh"):
+                os.kill(pid, signal.SIGKILL)
+
+
+def _argv0(pid: int) -> bytes:
+    """``argv[0]`` of a live process from ``/proc``, or ``b""`` when it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return fh.read().split(b"\0")[0]
+    except OSError:
+        return b""
 
 
 def test_a_hook_timeout_longer_than_one_wait_delivers_normally(

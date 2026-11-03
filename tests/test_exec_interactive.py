@@ -34,6 +34,7 @@ import pytest
 
 from claude_session.store import start_time
 
+from .conftest import linux_only
 from .fakeclaude import claude_bin, read_jsonl, wait_for, write_json
 from .test_exec_headless import (
     START,
@@ -182,6 +183,7 @@ def start_terminal(
     status_to: Path | None = None,
     command_args: Sequence[str] = ("exec",),
     claude: Path | None = None,
+    signals: Mapping[str, Any] | None = None,
 ) -> Terminal:
     """``controlling``: None (the terminal is only exec's stdin and stdout), ``"exec"`` (it
     is exec's controlling terminal, exec the session leader) or ``"leader"`` (``LEADER`` is
@@ -189,9 +191,13 @@ def start_terminal(
     exec's process before its entry point (a fault injected into exec). ``ignore``: signals
     exec inherits as ignored. ``command_args``: the command run instead of ``exec`` (e.g.
     ``resume <id>``). ``status_to``: claude first copies its ``/proc`` status there
-    (a shell wrapper that then execs the fake, same PID). ``claude``: the ``claude_bin``
-    used instead of the fake (``steps`` then unused)."""
-    scenario = write_json(tmp_path / "scenario.json", {"steps": steps})
+    (a shell wrapper that then execs the fake, same PID). ``signals``: the fake's signal
+    overrides (its scenario ``signals``). ``claude``: the ``claude_bin`` used instead of the
+    fake (``steps`` then unused)."""
+    body: dict[str, Any] = {"steps": steps}
+    if signals is not None:
+        body["signals"] = dict(signals)
+    scenario = write_json(tmp_path / "scenario.json", body)
     fake = claude or claude_bin(tmp_path / "fakebin", scenario, tmp_path / "fake.jsonl")
     if status_to is not None:
         fake = script(
@@ -332,6 +338,7 @@ def test_an_interactive_run_goes_to_permission_and_reported_then_auto_exits(
     assert gone(row["child_pid"])
 
 
+@linux_only  # reads /proc/<pid>/stat and /proc/<pid>/fd; Linux pty names
 def test_the_interactive_child_shares_the_terminal_and_the_foreground_group(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
@@ -673,6 +680,7 @@ def test_a_done_report_drained_by_the_stops_own_hook_auto_exits(
     assert fake_signals(term) == [("signal", "TERM")]
 
 
+@linux_only  # reads /proc/<pid>/status
 def test_an_inherited_ignored_sighup_stays_ignored_for_exec_and_claude(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
@@ -700,6 +708,7 @@ def test_an_inherited_ignored_sighup_stays_ignored_for_exec_and_claude(
     assert signals_not_sent(term) == []
 
 
+@linux_only  # reads /proc/<pid>/status
 def test_an_interactive_claude_inherits_an_ignored_sigterm(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
@@ -725,7 +734,12 @@ def test_an_interactive_claude_that_cannot_be_executed_ends_the_run_not_started(
     """G3: the exec fails only at the gate's release (a bad interpreter): the run goes back
     to the launch phase and ends not-started, launch_interrupted, with no child recorded."""
     claude = script(tmp_path / "badbin" / "claude", "#!/nonexistent/interp\n")
-    term = start_terminal(tmp_path, state, work, [], claude=claude)
+    # The ``claude --version`` probe (min_claude_version) would already fail to run this
+    # binary (claude_not_found); skip it so that the exec fails at the gate's release.
+    skip_probe = (
+        "import claude_session.claude_version as _cv\n_cv.require = lambda *a, **k: '2.1.400'"
+    )
+    term = start_terminal(tmp_path, state, work, [], claude=claude, patch=skip_probe)
     code, outcome, err = term.finish()
     outcome = check_outcome(code, outcome, err)
     assert code == 12

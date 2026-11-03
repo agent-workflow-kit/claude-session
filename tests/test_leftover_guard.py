@@ -20,15 +20,23 @@ from tests.conftest import _Started, _stat  # pyright: ignore[reportPrivateUsage
 linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc")
 
 
+class _Item:
+    """A test item stand-in for ``conftest.watchdog_seconds``."""
+
+    def __init__(self, *markers: str) -> None:
+        self._markers = markers
+
+    def get_closest_marker(self, name: str) -> object | None:
+        return name if name in self._markers else None
+
+
 def _alive(pid: int) -> bool:
-    stat = _stat(pid)
-    if stat is None:
-        return False
     try:
         with open(f"/proc/{pid}/stat", "rb") as fh:
-            return fh.read().rpartition(b")")[2].split()[0] not in (b"Z", b"X")
-    except (FileNotFoundError, ProcessLookupError):  # gone before open, or mid-read
+            data = fh.read()
+    except (FileNotFoundError, ProcessLookupError):  # gone, or reaped between open and read
         return False
+    return data.rpartition(b")")[2].split()[0] not in (b"Z", b"X")
 
 
 def _stub(pid: int, returncode: int | None) -> subprocess.Popen[Any]:
@@ -96,7 +104,7 @@ def test_stat_of_an_unreadable_process_is_not_ours(monkeypatch: pytest.MonkeyPat
 
 
 def test_the_tracking_popen_is_restored_when_the_setup_fails(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
     real = subprocess.Popen
 
@@ -104,7 +112,8 @@ def test_the_tracking_popen_is_restored_when_the_setup_fails(
         raise RuntimeError("no thread")
 
     monkeypatch.setattr(conftest.threading, "Thread", failing)
-    guard = conftest.no_leftover_processes.__wrapped__()  # pyright: ignore[reportAttributeAccessIssue]
+    request = SimpleNamespace(node=_Item())
+    guard = conftest.no_leftover_processes.__wrapped__(request, tmp_path_factory)  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(RuntimeError):
         next(guard)
     assert subprocess.Popen is real
@@ -146,6 +155,18 @@ def test_the_watchdog_kills_a_hung_test_s_processes_through_their_pidfds(
     result.stdout.fnmatch_lines(["*watchdog fired*"])
 
 
+def test_a_live_test_gets_the_live_watchdog_and_every_other_test_the_short_one() -> None:
+    assert conftest.watchdog_seconds(_Item()) == conftest.WATCHDOG_SECONDS
+    assert conftest.watchdog_seconds(_Item("slow")) == conftest.WATCHDOG_SECONDS
+    assert conftest.watchdog_seconds(_Item("live")) == conftest.LIVE_WATCHDOG_SECONDS
+    # Longer than the longest single live step (an end-to-end run's 900 s timeout).
+    assert conftest.LIVE_WATCHDOG_SECONDS > 900 > conftest.WATCHDOG_SECONDS
+
+
+def test_this_test_runs_under_the_short_watchdog(request: pytest.FixtureRequest) -> None:
+    assert conftest.watchdog_seconds(request.node) == conftest.WATCHDOG_SECONDS
+
+
 def test_a_pidfd_is_available_on_x86_64_and_aarch64_linux() -> None:
     expected = sys.platform.startswith("linux") and platform.machine() in ("x86_64", "aarch64")
     assert conftest.PIDFD == expected
@@ -154,7 +175,7 @@ def test_a_pidfd_is_available_on_x86_64_and_aarch64_linux() -> None:
 @linux_only
 @pytest.mark.skipif(not conftest.PIDFD, reason="needs a pidfd")
 def test_signalling_a_reaped_process_through_its_pidfd_raises_process_lookup_error() -> None:
-    proc = subprocess.Popen(["/bin/true"])
+    proc = subprocess.Popen([conftest.TRUE_BIN])
     fd = conftest._pidfd_open(proc.pid)  # pyright: ignore[reportPrivateUsage]
     try:
         proc.wait(timeout=5)
@@ -265,7 +286,7 @@ def test_a_record_whose_start_ticks_differ_signals_nothing(
 
 
 def test_a_recorded_fake_that_already_exited_is_no_leftover(tmp_path: Path) -> None:
-    proc = subprocess.Popen(["/bin/true"])
+    proc = subprocess.Popen([conftest.TRUE_BIN])
     proc.wait(timeout=5)
     (tmp_path / f"{proc.pid}.1").touch()
     assert conftest._end_leftover_fakes(str(tmp_path)) == []  # pyright: ignore[reportPrivateUsage]
@@ -275,3 +296,16 @@ def test_the_fixture_points_the_fake_at_a_directory_of_its_own() -> None:
     directory = os.environ.get(conftest.STARTED_ENV)
     assert directory is not None
     assert os.path.isdir(directory)
+
+
+def test_true_bin_names_an_executable_true_that_exits_0() -> None:
+    """Tests spawn ``conftest.TRUE_BIN``, not ``/bin/true``: macOS has only ``/usr/bin/true``."""
+    assert os.path.isabs(conftest.TRUE_BIN)
+    assert os.path.basename(conftest.TRUE_BIN) == "true"
+    assert subprocess.run([conftest.TRUE_BIN], check=False).returncode == 0
+
+
+def test_linux_only_skips_exactly_off_linux() -> None:
+    (mark,) = conftest.linux_only.mark.args
+    assert mark is (not sys.platform.startswith("linux"))
+    assert conftest.linux_only.mark.name == "skipif"
