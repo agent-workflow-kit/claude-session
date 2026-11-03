@@ -324,13 +324,6 @@ def session_writable(
     return SessionWritable(paths)
 
 
-def profile_write_paths(profile: Mapping[str, Any], *, cwd: str, home: str) -> list[str]:
-    """The paths the expanded ``profile`` makes writable: its sandbox ``allowWrite`` entries
-    and ``Edit``/``Write`` (and ``MultiEdit``/``NotebookEdit``) allow-rule targets. Raises
-    ``InvalidPermissionProfile`` for one it cannot place."""
-    return _profile_writes(profile, cwd=cwd, home=home)
-
-
 def profile_write_entries(profile: Mapping[str, Any]) -> list[str]:
     """The strings of a profile (before expansion) that can make a path writable: its sandbox
     ``allowWrite`` entries and every allow rule (whose target is placed after expansion)."""
@@ -338,6 +331,13 @@ def profile_write_entries(profile: Mapping[str, Any]) -> list[str]:
         *_strings(profile, "sandbox", "filesystem", "allowWrite"),
         *_strings(profile, "permissions", "allow"),
     ]
+
+
+def profile_write_paths(profile: Mapping[str, Any], *, cwd: str, home: str) -> list[str]:
+    """The paths the expanded ``profile`` makes writable: its sandbox ``allowWrite`` entries
+    and ``Edit``/``Write`` (and ``MultiEdit``/``NotebookEdit``) allow-rule targets. Raises
+    ``InvalidPermissionProfile`` for one it cannot place."""
+    return _profile_writes(profile, cwd=cwd, home=home)
 
 
 def _profile_writes(profile: Mapping[str, Any], *, cwd: str, home: str) -> list[str]:

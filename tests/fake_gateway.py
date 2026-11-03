@@ -23,11 +23,13 @@ from claude_session.gateway import (
     GATE_EXEC_FAILED,
     Child,
     Gateway,
+    GatewayOutputLimit,
     GatewayTimeout,
     Inherit,
     Result,
     check_argv,
     check_kill_grace,
+    check_kill_over_bytes,
     check_output_limit,
     check_spawn_stdin,
 )
@@ -62,15 +64,16 @@ class Call:
     output_limit: int | None = None  # run only
     discard_output: bool = False  # run only
     gated: bool = False  # spawn only
+    kill_over_bytes: int | None = None  # run only
 
 
 @dataclass(frozen=True)
 class Response:
     """One scripted answer. ``timeout``: ``run`` raises ``GatewayTimeout`` (only for a call
-    given a ``timeout``: otherwise the fake fails, as the real call could not time out), a
-    spawned child keeps running. ``error``: the call raises it. ``release_error``: a gated
-    spawn's ``release`` raises it, as the real one does when the exec fails (the child then
-    exits ``GATE_EXEC_FAILED``)."""
+    given a ``timeout``: otherwise the fake fails, as the real call could not time out;
+    carrying ``stderr``), a spawned child keeps running. ``error``: the call raises it.
+    ``release_error``: a gated spawn's ``release`` raises it, as the real one does when the
+    exec fails (the child then exits ``GATE_EXEC_FAILED``)."""
 
     returncode: int = 0
     stdout: str = ""
@@ -199,6 +202,7 @@ class FakeGateway:
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        kill_over_bytes: int | None = None,
         kill_group_on_exit: bool = False,
         output_limit: int | None = None,
         discard_output: bool = False,
@@ -211,6 +215,7 @@ class FakeGateway:
             kill_grace, new_process_group=new_process_group, kill_group_on_exit=kill_group_on_exit
         )
         check_output_limit(output_limit)
+        check_kill_over_bytes(kill_over_bytes)
         args = tuple(argv)
         self.calls.append(
             Call(
@@ -227,6 +232,7 @@ class FakeGateway:
                 executable=executable,
                 output_limit=output_limit,
                 discard_output=discard_output,
+                kill_over_bytes=kill_over_bytes,
             )
         )
         response = self._answer(args)
@@ -244,14 +250,23 @@ class FakeGateway:
                 )
             if self._clock is not None:
                 self._clock.advance(timeout + (kill_grace or 0))
-            raise GatewayTimeout(args, timeout)
+            err_bytes = response.stderr.encode()
+            if output_limit is not None:
+                err_bytes = err_bytes[:output_limit]
+            raise GatewayTimeout(args, timeout, stderr=err_bytes)
+        if kill_over_bytes is not None and len(response.stdout.encode()) > kill_over_bytes:
+            raise GatewayOutputLimit(args, kill_over_bytes)
         out, err = response.stdout, response.stderr
+        if kill_over_bytes is not None:
+            err = err.encode()[:kill_over_bytes].decode(errors="ignore")
         if discard_output:
             out, err = "", ""
+        out_bytes, err_bytes = out.encode(), err.encode()
         if output_limit is not None:  # as the real gateway: a byte prefix of each stream
-            out = out.encode()[:output_limit].decode("utf-8", "replace")
-            err = err.encode()[:output_limit].decode("utf-8", "replace")
-        return Result(args, response.returncode, out, err)
+            out_bytes, err_bytes = out_bytes[:output_limit], err_bytes[:output_limit]
+            out = out_bytes.decode("utf-8", "replace")
+            err = err_bytes.decode("utf-8", "replace")
+        return Result(args, response.returncode, out, err, out_bytes, err_bytes)
 
     def spawn(
         self,

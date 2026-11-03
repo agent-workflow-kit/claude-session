@@ -4,6 +4,7 @@
 ``write_private_file_at`` and the ``*_private_dir_at`` helpers for the session-directory
 writes (design.md, Session directories), which work relative to pinned directory
 descriptors, and ``append_private_line`` for the ``log.jsonl`` and ``audit.jsonl`` appends.
+``is_utf8`` checks that an argv token or path is valid UTF-8 as bytes.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
-import secrets
 import stat
 import sys
 import time
@@ -25,8 +25,28 @@ _LOCK_RETRY_INTERVAL = 0.005
 _SUBDIR_FLAGS = _DIR_FLAGS | os.O_NONBLOCK
 
 
+def is_utf8(text: str) -> bool:
+    """Whether ``text``, as the bytes the OS handed over (re-encoded with the filesystem
+    encoding and ``surrogateescape``), is valid UTF-8. An undecodable byte arrives as a lone
+    surrogate under a UTF-8 locale, and as an ordinary character (``b"\\xe9"`` as ``é``) under
+    a non-UTF-8 one with UTF-8 mode off; both are caught. Text the filesystem encoding cannot
+    encode is not valid either."""
+    try:
+        os.fsencode(text).decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return False
+    return True
+
+
 class UnsafePathError(OSError):
     """A directory that is not a real directory owned by this user."""
+
+
+def token_hex(nbytes: int) -> str:
+    """``nbytes`` random bytes as hex, as ``secrets.token_hex`` makes them and from the same
+    source: this module is imported on every hook, and importing ``secrets`` costs
+    milliseconds there."""
+    return os.urandom(nbytes).hex()
 
 
 def _check_segment(name: str) -> None:
@@ -214,7 +234,7 @@ def write_private_file_at(
     removed) and ``ValueError`` when ``name`` is not one path segment."""
     _check_segment(name)
     tmp_fd = dir_fd if tmp_dir_fd is None else tmp_dir_fd
-    tmp_name = f".{secrets.token_hex(4)}.tmp"
+    tmp_name = f".{token_hex(4)}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(tmp_name, flags, 0o600, dir_fd=tmp_fd)
     try:

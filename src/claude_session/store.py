@@ -61,6 +61,7 @@ APPLICATION_ID = 0x43536573
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # A session id or a prefix of one (ids.SESSION_ID is the full grammar).
 _SESSION_ID_PREFIX = re.compile(r"cs-[a-z2-7]{1,8}")
+_SESSION_ID = re.compile(r"cs-[a-z2-7]{8}")
 # Held while state.db is checked and, when missing, created: closing the create descriptor
 # drops this process's POSIX locks, so no other thread may connect before that close. Any
 # thread that takes it after the creator finds the file and closed descriptor; it is never
@@ -165,8 +166,9 @@ def _check_db_file(path: str, info: os.stat_result) -> None:
 
 
 def _prepare_db_file(path: str, *, migrate: bool) -> None:
-    """Check ``path`` without opening it; with ``migrate``, create it when missing and
-    tighten it (and an existing ``-wal``/``-shm``) to 0600.
+    """Check ``path`` without opening it; with ``migrate``, create it (0600) when missing and
+    tighten it (and an existing ``-wal``/``-shm``): group and other bits are cleared, owner
+    bits never added, so a mode is only ever tightened.
 
     No descriptor is ever held on an existing database: POSIX ``close`` drops all of this
     process's ``fcntl`` locks on the file, including those of live SQLite connections. A
@@ -190,20 +192,22 @@ def _prepare_db_file(path: str, *, migrate: bool) -> None:
     _check_db_file(path, info)
     if not migrate:
         return
-    if stat.S_IMODE(info.st_mode) != 0o600:
-        os.chmod(path, 0o600)
+    _tighten(path, info)
     for sidecar in (path + "-wal", path + "-shm"):
         try:
             side = os.lstat(sidecar)
         except FileNotFoundError:
             continue
         # Anything else is skipped: SQLite refuses a symlinked -wal/-shm itself.
-        if (
-            stat.S_ISREG(side.st_mode)
-            and side.st_uid == os.geteuid()
-            and stat.S_IMODE(side.st_mode) != 0o600
-        ):
-            os.chmod(sidecar, 0o600)
+        if stat.S_ISREG(side.st_mode) and side.st_uid == os.geteuid():
+            _tighten(sidecar, side)
+
+
+def _tighten(path: str, info: os.stat_result) -> None:
+    """Clear the group and other bits of ``path`` (never adds a bit)."""
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        os.chmod(path, mode & ~0o077)
 
 
 def _unsafe(path: str, cause: str) -> FailedError:
@@ -290,13 +294,18 @@ def current_holder() -> Holder:
     return Holder(pid=os.getpid(), start=start_time(os.getpid()))
 
 
+# The largest PID the kernel's pid_t can hold; a larger stored value names no process.
+MAX_PID = 2**31 - 1
+
+
 def pid_exists(pid: int) -> bool:
-    """Whether a process with ``pid`` exists (one we may not signal counts)."""
-    if pid <= 0:
+    """Whether a process with ``pid`` exists (one we may not signal counts). A PID outside
+    1..``MAX_PID`` names none."""
+    if not 0 < pid <= MAX_PID:
         return False
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
+    except (ProcessLookupError, OverflowError):
         return False
     except PermissionError:
         return True
@@ -320,6 +329,23 @@ def pid_alive(pid: int, start: str) -> bool:
     except (ProcInfoError, OSError, GatewayTimeout):
         return True
     except ValueError:  # not a valid PID
+        return False
+
+
+def pid_known_alive(pid: int, start: str) -> bool:
+    """Whether the exact process ``pid`` with the start-time token ``start`` is known to run:
+    for showing the processes of a run that has ended, and for ``verify-secret``'s liveness
+    gate. Unlike ``pid_alive``, an unknown start (``""``) or a check the platform cannot answer
+    counts as gone, and must keep doing so (fail closed): a reused PID must not show an ended
+    run's wrapper as alive, and must not let a secret match."""
+    if start == "" or not 0 < pid <= MAX_PID:
+        return False
+    from .gateway import GatewayTimeout
+    from .procinfo import ProcInfoError
+
+    try:
+        return bool(system_procinfo().is_alive(pid, start))
+    except (ProcInfoError, OSError, GatewayTimeout, ValueError):
         return False
 
 
@@ -639,6 +665,7 @@ class Store:
         holder: Holder | None,
         liveness: Liveness,
         clock: Clock,
+        known_liveness: Liveness = pid_known_alive,
     ) -> None:
         self.conn = conn
         self.path = path
@@ -647,6 +674,9 @@ class Store:
         # Lease ownership is (pid, start, token): two stores of one process never share one.
         self.token = uuid.uuid4().hex
         self.liveness = liveness
+        # Display of an ended run's processes, and the verify-secret liveness gate: "cannot
+        # tell" counts as gone (fail closed; it must stay so).
+        self.known_liveness = known_liveness
         self.clock = clock
 
     @classmethod
@@ -661,6 +691,7 @@ class Store:
         liveness: Liveness | None = None,
         clock: Clock | None = None,
         migrate_wait: float = MIGRATE_WAIT,
+        known_liveness: Liveness | None = None,
     ) -> Store:
         """Open (creating it, mode 0600 in a 0700 directory) the database at ``path``.
 
@@ -682,6 +713,7 @@ class Store:
             holder=holder,
             liveness=liveness or pid_alive,
             clock=clock or utc_now,
+            known_liveness=known_liveness or pid_known_alive,
         )
         try:
             if migrate:
@@ -963,28 +995,246 @@ class Store:
         A range comparison on the primary key (``prefix <= id < upper``, where ``upper`` is
         ``prefix`` with its last character incremented), never ``LIKE``. Callers normalize
         and validate the prefix first (``ids.lookup_session_id``); a prefix outside
-        ``cs-[a-z2-7]{1,8}`` raises ``ValueError``.
+        ``cs-[a-z2-7]{1,8}`` raises ``ValueError``. Stored ids are decoded leniently and a
+        row whose id is not a valid session id (corrupt) is skipped, so it never breaks the
+        lookup of the others.
         """
         if _SESSION_ID_PREFIX.fullmatch(prefix) is None:
             raise ValueError(f"not a session id prefix: {prefix!r}")
         upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
-        rows = self.conn.execute(
-            "SELECT csession_id, forgotten_at IS NOT NULL FROM sessions "
-            "WHERE csession_id >= ? AND csession_id < ? ORDER BY csession_id",
-            (prefix, upper),
-        ).fetchall()
-        return [(sid, bool(forgotten)) for sid, forgotten in rows]
+        with self._lenient_decoding():
+            rows = self.conn.execute(
+                "SELECT csession_id, forgotten_at IS NOT NULL FROM sessions "
+                "WHERE csession_id >= ? AND csession_id < ? ORDER BY csession_id",
+                (prefix, upper),
+            ).fetchall()
+        return [
+            (sid, bool(forgotten))
+            for sid, forgotten in rows
+            if isinstance(sid, str) and _SESSION_ID.fullmatch(sid) is not None
+        ]
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """Sessions that are not forgotten, most recently updated first (raw ``sessions``
-        rows)."""
-        # TODO(#16): join the current run and labels, apply the list filters.
+        rows). ``list_records`` adds each one's current run, labels and run kinds."""
         cursor = self.conn.execute(
             "SELECT * FROM sessions WHERE forgotten_at IS NULL "
             "ORDER BY updated_at DESC, csession_id DESC"
         )
         names = [column[0] for column in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+    # Read views (status, list). One read transaction each, so a view is one snapshot; text
+    # is decoded leniently (``_lenient_text``) so stored bytes that are not UTF-8 never fail.
+
+    @contextmanager
+    def _lenient_decoding(self) -> Iterator[None]:
+        """Lenient text decoding on the shared connection (restored afterwards); usable
+        inside a caller's transaction."""
+        previous = self.conn.text_factory
+        self.conn.text_factory = _lenient_text
+        try:
+            yield
+        finally:
+            self.conn.text_factory = previous
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """A deferred read transaction with lenient text decoding (restored afterwards)."""
+        with self._lenient_decoding():
+            self.conn.execute("BEGIN")
+            try:
+                yield self.conn
+            finally:
+                if self.conn.in_transaction:
+                    self.conn.execute("ROLLBACK")  # nothing was written
+
+    def status_record(self, csession_id: str, run_no: int | None = None) -> StatusRecord | None:
+        """The rows ``status`` shows: the session (forgotten or not; the caller resolved the
+        id), run ``run_no`` (default: the current run; None when it does not exist), the run
+        count, labels, Claude session ids and the last ``STATUS_EVENTS`` events (oldest
+        first). None when the session does not exist."""
+        with self._read_snapshot() as conn:
+            session = _one_dict(conn, "SELECT * FROM sessions WHERE csession_id = ?", csession_id)
+            if session is None:
+                return None
+            wanted = session["current_run"] if run_no is None else run_no
+            run = None
+            if isinstance(wanted, int) and 1 <= wanted <= MAX_SQLITE_INTEGER:
+                run = _one_dict(
+                    conn,
+                    "SELECT * FROM runs WHERE csession_id = ? AND run_no = ?",
+                    csession_id,
+                    wanted,
+                )
+            current = session["current_run"]
+            current_run = run
+            if run_no is not None and run_no != current:
+                current_run = _one_dict(
+                    conn,
+                    "SELECT * FROM runs WHERE csession_id = ? AND run_no = ?",
+                    csession_id,
+                    current,
+                )
+            (runs,) = conn.execute(
+                "SELECT COUNT(*) FROM runs WHERE csession_id = ?", (csession_id,)
+            ).fetchone()
+            labels = _labels(conn, csession_id)
+            claude_ids = _all_dicts(
+                conn,
+                "SELECT claude_session_id, run_no, source, transcript_path, seen_at "
+                "FROM claude_ids WHERE csession_id = ? ORDER BY seen_at, claude_session_id",
+                csession_id,
+            )
+            events = _all_dicts(
+                conn,
+                "SELECT * FROM (SELECT id, run_no, event_ts, from_state, to_state, "
+                "from_activity, to_activity, needs_input_reason, cause, final, delivered_at "
+                "FROM events WHERE csession_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id",
+                csession_id,
+                STATUS_EVENTS,
+            )
+        return StatusRecord(
+            session=session,
+            run=run,
+            current_run=current_run,
+            runs=int(runs),
+            labels=labels,
+            claude_ids=claude_ids,
+            events=events,
+        )
+
+    def list_records(self) -> list[ListRecord]:
+        """Every session that is not forgotten, in ``list_sessions`` order, with its current
+        run, labels and the kinds of all its runs. A session whose current-run row is
+        missing (corrupt) is skipped, as ``status`` does not find it."""
+        with self._read_snapshot() as conn:
+            sessions = self.list_sessions()
+            runs = _all_dicts(
+                conn,
+                "SELECT r.* FROM runs r JOIN sessions s ON s.csession_id = r.csession_id "
+                "AND r.run_no = s.current_run WHERE s.forgotten_at IS NULL",
+            )
+            labels: dict[str, list[str]] = {}
+            for sid, key, value in conn.execute(
+                "SELECT l.csession_id, l.key, l.value FROM labels l JOIN sessions s "
+                "ON s.csession_id = l.csession_id WHERE s.forgotten_at IS NULL "
+                "ORDER BY l.csession_id, l.key, l.value"
+            ):
+                labels.setdefault(sid, []).append(f"{key}={value}")
+            kinds: dict[str, set[str]] = {}
+            for sid, kind in conn.execute(
+                "SELECT DISTINCT r.csession_id, r.run_kind FROM runs r JOIN sessions s "
+                "ON s.csession_id = r.csession_id WHERE s.forgotten_at IS NULL"
+            ):
+                kinds.setdefault(sid, set()).add(kind)
+        current = {row["csession_id"]: row for row in runs}
+        return [
+            ListRecord(
+                session=session,
+                run=current[session["csession_id"]],
+                labels=labels.get(session["csession_id"], []),
+                run_kinds=frozenset(kinds.get(session["csession_id"], set())),
+            )
+            for session in sessions
+            if session["csession_id"] in current
+        ]
+
+    # Labels (interface.md, label add / label remove)
+
+    def change_labels(
+        self,
+        csession_id: str,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        add: bool,
+        dry_run: bool = False,
+    ) -> LabelChange | None:
+        """Add (``add``) or remove ``pairs`` (already validated by ``ids.parse_label``) on a
+        session that is not forgotten, in one transaction; None when there is no such session.
+        Adding a present pair or removing an absent one is a no-op; a pair given twice counts
+        once. A change sets ``updated_at``. With ``dry_run`` nothing is written: the result is
+        what the change would be."""
+        unique = list(dict.fromkeys(pairs))
+        if dry_run:
+            with self._read_snapshot() as conn:
+                return self._label_change(conn, csession_id, unique, add=add)
+        # Stored text is only read and compared: decode it leniently, as the dry run does.
+        with self._lenient_decoding(), self.transaction() as conn:
+            change = self._label_change(conn, csession_id, unique, add=add)
+            if change is None:
+                return None
+            for key, value in change.added:
+                conn.execute(
+                    "INSERT INTO labels (csession_id, key, value) VALUES (?, ?, ?)",
+                    (csession_id, key, value),
+                )
+            for key, value in change.removed:
+                conn.execute(
+                    "DELETE FROM labels WHERE csession_id = ? AND key = ? AND value = ?",
+                    (csession_id, key, value),
+                )
+            if change.added or change.removed:
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE csession_id = ?",
+                    (format_ts(self.clock()), csession_id),
+                )
+        return change
+
+    @staticmethod
+    def _label_change(
+        conn: sqlite3.Connection,
+        csession_id: str,
+        pairs: Sequence[tuple[str, str]],
+        *,
+        add: bool,
+    ) -> LabelChange | None:
+        row = conn.execute(
+            "SELECT 1 FROM sessions WHERE csession_id = ? AND forgotten_at IS NULL",
+            (csession_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        current = {
+            (key, value)
+            for key, value in conn.execute(
+                "SELECT key, value FROM labels WHERE csession_id = ?", (csession_id,)
+            )
+        }
+        if add:
+            added = [pair for pair in pairs if pair not in current]
+            removed: list[tuple[str, str]] = []
+            result = current | set(added)
+        else:
+            added = []
+            removed = [pair for pair in pairs if pair in current]
+            result = current - set(removed)
+        return LabelChange(labels=sorted(result), added=added, removed=removed)
+
+    # verify-secret (interface.md, Internal commands)
+
+    def secret_run(self, csession_id: str) -> SecretRun | None:
+        """The current run's stored secret digest, wrapper and child, only when the session is
+        not forgotten and the run is adopted (wrapper set) and has not ended; otherwise None.
+        A stored value of an unexpected type reads as None."""
+        row = self.conn.execute(
+            "SELECT r.secret_sha256, r.wrapper_pid, r.wrapper_start, r.child_pid, r.child_start "
+            "FROM sessions s JOIN runs r "
+            "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
+            "WHERE s.csession_id = ? AND s.forgotten_at IS NULL AND r.ended_at IS NULL "
+            "AND r.wrapper_pid IS NOT NULL",
+            (csession_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        digest, wrapper_pid, wrapper_start, child_pid, child_start = row
+        return SecretRun(
+            secret_sha256=digest if isinstance(digest, str) else None,
+            wrapper_pid=wrapper_pid if isinstance(wrapper_pid, int) else None,
+            wrapper_start=wrapper_start if isinstance(wrapper_start, str) else None,
+            child_pid=child_pid if isinstance(child_pid, int) else None,
+            child_start=child_start if isinstance(child_start, str) else None,
+        )
 
     # Forget and retention (docs/design.md, Reconcile, salvage and retention)
 
@@ -1184,9 +1434,11 @@ class Store:
         A fork (``forked_from``: the source session) records ``forked_from`` and copies the
         source's taint, read in this transaction: an unknown or forgotten source raises
         ``NotFoundError``, and a tainted source forked into a run that is not
-        third-party-reading raises ``RefusedError`` (``tainted``)."""
+        third-party-reading raises ``RefusedError`` (``tainted``) unless the run records
+        ``--allow-tainted`` (``ALLOW_TAINTED``); the fork is tainted either way."""
         if run.wrapper_pid is None or run.wrapper_start is None:
             raise ValueError("a run is allocated with its wrapper")
+        allow = _allows_tainted(run.invocation)
         with self.transaction() as conn:
             now = format_ts(self.clock())
             taint = (
@@ -1200,7 +1452,7 @@ class Store:
                 if source is None or source[0] is not None:
                     raise NotFoundError(f"unknown session: {forked_from}")
                 if source[1]:
-                    _refuse_tainted(forked_from, run.reads_third_party)
+                    _refuse_tainted(forked_from, run.reads_third_party, allow)
                     # The fork inherits the source's taint (and its time); no run of the
                     # fork caused it.
                     taint = (1, source[2] or now, None)
@@ -1245,7 +1497,8 @@ class Store:
         and not be forgotten (``NotFoundError``); its current run must still be
         ``previous_run`` (the run the carry-over was computed from) and final, else
         ``RefusedError`` ``live``; a tainted session resumed into a run that is not
-        third-party-reading is refused ``tainted``. Then the run row (with its wrapper set,
+        third-party-reading is refused ``tainted`` unless the run records ``--allow-tainted``
+        (``ALLOW_TAINTED``). Then the run row (with its wrapper set,
         as ``allocate``), the session's current run and state ``starting``, the taint of a
         third-party-reading run, the given labels (added) and the ``launch`` event. Returns
         the new run number."""
@@ -1274,7 +1527,8 @@ class Store:
                     f"cannot resume {csession_id}: it is live; {LIVE_HINT}", reason="live"
                 )
             if tainted:
-                _refuse_tainted(csession_id, run.reads_third_party)
+                allow = _allows_tainted(run.invocation)
+                _refuse_tainted(csession_id, run.reads_third_party, allow)
             run_no = previous_run + 1
             now = format_ts(self.clock())
             self._insert_run(conn, csession_id, run_no, run, now, None)
@@ -1381,6 +1635,17 @@ class Store:
         relative to the session directory, e.g. ``inputs/2/b.txt``) in the run's
         ``invocation_json`` (``copied_inputs``). ``InternalError`` when the run row does not
         exist."""
+        self._merge_invocation(csession_id, run_no, "copied_inputs", list(paths))
+
+    def record_override_audit(self, csession_id: str, run_no: int, mark: Mapping[str, Any]) -> None:
+        """Mark a run whose launch is about to write its ``launch_escalation_override``
+        ``result: ok`` record: the record's redacted ``actor``, ``decision_ids`` and ``inputs``
+        in the run's ``invocation_json`` (``override_audit``), so the liveness check can write
+        the ``result: error`` follow-up when the run's launch dies (``launch_interrupted``).
+        ``InternalError`` when the run row does not exist."""
+        self._merge_invocation(csession_id, run_no, "override_audit", dict(mark))
+
+    def _merge_invocation(self, csession_id: str, run_no: int, key: str, value: Any) -> None:
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT invocation_json FROM runs WHERE csession_id = ? AND run_no = ?",
@@ -1394,30 +1659,51 @@ class Store:
                 invocation = None
             if not isinstance(invocation, dict):
                 raise InternalError(f"run {run_no} of {csession_id} has an unreadable record")
-            invocation["copied_inputs"] = list(paths)
+            invocation[key] = value
             conn.execute(
                 "UPDATE runs SET invocation_json = ? WHERE csession_id = ? AND run_no = ?",
                 (json.dumps(invocation, ensure_ascii=False), csession_id, run_no),
             )
 
-    def recheck_fork_taint(self, csession_id: str, source: str, *, reads_third_party: bool) -> None:
-        """Right before step 7 of a run that forks ``source``'s conversation (a fork's run 1,
-        or a later run of a fork that never captured a Claude id): the source's taint read
-        again in one transaction (it may have been tainted since the fork was allocated).
-        A tainted source and a third-party-reading run: the taint is copied onto the fork
-        (when it is not tainted yet); a run that is not third-party-reading is refused
-        ``tainted`` (``_refuse_tainted``, ``RefusedError``)."""
+    def recheck_fork_taint(self, csession_id: str, run_no: int, source: str | None) -> bool:
+        """Right before step 7 of every run (not only forks; the name is historical): the
+        taint read again in one transaction, with the run's own ``reads_third_party`` and
+        ``--allow-tainted`` as its row records them (never the launch spec file). For a run
+        that forks ``source``'s conversation (a fork's run 1, or a later run of a fork that
+        never captured a Claude id), the source's taint (it may have been tainted since the
+        fork was allocated): a tainted source that does not refuse the run copies its taint
+        onto the fork. Then the session's own taint. A tainted one with a run that is not
+        third-party-reading is refused ``tainted`` (``_refuse_tainted``, ``RefusedError``)
+        unless the run recorded ``--allow-tainted``. Returns whether only
+        ``--allow-tainted`` lets the run go ahead (its ``resume_tainted`` record is then
+        due)."""
         with self.transaction() as conn:
-            _recheck_fork_taint(conn, csession_id, source, reads_third_party)
+            row = conn.execute(
+                "SELECT r.reads_third_party, r.invocation_json FROM runs r "
+                "WHERE r.csession_id = ? AND r.run_no = ?",
+                (csession_id, run_no),
+            ).fetchone()
+            if row is None:
+                raise InternalError(f"no run {run_no} of session {csession_id}")
+            third_party, allow = bool(row[0]), allows_tainted(row[1])
+            lifted = False
+            if source is not None:
+                lifted = _recheck_fork_taint(conn, csession_id, source, third_party, allow)
+            tainted = conn.execute(
+                "SELECT tainted FROM sessions WHERE csession_id = ?", (csession_id,)
+            ).fetchone()
+            if tainted is not None and tainted[0]:
+                lifted = _refuse_tainted(csession_id, third_party, allow) or lifted
+            return lifted
 
     def fork_source_taints(self, csession_id: str) -> bool:
         """Whether adopting the session's current run now would be refused ``tainted`` by
         the fork re-check (``adopt``): the run forks its source's conversation, is not
-        third-party-reading, and the source is tainted (its rows gone: the fork, which
-        retention gave its taint). Reads only (a dry run)."""
+        third-party-reading, did not record ``--allow-tainted``, and the source is tainted (its
+        rows gone: the fork, which retention gave its taint). Reads only (a dry run)."""
         row = self.conn.execute(
             "SELECT s.forked_from, s.claude_session_id, r.reads_third_party, "
-            "COALESCE(src.tainted, s.tainted) "
+            "COALESCE(src.tainted, s.tainted), r.invocation_json "
             "FROM sessions s JOIN runs r "
             "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
             "LEFT JOIN sessions src ON src.csession_id = s.forked_from "
@@ -1426,12 +1712,13 @@ class Store:
         ).fetchone()
         if row is None:
             return False
-        forked_from, claude_id, third_party, source_tainted = row
+        forked_from, claude_id, third_party, source_tainted, invocation = row
         return (
             forked_from is not None
             and claude_id is None
             and not third_party
             and bool(source_tainted)
+            and not allows_tainted(invocation)
         )
 
     def set_pending_cause(self, csession_id: str, run_no: int, cause: str) -> bool:
@@ -1443,6 +1730,18 @@ class Store:
                 "UPDATE runs SET pending_cause = ? WHERE csession_id = ? AND run_no = ? "
                 "AND pending_cause IS NULL AND ended_at IS NULL",
                 (cause, csession_id, run_no),
+            )
+        return cursor.rowcount == 1
+
+    def clear_pending_cause(self, csession_id: str, run_no: int, cause: str) -> bool:
+        """Undo ``set_pending_cause`` when the signal it preceded was not sent: clears the
+        cause only while it is still ``cause`` and the run is not final. The caller clears
+        only a cause its own ``set_pending_cause`` recorded. Returns whether it was cleared."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET pending_cause = NULL WHERE csession_id = ? AND run_no = ? "
+                "AND pending_cause = ? AND ended_at IS NULL",
+                (csession_id, run_no, cause),
             )
         return cursor.rowcount == 1
 
@@ -1525,6 +1824,87 @@ class Store:
             conn.execute(
                 "UPDATE runs SET warnings_json = ? WHERE csession_id = ? AND run_no = ?",
                 (json.dumps(merged, ensure_ascii=False), csession_id, run_no),
+            )
+
+    # Pre-launch hooks (launch step 6; design.md, Lifecycle hooks)
+
+    def pre_launch_record(self, csession_id: str, run_no: int) -> dict[str, Any]:
+        """What step 6 reads of a run's session, in one snapshot: ``launch_kind``,
+        ``tainted``, ``forked_from``, the labels (``labels``, sorted ``key=value``), the kind
+        of the previous run (``previous_run_kind``: run ``run_no`` - 1, else for a fork's
+        run 1 the source's current run; None for a new session) and the previous run's
+        ``escalated_hooks`` (``previous_escalated``; entries that are not strings, or an
+        unreadable value, give none: nothing is overridden). ``InternalError`` when the
+        session does not exist."""
+        with self.transaction() as conn:
+            session = conn.execute(
+                "SELECT launch_kind, tainted, forked_from FROM sessions WHERE csession_id = ?",
+                (csession_id,),
+            ).fetchone()
+            if session is None:
+                raise InternalError(f"no session {csession_id}")
+            labels = [
+                f"{key}={value}"
+                for key, value in conn.execute(
+                    "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+                    (csession_id,),
+                )
+            ]
+            previous_kind, escalated = None, None
+            if run_no > 1:
+                row = conn.execute(
+                    "SELECT run_kind, escalated_hooks FROM runs "
+                    "WHERE csession_id = ? AND run_no = ?",
+                    (csession_id, run_no - 1),
+                ).fetchone()
+                if row is not None:
+                    previous_kind, escalated = row
+            elif session[2] is not None:
+                row = conn.execute(
+                    "SELECT r.run_kind FROM runs r JOIN sessions s "
+                    "ON s.csession_id = r.csession_id AND s.current_run = r.run_no "
+                    "WHERE s.csession_id = ?",
+                    (session[2],),
+                ).fetchone()
+                previous_kind = None if row is None else row[0]
+        return {
+            "launch_kind": session[0],
+            "tainted": bool(session[1]),
+            "forked_from": session[2],
+            "labels": labels,
+            "previous_run_kind": previous_kind,
+            "previous_escalated": _string_list_json(escalated),
+        }
+
+    def record_pre_launch(
+        self,
+        csession_id: str,
+        run_no: int,
+        *,
+        decision_ids: Sequence[str],
+        escalated_hooks: Sequence[str],
+    ) -> None:
+        """Record what step 6 returned, in one transaction: the hooks' ``decision_ids``
+        appended to the run's ``decision_ids_json`` (after the ``--decision-id`` values) and
+        the hashes of the entries that exited 13 as ``escalated_hooks`` (a JSON list; NULL
+        when none did)."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT decision_ids_json FROM runs WHERE csession_id = ? AND run_no = ?",
+                (csession_id, run_no),
+            ).fetchone()
+            if row is None:
+                raise InternalError(f"no run {run_no} of session {csession_id}")
+            merged = [*_string_list_json(row[0]), *decision_ids]
+            conn.execute(
+                "UPDATE runs SET decision_ids_json = ?, escalated_hooks = ? "
+                "WHERE csession_id = ? AND run_no = ?",
+                (
+                    json.dumps(merged, ensure_ascii=False),
+                    json.dumps(list(escalated_hooks)) if escalated_hooks else None,
+                    csession_id,
+                    run_no,
+                ),
             )
 
     # Outcome file (interface.md, Outcome file; design.md, Data model)
@@ -1688,6 +2068,32 @@ class Store:
         )
         return True
 
+    @staticmethod
+    def _record_with_final(
+        conn: sqlite3.Connection, csession_id: str, run_no: int, final: Final
+    ) -> None:
+        """The parts of ``final`` recorded with the compare-and-set (see ``Final``)."""
+        key = (csession_id, run_no)
+        if final.drop_outcome_file:
+            conn.execute(
+                "UPDATE runs SET outcome_file = NULL WHERE csession_id = ? AND run_no = ?", key
+            )
+        if final.writable is not None:
+            conn.execute(
+                "UPDATE runs SET writable_json = COALESCE(writable_json, ?) "
+                "WHERE csession_id = ? AND run_no = ?",
+                (json.dumps(list(final.writable), ensure_ascii=False), *key),
+            )
+        if final.warnings:
+            (current,) = conn.execute(
+                "SELECT warnings_json FROM runs WHERE csession_id = ? AND run_no = ?", key
+            ).fetchone()
+            merged = list(dict.fromkeys([*json.loads(current or "[]"), *final.warnings]))
+            conn.execute(
+                "UPDATE runs SET warnings_json = ? WHERE csession_id = ? AND run_no = ?",
+                (json.dumps(merged, ensure_ascii=False), *key),
+            )
+
     # Pending runs (start) and adoption (exec --session-id)
 
     def adopt(
@@ -1714,7 +2120,8 @@ class Store:
           with ``never_adopted`` in this transaction (cause ``adopt``), then ``expired``;
         - a pending run that forks its source's conversation (a fork's run 1, or a later run
           of a fork that never captured a Claude id) whose source is tainted now while the
-          run is not third-party-reading (``_refuse_tainted``): finalized ``not-started``
+          run is not third-party-reading and did not record ``--allow-tainted``
+          (``_refuse_tainted``): finalized ``not-started``
           with ``never_adopted`` (cause ``adopt``) in this transaction, then ``tainted``;
         - otherwise the wrapper is set (this process), and ``outcome_file`` and
           ``hook_interpreter`` (the adopting process's, written into the injected hooks),
@@ -1723,7 +2130,7 @@ class Store:
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT s.forgotten_at, r.run_no, r.wrapper_pid, r.ended_at, r.expires_at, "
-                "s.forked_from, s.claude_session_id, r.reads_third_party "
+                "s.forked_from, s.claude_session_id, r.reads_third_party, r.invocation_json "
                 "FROM sessions s JOIN runs r "
                 "ON r.csession_id = s.csession_id AND r.run_no = s.current_run "
                 "WHERE s.csession_id = ?",
@@ -1731,7 +2138,7 @@ class Store:
             ).fetchone()
             if row is None or row[0] is not None:
                 return Adoption("not_found", None)
-            _, current, wrapper, ended, expires, forked_from, claude_id, third_party = row
+            _, current, wrapper, ended, expires, forked_from, claude_id, third_party, inv = row
             if run_no is not None and run_no != current:
                 return Adoption("expired", run_no)
             if ended is not None:
@@ -1745,7 +2152,9 @@ class Store:
                 return Adoption("expired", current, expired_now=True)
             if forked_from is not None and claude_id is None:
                 try:
-                    _recheck_fork_taint(conn, csession_id, forked_from, bool(third_party))
+                    _recheck_fork_taint(
+                        conn, csession_id, forked_from, bool(third_party), allows_tainted(inv)
+                    )
                 except RefusedError:
                     final = dataclasses.replace(
                         NEVER_ADOPTED,
@@ -1788,6 +2197,35 @@ class Store:
             return self._finalize(
                 conn, csession_id, run_no, dataclasses.replace(NEVER_ADOPTED, cause=cause)
             )
+
+    def request_stop(self, csession_id: str, run_no: int) -> bool:
+        """``stop``'s request (interface.md, stop, step 1): set ``stop_requested_at`` on the
+        run unless it is final (an earlier request's time stands). ``exec`` reads it in both
+        phases: a SIGTERM or SIGHUP then ends the run ``stopped`` (session phase) or
+        ``canceled`` (launch phase). Returns whether the run was not final."""
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE runs SET stop_requested_at = COALESCE(stop_requested_at, ?) "
+                "WHERE csession_id = ? AND run_no = ? AND ended_at IS NULL",
+                (format_ts(self.clock()), csession_id, run_no),
+            )
+        return cursor.rowcount == 1
+
+    def cancel_pending(self, csession_id: str, run_no: int, final: Final) -> bool:
+        """``stop``'s cancel of a pending run (interface.md, stop, step 2): one ``BEGIN
+        IMMEDIATE`` compare-and-set on the run having no wrapper and not being final, the
+        condition ``adopt`` checks in its own transaction, so exactly one of them wins. A run
+        ``start`` still holds (its wrapper set until ``release_pending``) is not pending.
+        Returns whether this call finalized it with ``final``; the caller deletes the launch
+        spec, writes the outcome file and delivers the final event."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT wrapper_pid, ended_at FROM runs WHERE csession_id = ? AND run_no = ?",
+                (csession_id, run_no),
+            ).fetchone()
+            if row is None or row[0] is not None or row[1] is not None:
+                return False
+            return self._finalize(conn, csession_id, run_no, final, expect={"wrapper_pid": None})
 
     def release_pending(
         self,
@@ -1888,32 +2326,6 @@ class Store:
             ).fetchone()
             record["run1_invocation_json"] = None if row is None else row[0]
         return record
-
-    @staticmethod
-    def _record_with_final(
-        conn: sqlite3.Connection, csession_id: str, run_no: int, final: Final
-    ) -> None:
-        """The parts of ``final`` recorded with the compare-and-set (see ``Final``)."""
-        key = (csession_id, run_no)
-        if final.drop_outcome_file:
-            conn.execute(
-                "UPDATE runs SET outcome_file = NULL WHERE csession_id = ? AND run_no = ?", key
-            )
-        if final.writable is not None:
-            conn.execute(
-                "UPDATE runs SET writable_json = COALESCE(writable_json, ?) "
-                "WHERE csession_id = ? AND run_no = ?",
-                (json.dumps(list(final.writable), ensure_ascii=False), *key),
-            )
-        if final.warnings:
-            (current,) = conn.execute(
-                "SELECT warnings_json FROM runs WHERE csession_id = ? AND run_no = ?", key
-            ).fetchone()
-            merged = list(dict.fromkeys([*json.loads(current or "[]"), *final.warnings]))
-            conn.execute(
-                "UPDATE runs SET warnings_json = ? WHERE csession_id = ? AND run_no = ?",
-                (json.dumps(merged, ensure_ascii=False), *key),
-            )
 
     def run_record(self, csession_id: str, run_no: int) -> dict[str, Any]:
         """The run row joined with its session's ``forked_from``, ``claude_session_id`` and
@@ -2066,6 +2478,16 @@ class Store:
         unknown start (``""``) is checked by PID only (it counts as alive while that PID
         exists)."""
         return self._holder_alive(pid, start)
+
+    def session_labels(self, csession_id: str) -> list[tuple[str, str]]:
+        """The session's labels as ``(key, value)`` pairs, ordered by key, then value."""
+        return [
+            (key, value)
+            for key, value in self.conn.execute(
+                "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+                (csession_id,),
+            )
+        ]
 
     # The hook path (hookevent). Call these inside one ``transaction()``; they read and write
     # only columns of schema 1.0, so a newer additive schema keeps working (design.md, Data
@@ -2357,16 +2779,25 @@ DELIVERY_LEASE_PREFIX = "delivery:"
 
 
 LIVE_HINT = "resume --fork still works"
+# The key of ``runs.invocation_json`` that records ``--allow-tainted`` (``taint.AllowTainted``).
+ALLOW_TAINTED = "allow_tainted"
 # The run columns a finalization compare-and-set may also require unchanged (``expect``).
 EXPECTABLE = frozenset({"wrapper_pid", "wrapper_start", "child_pid", "child_start"})
 
 
 def _recheck_fork_taint(
-    conn: sqlite3.Connection, csession_id: str, source: str, reads_third_party: bool
-) -> None:
+    conn: sqlite3.Connection,
+    csession_id: str,
+    source: str,
+    reads_third_party: bool,
+    allow_tainted: bool = False,
+) -> bool:
     """``Store.recheck_fork_taint`` inside the caller's transaction. When the source's rows
     are gone (deleted by retention), its taint was copied onto the fork in that deletion's
-    transaction (``delete_session_rows``), so the fork's own taint stands in for it."""
+    transaction (``delete_session_rows``), so the fork's own taint stands in for it. A
+    tainted source that does not refuse the run (third-party-reading, or ``--allow-tainted``)
+    copies its taint onto the fork: the fork's conversation holds what tainted it. Returns
+    whether only ``--allow-tainted`` let the run go ahead (``_refuse_tainted``)."""
     row = conn.execute(
         "SELECT tainted, tainted_at FROM sessions WHERE csession_id = ?", (source,)
     ).fetchone()
@@ -2375,29 +2806,52 @@ def _recheck_fork_taint(
             "SELECT tainted FROM sessions WHERE csession_id = ?", (csession_id,)
         ).fetchone()
         if own is not None and own[0]:
-            _refuse_tainted(source, reads_third_party)
-        return
+            return _refuse_tainted(source, reads_third_party, allow_tainted)
+        return False
     if not row[0]:
-        return
-    _refuse_tainted(source, reads_third_party)
+        return False
+    lifted = _refuse_tainted(source, reads_third_party, allow_tainted)
     conn.execute(
         "UPDATE sessions SET tainted = 1, tainted_at = ?, tainted_by_run = NULL "
         "WHERE csession_id = ? AND tainted = 0",
         (row[1], csession_id),
     )
+    return lifted
 
 
-def _refuse_tainted(csession_id: str, reads_third_party: bool) -> None:
+def allows_tainted(invocation_json: str | None) -> bool:
+    """Whether the run row recorded ``--allow-tainted`` (``ALLOW_TAINTED`` in its
+    ``invocation_json``: an object with a boolean ``tty``; ``taint.AllowTainted``). Anything
+    malformed counts as not given (the refusal stands)."""
+    try:
+        invocation = json.loads(invocation_json or "{}")
+    except ValueError:
+        return False
+    return _allows_tainted(invocation)
+
+
+def _allows_tainted(invocation: object) -> bool:
+    if not isinstance(invocation, Mapping):
+        return False
+    value = invocation.get(ALLOW_TAINTED)
+    return isinstance(value, Mapping) and isinstance(value.get("tty"), bool)
+
+
+def _refuse_tainted(csession_id: str, reads_third_party: bool, allow_tainted: bool = False) -> bool:
     """A tainted session resumed or forked into a run that is not third-party-reading is
-    refused (interface.md, Taint).
-
-    TODO(#30): ``--allow-tainted`` (human-only, audited ``resume_tainted``) lifts this
-    refusal; until then it is refused whatever the flags."""
-    if not reads_third_party:
-        raise RefusedError(
-            f"{csession_id} is tainted: a run of a kind that is not third-party-reading is refused",
-            reason="tainted",
-        )
+    refused (interface.md, Taint), unless the run recorded ``--allow-tainted`` (human-only,
+    checked at launch step 2). The single refusal point: the allocation, the adoption
+    compare-and-set and the check right before step 7 all decide here. Returns whether the
+    refusal was lifted by ``--allow-tainted`` (the run then owes its ``resume_tainted``
+    audit record, written right before step 7: ``launch.recheck_fork_taint``)."""
+    if reads_third_party:
+        return False
+    if allow_tainted:
+        return True
+    raise RefusedError(
+        f"{csession_id} is tainted: a run of a kind that is not third-party-reading is refused",
+        reason="tainted",
+    )
 
 
 # Run and session columns ``exec`` sets after allocation (``update_run``, ``update_session``).
@@ -2482,6 +2936,16 @@ NEVER_ADOPTED = Final(
     cause="adopt",
     message="the pending run was not adopted before it expired",
 )
+# A pending run canceled by ``stop`` (interface.md, Outcome mapping: launch).
+CANCELED = Final(
+    phase="launch",
+    outcome="not-started",
+    end_reason="canceled",
+    exit_code=12,
+    state="not-started",
+    cause="stop",
+    message="the pending run was canceled by stop",
+)
 
 
 @dataclass(frozen=True)
@@ -2518,6 +2982,99 @@ class HookRun:
     secret_sha256: str | None = None
     outbox_dev_ino: str | None = None
     artifacts_dev_ino: str | None = None
+
+
+@dataclass(frozen=True)
+class LabelChange:
+    """``Store.change_labels``: the resulting labels (sorted) and the pairs actually added or
+    removed (in the order given)."""
+
+    labels: list[tuple[str, str]]
+    added: list[tuple[str, str]]
+    removed: list[tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class SecretRun:
+    """``Store.secret_run``: what ``verify-secret`` checks a presented secret against."""
+
+    secret_sha256: str | None
+    wrapper_pid: int | None
+    wrapper_start: str | None
+    child_pid: int | None
+    child_start: str | None
+
+
+@dataclass(frozen=True)
+class StatusRecord:
+    """``Store.status_record``: raw rows (column name -> value) for ``status``."""
+
+    session: dict[str, Any]
+    # The selected run (None: no such run) and the session's current run.
+    run: dict[str, Any] | None
+    current_run: dict[str, Any] | None
+    runs: int
+    labels: list[str]
+    claude_ids: list[dict[str, Any]]
+    events: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ListRecord:
+    """``Store.list_records``: one session for ``list``."""
+
+    session: dict[str, Any]
+    run: dict[str, Any] | None
+    labels: list[str]
+    run_kinds: frozenset[str]
+
+
+# ``status`` shows this many of a session's latest events (design.md, Data model).
+STATUS_EVENTS = 20
+# The largest value SQLite stores as an INTEGER; larger Python ints cannot be bound.
+MAX_SQLITE_INTEGER = 2**63 - 1
+
+
+def _lenient_text(raw: bytes) -> str:
+    """TEXT values for the read views: bytes that are not UTF-8 become U+FFFD, never an
+    error, so status and list print any stored value."""
+    return raw.decode("utf-8", errors="replace")
+
+
+def _one_dict(conn: sqlite3.Connection, sql: str, *params: Any) -> dict[str, Any] | None:
+    cursor = conn.execute(sql, params)
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return dict(zip([column[0] for column in cursor.description], row, strict=True))
+
+
+def _all_dicts(conn: sqlite3.Connection, sql: str, *params: Any) -> list[dict[str, Any]]:
+    cursor = conn.execute(sql, params)
+    names = [column[0] for column in cursor.description]
+    return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+
+def _labels(conn: sqlite3.Connection, csession_id: str) -> list[str]:
+    return [
+        f"{key}={value}"
+        for key, value in conn.execute(
+            "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+            (csession_id,),
+        )
+    ]
+
+
+def _string_list_json(value: str | None) -> list[str]:
+    """A stored JSON list of strings; [] when it is NULL, unreadable or holds anything
+    else (the conservative reading: nothing recorded)."""
+    try:
+        items = json.loads(value or "[]")
+    except ValueError:
+        return []
+    if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+        return []
+    return items
 
 
 def open_state(**kwargs: Any) -> Store:

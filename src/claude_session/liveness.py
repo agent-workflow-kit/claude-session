@@ -12,8 +12,10 @@ finalizes it only when nobody owns it any more:
   launch phase: a ``start`` that died before the run became pending, an adopting or plain
   ``exec`` that died between allocation or the adoption compare-and-set and the recording
   of its child; the spawn is gated, so such a child never ran ``claude``):
-  ``not-started``, ``launch_interrupted``, its launch spec and secret index deleted before
-  the compare-and-set;
+  ``not-started``, ``launch_interrupted`` (``canceled`` when the run has a ``stop`` request:
+  ``stop`` during the launch window, interface.md, Outcome mapping), its launch spec and
+  secret index deleted before the compare-and-set (a run marked as having audited an
+  escalation override gets that record's ``result: error`` follow-up);
 - a run whose **wrapper is dead and child alive**: left live and reported as an **orphan**
   (``reconcile`` lists it; ``stop`` ends it); nothing is ever signaled here;
 - a run whose **wrapper and child are dead**: **salvaged** under the lease
@@ -53,8 +55,10 @@ nothing in a dry run (``dry_run``: the changes it would make, not applied).
 TODO(#16): ``views.check_liveness`` and ``views.check_liveness_all`` (``status``/``list``, on
 the #65 line) call ``check_session`` (and ``sessions_with_open_runs`` for ``list``) without
 delivering; ended runs keep their ``Store.known_liveness`` display.
-TODO(#32): ``stop`` runs ``check_session`` (cause ``stop`` for its own changes, ``liveness``
-for this check's) and delivers what it changed.
+``stop`` (``stopper``) runs ``check_session`` first (cause ``liveness``) and again, with cause
+``stop``, to finalize a run whose wrapper it found gone or SIGKILLed.
+``forget`` runs ``check_session`` (cause ``forget`` for its own changes,
+``liveness`` for this check's) and delivers what it changed.
 TODO(#36): ``verify-secret`` keeps its fail-closed reading (a run is live only when its
 wrapper or child is confirmed alive by a non-empty token) and its constant-work probes; it may
 reuse ``open_run_live`` only with that reading.
@@ -70,13 +74,14 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from . import endmap, hookevent, logs, outbox, outcomefile, secretindex, sessiondir, store
+from . import audit, endmap, hookevent, logs, outbox, outcomefile, secretindex, sessiondir, store
 from .endmap import EXIT_CODES, HeadlessResult, Mapped
 
 if TYPE_CHECKING:
     from .config import Config
 
 LOG_NAME = "log.jsonl"
+AUDIT_NAME = "audit.jsonl"
 SALVAGE_LEASE = "salvage"
 # Final drains of one salvaged run at most (as ``supervisor.FINAL_DRAINS``).
 FINAL_DRAINS = 4
@@ -87,6 +92,7 @@ SALVAGE_POLL = 0.1
 # End reasons whose final event keeps the cause exec recorded (as ``supervisor._FINAL_CAUSES``).
 FINAL_CAUSES = {"auto_exit": "auto_exit", "timeout": "timeout"}
 LAUNCH_LOST_MESSAGE = "the wrapper died before claude was spawned"
+LAUNCH_CANCELED_MESSAGE = "launch canceled by stop: the wrapper ended before claude was spawned"
 SECRET_NAME = sessiondir.SECRET
 
 # Verdicts of ``classify``.
@@ -246,14 +252,15 @@ def _check_run(
             checked.changes += _after_launch_end(st, sid, run, state_root)
         return checked
     if verdict == LAUNCH_LOST:
+        stopped = row["stop_requested_at"] is not None
         final = store.Final(
             phase="launch",
             outcome="not-started",
-            end_reason="launch_interrupted",
+            end_reason="canceled" if stopped else "launch_interrupted",
             exit_code=EXIT_CODES["not-started"],
             state="not-started",
             cause=cause,
-            message=LAUNCH_LOST_MESSAGE,
+            message=LAUNCH_CANCELED_MESSAGE if stopped else LAUNCH_LOST_MESSAGE,
         )
         # The adopter (or exec) is dead and its child never ran claude (the spawn gate):
         # nothing reads the launch spec or the secret index any more, so they go before the
@@ -262,6 +269,7 @@ def _check_run(
         if st.finalize_run(sid, run, final, expect=_dead(row)):
             checked.changes.append(_change(st, sid, run, "marked_not_started", before))
             checked.changes += _after_launch_end(st, sid, run, state_root)
+            _audit_lost_override(st, sid, run, state_root)
         return checked
     return _salvage(st, row, state_root, cause=cause, patience=patience)
 
@@ -300,6 +308,36 @@ def _tmpdir_change(st: store.Store, sid: str, run: int) -> list[Change]:
     if reconcile.remove_tmpdir(st, sid, expected_run=run):
         return [Change(sid, run, "tmpdir_removed")]
     return []
+
+
+def _audit_lost_override(st: store.Store, sid: str, run: int, state_root: str) -> None:
+    """A run whose launch audited an escalation override (``result: ok``; the run's
+    ``override_audit`` mark, ``Store.record_override_audit``) and then died before the spawn:
+    the ``result: error`` follow-up with the same fields, as ``exec`` would have written it
+    (best effort; a failure is logged ``audit_failed``)."""
+    try:
+        invocation = json.loads(st.run_record(sid, run)["invocation_json"] or "{}")
+        mark = invocation.get("override_audit") if isinstance(invocation, dict) else None
+        if not isinstance(mark, dict):
+            return
+        audit.append(
+            os.path.join(state_root, AUDIT_NAME),
+            actor=mark["actor"],
+            target=sid,
+            action="launch_escalation_override",
+            result="error",
+            decision_ids=mark["decision_ids"],
+            inputs=mark["inputs"],
+        )
+    except Exception:
+        _log(
+            state_root,
+            "audit_failed",
+            "warn",
+            sid,
+            run,
+            "a launch_escalation_override error record could not be written",
+        )
 
 
 def _change(
@@ -638,6 +676,12 @@ def _delete_index(state_root: str, sid: str, run: int) -> None:
 # Dry run
 
 
+def _launch_end_reason(row: dict[str, Any], verdict: str) -> str:
+    if verdict == EXPIRED:
+        return "never_adopted"
+    return "canceled" if row["stop_requested_at"] is not None else "launch_interrupted"
+
+
 def _predicted(
     st: store.Store, row: dict[str, Any], verdict: str, state_root: str, before: str | None
 ) -> Change:
@@ -653,7 +697,7 @@ def _predicted(
             from_state=before,
             to_state="not-started",
             outcome="not-started",
-            end_reason="never_adopted" if verdict == EXPIRED else "launch_interrupted",
+            end_reason=_launch_end_reason(row, verdict),
             detail=detail,
         )
     headless = row["mode"] == "headless"
