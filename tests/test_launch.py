@@ -341,7 +341,7 @@ def test_the_version_probe_path_is_the_tool_lookup_path_without_writable_entries
     claude = pathrules.ResolvedTool("/opt/claude/claude", "claude")
     writable = pathrules.SessionWritable([str(tmp_path / "cwd")])
     checked = launch.check_claude_version(cfg, resolution(cfg), proc, claude, writable)
-    assert checked == ("2.1.312 (Claude Code)", None)
+    assert (checked.text, checked.warning) == ("2.1.312 (Claude Code)", None)
     (call,) = gw.calls
     assert call.env is not None
     assert call.env["PATH"] == f"{prepend}:/usr/bin:/bin"

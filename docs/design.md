@@ -683,7 +683,7 @@ What is carried, reset and refused on resume and fork is normative in [interface
 
 The record format the renderer reads (`type` `user` or `assistant`, `message.content` as a string or a list of `text`, `tool_use` and `tool_result` blocks; offloaded results named in tool-result text as `tool-results/<name>`; the main file named `<claude session id>.jsonl`) is not yet live-verified (#41). Recorded paths, files and records are untrusted: the allowed location, the no-follow opens and the read caps are in [interface.md, transcript](interface.md#transcript).
 
-Human-readable output of untrusted fields (transcript text, summaries, reasons, descriptions) strips or escapes C0 and C1 control characters; `--raw` output is unchanged and documented as raw.
+Human-readable output of untrusted fields (transcript text, summaries, reasons, descriptions) strips or escapes C0 and C1 control characters; `--json` output escapes them, and format characters, as JSON escapes; `--raw` output is unchanged and documented as raw, and `--raw` to a terminal is refused (exit 2) unless `--allow-tty` is given.
 
 ### Reconcile, salvage and retention
 

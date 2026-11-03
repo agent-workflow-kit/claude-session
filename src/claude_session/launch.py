@@ -1520,8 +1520,9 @@ class Effects:
         whose ``#!`` interpreter, as the launch's probe would find it, is under one of them
         or cannot be checked (``claude_version.check_interpreter``). Otherwise
         ``check_claude_version`` as a launch makes it, the probe's ``PATH`` without those
-        paths either; a ``claude_not_found`` is then only a warning when that ``PATH`` lost
-        entries the launch's probe keeps (the launch may well run it)."""
+        paths either; when that probe could not run (``Checked.not_run``) and its ``PATH``
+        lost entries the launch's probe keeps, the ``claude_version_unknown`` warning becomes
+        the not-probed one (the launch may well run it)."""
         known = dry_run()
         if known is None:
             why = "the permission profile or write_dirs are not known"
@@ -1548,9 +1549,9 @@ class Effects:
         if checked.warning is None:
             return []
         dropped = set(_probe_entries(entries, writable)) - set(_probe_entries(entries, guard))
-        if dropped and checked.text is None and "--version: " in checked.warning:
+        if dropped and checked.not_run:
             # It could not run, and the dry run's PATH lost entries the launch's probe keeps.
-            why = f"{checked.warning}; PATH entries under session-writable paths were dropped"
+            why = f"{checked.detail}; PATH entries under session-writable paths were dropped"
             return [VERSION_NOT_PROBED.format(why=why)]
         return [checked.warning]
 
@@ -1610,6 +1611,11 @@ class Recording(Effects):
                 _discard_tmpdir(alloc.csession_id, check.tmpdir_pin)
                 raise
         return check
+
+    def warn(self, warnings: Sequence[str]) -> None:
+        """Step-5 warnings are recorded on the run as they are found, so a run that a later
+        check ends ``not-started`` keeps them (``add_run_warnings`` keeps each once)."""
+        self.st.add_run_warnings(self.alloc.csession_id, self.alloc.run, warnings)
 
     def claude_version(
         self,

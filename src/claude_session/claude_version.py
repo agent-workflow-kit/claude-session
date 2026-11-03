@@ -269,10 +269,14 @@ def at_least(text: str | None, minimum: str) -> bool | None:
 
 class Checked(NamedTuple):
     """The launch's version check result: ``text`` is the version for display (None when it
-    could not be determined), ``warning`` the ``claude_version_unknown`` warning then."""
+    could not be determined), ``warning`` the ``claude_version_unknown`` warning then,
+    ``detail`` why the version is not known (the warning without its code and hint) and
+    ``not_run`` whether that is because ``claude --version`` could not run (``NotRun``)."""
 
     text: str | None
     warning: str | None
+    detail: str | None = None
+    not_run: bool = False
 
 
 def unknown(detail: str, hint: str) -> str:
@@ -300,12 +304,12 @@ def require(
         version = run(claude, environ, gw, writable=writable)
     except NotRun as error:
         detail = f"could not run {claude.path!r} --version: {error.reason}"
-        return Checked(None, unknown(detail, NOT_RUN_HINT))
+        return Checked(None, unknown(detail, NOT_RUN_HINT), detail, not_run=True)
     text = version.text
     ok = at_least(version.line, minimum)
     if ok is None:
         detail = f"{claude.path!r} --version printed no version: {text!r}"
-        return Checked(None, unknown(detail, NO_VERSION_HINT))
+        return Checked(None, unknown(detail, NO_VERSION_HINT), detail)
     if not ok:
         raise LaunchValidationError(
             f"Claude Code {text!r} ({claude.path!r}) is older than min_claude_version {minimum}",

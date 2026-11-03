@@ -139,6 +139,13 @@ def test_a_version_that_cannot_be_read_warns_and_does_not_block(stdout: str) -> 
     assert result.warning is not None
     assert result.warning.startswith("claude_version_unknown: ")
     assert "no version" in result.warning
+    assert not result.not_run and result.detail is not None and result.detail in result.warning
+
+
+def test_output_naming_version_is_not_mistaken_for_a_probe_that_could_not_run() -> None:
+    """Whether the probe ran is a field, never read from the (untrusted) output."""
+    result = probe(gateway(stdout="usage: claude --version: unknown option\n"))
+    assert result.warning is not None and not result.not_run
 
 
 @pytest.mark.parametrize(
@@ -170,6 +177,8 @@ def test_a_claude_that_cannot_run_its_version_warns_naming_why_and_does_not_bloc
     assert reason in warning
     assert claude_version.NOT_RUN_HINT in warning
     assert "not verified" in warning
+    assert result.not_run and result.detail is not None
+    assert result.detail in warning and claude_version.UNKNOWN_CODE not in result.detail
 
 
 def test_the_probe_is_short_so_an_unknown_version_never_stalls_a_launch_long() -> None:

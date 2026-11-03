@@ -546,7 +546,7 @@ No `crontab` command exits 12 (`failed`), as does a `crontab -l` that fails for 
 
 `--json`, `--config <path>`, `--verbose`, `--quiet`, `--version`, `--yes` (accepted by every command and a no-op: claude-session never prompts for confirmation). Internal commands (`hook-event` and `verify-secret`, see [Internal commands](#internal-commands)) take only their documented argv; global flags do not apply to them. Global flags follow the command name (`claude-session list --json`); only `--version` is also accepted before it. `--verbose` and `--quiet` are mutually exclusive (exit 2). `--help` is exempt from `--json`, and `--version` prints plain text even with `--json`. `--dry-run` is accepted by `exec`, `start`, `resume`, `stop`, `forget`, `label add/remove`, `reconcile` and `cron install/uninstall` (for the non-launch commands it prints what would change).
 
-Human-readable output of untrusted fields (transcript text, summaries, reasons, subagent descriptions) strips or escapes C0 and C1 control characters. `--json` output carries them JSON-escaped; `transcript --raw` prints files unchanged (refused on a terminal without `--allow-tty`).
+Human-readable output of untrusted fields (transcript text, summaries, reasons, subagent descriptions) strips or escapes C0 and C1 control characters. `--json` output is ASCII: C0 and C1 control characters and format characters (such as a bidi override) are JSON-escaped (`\u009b`); `transcript --raw` prints files unchanged (refused on a terminal without `--allow-tty`).
 
 ## States
 
@@ -796,7 +796,7 @@ Precedence: top-level scalars: built-in → config → environment → flags. Ki
 | Key | Default | Meaning |
 |---|---|---|
 | `claude_bin` | `claude` | `claude` executable, resolved to an absolute path on the sanitized session `PATH` (outside every session-writable path) at launch and again at adoption |
-| `min_claude_version` | `2.1.312` | minimum `claude --version` a launch accepts; older fails with `claude_too_old` (built-in: the version the spike verified) |
+| `min_claude_version` | `2.1.312` | minimum `claude --version` a launch accepts; older fails with `claude_too_old`; a version that cannot be determined only warns (`claude_version_unknown`) (built-in: the version the spike verified) |
 | `default_kind` | `implement` | kind used when `--kind` is omitted |
 | `kinds.<name>` | built-in kinds | kind profiles (fields below); entries merge over built-ins; a new name starts from the **built-in** `review` kind's fields (not a configured override of it) |
 | `permission_profiles.<name>` | built-in `default`, `readonly`, `review`, `respond` | profiles: `{permissions: {...}, sandbox: {...}}` Claude Code settings fragments |
