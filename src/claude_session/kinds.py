@@ -425,6 +425,21 @@ def _apply_flags(
                     "--reads-third-party; give both in the same call to keep it"
                 )
             put(key, value, "flag-implied")
+    elif data["reads_third_party"]:
+        # The kind (built-in `review`, a configured kind or a per-repo override) makes the run
+        # third-party-reading: a carried flag never beats the implications either, exactly as
+        # for a carried `--reads-third-party`. A flag given now still does (it is audited
+        # `sandbox_lowered`).
+        for key, value, flag in _IMPLIED:
+            given = explicit.get(flag) if flag is not None else None
+            if flag is None or given is None or given[1] != "previous_run":
+                continue
+            if get(key) != value:
+                warnings.append(
+                    f"{_FLAG_NAMES[flag]} (from {_LAYER_NAMES[given[1]]}) is overridden by the"
+                    " kind's reads_third_party; give it in this call to keep it"
+                )
+            put(key, value, "flag-implied")
 
     def where(loc: tuple[str | int, ...]) -> str:
         top = str(loc[0]) if loc else ""

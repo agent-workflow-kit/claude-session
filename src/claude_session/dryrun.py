@@ -61,7 +61,6 @@ from . import (
     kinds,
     launch,
     pathrules,
-    permission_profiles,
     selfcheck,
     sessiondir,
     settings_builder,
@@ -237,17 +236,8 @@ def _tool(
 def _kind_profile(
     cfg: Config, resolution: kinds.Resolution, recorded: Profile | None
 ) -> Profile | None:
-    """The permission profile a launch would use: the one its checks read (``recorded``),
-    else the kind's built-in or configured profile; None for a profile file that was not
-    read (a dry run never reads it outside the launch checks)."""
-    if recorded is not None:
-        return recorded
-    if resolution.permission_profile_file is not None:
-        return None
-    try:
-        return permission_profiles.select(cfg, resolution, session_writable=launch.NO_SANDBOX)
-    except LaunchValidationError:
-        return None
+    """The permission profile a launch would use (``launch.kind_profile``)."""
+    return launch.kind_profile(cfg, resolution, recorded)
 
 
 def unchecked_writable(
@@ -463,6 +453,12 @@ def kinds_report(
     profiles = []
     for resolution, writable in zip(resolutions, sets, strict=True):
         warnings += resolution.warnings
+        # bwrap, socat and the preview's git must lie under no kind's paths, not only the row's.
+        writable = (
+            None
+            if writable is None or every is None
+            else pathrules.SessionWritable([*writable.paths, *every.union.paths])
+        )
         sandbox = probes.check(process, resolution, writable)
         claude_path = None if claude is None else claude.path
         profiles.append(
@@ -504,7 +500,10 @@ def _variants(cfg: Config, name: str, repo: str | None) -> list[kinds.Resolution
 
 
 def _writable_of(
-    cfg: Config, process: launch.Process, resolution: kinds.Resolution
+    cfg: Config,
+    process: launch.Process,
+    resolution: kinds.Resolution,
+    git: GitDir | None = None,
 ) -> pathrules.SessionWritable | None:
     return unchecked_writable(
         cfg,
@@ -512,7 +511,24 @@ def _writable_of(
         resolution,
         probe_cwd=process.caller_cwd,
         caller_cwd=_kinds_cwd(process, resolution),
+        git=git,
     )
+
+
+def tool_writable(
+    cfg: Config,
+    process: launch.Process,
+    own: pathrules.SessionWritable | None,
+    git: GitDir | None = None,
+) -> pathrules.SessionWritable | None:
+    """What ``bwrap``, ``socat`` and ``git`` must not be under when a dry run probes them:
+    ``own`` (the run's or row's paths) and the session-writable paths of every kind
+    (``_every_kind``), as a launch checks its tools (``launch.other_kinds_writable``). None
+    when any of them is not known: nothing is probed."""
+    every = _every_kind(cfg, process, git)
+    if own is None or every is None:
+        return None
+    return pathrules.SessionWritable([*own.paths, *every.union.paths])
 
 
 def kind_writable(
@@ -540,16 +556,17 @@ class Every:
     isolated: pathrules.SessionWritable
 
 
-def _every_kind(cfg: Config, process: launch.Process) -> Every | None:
+def _every_kind(cfg: Config, process: launch.Process, git: GitDir | None = None) -> Every | None:
     """The session-writable paths, known without a session, of every built-in and
     configured kind, each as configured and as every per-repo override makes it, whatever
     ``--kind`` and ``--repo`` name: ``claude_bin`` is shared by all of them. None when any
-    of them is not known."""
+    of them is not known. ``git``: the git directory a dry run's checks found (``${GIT_DIR}``
+    entries of every kind then stand for it)."""
     union: list[str] = []
     isolated: list[str] = []
     for name in cfg.kinds:
         for resolution in _variants(cfg, name, None):
-            writable = _writable_of(cfg, process, resolution)
+            writable = _writable_of(cfg, process, resolution, git)
             if writable is None:
                 return None
             union += writable.paths
@@ -798,6 +815,7 @@ def new_session_plan(
         recorded=found.profile,
         git=found.git,
     )
+    writable = tool_writable(cfg, process, writable, found.git)
     sandbox = plan_sandbox(process, resolution, found, writable, prerequisites)
     plan = plan_json(
         cfg,

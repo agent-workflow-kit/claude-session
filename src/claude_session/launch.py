@@ -898,6 +898,7 @@ def known_write_paths(
     caller_cwd: str | None,
     git_dirs: gitinfo.GitDirs | None = None,
     git_known: bool = False,
+    skip_git_dir: bool = False,
     alloc: Allocated | None = None,
 ) -> pathrules.SessionWritable | None:
     """The session-writable paths of a run of ``resolution`` known without a session
@@ -908,9 +909,12 @@ def known_write_paths(
     ``git_writable`` computes them; ``${GIT_DIR}`` is expanded with ``git_dirs`` when the
     git directory is known (``git_known``). None when they are not known: no ``profile``
     (a profile file that was not read), a ``${GIT_DIR}`` write entry while the git
-    directory is not known, or an entry that does not expand. ``alloc`` is the session's
-    (default: the placeholder session; the adoption dry run passes the pending run's)."""
-    if profile is None or (not git_known and uses_git_dir(resolution, profile)):
+    directory is not known, or an entry that does not expand. ``skip_git_dir`` leaves the
+    ``${GIT_DIR}`` entries out instead (the caller adds the candidate directories itself).
+    ``alloc`` is the session's (default: the placeholder session; the adoption dry run
+    passes the pending run's)."""
+    unknown_git = not git_known and not skip_git_dir
+    if profile is None or (unknown_git and uses_git_dir(resolution, profile)):
         return None
     home = os.path.realpath(process.environ.get("HOME", "/"))
     alloc = alloc or placeholder_alloc(process, resolution)
@@ -919,9 +923,12 @@ def known_write_paths(
     variables = profile_variables(alloc, cwd, home, git_dirs)
     content = profile.content if git_known else _without_git_dir(profile.content)
     try:
-        write = pathrules.resolve_dirs(
-            resolution.profile.write_dirs, variables, home=home, key="write_dirs"
-        )
+        entries = [
+            e
+            for e in resolution.profile.write_dirs
+            if git_known or not skip_git_dir or GIT_DIR_VARIABLE not in e
+        ]
+        write = pathrules.resolve_dirs(entries, variables, home=home, key="write_dirs")
         return pathrules.session_writable(
             session_dir=alloc.session_dir,
             cwd=cwd,
@@ -930,6 +937,62 @@ def known_write_paths(
             write_dirs=write,
             profile=permission_profiles.expand(content, variables),
         )
+    except LaunchValidationError:
+        return None
+
+
+def other_kinds_writable(
+    cfg: Config, process: Process, *, git_cwd: str | None
+) -> pathrules.SessionWritable:
+    """The union of the session-writable paths known without a session of every built-in
+    and configured kind, each as configured and as every per-repo override makes it (the
+    step-2 set, the placeholder session's paths, ``write_dirs`` and the permission
+    profile's write paths), trusted and isolated kinds alike: a tool a launch runs must lie
+    under none of them, whatever the launching run's own kind (an agent of one kind could
+    plant a binary where another kind's runs resolve it). The cwd of a ``caller``-cwd kind is
+    not part of it (it is the launching run's, and an isolated run's own cwd is in its own
+    set). A ``${GIT_DIR}`` entry stands for every directory git could
+    take for the git directory of ``git_cwd`` (``gitinfo.candidate_dirs``; the git
+    directories of other repositories are not known). ``unsafe_path`` when the paths of any
+    kind are not known (a permission profile that cannot be read, an entry that does not
+    expand): fail closed."""
+    paths = list(step2_writable(process, None).paths)
+    uses_git = False
+    for name in cfg.kinds:
+        for repo in (None, *cfg.repos):
+            resolution = kinds.resolve(cfg, name, mode="headless", repo=repo, cwd=None)
+            profile = kind_profile(cfg, resolution)
+            known = None
+            if profile is not None:
+                known = known_write_paths(
+                    resolution, profile, process, caller_cwd=None, skip_git_dir=True
+                )
+                uses_git = uses_git or uses_git_dir(resolution, profile)
+            if known is None:
+                raise LaunchValidationError(
+                    f"the session-writable paths of kind {name!r} are not known, so no tool can"
+                    " be checked against them (its permission profile or write_dirs cannot be"
+                    " read or expanded)",
+                    end_reason="unsafe_path",
+                )
+            paths += known.paths
+    if uses_git and git_cwd is not None:
+        paths += gitinfo.candidate_dirs(git_cwd)
+    return pathrules.SessionWritable(paths)
+
+
+def kind_profile(
+    cfg: Config, resolution: kinds.Resolution, recorded: permission_profiles.Profile | None = None
+) -> permission_profiles.Profile | None:
+    """The permission profile a launch would use: ``recorded`` (the one its checks read),
+    else the kind's built-in or configured profile; None for a profile file that was not read
+    or a profile that cannot be selected."""
+    if recorded is not None:
+        return recorded
+    if resolution.permission_profile_file is not None:
+        return None
+    try:
+        return permission_profiles.select(cfg, resolution, session_writable=NO_SANDBOX)
     except LaunchValidationError:
         return None
 
@@ -1242,15 +1305,20 @@ def check_tools(
     process: Process,
     writable: Callable[[str], bool],
     git_before: pathrules.ResolvedTool | None,
+    *,
+    guard: Callable[[str], bool] | None = None,
 ) -> Tools:
     """``claude_bin``, ``git``, ``bwrap`` and ``socat`` resolved on the sanitized PATH, outside
     the session-writable paths (``unsafe_path``); each runs from its realpath with ``argv[0]``
     its name. ``claude_not_found`` when there is no ``claude_bin``. With session-writable
     paths (not ``NO_SANDBOX``) a script ``claude``'s ``#!`` interpreter is checked too
     (``claude_version.check_interpreter``, on the version probe's ``PATH``). git must be the one the
-    git directory was resolved with (it was looked up before the full set was known)."""
+    git directory was resolved with (it was looked up before the full set was known).
+    ``guard`` (default ``writable``) is what the tools must lie outside of: ``writable`` and
+    the session-writable paths of every kind (``other_kinds_writable``)."""
+    guard = guard or writable
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
-    claude = pathrules.resolve_tool(cfg.claude_bin, entries, writable)
+    claude = pathrules.resolve_tool(cfg.claude_bin, entries, guard)
     if claude is None:
         raise LaunchValidationError(
             f"claude not found: {cfg.claude_bin!r}",
@@ -1258,8 +1326,8 @@ def check_tools(
             hint=HINTS["claude_not_found"],
         )
     if writable is not NO_SANDBOX:
-        claude_version.check_interpreter(claude, _probe_entries(entries, writable), writable)
-    git = pathrules.resolve_tool("git", entries, writable)
+        claude_version.check_interpreter(claude, _probe_entries(entries, guard), guard)
+    git = pathrules.resolve_tool("git", entries, guard)
     if git != git_before:
         raise LaunchValidationError(
             "git resolved differently once every session-writable path was known",
@@ -1267,9 +1335,14 @@ def check_tools(
         )
     bwrap = socat = None
     if resolution.profile.sandbox != "off":
-        bwrap = pathrules.resolve_tool("bwrap", entries, writable)
-        socat = pathrules.resolve_tool("socat", entries, writable)
+        bwrap = pathrules.resolve_tool("bwrap", entries, guard)
+        socat = pathrules.resolve_tool("socat", entries, guard)
     return Tools(claude=claude, git=git, bwrap=bwrap, socat=socat)
+
+
+def _either(first: Callable[[str], bool], second: Callable[[str], bool]) -> Callable[[str], bool]:
+    """A path is under either set."""
+    return lambda path: first(path) or second(path)
 
 
 def _probe_entries(entries: Sequence[str], writable: Callable[[str], bool]) -> list[str]:
@@ -1678,7 +1751,8 @@ def checks(
     if isolated:
         effects.known_writable(known_writable(resolution, alloc, cwd, home, profile.content))
     git_cwd = effects.git_cwd(cwd)
-    before_git = git_writable(resolution, alloc, cwd, home, tmp, profile, git_cwd)
+    others = other_kinds_writable(cfg, process, git_cwd=git_cwd)
+    before_git = _either(git_writable(resolution, alloc, cwd, home, tmp, profile, git_cwd), others)
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
     git_tool = pathrules.resolve_tool("git", entries, before_git)
     git_dirs, credential = check_git(resolution, git_cwd, git_tool, process)
@@ -1701,14 +1775,15 @@ def checks(
     effects.record_plugin_dirs(plugins)
     check_hook_interpreter(process, writable)
     check_tmpdir(resolution, alloc)
-    tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool)
-    notes_tool, notes_problem = resolve_notes(cfg, resolution, process, writable or NO_SANDBOX)
+    guard = _either(writable or NO_SANDBOX, others)
+    tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool, guard=guard)
+    notes_tool, notes_problem = resolve_notes(cfg, resolution, process, guard)
     version_warnings = effects.claude_version(
         cfg,
         resolution,
         process,
         tools,
-        writable or NO_SANDBOX,
+        guard,
         lambda: dry_run_writable(resolution, profile, process, resolved.caller_cwd, git_dirs),
     )
     warnings += version_warnings

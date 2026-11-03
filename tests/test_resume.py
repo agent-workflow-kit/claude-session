@@ -542,6 +542,26 @@ def test_a_carried_sandbox_never_overrides_the_reads_third_party_implication(
     assert out["profile"]["sandbox"] == "required"
 
 
+def test_a_carried_sandbox_off_never_applies_to_a_resumed_review_kind(env: Env) -> None:
+    # `review` is third-party-reading by its kind profile, not by --reads-third-party: a
+    # carried --sandbox off gets the same implications as in the test above.
+    sid = exec_session(env, "--kind", "review", "--sandbox", "off")["csession_id"]
+    assert json.loads(env.run_row(sid)["resolved_json"])["profile"]["sandbox"] == "off"
+    proc, out = resume(env, sid, "--dry-run")
+    assert out["profile"]["sandbox"] == "required"
+    assert out["origins"]["sandbox"] == "flag-implied"
+    assert out["origins"]["reads_third_party"] == "builtin"
+    assert any("--sandbox" in w and "overridden" in w for w in out["warnings"])
+    # A fork carries the same way.
+    proc, out = resume(env, sid, "--fork", "--dry-run")
+    assert out["profile"]["sandbox"] == "required"
+    assert out["origins"]["sandbox"] == "flag-implied"
+    # A --sandbox given now still applies (audited as lowered).
+    proc, out = resume(env, sid, "--dry-run", "--sandbox", "off")
+    assert out["profile"]["sandbox"] == "off"
+    assert out["origins"]["sandbox"] == "flag"
+
+
 # The permission profile snapshot
 
 
