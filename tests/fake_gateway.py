@@ -274,8 +274,7 @@ class FakeGateway:
             out_bytes = b""
         if output_limit is not None:  # as the real gateway: a byte prefix of each stream
             out_bytes, err_bytes = out_bytes[:output_limit], err_bytes[:output_limit]
-            out = out_bytes.decode("utf-8", "replace")
-            err = err_bytes.decode("utf-8", "replace")
+            out, err = _text(out_bytes), _text(err_bytes)
         return Result(args, response.returncode, out, err, out_bytes, err_bytes)
 
     def spawn(

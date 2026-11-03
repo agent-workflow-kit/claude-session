@@ -45,8 +45,9 @@ the rows and a warning, every pass, so the next pass retries; a session with an 
 to deliver or a run that is not final is not due (the first a warning with their count). At
 most ``DELETE_MAX`` sessions per pass, picked at random among those due so that sessions
 failing every pass cannot starve the rest; the lease is checked between them.
-TODO(#40): add ``upgrades.hook_interpreter_warning(run.hook_interpreter)`` to ``warnings``
-for every live run (on the #77 line).
+A run still live after the check, with a wrapper (a pending run has no hooks yet), whose
+recorded hook interpreter no longer exists adds ``upgrades.hook_interpreter_warning`` to
+``warnings``.
 """
 
 from __future__ import annotations
@@ -59,7 +60,17 @@ from collections.abc import Mapping
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from . import liveness, logs, outcomefile, secretindex, sessiondir, store, tmpdir, toolhooks
+from . import (
+    liveness,
+    logs,
+    outcomefile,
+    secretindex,
+    sessiondir,
+    store,
+    tmpdir,
+    toolhooks,
+    upgrades,
+)
 from .liveness import Change, Checked
 
 if TYPE_CHECKING:
@@ -194,6 +205,7 @@ def _pass(
         lease.renew()
     for sid in st.sessions_with_open_runs():
         checked.extend(liveness.check_session(st, cfg, sid, cause="reconcile", dry_run=dry_run))
+        _warn_hook_interpreters(st, sid, checked)
         lease.renew()
     if not dry_run:
         checked.warnings += outcomefile.backfill(st)
@@ -209,6 +221,15 @@ def _pass(
         lease.renew()
     _retention(st, cfg, state_root, checked, dry_run=dry_run, lease=lease)
     _tmpdirs(st, checked, dry_run=dry_run, lease=lease)
+
+
+def _warn_hook_interpreters(st: store.Store, sid: str, checked: Checked) -> None:
+    for run in st.open_runs(sid):
+        if run.get("wrapper_pid") is None:  # pending: adoption injects the hooks
+            continue
+        warning = upgrades.hook_interpreter_warning(run.get("hook_interpreter"))
+        if warning is not None:
+            checked.warnings.append(f"{sid} run {run['run_no']}: {warning}")
 
 
 def _log_path(state_root: str) -> str:

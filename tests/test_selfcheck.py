@@ -67,7 +67,7 @@ class FakeRunner(FakeGateway):
             answer = self.error if self.error is not None else self.returncode
         if isinstance(answer, BaseException):
             raise answer
-        return Result(tuple(argv), answer, "", "probe stderr")
+        return Result(tuple(argv), answer, "", "probe stderr", b"", b"probe stderr")
 
 
 def executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> str:

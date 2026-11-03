@@ -88,7 +88,14 @@ class FakeRun:
 
     def run(self, argv: list[str], **kw: Any) -> Result:
         self.calls.append({"argv": argv, **kw})
-        return Result(tuple(argv), self.returncode, self.stdout, self.stderr)
+        return Result(
+            tuple(argv),
+            self.returncode,
+            self.stdout,
+            self.stderr,
+            self.stdout.encode(),
+            self.stderr.encode(),
+        )
 
 
 def fake(returncode: int, stdout: str = "", stderr: str = "") -> Any:

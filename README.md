@@ -41,7 +41,7 @@ Prerequisites:
   with its usual authentication variables set.
 - For sandboxed kinds (`review`, `gate-check` and `respond` by default; `rank` prefers it) on Linux
   and WSL2: `bubblewrap` and `socat` (`sudo apt install bubblewrap socat`). macOS needs nothing
-  extra. WSL1 has no sandbox. Keep the state directory on the Linux file system under WSL.
+  extra (see the [macOS manual checklist](docs/macos-checklist.md)). WSL1 has no sandbox. Keep the state directory on the Linux file system under WSL.
 - memoctl, optional, for session-start context (config `notes_context_cmd`, enabled per kind with
   `notes_context: true`):
   `uv tool install git+https://github.com/agent-workflow-kit/memoctl`.
@@ -337,7 +337,7 @@ Exit codes: 0 done; 1 internal error; 2 usage (including interactive `exec`/`res
 
 Global flags: `--json`, `--config`, `--verbose`, `--quiet`, `--version`, and `--yes` (accepted everywhere, a no-op: claude-session never asks for confirmation). Global flags follow the command name (`claude-session list --json`); only `--version` may also precede it.
 
-Environment: sessions get `CSESSION_ID`, `CSESSION_DIR` and `CSESSION_KIND`. Config overrides use the `CSESSION_` prefix (top-level scalar keys only). `post-state-change` hooks (and, once they ship, `pre-launch` hooks) run as `sh -c` with the state directory as cwd and get `CSESSION_HOOK`, `CSESSION_ID` and `CSESSION_OBJECT_TYPE`. `post-state-change` fires on every turn (`working` ↔ `idle`) and is delivered at least once (deduplicate on `event_id`), so notification hooks should filter with the `states` selector (e.g. `states: [needs-input, exited, exited-unreported, killed, timeout, lost, not-started]`); hook entries also take `kinds`, `exclude_kinds` and `labels` selectors. A hook that launches sessions must exclude their kinds (`exclude_kinds`) to avoid recursion. claude-session needs no credentials of its own.
+Environment: sessions get `CSESSION_ID`, `CSESSION_DIR` and `CSESSION_KIND`. Config overrides use the `CSESSION_` prefix (top-level scalar keys only). `post-state-change` hooks (and `pre-launch` hooks) run as `sh -c` with the state directory as cwd and get `CSESSION_HOOK`, `CSESSION_ID` and `CSESSION_OBJECT_TYPE`. `post-state-change` fires on every turn (`working` ↔ `idle`) and is delivered at least once (deduplicate on `event_id`), so notification hooks should filter with the `states` selector (e.g. `states: [needs-input, exited, exited-unreported, killed, timeout, lost, not-started]`); hook entries also take `kinds`, `exclude_kinds` and `labels` selectors. A hook that launches sessions must exclude their kinds (`exclude_kinds`) to avoid recursion. claude-session needs no credentials of its own.
 
 ## Documentation
 

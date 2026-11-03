@@ -1977,9 +1977,7 @@ def pre_launch_payload(
         "forked_from": record["forked_from"],
         "skill": req.skill,
         "has_prompt": req.prompt is not None,
-        # TODO(#30): `req.allow_tainted is not None` once #30 adds Request.allow_tainted (at
-        # adoption it comes from the run row's invocation_json); until then never given.
-        "allow_tainted": False,
+        "allow_tainted": req.allow_tainted is not None,
         "override_escalation": req.override_escalation,
         "actor": req.actor,
         "decision_ids": list(req.decision_ids),

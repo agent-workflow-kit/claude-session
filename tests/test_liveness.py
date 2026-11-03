@@ -795,6 +795,20 @@ def test_reconcile_dry_run_changes_nothing(tmp_path: Path, procs: Procs) -> None
         assert st.run_record(sid, 1)["ended_at"] is None
 
 
+def test_reconcile_warns_of_a_live_run_whose_hook_interpreter_is_gone(
+    tmp_path: Path, procs: Procs
+) -> None:
+    with store.open_state() as st:
+        root = os.path.dirname(st.path)
+        sid = session(st, root, wrapper=procs.live())
+        st.conn.execute(
+            "UPDATE runs SET hook_interpreter = ? WHERE csession_id = ?", ("/gone/python", sid)
+        )
+        st.conn.commit()
+    out = reconcile_json(tmp_path, "--dry-run")
+    assert any(sid in w and "/gone/python" in w for w in out["warnings"])
+
+
 def test_a_second_reconcile_reports_already_running(tmp_path: Path, procs: Procs) -> None:
     holder = procs.live()
     with store.open_state() as st:

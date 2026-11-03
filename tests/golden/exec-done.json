@@ -1,0 +1,23 @@
+{
+  "claude_session_id": "c0ffee00-0000-4000-8000-000000000001",
+  "cost_usd": 0.0,
+  "csession_id": "cs-aaaaaaaa",
+  "end_reason": "normal",
+  "exit_code": 0,
+  "forked_from": null,
+  "message": null,
+  "outcome": "done",
+  "phase": "session",
+  "report": {
+    "artifact": null,
+    "implicit": false,
+    "reason": null,
+    "reported_at": "2026-01-01T00:00:00.000000Z",
+    "status": "done",
+    "summary": "all good"
+  },
+  "run": 1,
+  "session_started_at": "2026-01-01T00:00:00.000000Z",
+  "state": "exited",
+  "warnings": []
+}

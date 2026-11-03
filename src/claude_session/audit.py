@@ -34,7 +34,6 @@ RESULTS = frozenset({"ok", "refused", "error"})
 # The longest record line (bytes, newline included; interface.md, Audit and log). ``append``
 # refuses a longer record like any it cannot write; ``exporter`` reads no longer line. JSON
 # escapes expand a byte up to six times, so an argv well under ARG_MAX can exceed it.
-# TODO(#31): cap hook stdout feeding decision_id so a record stays under MAX_RECORD_BYTES.
 MAX_RECORD_BYTES = 4 * 1024 * 1024
 SANDBOX_LEVELS = frozenset({"required", "preferred", "off"})
 # schemas/audit.json inputs.grace: seconds, at most 2**53 (exact as a JSON number).

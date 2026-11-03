@@ -936,7 +936,7 @@ class _BlockingGateway:
         self.entered.set()
         assert self.release.wait(20)
         kw["on_started"]()
-        return Result(tuple(argv), 0, "", "")
+        return Result(tuple(argv), 0, "", "", b"", b"")
 
     def spawn(self, argv: Any, **kw: Any) -> Any:
         raise AssertionError("hooks are run, never spawned")
@@ -1074,24 +1074,28 @@ def test_a_hook_leaving_a_process_in_the_background_finishes_when_sh_exits(
     tmp_path: Path, root: Path, st: Store
 ) -> None:
     pidfile = tmp_path / "pid"
-    cmd = f"/bin/sleep 30 & echo $! > {shlex.quote(str(pidfile))}; exit 0"
-    cfg = load_config(tmp_path, hooks_config({"cmd": cmd, "timeout": "2s"}))
+    # The hook's timeout and the background sleep are far longer than the time `sh` needs to
+    # run two commands even on a starved machine; a delivery that waited for the background
+    # process would end in a timeout, not in "exit 0". The timeout and the bound below stay
+    # well under the test watchdog (conftest.WATCHDOG_SECONDS), the sleep well above both.
+    cmd = f"/bin/sleep 120 & echo $! > {shlex.quote(str(pidfile))}; exit 0"
+    cfg = load_config(tmp_path, hooks_config({"cmd": cmd, "timeout": "25s"}))
     sid = allocate(st, root)
     start = time.monotonic()
     try:
         done = deliverer(st, cfg, root).deliver(sid)
-        assert time.monotonic() - start < 2
+        assert time.monotonic() - start < 20  # not the 25 s timeout, nor the 120 s sleep
         assert len(done.delivered) == 1
         hooks = [r for r in log_records(root) if r["event"].startswith("hook_")]
         assert [r["event"] for r in hooks] == ["hook_delivered"]
         assert hooks[0]["message"].endswith(": exit 0")
     finally:
-        wait_until(lambda: pidfile.exists() and pidfile.read_text().strip() != "", 5)
+        wait_until(lambda: pidfile.exists() and pidfile.read_text().strip() != "", 30)
         pid = int(pidfile.read_text())
         try:
             # sh writes $! as soon as it forks, so the child may still be the forked /bin/sh
             # (or have an empty cmdline) when first read: wait until it has exec'd the sleep.
-            wait_until(lambda: _argv0(pid) == b"/bin/sleep", 5)
+            wait_until(lambda: _argv0(pid) == b"/bin/sleep", 30)
         finally:
             # The exact child this test started: the sleep (argv0 as written in cmd), or the
             # fork of the hook's `sh -c` (argv0 "sh", toolhooks.run_entry) not yet exec'd. Exact

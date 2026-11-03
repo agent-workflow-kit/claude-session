@@ -46,7 +46,6 @@ supervision fails and the internal-error path ends the child. A headless run wit
 ``SessionStart`` within ``session_start_timeout`` of the spawn gets a warning (logged
 ``session_start_missing`` and added to the run's ``warnings``); the run goes on.
 
-TODO(#20): deliver ``post-state-change`` events of the run in the poll loop and at the end.
 The process that wins the finalization compare-and-set (``finish``, or the internal-error
 path) writes the run's ``--outcome-file`` right after it (``outcomefile.write_run``, checked
 against the run's full session-writable set stored at launch step 5), before the secret

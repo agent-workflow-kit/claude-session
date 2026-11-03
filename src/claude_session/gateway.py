@@ -148,14 +148,16 @@ except (ValueError, OSError):
 class Result:
     """A finished ``run``: exit code and decoded output (invalid UTF-8 replaced, newlines
     translated), plus the raw bytes kept of each stream (``stdout_bytes``, ``stderr_bytes``:
-    exactly as read, for a caller that must check them strictly)."""
+    exactly as read, for a caller that must check them strictly). The bytes are required: a
+    default of ``b""`` would make a result built without them read as empty output (an empty
+    crontab, which ``cron install`` would then overwrite)."""
 
     argv: tuple[str, ...]
     returncode: int
     stdout: str
     stderr: str
-    stdout_bytes: bytes = b""
-    stderr_bytes: bytes = b""
+    stdout_bytes: bytes
+    stderr_bytes: bytes
 
 
 class GatewayOutputLimit(Exception):

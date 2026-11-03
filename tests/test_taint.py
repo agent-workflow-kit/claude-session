@@ -263,6 +263,22 @@ def test_allow_tainted_from_a_terminal_uses_the_default_human_actor(
     assert record["actor"].startswith("human:") and record["inputs"]["tty"] is True
 
 
+def test_the_pre_launch_payload_says_allow_tainted_was_given(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = tainted_session(env)
+    seen = env.tmp_path / "payload.json"
+    code = f"import sys; open({str(seen)!r}, 'w').write(sys.stdin.read())"
+    entry = json.dumps({"cmd": f'{sys.executable} -I -c "{code}"'})
+    env.write_config(f"hooks:\n  pre-launch:\n    - {entry}\n")
+    monkeypatch.setattr(sys, "stdin", Tty())
+    code_, out = resume_in_process(
+        env, monkeypatch, capsys, sid, *TRUSTED, "--mode", "headless", "--allow-tainted"
+    )
+    assert code_ == 0, out
+    assert json.loads(seen.read_text())["allow_tainted"] is True
+
+
 # One human-only rule for both flags (--allow-tainted and --override-escalation)
 
 HUMAN_ONLY_FLAGS = ["--allow-tainted", "--override-escalation"]

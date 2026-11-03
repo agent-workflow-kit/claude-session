@@ -1,0 +1,7 @@
+{
+  "action": "installed",
+  "block": "# claude-session managed\n*/5 * * * * /bin/sh -c '<command> reconcile >/dev/null'\n# claude-session managed end",
+  "dry_run": true,
+  "env_file": null,
+  "interval_minutes": 5
+}
