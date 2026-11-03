@@ -26,11 +26,25 @@ class CliError(Exception):
         return {}
 
     def envelope(self) -> dict[str, Any]:
-        """The ``--json`` error envelope for this error."""
+        """The ``--json`` error envelope for this error. Its text never carries a lone
+        surrogate (an argv byte that is not UTF-8 arrives surrogate-escaped): U+FFFD instead,
+        so the envelope encodes as strict UTF-8."""
         error: dict[str, Any] = {"code": self.code, "message": self.message, **self.fields()}
         if self.detail is not None:
             error["detail"] = self.detail
-        return {"error": error}
+        return {"error": _no_surrogates(error)}
+
+
+def _no_surrogates(value: Any) -> Any:
+    from .terminal import no_surrogates  # only on an error: keeps the hook path's imports lean
+
+    if isinstance(value, str):
+        return no_surrogates(value)
+    if isinstance(value, list):
+        return [_no_surrogates(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _no_surrogates(item) for key, item in value.items()}
+    return value
 
 
 class InternalError(CliError):
@@ -110,8 +124,9 @@ class LaunchFailedError(CliError):
         run: int,
         end_reason: str,
         hint: str | None,
+        detail: str | None = None,
     ) -> None:
-        super().__init__(message)
+        super().__init__(message, detail=detail)
         self.csession_id = csession_id
         self.run = run
         self.end_reason = end_reason
@@ -142,7 +157,8 @@ class LaunchValidationError(FailedError):
     ``failed`` envelope."""
 
     # exec maps it to a not-started run (launch.fail_launch: end_reason, its message, detail
-    # and hint as the outcome message, exit 12). TODO(#28): start maps it to LaunchFailedError.
+    # and hint as the outcome message, exit 12); start also ends the run that way and prints
+    # it as LaunchFailedError (lifecycle.start).
 
     end_reason: str
 

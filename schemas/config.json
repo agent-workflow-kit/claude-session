@@ -249,13 +249,15 @@
     "notes_context_cmd": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "pattern": "^[^\u0000-\u001f\u007f-\u009f]*$"
       },
       "minItems": 1,
       "default": [
         "memoctl",
         "context"
-      ]
+      ],
+      "description": "argv run at session start (no shell); items contain no control characters (C0, DEL or C1). --repo=<id> (when the session has a repo) and one --label=<key>=<value> token per session label are appended."
     },
     "notes_context_timeout": {
       "anyOf": [
@@ -269,14 +271,15 @@
           "pattern": "^(?!0+(\\.0+)?(ms|s|m|h|d)$)[0-9]+(\\.[0-9]+)?(ms|s|m|h|d)$"
         }
       ],
-      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). A text value so small that it underflows to zero (e.g. '0.' then hundreds of zeros then '1s') matches the pattern but is refused by the loader.",
+      "description": "Seconds as a positive number (fractions allowed), or a string <number><unit> with unit ms, s, m, h or d (e.g. '90s', '10m', '0.5s'); zero is refused; at most 36500d (the text form too: the loader enforces the maximum, the string pattern does not). A text value so small that it underflows to zero (e.g. '0.' then hundreds of zeros then '1s') matches the pattern but is refused by the loader. At most 15 s is used (the SessionStart hook's budget).",
       "default": "5s"
     },
     "notes_context_max_bytes": {
       "type": "integer",
       "minimum": 0,
       "maximum": 9007199254740991,
-      "default": 16384
+      "default": 16384,
+      "description": "Cap on the notes command's output (bytes). At most 1 MiB (1048576) is used."
     },
     "notes_context_sources": {
       "type": "array",
@@ -294,7 +297,8 @@
       },
       "default": [
         "startup"
-      ]
+      ],
+      "description": "SessionStart sources that get notes. 'other' is accepted for compatibility but currently never matches: hook-event treats a SessionStart with any source other than startup, resume, fork, clear or compact as an internal error."
     },
     "summary_max_bytes": {
       "type": "integer",

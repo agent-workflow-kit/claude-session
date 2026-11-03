@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -10,7 +12,7 @@ from typing import Any
 import pytest
 
 from claude_session import config, kinds, launch, pathrules
-from claude_session.errors import InternalError, LaunchValidationError, UsageError
+from claude_session.errors import LaunchValidationError, UsageError
 from claude_session.gateway import SystemGateway
 
 from .fake_gateway import FakeGateway
@@ -71,10 +73,52 @@ def args(**given: Any) -> argparse.Namespace:
     return parsed
 
 
-def test_interactive_exec_is_not_implemented_yet(tmp_path: Path) -> None:
-    with pytest.raises(InternalError, match="--mode headless") as info:
-        launch.read_request(args(), load(tmp_path))
-    assert info.value.detail == "not_implemented"
+class _Stream:
+    def __init__(self, tty: bool) -> None:
+        self.tty = tty
+        self.buffer = self
+
+    def isatty(self) -> bool:
+        return self.tty
+
+
+@pytest.mark.parametrize(("stdin", "stdout"), [(False, False), (True, False), (False, True)])
+def test_interactive_mode_needs_a_terminal_on_stdin_and_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdin: bool, stdout: bool
+) -> None:
+    monkeypatch.setattr("sys.stdin", _Stream(stdin))
+    monkeypatch.setattr("sys.stdout", _Stream(stdout))
+    with pytest.raises(UsageError, match="terminal on stdin and stdout"):
+        launch.read_request(args(), load(tmp_path))  # interactive is the default mode
+    with pytest.raises(UsageError):
+        launch.read_request(args(mode="interactive"), load(tmp_path))
+
+
+def test_interactive_mode_with_a_terminal_reads_the_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sys.stdin", _Stream(True))
+    monkeypatch.setattr("sys.stdout", _Stream(True))
+    request = launch.read_request(args(), load(tmp_path))
+    assert request.mode == "interactive" and request.prompt is None
+
+
+def test_interactive_prompt_from_a_terminal_stdin_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sys.stdin", _Stream(True))
+    monkeypatch.setattr("sys.stdout", _Stream(True))
+    with pytest.raises(UsageError, match="--prompt-file -"):
+        launch.read_request(args(prompt_file="-"), load(tmp_path))
+
+
+def test_a_raised_unreadable_isatty_counts_as_no_terminal() -> None:
+    class Broken:
+        def isatty(self) -> bool:
+            raise ValueError("closed")
+
+    assert launch._isatty(Broken()) is False
+    assert launch._isatty(None) is False
 
 
 def test_read_request_reads_the_prompt_and_inputs_capped(tmp_path: Path) -> None:
@@ -383,3 +427,85 @@ def test_fail_launch_records_the_hint_as_the_message(tmp_path: Path) -> None:
         "no bwrap; install",
     )
     assert row["phase"] == "launch" and row["session_state"] == "not-started"
+
+
+# The notes command (resolved like the tools; never fails the launch)
+
+
+def test_notes_command_resolves_on_the_path_to_its_realpath(tmp_path: Path) -> None:
+    real = executable(tmp_path / "real" / "memoctl-1.0")
+    link = tmp_path / "bin" / "memoctl"
+    link.parent.mkdir()
+    link.symlink_to(real)
+    cfg = load(tmp_path)
+    proc = process(tmp_path, PATH=f"rel:{tmp_path / 'bin'}:/usr/bin")
+    tool, problem = launch.resolve_notes(cfg, resolution(cfg), proc, launch.NO_SANDBOX)
+    assert (tool, problem) == (pathrules.ResolvedTool(path=str(real), name="memoctl"), None)
+
+
+def test_a_missing_notes_command_is_a_problem_not_an_error(tmp_path: Path) -> None:
+    cfg = load(tmp_path, "notes_context_cmd: [no-such-notes-command, context]\n")
+    tool, problem = launch.resolve_notes(cfg, resolution(cfg), process(tmp_path), launch.NO_SANDBOX)
+    assert tool is None
+    assert problem == "notes command not found: 'no-such-notes-command'"
+
+
+@pytest.mark.parametrize("name", ["bin/memoctl", "./memoctl"])
+def test_a_relative_notes_command_path_is_refused(tmp_path: Path, name: str) -> None:
+    cfg = load(tmp_path, f"notes_context_cmd: [{name}]\n")
+    tool, problem = launch.resolve_notes(cfg, resolution(cfg), process(tmp_path), launch.NO_SANDBOX)
+    assert tool is None and problem is not None and problem.startswith("notes command refused")
+
+
+def test_a_notes_command_in_a_session_writable_path_is_refused(tmp_path: Path) -> None:
+    cmd = executable(tmp_path / "cwd" / "memoctl")
+    cfg = load(tmp_path, f"notes_context_cmd: [{cmd}]\n")
+    writable = pathrules.SessionWritable([str(tmp_path / "cwd")])
+    tool, problem = launch.resolve_notes(cfg, resolution(cfg), process(tmp_path), writable)
+    assert tool is None and problem is not None and "session-writable" in problem
+
+
+def test_a_kind_without_notes_context_resolves_nothing(tmp_path: Path) -> None:
+    cfg = load(tmp_path, "notes_context_cmd: [/no/such]\n")
+    tool, problem = launch.resolve_notes(
+        cfg, resolution(cfg, "audit"), process(tmp_path), launch.NO_SANDBOX
+    )
+    assert (tool, problem) == (None, None)
+
+
+def test_hookconf_drops_notes_settings_too_large_for_the_file(tmp_path: Path) -> None:
+    from claude_session import notes
+
+    cfg = load(tmp_path)
+    big = notes.NotesConf(
+        argv=("m", *(f"--label=k{i}={'v' * 250}" for i in range(300))),
+        executable="/usr/bin/m",
+        env={"PATH": "/bin"},
+        timeout=5.0,
+        max_bytes=10,
+        sources=("startup",),
+    )
+    data, problem = launch.hookconf([], cfg, big)
+    assert problem == "notes command settings too large"
+    assert json.loads(data)["notes"] is None
+    data, problem = launch.hookconf([], cfg, dataclasses.replace(big, argv=("m",)))
+    assert problem is None and json.loads(data)["notes"]["argv"] == ["m"]
+
+
+def test_hookconf_drops_invalid_notes_settings_without_calling_them_too_large(
+    tmp_path: Path,
+) -> None:
+    from claude_session import notes
+
+    cfg = load(tmp_path)
+    bad = notes.NotesConf(
+        argv=("m", "a\x00b"),
+        executable="/usr/bin/m",
+        env={"PATH": "/bin"},
+        timeout=5.0,
+        max_bytes=10,
+        sources=("startup",),
+    )
+    data, problem = launch.hookconf([], cfg, bad)
+    assert problem == "notes command settings invalid"
+    assert json.loads(data)["notes"] is None
