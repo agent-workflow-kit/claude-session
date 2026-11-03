@@ -27,6 +27,8 @@ FLAGS_USED = (
     "--allowedTools",
     "--max-budget-usd",
     "--debug",
+    "--mcp-config",
+    "--tools",
 )
 
 

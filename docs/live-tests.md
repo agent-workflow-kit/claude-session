@@ -47,7 +47,7 @@ Every path that starts `claude` with credentials passes one spend gate first (`L
 
 Some checks are open questions (an exit code, a payload shape, a message text). Those tests assert what the design tolerates and record the value seen with `live.observe(key, value)`: printed in the terminal summary and, with `CSESSION_LIVE_OBSERVATIONS`, written to a file. After a run, compare the observations with the fake claude's assumptions (`tests/fakebin/fake_claude.py`) and with the table rows named in the tests, and update them. The open follow-up in code is the `TODO(#42)` at the `post_tool_use` row of `src/claude_session/hookevent.py` (#58 item 1).
 
-## Extending (issues #42 and #43)
+## Extending
 
 - New API-using tests take the `live` fixture, zero-cost ones `cheap`; both come from `tests/live/conftest.py`. Put helpers in `tests/live/harness.py` and unit-test them in `tests/test_live_harness.py`, with the fake claude or `sh`.
 - `LiveEnv.headless(prompt, *flags)` runs a small-model `-p` with `stream-json`, the prompt after `--`. `LiveEnv.claude_run` runs with exactly the given argv (add `*live.budget()` to a `-p` argv). `spawn_headless` and `tmux_driver.Tmux` are for signals and interactive sessions; a new path that starts `claude` must call `spend_gate()` and `charge()`.
@@ -106,9 +106,9 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 
 | Item | Test or owner |
 |---|---|
-| Glob, Grep and LS under the review profile | #42 |
+| Glob, Grep and LS under the review profile | `test_open_items.py::test_search_tools_...` (LS is not a tool in the verified Claude Code; the `init` tool list is recorded) |
 | `--strict-mcp-config` drops a `--plugin-dir` plugin's MCP servers | `test_headless.py::test_strict_mcp_config_...` |
-| MCP elicitation (`elicitation_dialog`) | #42 |
+| MCP elicitation (`elicitation_dialog`) | `test_interactive.py::test_an_mcp_elicitation_...` |
 | Background subagents: last `result` taken, cost and turns summed | Raw stream: `test_headless_signals.py::test_background_subagents_...`; the product's summing: #42 |
 | Report forms under `dontAsk` | `test_isolation.py::test_report_command_forms_under_dont_ask` |
 | A trusted run with `--setting-sources ""` does not start in `auto` | `test_settings.py::test_empty_setting_sources_...` |
@@ -139,7 +139,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 | C (built-in write protections beyond the placeholder check), C2 (single-`*` glob ignored), C5 (uv tool install), C7 (`GIT_CONFIG_COUNT`), C8 (outbox/artifacts directory swap) | #42 | Sandbox internals on a Linux sandbox host. |
 | Respond isolation: network, tmux socket and SSH agent blocked | #42 | Needs an outside listener. |
 | Sandbox: TMPDIR socket length; `excludedCommands` matching; `.bash_profile` placeholder | #42 | Unit-tested in `selfcheck`; the live half needs a sandbox host. |
-| Search tools under the review profile (Glob, Grep, LS); symlink planted by sandboxed Bash and the Read tool (F1); `/proc` isolation (F2); MCP elicitation (`elicitation_dialog`) | #42 | Open items. |
+| Glob and Grep through the generated review settings end to end | n/a | Isolated runs refuse `--tools` in `claude_args` (`unsafe_claude_args`), so the product cannot enable them; `test_open_items.py` builds the same permission keys by hand. |
 | Managed settings (#56 (b), #59 item 13) | #42 | Needs a root-owned managed settings file (procedure below). |
 | macOS Seatbelt checks | #43 | Manual checklist (macOS only). |
 
@@ -149,7 +149,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 |---|---|
 | #55 Bedrock/Vertex truthy values | `test_provider_env.py` (zero cost; message patterns are guesses, see the docstring) |
 | #56 1 `--` before the prompt | `test_headless.py::test_double_dash_...` and the control (no prompt: `-p` fails for want of input) |
-| #56 2 Notification matchers | `test_interactive.py::test_permission_prompt_notifications_...` (`permission_prompt` and `idle_prompt`; `elicitation_dialog`: #42) |
+| #56 2 Notification matchers | `test_interactive.py::test_permission_prompt_notifications_...` (`permission_prompt` and `idle_prompt`; `elicitation_dialog`: `test_interactive.py::test_an_mcp_elicitation_...`) |
 | #56 3 Omitted `matcher` | `test_hooks.py::test_a_group_without_a_matcher_...` (PostToolUse and SessionStart; PermissionRequest is only ever seen unmatched in the interactive test) |
 | #56 4 Hook `timeout` unit | `test_hooks.py::test_hook_timeout_is_in_seconds` |
 | #56 5 `defaultMode` precedence | `test_settings.py::test_settings_default_mode_...` |
@@ -171,7 +171,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 | #59 9 `~/.gitconfig` re-opened under deny-root | #42 (sandbox host) |
 | #59 10 skills in `--add-dir` under `--setting-sources ""` | `test_isolation.py::test_skills_in_an_add_dir_directory_...` (records the answer) |
 | #59 11 `sandbox: off` vs user `enabled: true` | #42 (sandbox host) |
-| #59 12 Grep and Glob read denies | #42 |
+| #59 12 Grep and Glob read denies | `test_open_items.py::test_search_tools_and_the_home_read_denies` (three variants; only `both` asserts, for Read and Grep content; the rest is recorded) |
 | #60 `preferred` fallback: Claude Code runs unsandboxed when the sandbox is missing | `test_sandbox.py::test_without_a_sandbox_enabled_without_fail_if_unavailable_...` (Linux without a sandbox) |
 | #60 bwrap probe fidelity, socat, socket names, `TMPDIR` vs `CLAUDE_CODE_TMPDIR`, `/tmp` ownership | #42 (a sandbox host and a namespace); unit tests cover the probe |
 | #63 10 MiB artifact | `test_e2e.py::test_a_10_mib_artifact_...` |
@@ -180,6 +180,32 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 | #37 1 to 7 and review additions | `test_transcript.py` (item 7 also in `test_headless.py`); counts of `subagents/` and `tool-results/` entries are recorded, not compared with the bounds |
 | #76 SessionStart `source` values | `test_headless.py`, `test_interactive.py::test_clear_changes_the_id_...` |
 
+### Open items (issue #42)
+
+None of these tests has been run against a real Claude Code. They are queued for the first human `make live`; until then the rows that call these items open or untested are unchanged. After the run, read the observations (`CSESSION_LIVE_OBSERVATIONS`) and update every one of these rows, and open a follow-up issue for any required change:
+
+- design.md, the live-verification table: AskUserQuestion (B4), whose consequence column calls `elicitation_dialog` untested without an MCP server; search tools under the review profile (D3); the safety re-review check (F1); and the "Still to verify" line below the table (MCP elicitation, F1, F2).
+- design.md, Testing: the open entries for Glob, Grep and LS under the review profile and for MCP elicitation detection.
+- interface.md: `needs_input_reason` `elicitation` ("not live-tested without an MCP server"), the residual risks and the home-directory Read denies.
+
+| Item | Test | What it asserts and records |
+|---|---|---|
+| F1 Read, Grep, Glob on a symlink to a file outside | `test_open_items.py::test_f1_...[Read\|Grep\|Glob]` (needs a sandbox) | The test plants (before the run, so no tool call can race it) a file symlink and a directory symlink in the cwd to a private `outside/` dir, as sandboxed Bash could. Controls: the tool works on a plain file in the cwd, and a direct read of the outside file is blocked (else the result is inconclusive, not a symlink finding). Read and Grep must probe the link, must not find it missing, and must not return the secret nor, for Grep's paths-only mode, list the link. Grep is asked for `output_mode: "content"`; the mode used is recorded. What Glob lists behind the directory link is recorded. If this fails, the home Read denies in the isolated settings must stay. |
+| F2 `/proc` isolation | `test_open_items.py::test_f2_...` (needs a sandbox, Linux) | A host child (exact PID, killed at teardown, environment only `PATH` and a marker) must not appear in the sandbox's `ls /proc`, which must succeed and list `self` (else the namespace is unverified and the test fails); the agent must run `cat /proc/<pid>/environ` and not see the marker. `/proc/<pid>/root`, `/proc/1/cmdline` and the process counts are recorded; environ text never is. |
+| MCP elicitation | `test_interactive.py::test_an_mcp_elicitation_...` | A stdlib stdio MCP server (`tests/live/mcp_elicit_server.py`) sends `elicitation/create` from its tool; the `elicitation_dialog` Notification hook must fire. Records the payload, any `PermissionRequest`, the screen, and what Esc does to the pending request. |
+| Search tools and the home Read denies (#59 12) | `test_open_items.py::test_search_tools_...[block-reads\|read-deny\|both]` | A planted `~/.ssh/id_test` in the private home; Read, Grep and Glob under `blockReadsOutsideWorkingDirectories` only, a `Read(//<home>/.ssh/**)` deny only, and both. Each tool must probe `~/.ssh` (controls in the cwd first). Records which tools return the key or its name (a Grep result listing `id_test` counts as a leak); asserts only for `both` and only for Read and Grep. |
+| `--strict-mcp-config` drops plugin MCP servers | already covered: `test_headless.py::test_strict_mcp_config_...` | The issue's scope lists it; no new test. |
+
+### Comments on issue #42
+
+| Comment | Test or status |
+|---|---|
+| PR #59: F1 still gates the home and credential Read denies | `test_open_items.py::test_f1_...` (above) |
+| PR #59: system dirs, `/bin/sh` and the ELF loader under deny-root on a usr-merged distro | `test_sandbox.py::test_deny_root_...` runs `/bin/sh` (dynamically linked) by its literal path under deny-root with the system dirs and their realpaths; it proves the usr-merged case only on a usr-merged host, so whether `/bin` is a symlink is recorded |
+| PR #59: ancestors of the tmpdir in `read_dirs` | Refused by the code (`pathrules`); no live test |
+
+Planted files and symlinks live only under the test's private root (`live.root`); the private `HOME` is the only home used.
+
 ### Tests of the suite itself
 
-`tests/test_live_harness.py` covers the helpers (environment allowlist and forbidden names, credentials and the login cache, the API-key approval, reprs, the ledger and the spend gate on every path, charging the estimate on a timeout or unparsable output, spawned runs and their process groups, stream and transcript parsing, the tmux driver, token-checked signals and hook PID records, `headless` against the fake claude) and the gating: a default run deselects every live test, `-m live` without the opt-in skips them all, `make live` sets the opt-in and `verify` does not depend on it. `tests/test_leftover_guard.py` covers the live watchdog limit.
+`tests/test_live_harness.py` covers the helpers (environment allowlist and forbidden names, credentials and the login cache, the API-key approval, reprs, the ledger and the spend gate on every path, charging the estimate on a timeout or unparsable output, spawned runs and their process groups, stream and transcript parsing, tool-call pairing, the probe-call and leak checks of the open-item tests, the `/proc` listing parser, the elicitation MCP server driven by a fake client (including `ping` while a question is pending), the tmux driver, token-checked signals and hook PID records, `headless` against the fake claude) and the gating: a default run deselects every live test, `-m live` without the opt-in skips them all, `make live` sets the opt-in and `verify` does not depend on it. `tests/test_leftover_guard.py` covers the live watchdog limit.

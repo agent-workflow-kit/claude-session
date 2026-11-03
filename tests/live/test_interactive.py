@@ -273,3 +273,69 @@ def test_signals_end_interactive_claude_cleanly(
             "Reply OK.", "--resume", sid, "--setting-sources", "", cwd=session.work
         )
         assert resumed.session_id == sid
+
+
+@pytest.mark.live
+def test_an_mcp_elicitation_fires_the_elicitation_dialog_notification(session: Session) -> None:
+    """MCP elicitation (design.md, still to verify): a test MCP server (`mcp_elicit_server.py`)
+    asks the user a question while its tool runs. The `Notification` hook with the
+    `elicitation_dialog` matcher must fire, which `needs-input(elicitation)` relies on. The
+    payload, the tool permission events and what Esc does to the pending request are recorded.
+    The test fails before the notification only if the server never asked (the model did not
+    call the tool), so a silent notification is told apart from a tool that never ran."""
+    server_log = session.live.root / "elicit-server.log"
+    config = session.live.write_json(
+        "mcp.json",
+        {
+            "mcpServers": {
+                "elicit": {
+                    "command": sys.executable,
+                    "args": ["-I", str(Path(__file__).with_name("mcp_elicit_server.py"))],
+                    "env": {"ELICIT_SERVER_LOG": str(server_log)},
+                }
+            }
+        },
+    )
+    session.start(
+        f"--mcp-config={config}", "--strict-mcp-config", "--allowedTools=mcp__elicit__ask"
+    )
+    session.ready()
+    session.submit(
+        "Call the ask tool of the elicit MCP server once, with no arguments. Then tell me which "
+        "action the user took."
+    )
+
+    def asked() -> bool:
+        return server_log.exists() and "elicitation sent" in server_log.read_text(encoding="utf-8")
+
+    assert wait_for(asked, 120), (
+        "control failed: the MCP server never sent an elicitation",
+        session.tmux.capture(),
+    )
+    session.live.observe(
+        "MCP server log before the answer", server_log.read_text(encoding="utf-8").splitlines()
+    )
+    initialize = [
+        line for line in server_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith("initialize capabilities=")
+    ]  # fmt: skip
+    assert initialize and "elicitation" in initialize[0], (
+        "the client did not advertise elicitation support, so no dialog can be expected",
+        initialize,
+    )
+    fired = wait_for(lambda: bool(read_log(session.notify["elicitation_dialog"])), 30)
+    session.live.observe("elicitation screen", session.tmux.capture()[-600:])
+    session.live.observe(
+        "events around the elicitation",
+        {
+            "PermissionRequest": [e.get("tool_name") for e in session.events("PermissionRequest")],
+            "permission_prompt": len(read_log(session.notify["permission_prompt"])),
+            "elicitation_dialog": [dict(p) for p in read_log(session.notify["elicitation_dialog"])],
+        },
+    )
+    assert fired, "the elicitation was pending but no elicitation_dialog notification fired"
+    session.tmux.send_keys("Escape")
+    wait_for(lambda: "answered" in server_log.read_text(encoding="utf-8"), 30)
+    session.live.observe(
+        "MCP server log after Esc", server_log.read_text(encoding="utf-8").splitlines()
+    )

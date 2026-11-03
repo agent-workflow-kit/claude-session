@@ -72,7 +72,10 @@ def sandbox_settings(
 @needs_sandbox
 def test_deny_root_hides_files_outside_the_allowlist_and_tools_still_work(live: LiveEnv) -> None:
     """E1 and #59 items 4, 7: markers outside the allowlist are hidden from Bash while `ls`,
-    `cat`, `sh -c` and writes in the cwd work with TMPDIR only in `allowWrite`."""
+    `cat`, `sh -c` and writes in the cwd work with TMPDIR only in `allowWrite`. `/bin/sh` by
+    its literal path (dynamically linked, so the ELF loader must resolve too) is the #42 check
+    of the system dirs; it proves the usr-merged case only on a usr-merged host, so whether
+    `/bin` is a symlink here is recorded."""
     work = live.dir("work")
     outside = live.dir("outside")
     (outside / "marker.txt").write_text(SECRET, encoding="utf-8")
@@ -81,17 +84,22 @@ def test_deny_root_hides_files_outside_the_allowlist_and_tools_still_work(live: 
         "s.json",
         sandbox_settings(
             live, work,
-            allow=["Bash(cat:*)", "Bash(ls:*)", "Bash(sh:*)", "Bash(echo:*)"],
+            allow=["Bash(cat:*)", "Bash(ls:*)", "Bash(sh:*)", "Bash(/bin/sh:*)", "Bash(echo:*)"],
             auto_allow=True,
         ),
     )  # fmt: skip
     run = live.headless(
         f"With the Bash tool run, one per call: `cat {outside / 'marker.txt'}`, `cat visible.txt`,"
-        " `sh -c 'echo shell-ok'`. Report what each printed or the error it gave. Then reply DONE.",
+        " `sh -c 'echo shell-$((40+2))'`, `/bin/sh -c 'echo bin-sh-$((6*7))'`. Report what each"
+        " printed or the error it gave. Then reply DONE.",
         "--setting-sources", "", "--settings", str(settings), cwd=work,
     )  # fmt: skip
     text = session_tool_results(live.projects, run.session_id)
-    assert "visible-content" in text and "shell-ok" in text
+    live.observe("/bin is a symlink (usr-merged host)", os.path.islink("/bin"))
+    # The shells print computed values, which neither the command lines nor the prompt contain;
+    # they are looked for in what the tools returned, not in what the model said.
+    assert "visible-content" in text and "shell-42" in text
+    assert "bin-sh-42" in text, "/bin/sh (or its ELF loader) did not resolve under deny-root"
     assert SECRET not in text
 
 
