@@ -146,12 +146,16 @@ except (ValueError, OSError):
 
 @dataclass(frozen=True)
 class Result:
-    """A finished ``run``: exit code and decoded output (invalid UTF-8 replaced)."""
+    """A finished ``run``: exit code and decoded output (invalid UTF-8 replaced, newlines
+    translated), plus the raw bytes kept of each stream (``stdout_bytes``, ``stderr_bytes``:
+    exactly as read, for a caller that must check them strictly)."""
 
     argv: tuple[str, ...]
     returncode: int
     stdout: str
     stderr: str
+    stdout_bytes: bytes = b""
+    stderr_bytes: bytes = b""
 
 
 class GatewayOutputLimit(Exception):
@@ -179,12 +183,15 @@ class GatewayTimeout(Exception):
       then not signaled). "Empty group" is detected through
       ``/proc`` on Linux (two scans in a row finding no live member); elsewhere the full grace
       is waited. A descendant that left the group (``setsid``/``setpgid``) is not signaled.
+
+    ``stderr``: the raw bytes of stderr read before the timeout (within ``output_limit``).
     """
 
-    def __init__(self, argv: Sequence[str], timeout: float | None) -> None:
+    def __init__(self, argv: Sequence[str], timeout: float | None, *, stderr: bytes = b"") -> None:
         super().__init__(f"{argv[0]} timed out after {timeout} s")
         self.argv = tuple(argv)
         self.timeout = timeout
+        self.stderr = stderr
 
 
 class GatewayCanceled(Exception):
@@ -846,7 +853,8 @@ def _exchange(
     as soon as stdout passes it, and stderr past it is dropped as it arrives. With
     ``kill_group`` (Linux), reading also ends once the leader has exited: its group is then
     SIGKILLed and only what is already buffered is read (``_drain``). ``on_started`` is called
-    once stdin is written and closed (at once without stdin)."""
+    once stdin is written and closed (at once without stdin). The
+    ``subprocess.TimeoutExpired`` carries the output read so far (``output``, ``stderr``)."""
     deadline = None if timeout is None else time.monotonic() + timeout
     fds = [None if f is None else f.fileno() for f in (popen.stdout, popen.stderr)]
     out_fd, err_fd = fds
@@ -863,60 +871,65 @@ def _exchange(
             if on_started is not None:
                 on_started()
 
-    poll_exit = kill_group and hasattr(os, "waitid")
-    with selectors.DefaultSelector() as selector:
-        for fd in readers:
-            selector.register(fd, selectors.EVENT_READ)
-        stdin = popen.stdin
-        in_fd = -1 if stdin is None else stdin.fileno()
-        if stdin is not None and pending:
-            selector.register(in_fd, selectors.EVENT_WRITE)
-        else:
-            if stdin is not None:
-                stdin.close()
-            fed()
-        while selector.get_map():
-            _check(popen, deadline, timeout, canceled)
-            wait = _chunk(_remaining(deadline), canceled)
-            if poll_exit:
-                wait = _EXIT_POLL_MAX if wait is None else min(wait, _EXIT_POLL_MAX)
-            for key, _ in selector.select(wait):
-                if key.fd == in_fd:
-                    try:
-                        pending = pending[os.write(key.fd, pending[:_PIPE_BUF]) :]
-                    except BrokenPipeError:  # the child stopped reading
-                        pending = pending[:0]
-                    if not pending:
-                        selector.unregister(key.fd)
-                        assert stdin is not None
-                        stdin.close()
-                        fed()
-                    continue
-                chunk = os.read(key.fd, _READ_SIZE)
-                if chunk:
-                    if kill_over_bytes is not None:
-                        if key.fd == out_fd and kept[key.fd] + len(chunk) > kill_over_bytes:
-                            raise _OutputLimit
-                        chunk = chunk[: max(0, kill_over_bytes - kept[key.fd])]
-                        kept[key.fd] += len(chunk)
-                    _keep(output[key.fd], chunk, output_limit)
-                    continue
-                selector.unregister(key.fd)
-                readers[key.fd].close()
-            if poll_exit and _leader_exited(popen):
-                # The rest of the group is SIGKILLed: only a descendant that left the group
-                # can still hold the output open, so read what is buffered and stop.
-                _signal_group(popen, signal.SIGKILL)
-                fds_open = [key.fd for key in selector.get_map().values()]
-                _drain([fd for fd in fds_open if fd != in_fd], output, output_limit)
-                for fd in fds_open:
-                    selector.unregister(fd)
-                    if fd == in_fd:
-                        assert stdin is not None
-                        stdin.close()
-                    else:
-                        readers[fd].close()
-    _wait_exited(popen, deadline, timeout, canceled, kill_group=kill_group)
+    try:
+        poll_exit = kill_group and hasattr(os, "waitid")
+        with selectors.DefaultSelector() as selector:
+            for fd in readers:
+                selector.register(fd, selectors.EVENT_READ)
+            stdin = popen.stdin
+            in_fd = -1 if stdin is None else stdin.fileno()
+            if stdin is not None and pending:
+                selector.register(in_fd, selectors.EVENT_WRITE)
+            else:
+                if stdin is not None:
+                    stdin.close()
+                fed()
+            while selector.get_map():
+                _check(popen, deadline, timeout, canceled)
+                wait = _chunk(_remaining(deadline), canceled)
+                if poll_exit:
+                    wait = _EXIT_POLL_MAX if wait is None else min(wait, _EXIT_POLL_MAX)
+                for key, _ in selector.select(wait):
+                    if key.fd == in_fd:
+                        try:
+                            pending = pending[os.write(key.fd, pending[:_PIPE_BUF]) :]
+                        except BrokenPipeError:  # the child stopped reading
+                            pending = pending[:0]
+                        if not pending:
+                            selector.unregister(key.fd)
+                            assert stdin is not None
+                            stdin.close()
+                            fed()
+                        continue
+                    chunk = os.read(key.fd, _READ_SIZE)
+                    if chunk:
+                        if kill_over_bytes is not None:
+                            if key.fd == out_fd and kept[key.fd] + len(chunk) > kill_over_bytes:
+                                raise _OutputLimit
+                            chunk = chunk[: max(0, kill_over_bytes - kept[key.fd])]
+                            kept[key.fd] += len(chunk)
+                        _keep(output[key.fd], chunk, output_limit)
+                        continue
+                    selector.unregister(key.fd)
+                    readers[key.fd].close()
+                if poll_exit and _leader_exited(popen):
+                    # The rest of the group is SIGKILLed: only a descendant that left the group
+                    # can still hold the output open, so read what is buffered and stop.
+                    _signal_group(popen, signal.SIGKILL)
+                    fds_open = [key.fd for key in selector.get_map().values()]
+                    _drain([fd for fd in fds_open if fd != in_fd], output, output_limit)
+                    for fd in fds_open:
+                        selector.unregister(fd)
+                        if fd == in_fd:
+                            assert stdin is not None
+                            stdin.close()
+                        else:
+                            readers[fd].close()
+        _wait_exited(popen, deadline, timeout, canceled, kill_group=kill_group)
+    except subprocess.TimeoutExpired as exc:
+        exc.output = b"" if out_fd is None else b"".join(output[out_fd])
+        exc.stderr = b"" if err_fd is None else b"".join(output[err_fd])
+        raise
     return (
         b"" if out_fd is None else b"".join(output[out_fd]),
         b"" if err_fd is None else b"".join(output[err_fd]),
@@ -1108,9 +1121,9 @@ class SystemGateway:
                         on_started=on_started,
                         canceled=canceled,
                     )
-                except subprocess.TimeoutExpired:
+                except subprocess.TimeoutExpired as exc:
                     _end(popen, group=new_process_group, kill_grace=kill_grace)
-                    raise GatewayTimeout(args, timeout) from None
+                    raise GatewayTimeout(args, timeout, stderr=exc.stderr or b"") from None
                 except _OutputLimit:
                     assert kill_over_bytes is not None  # raised only with a limit
                     _end(popen, group=new_process_group, kill_grace=kill_grace)
@@ -1122,7 +1135,7 @@ class SystemGateway:
             if popen.returncode is None:  # raised before the inner handler (entering with)
                 _end(popen, group=new_process_group, kill_grace=kill_grace)
             raise
-        return Result(args, popen.returncode, _text(out), _text(err))
+        return Result(args, popen.returncode, _text(out), _text(err), out, err)
 
     def spawn(
         self,

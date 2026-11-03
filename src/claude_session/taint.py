@@ -7,10 +7,13 @@ session resumed or forked into a run that is not third-party-reading is refused 
 at every point that decides it (``store._refuse_tainted``): the allocation, the adoption
 compare-and-set and the check right before step 7. ``--allow-tainted`` lifts that refusal:
 
-- **Human-only** (launch step 2, exit 2; ``check_human_only``): an explicit ``--actor`` must
-  be ``human:<user>``; without one, stdin must be a terminal (the default actor is then
-  ``human:<me.name>``). An explicit automated actor is refused even with a terminal: the
-  caller said it is not a human. An audited honor system, not authentication.
+- **Human-only** (launch step 2, before the session lookup, exit 2; ``check_human_only``, the
+  one rule of ``--allow-tainted`` and ``--override-escalation``): an explicit ``--actor``
+  must be ``human:<user>`` with a non-blank user; without one, stdin must be a terminal and
+  the effective actor (``human:<me.name>``) must have a non-blank name. An explicit
+  automated actor is refused even with a terminal: the caller said it is not a human. At
+  adoption the frozen actor is checked again (``check_frozen_actor``). An audited honor
+  system, not authentication.
 - **Recorded on the run** (``Request.allow_tainted``, stored in the run row's
   ``invocation_json``, never only in the launch spec file): the store reads it from there at
   every refusal point, so the flag of ``start --resume`` reaches its adoption, and nothing
@@ -78,9 +81,11 @@ def is_human_actor(actor: str) -> bool:
     return actor.startswith(HUMAN_PREFIX) and actor[len(HUMAN_PREFIX) :].strip() != ""
 
 
-def check_human_only(flag: str, actor: str | None, *, tty: bool) -> None:
-    """A human-only flag (launch step 2): an explicit ``--actor`` must be ``human:<user>``;
-    without one, stdin must be a terminal. ``UsageError`` (exit 2) otherwise."""
+def check_human_only(flag: str, actor: str | None, *, tty: bool, effective: str) -> None:
+    """A human-only flag (launch step 2): an explicit ``actor`` (``--actor``) must be
+    ``human:<user>`` with a non-blank user; without one, stdin must be a terminal and the
+    ``effective`` actor (``human:<me.name>``) must have a non-blank name. ``UsageError``
+    (exit 2) otherwise, naming the condition that failed."""
     if actor is not None:
         if not is_human_actor(actor):
             raise UsageError(
@@ -94,15 +99,28 @@ def check_human_only(flag: str, actor: str | None, *, tty: bool) -> None:
             " --actor human:<user>",
             detail="run it from a terminal, or pass --actor human:<user>",
         )
+    if not is_human_actor(effective):
+        raise UsageError(
+            f"{flag} is human-only: the default actor human:<me.name> has a blank me.name",
+            detail="set me.name in the config, or pass --actor human:<user>",
+        )
 
 
-def from_args(args: Any) -> AllowTainted | None:
+def check_frozen_actor(flag: str, actor: str) -> None:
+    """At adoption: the actor ``start`` froze with a human-only flag must still be
+    ``human:<user>`` (``UsageError``; the adoption ends the run ``not-started``)."""
+    if not is_human_actor(actor):
+        raise UsageError(f"{flag} is human-only: the launch spec's actor is not human:<user>")
+
+
+def from_args(args: Any, effective: str) -> AllowTainted | None:
     """``--allow-tainted`` of ``resume`` or ``start --resume`` after the human-only check
-    (``UsageError``, exit 2); None when it is not given."""
+    (``UsageError``, exit 2; ``effective``: the effective actor); None when it is not
+    given."""
     if not getattr(args, "allow_tainted", False):
         return None
     tty = stdin_is_tty()
-    check_human_only(FLAG, getattr(args, "actor", None), tty=tty)
+    check_human_only(FLAG, getattr(args, "actor", None), tty=tty, effective=effective)
     return AllowTainted(tty=tty)
 
 

@@ -134,6 +134,98 @@ def test_read_request_reads_the_prompt_and_inputs_capped(tmp_path: Path) -> None
         )
 
 
+def _escaped_to(limit: int, char: str = "a") -> str:
+    """A string whose escaped size (quotes included) is exactly ``limit`` bytes, built of
+    ``char`` (1 to 12 escaped bytes each) plus ASCII filler."""
+    unit = launch.toolhooks.escaped_size(char) - 2
+    count = (limit - 2) // unit
+    text = char * count
+    text += "a" * (limit - launch.toolhooks.escaped_size(text))
+    assert launch.toolhooks.escaped_size(text) == limit
+    return text
+
+
+def _request(tmp_path: Path, **given: Any) -> launch.Request:
+    return launch.read_request(args(mode="headless", **given), load(tmp_path))
+
+
+def test_actor_at_the_cap_is_accepted_and_one_over_is_refused(tmp_path: Path) -> None:
+    cap = launch.ACTOR_MAX_ESCAPED_BYTES
+    assert _request(tmp_path, actor=_escaped_to(cap)).actor == _escaped_to(cap)
+    with pytest.raises(UsageError, match="--actor"):
+        _request(tmp_path, actor=_escaped_to(cap + 1))
+
+
+@pytest.mark.parametrize("char", ["\x00", '"', "\\", "\u00e9", "\u20ac", "\U0001f600"])
+def test_actor_is_capped_by_its_escaped_size_not_its_length(tmp_path: Path, char: str) -> None:
+    cap = launch.ACTOR_MAX_ESCAPED_BYTES
+    under = _escaped_to(cap, char)
+    assert len(under) < cap or char in '"\\'
+    assert _request(tmp_path, actor=under).actor == under
+    with pytest.raises(UsageError):
+        _request(tmp_path, actor=_escaped_to(cap + 1, char))
+
+
+def test_an_oversized_ascii_actor_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(UsageError, match="--actor"):
+        _request(tmp_path, actor="a" * 1_000_000)
+
+
+def test_the_effective_actor_from_the_config_name_is_capped_too(tmp_path: Path) -> None:
+    name = "n" * (launch.ACTOR_MAX_ESCAPED_BYTES)
+    cfg = load(tmp_path, f"me:\n  name: {name}\n")
+    parsed = args(mode="headless", actor=None)
+    from unittest import mock
+
+    with mock.patch.object(launch.sys, "stdin", _Stream(True)):
+        with pytest.raises(UsageError, match="--actor"):
+            launch.read_request(parsed, cfg)
+
+
+def test_decision_ids_at_the_cap_are_accepted_and_one_over_is_refused(tmp_path: Path) -> None:
+    cap = launch.ARGV_DECISION_IDS_MAX_BYTES
+    # Each id costs its escaped size plus one separator byte, as for the hooks' ids.
+    one = _escaped_to(cap - 1)
+    assert _request(tmp_path, decision_id=[one]).decision_ids == (one,)
+    with pytest.raises(UsageError, match="--decision-id"):
+        _request(tmp_path, decision_id=[_escaped_to(cap)])
+
+
+def test_decision_ids_are_capped_in_all_not_each(tmp_path: Path) -> None:
+    cap = launch.ARGV_DECISION_IDS_MAX_BYTES
+    half = cap // 2
+    first, second = _escaped_to(half - 1), _escaped_to(cap - half - 1)
+    assert _request(tmp_path, decision_id=[first, second]).decision_ids == (first, second)
+    with pytest.raises(UsageError, match="--decision-id"):
+        _request(tmp_path, decision_id=[first, second + "a"])
+
+
+def test_many_small_decision_ids_are_capped_in_all(tmp_path: Path) -> None:
+    ids = ["x"] * (launch.ARGV_DECISION_IDS_MAX_BYTES // 4 + 1)  # 3 escaped + 1 separator each
+    with pytest.raises(UsageError, match="--decision-id"):
+        _request(tmp_path, decision_id=ids)
+
+
+@pytest.mark.parametrize("char", ["\x00", '"', "\u20ac", "\U0001f600"])
+def test_decision_ids_are_capped_by_escaped_size_not_length(tmp_path: Path, char: str) -> None:
+    cap = launch.ARGV_DECISION_IDS_MAX_BYTES
+    fits = _escaped_to(cap - 1, char)
+    assert _request(tmp_path, decision_id=[fits]).decision_ids == (fits,)
+    with pytest.raises(UsageError, match="--decision-id"):
+        _request(tmp_path, decision_id=[_escaped_to(cap, char)])
+
+
+def test_an_oversized_ascii_decision_id_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(UsageError, match="--decision-id"):
+        _request(tmp_path, decision_id=["d" * 1_000_000])
+
+
+def test_the_cap_is_checked_before_the_prompt_is_read(tmp_path: Path) -> None:
+    missing = str(tmp_path / "missing.md")
+    with pytest.raises(UsageError, match="--decision-id"):
+        _request(tmp_path, decision_id=["d" * 1_000_000], prompt_file=missing)
+
+
 def test_a_cwd_that_is_not_a_directory_is_a_usage_error(tmp_path: Path) -> None:
     cfg = load(tmp_path)
     request = launch.read_request(args(mode="headless", cwd=str(tmp_path / "nope")), cfg)

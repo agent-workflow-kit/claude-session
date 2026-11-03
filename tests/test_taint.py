@@ -70,16 +70,16 @@ def is_tainted(env: Env, sid: str) -> bool:
 
 @pytest.mark.parametrize("actor", ["human:alice", "human:a b", "human:x@example.org"])
 def test_an_explicit_human_actor_passes_without_a_terminal(actor: str) -> None:
-    taint.check_human_only("--allow-tainted", actor, tty=False)
+    taint.check_human_only("--allow-tainted", actor, tty=False, effective=actor)
 
 
 def test_a_terminal_passes_without_an_actor() -> None:
-    taint.check_human_only("--allow-tainted", None, tty=True)
+    taint.check_human_only("--allow-tainted", None, tty=True, effective="human:alice")
 
 
 def test_no_terminal_and_no_actor_is_a_usage_error() -> None:
     with pytest.raises(UsageError, match="human-only"):
-        taint.check_human_only("--allow-tainted", None, tty=False)
+        taint.check_human_only("--allow-tainted", None, tty=False, effective="auto:unknown")
 
 
 @pytest.mark.parametrize(
@@ -103,7 +103,7 @@ def test_an_explicit_actor_that_is_not_human_is_refused_even_with_a_terminal(
     actor: str, tty: bool
 ) -> None:
     with pytest.raises(UsageError, match="human-only"):
-        taint.check_human_only("--allow-tainted", actor, tty=tty)
+        taint.check_human_only("--allow-tainted", actor, tty=tty, effective="human:alice")
 
 
 def test_from_args_records_the_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,15 +113,21 @@ def test_from_args_records_the_terminal(monkeypatch: pytest.MonkeyPatch) -> None
 
     args = argparse.Namespace(allow_tainted=True, actor=None)
     monkeypatch.setattr(sys, "stdin", Tty())
-    assert taint.from_args(args) == taint.AllowTainted(tty=True)
+    assert taint.from_args(args, "human:me") == taint.AllowTainted(tty=True)
     monkeypatch.setattr(sys, "stdin", io.StringIO())
     with pytest.raises(UsageError):
-        taint.from_args(args)
+        taint.from_args(args, "auto:unknown")
     args.actor = "human:alice"
-    assert taint.from_args(args) == taint.AllowTainted(tty=False)
+    assert taint.from_args(args, "human:alice") == taint.AllowTainted(tty=False)
     args.allow_tainted = False
     args.actor = None
-    assert taint.from_args(args) is None
+    assert taint.from_args(args, "auto:unknown") is None
+
+
+def test_a_terminal_with_a_blank_default_actor_is_refused_naming_me_name() -> None:
+    with pytest.raises(UsageError, match="me.name") as info:
+        taint.check_human_only("--override-escalation", None, tty=True, effective="human:  ")
+    assert "--actor must be" not in info.value.message
 
 
 @pytest.mark.parametrize(
@@ -255,6 +261,81 @@ def test_allow_tainted_from_a_terminal_uses_the_default_human_actor(
     assert code == 0, out
     (record,) = tainted_records(env)
     assert record["actor"].startswith("human:") and record["inputs"]["tty"] is True
+
+
+# One human-only rule for both flags (--allow-tainted and --override-escalation)
+
+HUMAN_ONLY_FLAGS = ["--allow-tainted", "--override-escalation"]
+
+
+class Tty(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize("flag", HUMAN_ONLY_FLAGS)
+def test_a_terminal_with_a_blank_me_name_is_refused(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], flag: str
+) -> None:
+    sid = tainted_session(env)
+    before = audit_records(env)
+    env.write_config('me:\n  name: "  "\n')
+    monkeypatch.setattr(sys, "stdin", Tty())
+    code, out = resume_in_process(
+        env, monkeypatch, capsys, sid, *TRUSTED, "--mode", "headless", flag
+    )
+    assert code == 2 and out["error"]["code"] == "usage", out
+    message = out["error"]["message"]
+    assert "human-only" in message and "--actor must be" not in message
+    assert "me.name" in message
+    assert env.rows("SELECT COUNT(*) FROM runs") == [(1,)]
+    assert audit_records(env) == before
+
+
+@pytest.mark.parametrize("flag", HUMAN_ONLY_FLAGS)
+@pytest.mark.parametrize("command", ["resume", "start"])
+def test_without_a_terminal_an_unknown_session_exits_2_for_both_flags(
+    env: Env, flag: str, command: str
+) -> None:
+    argv = (
+        ["resume", "cs-zzzzzzzz", "--json", flag]
+        if command == "resume"
+        else ["start", "--json", "--resume", "cs-zzzzzzzz", flag]
+    )
+    proc, out = run_cs(env, argv)
+    assert proc.returncode == 2, (proc.stdout, proc.stderr)
+    message = out["error"]["message"]
+    assert out["error"]["code"] == "usage" and "human-only" in message
+    assert "terminal" in message and "--actor must be" not in message
+
+
+@pytest.mark.parametrize("flag", HUMAN_ONLY_FLAGS)
+def test_an_explicit_non_human_actor_names_the_actor_flag(env: Env, flag: str) -> None:
+    proc, out = run_cs(env, ["resume", "cs-zzzzzzzz", "--json", flag, "--actor", "auto:ci"])
+    assert proc.returncode == 2 and "--actor must be human:<user>" in out["error"]["message"]
+
+
+def test_adoption_refuses_a_frozen_non_human_actor_for_allow_tainted(env: Env) -> None:
+    sid = tainted_session(env)
+    argv = ["start", "--json", "--resume", sid, *TRUSTED, "--allow-tainted", *HUMAN]
+    proc, _ = run_cs(env, argv)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    # The spec and the run row agree on a non-human actor: only the human re-check refuses.
+    spec = env.private_run(sid, 2) / "launch-spec.json"
+    data = json.loads(spec.read_text())
+    data["request"]["actor"] = "auto:ci"
+    spec.write_text(json.dumps(data))
+    invocation = json.loads(env.run_row(sid, 2)["invocation_json"])
+    invocation["actor"] = "auto:ci"
+    env.write_db(
+        "UPDATE runs SET invocation_json = ? WHERE csession_id = ? AND run_no = 2",
+        (json.dumps(invocation), sid),
+    )
+    proc, out = env.adopt(sid)
+    assert proc.returncode == 12, out
+    assert (out["outcome"], out["end_reason"]) == ("not-started", "session_dir_unsafe")
+    assert tainted_records(env) == []
+    assert len(starts(env)) == 1
 
 
 # The refusal lifted, and the audit record

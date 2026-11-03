@@ -42,6 +42,7 @@ EVENTS = frozenset(
         "launch_interrupted",
         "outcome_file_failed",
         "hook_delivered",
+        "audit_failed",
     }
 )
 # Machine reasons (schemas/log.json "reason"): report rejection reasons and launch-phase end

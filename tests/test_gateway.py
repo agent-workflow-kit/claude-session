@@ -284,6 +284,33 @@ def test_run_output_limit_keeps_a_prefix_and_drains_the_rest(gw: SystemGateway) 
     assert proc.stderr == "éé\ufffd"  # 5 bytes: two whole characters, then half of one
 
 
+def test_run_keeps_the_raw_bytes_of_each_stream_untranslated(gw: SystemGateway) -> None:
+    proc = gw.run(
+        py(
+            """
+            import sys
+            sys.stdout.buffer.write(b"a\\r\\nb\\xff" + b"x" * 10)
+            sys.stderr.buffer.write(b"e\\r\\n")
+            """
+        ),
+        timeout=60,
+        output_limit=6,
+    )
+    assert proc.stdout_bytes == b"a\r\nb\xffx"  # a prefix, exactly as read
+    assert proc.stdout == "a\nb\ufffdx"  # the text: translated and replaced
+    assert proc.stderr_bytes == b"e\r\n"
+
+
+def test_a_timeout_carries_the_stderr_read_before_it(gw: SystemGateway) -> None:
+    with pytest.raises(GatewayTimeout) as info:
+        gw.run(
+            py("import sys, time; sys.stderr.write('why\\n'); sys.stderr.flush(); time.sleep(30)"),
+            timeout=1,
+            output_limit=100,
+        )
+    assert info.value.stderr == b"why\n"
+
+
 def test_run_output_limit_zero_discards_everything(gw: SystemGateway) -> None:
     proc = gw.run(py("print('out'); import sys; print('err', file=sys.stderr)"), output_limit=0)
     assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
