@@ -33,7 +33,8 @@ step 5 and ``create`` (through ``selfcheck.self_check`` in ``launch.check_sandbo
 action of step 5),
 passes the path as ``Isolation.tmpdir`` and ``envbuild``'s ``tmpdir``, and calls ``remove``
 when the run ends (``supervisor.finish``; a not-started run's in ``launch.end_launch``).
-TODO(#28): adoption calls ``check`` and ``create`` again.
+``start`` removes the tmpdir its self-check created; the adopting ``exec`` calls ``check``
+and ``create`` again (``launch.checks``).
 TODO(#29): reconcile calls ``remove`` for leftover tmpdirs of final runs and of deleted
 sessions.
 """

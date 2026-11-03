@@ -1046,6 +1046,68 @@ def test_signal_between_fork_and_exec_never_runs_our_python_handler(
 
 
 @linux_only
+def test_run_starts_its_child_with_every_signal_blocked_and_restores_both_masks(
+    gw: SystemGateway, monkeypatch: pytest.MonkeyPatch, usr1_blocked: None
+) -> None:
+    """R1-12: ``run`` builds its Popen with signals blocked (a handler raising in exec's
+    launch phase then waits until run holds the child); the caller's mask is restored, and
+    the child gets it (SIGUSR1 here) without the block, no death signal."""
+    masks: list[set[int]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        masks.append(_sigmask())
+        return real_popen(*args, **kwargs)
+
+    before = _sigmask()
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    result = gw.run(["/bin/cat", "/proc/self/status"])
+    monkeypatch.undo()
+    assert _sigmask() == before
+    assert len(masks) == 1
+    assert {signal.SIGINT, signal.SIGTERM, signal.SIGHUP} <= masks[0]
+    status = dict(line.split(":", 1) for line in result.stdout.splitlines() if ":" in line)
+    blocked = int(status["SigBlk"].strip(), 16)
+    assert blocked == 1 << (signal.SIGUSR1 - 1)
+
+
+@linux_only
+def test_a_handler_raising_while_run_starts_its_child_ends_that_child(
+    gw: SystemGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1-12: a signal arriving inside Popen (sent to this thread, so it waits for the mask):
+    its handler raises only once run holds the Popen, and run ends and reaps the child."""
+    started: list[subprocess.Popen[Any]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+        popen: subprocess.Popen[Any] = real_popen(*args, **kwargs)
+        started.append(popen)
+        signal.pthread_kill(threading.get_ident(), signal.SIGUSR1)  # pending until restored
+        return popen
+
+    def on_usr1(signum: int, frame: object) -> None:
+        del signum, frame
+        raise Interrupted
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    previous = signal.signal(signal.SIGUSR1, on_usr1)
+    try:
+        with pytest.raises(Interrupted):
+            gw.run(["/bin/sleep", "30"])
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+        monkeypatch.undo()
+        leftover = [p for p in started if p.returncode is None]
+        for p in leftover:  # the exact child this test started
+            p.kill()
+            p.wait()
+    assert len(started) == 1
+    assert leftover == []
+    assert started[0].returncode == -signal.SIGKILL
+
+
+@linux_only
 def test_prctl_failure_surfaces_as_oserror(
     gw: SystemGateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1124,3 +1186,31 @@ def test_over_kill_over_bytes_with_a_process_group_kills_grandchildren(
         )
     pid = _read_pid(pidfile, grandchildren)
     assert _wait_dead(pid, 5)
+
+
+@linux_only
+@pytest.mark.parametrize("kill_group", [False, True])
+def test_kill_group_on_exit_ends_descendants_left_by_a_leader_that_exited(
+    kill_group: bool,
+    gw: SystemGateway,
+    tmp_path: Path,
+    grandchildren: list[tuple[int, bytes | None]],
+) -> None:
+    """S7: a member that closed its output outlives a normal exit unless
+    ``kill_group_on_exit`` SIGKILLs the group (before the leader is reaped)."""
+    pidfile = tmp_path / "pid"
+    script = f"/bin/sleep 30 >/dev/null 2>&1 </dev/null & echo $! > {pidfile}; exit 0"
+    result = gw.run(
+        ["/bin/sh", "-c", script],
+        new_process_group=True,
+        timeout=30,
+        kill_group_on_exit=kill_group,
+    )
+    assert result.returncode == 0
+    member = _read_pid(pidfile, grandchildren)
+    assert _wait_dead(member, 5 if kill_group else 0.5) is kill_group
+
+
+def test_kill_group_on_exit_needs_a_process_group(gw: SystemGateway) -> None:
+    with pytest.raises(ValueError, match="kill_group_on_exit needs new_process_group"):
+        gw.run(["/bin/true"], kill_group_on_exit=True)
