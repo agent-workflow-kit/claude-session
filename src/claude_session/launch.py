@@ -1425,8 +1425,8 @@ def checks(
     write entries and ``write_dirs`` without ``${GIT_DIR}`` expanded), git and the git
     directory, the profile expanded, ``read_dirs``/``write_dirs``, the ``--outcome-file`` and the
     profile file against the full set, the profile's paths, plugin directories, the hook
-    interpreter, the tmpdir, the tools (``claude_bin``, ``git``, ``bwrap``, ``socat``), ``claude --version`` against
-    ``min_claude_version`` (``effects.claude_version``), the session environment
+    interpreter, the tmpdir, the tools (``claude_bin``, ``git``, ``bwrap``, ``socat``),
+    ``claude --version`` against ``min_claude_version`` (``effects.claude_version``), the session environment
     (``PATH``), the generated read entries, ``claude_args``, setting sources and the sandbox
     self-check, which creates the private tmpdir last. What a launch records and creates in
     between goes through ``effects``. Raises ``LaunchValidationError``; the first failure
