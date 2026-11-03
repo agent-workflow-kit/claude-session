@@ -22,6 +22,7 @@ from claude_session.gateway import (
     DEVNULL,
     Child,
     Gateway,
+    GatewayOutputLimit,
     GatewayTimeout,
     Inherit,
     Result,
@@ -53,9 +54,11 @@ class Call:
     stdout: int | Inherit | None = None  # spawn only
     stderr: int | Inherit | None = None  # spawn only
     kill_grace: float | None = None  # run only
+    kill_group_on_exit: bool = False  # run only
     executable: str | None = None  # the program run when argv[0] is only its name
     output_limit: int | None = None  # run only
     discard_output: bool = False  # run only
+    kill_over_bytes: int | None = None  # run only
 
 
 @dataclass(frozen=True)
@@ -171,13 +174,17 @@ class FakeGateway:
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        kill_over_bytes: int | None = None,
+        kill_group_on_exit: bool = False,
         output_limit: int | None = None,
         discard_output: bool = False,
         on_started: Callable[[], None] | None = None,
         canceled: Callable[[], bool] | None = None,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
-        check_kill_grace(kill_grace, new_process_group=new_process_group)
+        check_kill_grace(
+            kill_grace, new_process_group=new_process_group, kill_group_on_exit=kill_group_on_exit
+        )
         check_output_limit(output_limit)
         args = tuple(argv)
         self.calls.append(
@@ -191,9 +198,11 @@ class FakeGateway:
                 timeout=timeout,
                 new_process_group=new_process_group,
                 kill_grace=kill_grace,
+                kill_group_on_exit=kill_group_on_exit,
                 executable=executable,
                 output_limit=output_limit,
                 discard_output=discard_output,
+                kill_over_bytes=kill_over_bytes,
             )
         )
         response = self._answer(args)
@@ -210,7 +219,11 @@ class FakeGateway:
             if self._clock is not None:
                 self._clock.advance(timeout + (kill_grace or 0))
             raise GatewayTimeout(args, timeout)
+        if kill_over_bytes is not None and len(response.stdout.encode()) > kill_over_bytes:
+            raise GatewayOutputLimit(args, kill_over_bytes)
         out, err = response.stdout, response.stderr
+        if kill_over_bytes is not None:
+            err = err.encode()[:kill_over_bytes].decode(errors="ignore")
         if discard_output:
             out, err = "", ""
         if output_limit is not None:  # as the real gateway: a byte prefix of each stream

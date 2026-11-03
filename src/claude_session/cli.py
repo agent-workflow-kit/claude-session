@@ -21,7 +21,8 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 from . import durations, fsutil, ids, outbox, store
 from .defaults import MAX_INTEGER
-from .errors import CliError, InternalError, RefusedError, UsageError
+from .errors import CliError, InternalError, NotFoundError, RefusedError, UsageError
+from .terminal import display
 
 if TYPE_CHECKING:
     import threading
@@ -83,6 +84,13 @@ SESSION_ID_ARGS: dict[str, str | None] = {
     "forked_from": "--forked-from",
 }
 KIND_ARGS = ("kind", "launch_kind", "run_kind")
+# interface.md, Exit codes: a verify-secret mismatch (any reason).
+VERIFY_SECRET_MISMATCH = 11
+# Every verify-secret usage error: the arguments are never named (one may be a secret).
+VERIFY_SECRET_USAGE = (
+    "unexpected arguments (verify-secret takes only <full id> and --json; "
+    "the secret is read from stdin)"
+)
 # argparse takes a token like this as an option value, not as an option.
 NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
 
@@ -92,10 +100,13 @@ class _Parser(argparse.ArgumentParser):
 
     # Leaf command name -> its parser (set on the top-level parser only).
     leaves: dict[str, _Parser]
+    # When set, replaces every usage error message: for a command whose argv must never be
+    # echoed (verify-secret: a secret given there by mistake).
+    fixed_error: str | None = None
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
-        raise UsageError(message)
+        raise UsageError(self.fixed_error or message)
 
 
 class _VersionAction(argparse.Action):
@@ -127,18 +138,124 @@ def _not_implemented(args: argparse.Namespace) -> int:
     raise InternalError(f"{args.handler} is not implemented yet", detail="not_implemented")
 
 
-def _list(args: argparse.Namespace) -> int:
+def _status(args: argparse.Namespace) -> int:
+    """``status <id> [--run n]`` (interface.md, status)."""
+    from . import views
+
     with store.open_state() as state:
-        sessions = state.list_sessions()
-    if sessions:
-        # TODO(#16): list items (current run, labels, liveness) and the list filters.
-        raise InternalError(
-            "list of existing sessions is not implemented yet", detail="not_implemented"
+        obj = views.status_object(state, args.id, args.run)
+    if args.json:
+        print(json.dumps(obj, allow_nan=False))
+    else:
+        print("\n".join(views.status_lines(obj)))
+    return 0
+
+
+def _list(args: argparse.Namespace) -> int:
+    """``list`` with its filters (interface.md, list)."""
+    from . import views
+
+    with store.open_state() as state:
+        forked_from = None
+        if args.forked_from is not None:
+            forked_from = ids.lookup_session_id(args.forked_from, state.session_id_candidates)
+        flt = views.ListFilter(
+            labels=tuple(ids.parse_label(text) for text in args.label or []),
+            states=tuple(args.state or ()),
+            kind=args.kind,
+            launch_kind=args.launch_kind,
+            run_kind=args.run_kind,
+            mode=args.mode,
+            needs_input=args.needs_input,
+            pending=args.pending,
+            repo=args.repo,
+            since=None if args.since is None else since_threshold(args.since),
+            limit=args.limit,
+            forked_from=forked_from,
+            report_statuses=tuple(
+                None if status == "none" else status for status in args.report_status or ()
+            ),
+            live=args.live,
+            tainted=args.tainted,
+        )
+        items = views.list_items(state, flt)
+    if args.json:
+        print(json.dumps({"sessions": items}, allow_nan=False))
+    else:
+        print("\n".join(views.list_lines(items)))
+    return 0
+
+
+def _label(args: argparse.Namespace) -> int:
+    """``label add`` / ``label remove`` (interface.md, label add / label remove)."""
+    add = args.handler == "label add"
+    pairs = [ids.parse_label(text) for text in args.pairs]  # checked by the flag rules
+    with store.open_state() as st:
+        sid = ids.lookup_session_id(args.id, st.session_id_candidates)
+        change = st.change_labels(sid, pairs, add=add, dry_run=args.dry_run)
+    if change is None:  # forgotten (or deleted) since the id was resolved
+        raise NotFoundError(f"unknown session: {args.id}")
+    obj = {
+        "csession_id": sid,
+        "labels": [f"{key}={value}" for key, value in change.labels],
+        "added": [f"{key}={value}" for key, value in change.added],
+        "removed": [f"{key}={value}" for key, value in change.removed],
+        "dry_run": bool(args.dry_run),
+    }
+    if args.json:
+        print(json.dumps(obj))
+        return 0
+    action, done_key = ("add", "added") if add else ("remove", "removed")
+    changed = obj[done_key]
+    done = f"{done_key} {', '.join(changed)}" if changed else f"nothing to {action}"
+    prefix = "dry run: " if args.dry_run else ""
+    print(display(f"{sid}: {prefix}{done}"))
+    print(display(f"labels: {', '.join(obj['labels']) or '(none)'}"))
+    return 0
+
+
+def _verify_secret(args: argparse.Namespace) -> int:
+    """``verify-secret <full id>`` (interface.md, Internal commands): exit 0 on a match, 11
+    otherwise. The secret is read from stdin before the lookup, whatever the id; a terminal
+    on stdin is refused unread (the secret would be echoed), whatever the id."""
+    from . import secretcheck
+
+    if _is_terminal(sys.stdin.buffer):
+        raise UsageError("verify-secret reads the secret from a pipe; stdin is a terminal")
+    presented = secretcheck.read_secret(sys.stdin.buffer)
+    with store.open_state() as st:
+        match = secretcheck.matches(st, args.id, presented)
+    if args.json:
+        print(json.dumps({"match": match}))
+    return 0 if match else VERIFY_SECRET_MISMATCH
+
+
+def _is_terminal(stream: Any) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (OSError, ValueError):
+        return False
+
+
+def _export(args: argparse.Namespace) -> int:
+    """``export`` (interface.md, export): audit records, oldest first, filtered."""
+    from . import exporter
+
+    path = os.path.join(store.state_dir(), exporter.AUDIT_NAME)
+    since = None if args.since is None else since_threshold(args.since)
+    read = exporter.read_records(path, since=since, actions=frozenset(args.action or ()))
+    records = read.records
+    if read.skipped and not args.quiet:
+        lines = "line" if read.skipped == 1 else "lines"
+        print(
+            f"{PROG}: warning: skipped {read.skipped} unreadable {lines} in {exporter.AUDIT_NAME}",
+            file=sys.stderr,
         )
     if args.json:
-        print(json.dumps({"sessions": []}))
+        print(json.dumps([exporter.json_record(r) for r in records], allow_nan=False))
     else:
-        print("No sessions.")
+        for record in records:
+            print(exporter.encodable(exporter.record_line(record), sys.stdout.encoding))
     return 0
 
 
@@ -167,11 +284,9 @@ def _exec(args: argparse.Namespace) -> int:
     The signal handlers are installed before allocation and restored once the outcome is
     printed (until then a late signal is only recorded)."""
     if args.session_id is not None:
-        # TODO(#28): adoption of a pending run created by start.
-        raise InternalError("exec --session-id is not implemented yet", detail="not_implemented")
+        return _adopt(args)
     if args.dry_run:
-        # TODO(#27): the dry-run plan.
-        raise InternalError("exec --dry-run is not implemented yet", detail="not_implemented")
+        return _dry_run(args)
     from . import launch, supervisor
     from .gateway import SystemGateway
     from .signals import ExecSignals, LaunchInterrupted
@@ -255,6 +370,66 @@ def _deliver_rest(
         st.rollback_open_transaction()
 
 
+def _wait(args: argparse.Namespace) -> int:
+    """``wait <id> [--run n] [--timeout d] [--outcome-file p]`` (interface.md, wait): the
+    run's outcome code, or 22 when ``--timeout`` expired first. Ctrl-C ends it by the signal,
+    printing nothing."""
+    from . import waiter
+
+    cfg = load_config(args)
+    timeout = durations.parse_bound(args.timeout)
+    try:
+        with store.open_state() as st:
+            waited = waiter.wait_for_run(
+                st, args.id, run_no=args.run, timeout=timeout, poll_interval=cfg.poll_interval
+            )
+            state_root = os.path.dirname(st.path)
+    except KeyboardInterrupt:
+        _die_of(signal.SIGINT)
+    output = waited.output
+    if args.outcome_file is not None:
+        _write_wait_outcome_file(args.outcome_file, output, state_root)
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False, allow_nan=False))
+    elif output["timed_out"]:
+        line = (
+            f"{output['csession_id']} run {output['run']}: timed out, still {output['state']}"
+            f" (exit {waiter.TIMED_OUT})"
+        )
+        print(f"{PROG}: {display(line)}", file=sys.stderr)
+    else:
+        _print_outcome(output, False)
+    return waited.exit_code
+
+
+def _write_wait_outcome_file(path: str, output: dict[str, Any], state_root: str) -> None:
+    """``wait --outcome-file``: ``wait``'s own output (interface.md, Outcome file), mode 0600
+    without following a symlink; a failure adds a warning to the output and logs
+    ``outcome_file_failed``, and never changes the exit code."""
+    # TODO(#21): skip a path rejected by the session-writable check, with the other
+    # outcome-file writers.
+    from . import logs
+
+    data = (json.dumps(output, ensure_ascii=False, allow_nan=False) + "\n").encode()
+    try:
+        # Not abspath: `..` must be resolved after symlinks (realpath in write_private_file).
+        fsutil.write_private_file(os.path.join(os.getcwd(), path), data)
+    except (OSError, ValueError) as exc:
+        reason = getattr(exc, "strerror", None) or type(exc).__name__
+        warning = f"could not write --outcome-file: {reason}"
+        output["warnings"] = [*output["warnings"], warning]
+        try:
+            logs.EventLog(os.path.join(state_root, "log.jsonl")).write(
+                "outcome_file_failed",
+                level="warn",
+                csession_id=output["csession_id"],
+                run=output["run"],
+                message=warning,
+            )
+        except (OSError, ValueError):
+            pass
+
+
 def _end_interrupted_launch(
     st: store.Store, alloc: Allocated, process: Process, exc: BaseException
 ) -> None:
@@ -265,6 +440,143 @@ def _end_interrupted_launch(
     if st.run_record(alloc.csession_id, alloc.run)["ended_at"] is None:
         error = launch.interrupted_by(st, alloc, exc)
         launch.end_launch(st, alloc, None, None, process, error, exc=exc)
+
+
+def _adopt(args: argparse.Namespace) -> int:
+    """``exec --session-id <id>``: adopt the pending run ``start`` created and launch it
+    (interface.md, Launch order); with ``--dry-run``, inspect it without adopting. The signal
+    handlers are installed first and restored once the outcome is printed, as for plain exec."""
+    from . import launch, lifecycle, supervisor
+    from .gateway import SystemGateway
+    from .signals import ExecSignals, LaunchInterrupted
+
+    signals = ExecSignals()
+    try:  # entered first: a signal during the install is handled and the handlers restored
+        try:
+            signals.install()
+            with store.open_state() as st:
+                process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+                if args.dry_run:
+                    return _print_dry_run(args, *lifecycle.adoption_plan(st, args, process))
+                signals.defer()  # a signal during the adoption's checks acts once the run is ours
+                outcome, code = lifecycle.adopt(
+                    st, args, process, supervise=supervisor.run_session, signals=signals
+                )
+        except LaunchInterrupted as exc:  # before the adoption: nothing to record
+            _die_of(exc.signum)
+        except KeyboardInterrupt:  # handlers not installed (not the main thread)
+            _die_of(signal.SIGINT)
+        signals.defer()  # until the outcome is printed, a signal is only recorded
+        try:
+            _print_outcome(outcome, args.json)
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+    finally:
+        signals.restore()
+    return code
+
+
+def _start(args: argparse.Namespace) -> int:
+    """``start`` of a new session (interface.md, start): steps 1 to 5, the run frozen and
+    left pending; prints the start object. A launch-validation failure exits 12 with
+    ``launch_failed``."""
+    if args.resume is not None:
+        # TODO(#29): start --resume (and its --dry-run), with the carry-over.
+        raise InternalError("start --resume is not implemented yet", detail="not_implemented")
+    if args.dry_run:
+        return _dry_run(args)
+    from . import config, launch, lifecycle
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    source = config.Source.of(args.config)
+    with store.open_state() as st:
+        process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+        result = lifecycle.start(st, args, cfg, source, process)
+    print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+    return 0
+
+
+def _dry_run(args: argparse.Namespace) -> int:
+    """``exec``/``start --dry-run`` of a new session (interface.md, Dry run): the plan, exit
+    20 with ``would_refuse``, 12 with ``would_fail``, else 0. Nothing is allocated."""
+    from . import dryrun
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    plan, message = dryrun.new_session_plan(args, cfg, dryrun.current_process(SystemGateway()))
+    return _print_dry_run(args, plan, message)
+
+
+def _print_dry_run(args: argparse.Namespace, plan: dict[str, Any], message: str | None) -> int:
+    from . import dryrun
+
+    plan = dryrun.printable(plan)  # valid UTF-8 output, also for a non-UTF-8 path
+    if args.json:
+        print(json.dumps(plan, ensure_ascii=False, allow_nan=False))
+    else:
+        _print_plan(plan, dryrun.printable(message))
+    return dryrun.exit_code(plan)
+
+
+def _print_plan(plan: dict[str, Any], message: str | None) -> None:
+    """The short human-readable summary of a dry-run plan (untrusted strings escaped)."""
+    profile = plan["profile"]
+    kind = plan["run_kind"] + (" (unknown: review profile)" if profile["fallback"] else "")
+    sandbox = plan["sandbox"]
+    state = "available" if sandbox["available"] else "unavailable"
+    if sandbox["mode"] == "off":
+        state = "not used"
+    lines = [
+        f"dry run: kind {kind}, mode {plan['mode']}",
+        f"cwd: {plan['cwd']}",
+        f"sandbox: {sandbox['mode']} ({state})",
+        f"permission profile: {plan['permission_profile'] or 'from file'}",
+    ]
+    if plan["would_refuse"] is not None:
+        lines.append(f"result: a launch would be refused ({plan['would_refuse']})")
+    elif plan["would_fail"] is not None:
+        lines.append(f"result: a launch would fail ({plan['would_fail']}): {message or ''}")
+    else:
+        lines.append("result: a launch would pass the launch validations")
+    lines += [f"warning: {w}" for w in plan["warnings"] if not w.startswith("a launch would fail")]
+    for line in lines:
+        print(display(line))
+
+
+def _kinds(args: argparse.Namespace) -> int:
+    """``kinds`` (interface.md, kinds): the effective kind profiles."""
+    from . import dryrun
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    process = dryrun.current_process(SystemGateway())
+    report = dryrun.printable(dryrun.kinds_report(cfg, process, kind=args.kind, repo=args.repo))
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, allow_nan=False))
+        return 0
+    claude = report["claude_bin_resolved"] or "not found"
+    version = report["claude_version"] or "unknown"
+    ok = {True: "ok", False: "too old", None: "unknown"}[report["claude_version_ok"]]
+    lines = [
+        f"claude: {claude} (version {version}, minimum {report['min_claude_version']}: {ok})",
+        f"default kind: {report['default_kind']}",
+    ]
+    for profile in report["kinds"]:
+        available = profile["sandbox_available"]
+        sandbox = profile["sandbox"] + (
+            "" if available is None else (" available" if available else " unavailable")
+        )
+        lines.append(
+            f"{profile['name']}: profile {profile['permission_profile']}, sandbox {sandbox},"
+            f" cwd {profile['cwd']}, third-party {'yes' if profile['reads_third_party'] else 'no'}"
+        )
+        lines += [f"  warning: {w}" for w in profile["warnings"]]
+    lines += [f"warning: {w}" for w in [*report["state_dir_warnings"], *report["warnings"]]]
+    for line in lines:
+        print(display(line))
+    return 0
 
 
 def _die_of(signum: int) -> NoReturn:
@@ -290,31 +602,70 @@ def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
     )
     if outcome["message"]:
         line += f": {outcome['message']}"
-    print(f"{PROG}: {sanitize(line)}", file=sys.stderr)
+    print(f"{PROG}: {display(line)}", file=sys.stderr)
     for warning in outcome["warnings"]:
-        print(f"{PROG}: warning: {sanitize(warning)}", file=sys.stderr)
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
+
+
+def _transcript(args: argparse.Namespace) -> int:
+    """``transcript <id>`` (interface.md, transcript): rendered text by default, ``--raw``
+    bytes, ``--paths`` or ``--json`` file lists. state.db is closed before any file is read."""
+    from . import transcripts
+
+    with store.open_state() as state:
+        sid = ids.lookup_session_id(args.id, state.session_id_candidates)
+        record = state.status_record(sid)
+    if record is None or record.session.get("forgotten_at") is not None:
+        raise NotFoundError(f"unknown session: {args.id}")
+    if args.run is not None and not 1 <= args.run <= record.runs:
+        raise NotFoundError(f"session {sid} has no run {args.run}")
+    reader = transcripts.Reader()
+    warnings: list[str] = []
+    roots = transcripts.projects_roots(os.environ, warnings)
+    listing = transcripts.discover(sid, record.claude_ids, roots, reader, run_no=args.run)
+    warnings += listing.warnings
+    if args.json:
+        print(json.dumps(listing.as_json(), allow_nan=False))
+    elif args.paths:
+        warnings += transcripts.missing_warnings(listing, subagents=True)
+        for line in transcripts.path_lines(listing):
+            print(line)
+    elif args.raw:
+        warnings += transcripts.missing_warnings(listing, subagents=args.subagents)
+        sys.stdout.flush()
+        transcripts.write_raw(listing, reader, sys.stdout.buffer, subagents=args.subagents)
+        sys.stdout.buffer.flush()
+    else:
+        renderer = transcripts.Renderer(reader, subagents=args.subagents)
+        for line in renderer.lines(listing):
+            print(line)
+        warnings += renderer.warnings
+    for warning in warnings:
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
+    return 0
 
 
 # Command name (as typed, nested commands joined by a space) -> handler.
 HANDLERS: dict[str, Handler] = {
     "exec": _exec,
-    "start": _not_implemented,
+    "start": _start,
+    # TODO(#29): resume (and resume --dry-run).
     "resume": _not_implemented,
     "stop": _not_implemented,
-    "wait": _not_implemented,
+    "wait": _wait,
     "report": _report,
-    "status": _not_implemented,
+    "status": _status,
     "list": _list,
-    "kinds": _not_implemented,
-    "label add": _not_implemented,
-    "label remove": _not_implemented,
-    "transcript": _not_implemented,
+    "kinds": _kinds,
+    "label add": _label,
+    "label remove": _label,
+    "transcript": _transcript,
     "forget": _not_implemented,
     "reconcile": _not_implemented,
-    "export": _not_implemented,
+    "export": _export,
     "cron install": _not_implemented,
     "cron uninstall": _not_implemented,
-    "verify-secret": _not_implemented,
+    "verify-secret": _verify_secret,
 }
 
 
@@ -340,11 +691,16 @@ def _command(
     handler: str,
     help_text: str | None,
 ) -> _Parser:
-    """Add a leaf command; ``help_text=None`` keeps it out of ``--help`` (internal commands)."""
-    kwargs: dict[str, Any] = {"parents": [_global_flags()], "allow_abbrev": False}
+    """Add a leaf command; ``help_text=None`` keeps it out of ``--help`` and leaves out the
+    global flags (internal commands take only their documented argv)."""
+    kwargs: dict[str, Any] = {"allow_abbrev": False}
+    if help_text is not None:
+        kwargs["parents"] = [_global_flags()]
     if help_text is not None:
         kwargs["help"] = help_text
     parser = subparsers.add_parser(name, **kwargs)
+    if help_text is None:  # the global flags' values, for the code paths that read them
+        parser.set_defaults(json=False, config=None, verbose=False, quiet=False, yes=False)
     parser.set_defaults(handler=handler)
     leaves[handler] = parser
     return parser
@@ -500,6 +856,8 @@ def build_parser() -> _Parser:
     # Internal: run by agent-spawn, not listed in --help.
     p = _command(commands, leaves, "verify-secret", "verify-secret", None)
     p.add_argument("id")
+    p.add_argument("--json", action="store_true")
+    p.fixed_error = VERIFY_SECRET_USAGE
     return parser
 
 
@@ -507,8 +865,13 @@ def parse(parser: _Parser, argv: Sequence[str]) -> argparse.Namespace:
     """Parse ``argv``; leftover arguments are reported with the chosen command's usage."""
     args, extras = parser.parse_known_args(argv)
     if extras and args.handler in ("label add", "label remove"):
-        # Pairs given after an option (`label add <id> a=b --dry-run c=d`).
-        if not any(extra.startswith("-") for extra in extras):
+        # Pairs given after an option (`label add <id> a=b --dry-run c=d`), or after `--`
+        # there (`... --dry-run -- c=d`): those are pairs whatever they look like, and the
+        # label grammar refuses one that starts with `-`.
+        if extras[0] == "--":
+            args.pairs.extend(extras[1:])
+            extras = []
+        elif not any(extra.startswith("-") for extra in extras):
             args.pairs.extend(extras)
             extras = []
     if extras:
@@ -777,16 +1140,6 @@ def load_config(args: argparse.Namespace) -> Config:
 # Output
 
 
-def sanitize(text: str) -> str:
-    """Escape C0 and C1 control characters for human-readable output."""
-    return "".join(f"\\x{ord(c):02x}" if _is_control(c) else c for c in text)
-
-
-def _is_control(char: str) -> bool:
-    code = ord(char)
-    return code < 0x20 or 0x7F <= code <= 0x9F
-
-
 def _given(argv: Sequence[str], flag: str) -> bool:
     """Whether ``flag`` (or ``flag=...``) is in ``argv`` before any ``--``; used when parsing
     failed, so the error can still honor ``--json`` and ``--verbose``."""
@@ -822,14 +1175,14 @@ def _write_outcome_file(path: str, error: CliError) -> None:
         # Not abspath: `..` must be resolved after symlinks (realpath in write_private_file).
         fsutil.write_private_file(os.path.join(os.getcwd(), path), data)
     except OSError as exc:
-        reason = sanitize(str(exc))
+        reason = display(str(exc))
         print(f"{PROG}: warning: could not write --outcome-file: {reason}", file=sys.stderr)
 
 
 def _print_error(error: CliError, json_mode: bool) -> None:
-    message = sanitize(error.message)
+    message = display(error.message)
     if error.detail is not None:
-        message = f"{message} ({sanitize(error.detail)})"
+        message = f"{message} ({display(error.detail)})"
     print(f"{PROG}: error: {message}", file=sys.stderr)
     if json_mode:
         print(json.dumps(error.envelope()))
@@ -871,16 +1224,20 @@ def check_schema(argv: Sequence[str]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args: argparse.Namespace | None = None
+    schema_checked = False
     try:
         check_schema(argv)
+        schema_checked = True
         args = parse(build_parser(), argv)
         check_flag_rules(args)
         return HANDLERS[args.handler](args)
     except CliError as error:
-        if isinstance(error, (UsageError, RefusedError)):
-            path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
-            if path:
-                _write_outcome_file(path, error)
+        # `wait --outcome-file` gets any error envelope wait prints after the schema check
+        # (interface.md, Outcome file); the other commands' outcome files only usage errors
+        # and refusals.
+        is_wait = _command_name(args, argv) == "wait"
+        if (is_wait and schema_checked) or isinstance(error, (UsageError, RefusedError)):
+            _write_error_outcome_file(args, argv, error)
         code = error.exit_code
         _emit_error(error, args.json if args else _given(argv, "--json"))
         return code
@@ -889,13 +1246,57 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:  # last resort: any bug is reported as `internal` (exit 1)
         error = InternalError(f"internal error: {type(exc).__name__}")
         code = error.exit_code
+        if schema_checked and _command_name(args, argv) == "wait":
+            # wait's outcome file gets this envelope too (interface.md, Outcome file); a
+            # write failure only warns.
+            _write_error_outcome_file(args, argv, error)
         try:
             if args.verbose if args else _given(argv, "--verbose"):
-                traceback.print_exc(file=sys.stderr)
+                _print_traceback()
         except BrokenPipeError:
             pass
         _emit_error(error, args.json if args else _given(argv, "--json"))
         return code
+
+
+# Traceback chunks laid out by the traceback module itself (headers, frames, the messages
+# between chained exceptions): their own newlines separate lines.
+_TRACEBACK_LAYOUT = ("Traceback ", "  File ", "\n", "  [Previous line repeated")
+# The margin of a chunk inside an exception group ("  | ", "  + ", deeper: "    | ").
+_GROUP_MARGIN = re.compile(r"(?: *[|+] )*")
+
+
+def _print_traceback() -> None:
+    """The current exception's traceback on stderr, every line through ``display``. An
+    exception's message (which may carry untrusted text) stays one line: a newline in it is
+    escaped, so it cannot fake a line of output."""
+    exc = sys.exc_info()[1]
+    if exc is None:
+        return
+    lines: list[str] = []
+    for chunk in traceback.TracebackException.from_exception(exc).format():
+        text = chunk.removesuffix("\n")
+        if _GROUP_MARGIN.sub("", chunk, count=1).startswith(_TRACEBACK_LAYOUT):
+            lines += [display(line) for line in text.split("\n")]
+        else:
+            lines.append(display(text))
+    print("\n".join(lines), file=sys.stderr)
+
+
+def _command_name(args: argparse.Namespace | None, argv: Sequence[str]) -> str | None:
+    """The command being run: the parsed handler, else the first argument."""
+    if args:
+        return str(args.handler)
+    return argv[0] if argv else None
+
+
+def _write_error_outcome_file(
+    args: argparse.Namespace | None, argv: Sequence[str], error: CliError
+) -> None:
+    """Write ``error``'s envelope to the ``--outcome-file`` given, if any."""
+    path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
+    if path:
+        _write_outcome_file(path, error)
 
 
 def _emit_error(error: CliError, json_mode: bool) -> None:

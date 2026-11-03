@@ -289,10 +289,24 @@ def test_run_output_limit_zero_discards_everything(gw: SystemGateway) -> None:
     assert (proc.returncode, proc.stdout, proc.stderr) == (0, "", "")
 
 
+def test_run_output_limit_does_not_split_a_short_output(gw: SystemGateway) -> None:
+    proc = gw.run(py("print('2.1.312 (Claude Code)')"), output_limit=4096)
+    assert proc.stdout == "2.1.312 (Claude Code)\n"
+
+
 @pytest.mark.parametrize("limit", [-1, True, 1.5])
 def test_run_output_limit_must_be_a_non_negative_int(gw: SystemGateway, limit: Any) -> None:
     with pytest.raises((ValueError, TypeError)):
         gw.run([PY, "-c", "pass"], output_limit=limit)
+
+
+def test_run_output_limit_type_is_checked_before_the_child_starts(
+    gw: SystemGateway, tmp_path: Path
+) -> None:
+    marker = tmp_path / "ran"
+    with pytest.raises(TypeError, match="output_limit"):
+        gw.run(py(f"open({str(marker)!r}, 'w')"), output_limit=True)  # type: ignore[arg-type]
+    assert not marker.exists()
 
 
 def test_run_timeout_raises_gateway_timeout_and_reaps_the_child(
@@ -1245,3 +1259,149 @@ def test_prctl_failure_surfaces_as_oserror(
     with pytest.raises(OSError):
         gw.spawn(py(f"open({str(marker)!r}, 'w').close()"), die_with_parent=True)
     assert not marker.exists()
+
+
+# --- output limit (the notes command: design.md, Hook-event fast path) ------------------
+
+
+def test_run_within_kill_over_bytes_returns_the_output(gw: SystemGateway) -> None:
+    result = gw.run(py("import sys; sys.stdout.write('x' * 100)"), kill_over_bytes=100, timeout=60)
+    assert (result.returncode, result.stdout) == (0, "x" * 100)
+
+
+def test_run_over_kill_over_bytes_raises_and_reaps_the_child(gw: SystemGateway) -> None:
+    start = time.monotonic()
+    with pytest.raises(gateway.GatewayOutputLimit) as info:
+        gw.run(
+            py("import sys, time\nsys.stdout.write('x' * 101)\nsys.stdout.flush()\ntime.sleep(30)"),
+            kill_over_bytes=100,
+            timeout=60,
+            new_process_group=True,
+        )
+    assert time.monotonic() - start < 10  # ended at once, not at the timeout
+    assert info.value.argv[0] == PY
+    assert info.value.limit == 100
+
+
+def test_run_endless_output_is_cut_off_at_the_limit(gw: SystemGateway) -> None:
+    """An endless writer never fills memory: it is ended once it passes the limit."""
+    with pytest.raises(gateway.GatewayOutputLimit):
+        gw.run(["/usr/bin/yes"], kill_over_bytes=4096, timeout=60, new_process_group=True)
+
+
+def test_run_kill_over_bytes_zero_refuses_any_output(gw: SystemGateway) -> None:
+    assert gw.run(py("pass"), kill_over_bytes=0, timeout=60).stdout == ""
+    with pytest.raises(gateway.GatewayOutputLimit):
+        gw.run(py("print('x')"), kill_over_bytes=0, timeout=60)
+
+
+def test_run_kill_over_bytes_keeps_only_that_much_stderr(gw: SystemGateway) -> None:
+    result = gw.run(
+        py("import sys; sys.stderr.write('e' * 100000)"), kill_over_bytes=10, timeout=60
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "e" * 10)
+
+
+def test_negative_kill_over_bytes_is_refused(gw: SystemGateway) -> None:
+    with pytest.raises(ValueError):
+        gw.run([PY], kill_over_bytes=-1)
+
+
+@linux_only
+def test_over_kill_over_bytes_with_a_process_group_kills_grandchildren(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    pidfile = tmp_path / "pid"
+    with pytest.raises(gateway.GatewayOutputLimit):
+        gw.run(
+            [
+                "/bin/sh",
+                "-c",
+                f"/bin/sleep 30 >/dev/null 2>&1 & echo $! > {pidfile}; echo 0123456789; wait",
+            ],
+            new_process_group=True,
+            kill_over_bytes=5,
+            timeout=60,
+        )
+    pid = _read_pid(pidfile, grandchildren)
+    assert _wait_dead(pid, 5)
+
+
+@linux_only
+@pytest.mark.parametrize("kill_group", [False, True])
+def test_kill_group_on_exit_ends_descendants_left_by_a_leader_that_exited(
+    kill_group: bool,
+    gw: SystemGateway,
+    tmp_path: Path,
+    grandchildren: list[tuple[int, bytes | None]],
+) -> None:
+    """S7: a member that closed its output outlives a normal exit unless
+    ``kill_group_on_exit`` SIGKILLs the group (before the leader is reaped)."""
+    pidfile = tmp_path / "pid"
+    script = f"/bin/sleep 30 >/dev/null 2>&1 </dev/null & echo $! > {pidfile}; exit 0"
+    result = gw.run(
+        ["/bin/sh", "-c", script],
+        new_process_group=True,
+        timeout=30,
+        kill_group_on_exit=kill_group,
+    )
+    assert result.returncode == 0
+    member = _read_pid(pidfile, grandchildren)
+    assert _wait_dead(member, 5 if kill_group else 0.5) is kill_group
+
+
+@linux_only
+def test_kill_group_on_exit_returns_when_a_descendant_holds_the_output_open(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    """A member left holding stdout cannot delay the result: once the leader exited the
+    group is SIGKILLed and what was printed is returned."""
+    pidfile = tmp_path / "pid"
+    script = f"echo '2.1.400 (Claude Code)'; /bin/sleep 40 & echo $! > {pidfile}; exit 0"
+    start = time.monotonic()
+    result = gw.run(
+        ["/bin/sh", "-c", script],
+        new_process_group=True,
+        timeout=20,
+        kill_group_on_exit=True,
+    )
+    assert time.monotonic() - start < 5
+    assert (result.returncode, result.stdout) == (0, "2.1.400 (Claude Code)\n")
+    assert _wait_dead(_read_pid(pidfile, grandchildren), 5)
+
+
+@linux_only
+def test_kill_group_on_exit_returns_when_an_escaped_descendant_holds_the_output_open(
+    gw: SystemGateway, tmp_path: Path, grandchildren: list[tuple[int, bytes | None]]
+) -> None:
+    """A descendant that left the group (``setsid``) is not signaled, but it no longer
+    blocks the result either."""
+    pidfile = tmp_path / "pid"
+    code = f"""
+        import os, sys, time
+        print("2.1.400 (Claude Code)", flush=True)
+        if os.fork() == 0:
+            os.setsid()
+            open({str(pidfile)!r}, "w").write(str(os.getpid()))
+            time.sleep(40)
+            os._exit(0)
+        """
+    start = time.monotonic()
+    result = gw.run(py(code), new_process_group=True, timeout=20, kill_group_on_exit=True)
+    assert time.monotonic() - start < 5
+    assert (result.returncode, result.stdout) == (0, "2.1.400 (Claude Code)\n")
+    _read_pid(pidfile, grandchildren)  # SIGKILLed by the fixture
+
+
+def test_without_kill_group_on_exit_run_still_reads_to_the_end_of_the_output(
+    gw: SystemGateway,
+) -> None:
+    """Other callers keep reading until every writer closed the output."""
+    script = "/bin/sh -c 'sleep 0.5; echo late' & echo early; exit 0"
+    result = gw.run(["/bin/sh", "-c", script], new_process_group=True, timeout=20)
+    assert result.stdout.split() == ["early", "late"]
+
+
+def test_kill_group_on_exit_needs_a_process_group(gw: SystemGateway) -> None:
+    with pytest.raises(ValueError, match="kill_group_on_exit needs new_process_group"):
+        gw.run(["/bin/true"], kill_group_on_exit=True)
