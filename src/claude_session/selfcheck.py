@@ -37,9 +37,8 @@ records ``sandbox_active`` on the run, adds the warnings to the run's warnings, 
 ``tmpdir`` to ``settings_builder.Isolation`` and ``envbuild``, and maps a
 ``LaunchValidationError`` (with its ``hint`` as the outcome message) to a not-started run.
 TODO(#28): adoption calls both again.
-TODO(#27): ``--dry-run`` calls ``tmpdir.check`` at the temporary-directory slot of launch
-step 5, then ``self_check(..., create=False)`` after the ``claude_args`` check, for
-``would_fail``, ``sandbox_active`` and ``warnings``.
+``--dry-run`` (``dryrun``, through ``launch.checks``) makes the same two calls with
+``create=False``, for ``would_fail``, ``sandbox_active`` and ``warnings``.
 """
 
 from __future__ import annotations
@@ -116,11 +115,13 @@ class Prerequisites:
 @dataclass(frozen=True)
 class SelfCheck:
     """``tmpdir``: the private temporary directory (created unless a dry run; None for
-    ``off`` and for a dry run without a session id)."""
+    ``off`` and for a dry run without a session id). ``problems``: why a ``preferred``
+    sandbox is unavailable (``<problem>; <hint>``; a dry run reports it)."""
 
     sandbox_active: bool
     tmpdir: str | None
     warnings: tuple[str, ...] = ()
+    problems: tuple[str, ...] = ()
 
 
 def detect_platform(sys_platform: str | None = None, release: str | None = None) -> str:
@@ -206,7 +207,9 @@ def self_check(
         platform, bwrap=bwrap, socat=socat, gw=gw, sandbox_exec=sandbox_exec
     )
     warnings: list[str] = []
+    problems: tuple[str, ...] = ()
     if not prerequisites.available:
+        problems = (f"{prerequisites.problem}; {prerequisites.hint}",)
         if mode == "required":
             raise LaunchValidationError(
                 f"sandbox unavailable: {prerequisites.problem}",
@@ -227,7 +230,12 @@ def self_check(
                 f"leftover private temporary directory moved aside: {stale};"
                 f" remove it: rm -rf {stale}"
             )
-    return SelfCheck(sandbox_active=prerequisites.available, tmpdir=path, warnings=tuple(warnings))
+    return SelfCheck(
+        sandbox_active=prerequisites.available,
+        tmpdir=path,
+        warnings=tuple(warnings),
+        problems=problems,
+    )
 
 
 # Session ids have a fixed length (ids.SESSION_ID); a dry run of a new session checks this one.

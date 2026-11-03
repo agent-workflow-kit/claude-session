@@ -52,6 +52,7 @@ class Call:
     stdout: int | Inherit | None = None  # spawn only
     stderr: int | Inherit | None = None  # spawn only
     kill_grace: float | None = None  # run only
+    kill_group_on_exit: bool = False  # run only
     executable: str | None = None  # the program run when argv[0] is only its name
 
 
@@ -168,9 +169,12 @@ class FakeGateway:
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        kill_group_on_exit: bool = False,
     ) -> Result:
         check_argv(argv, env=env, extra_env=extra_env, executable=executable)
-        check_kill_grace(kill_grace, new_process_group=new_process_group)
+        check_kill_grace(
+            kill_grace, new_process_group=new_process_group, kill_group_on_exit=kill_group_on_exit
+        )
         args = tuple(argv)
         self.calls.append(
             Call(
@@ -183,6 +187,7 @@ class FakeGateway:
                 timeout=timeout,
                 new_process_group=new_process_group,
                 kill_grace=kill_grace,
+                kill_group_on_exit=kill_group_on_exit,
                 executable=executable,
             )
         )

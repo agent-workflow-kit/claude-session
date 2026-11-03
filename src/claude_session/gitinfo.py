@@ -2,8 +2,12 @@
 credential warning (interface.md, Path rules and Generated settings; design.md, Git calls).
 
 Every git command runs through ``gateway`` with the absolute ``git`` resolved at launch, the
-hardening options of ``kinds.GIT_HARDENING`` and ``kinds.git_env`` (no inherited variable that
-selects another repository or extra config; ``GIT_CONFIG_NOSYSTEM=1``).
+hardening options of ``kinds.GIT_HARDENING`` and the minimal environment ``kinds.git_env``
+(``PATH``, ``HOME``, ``LC_ALL=C``, ``GIT_CONFIG_NOSYSTEM=1``; nothing else is inherited).
+
+``candidate_dirs`` finds, without running git, every directory git could take for the cwd's
+git directory: with a ``${GIT_DIR}`` write entry, git is resolved against them before it runs
+(``launch.git_writable``).
 
 ``exec`` (``launch.check_git``) resolves the git directory at the session's first launch
 (``resolve``; its ``FailedError`` ends the launch ``unsafe_cwd``), stores ``stored_value`` on
@@ -18,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -37,6 +42,9 @@ REPO_SCOPES = frozenset({"local", "worktree"})
 _URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://([^/@\s]*)@")
 # The start of git's stderr line for a directory outside every repository (LC_ALL=C).
 NOT_A_REPOSITORY = "fatal: not a git repository"
+# A ``.git`` file (``gitdir: <path>``) or ``commondir`` file larger than this is not one.
+GITFILE_MAX = 4096
+GITFILE_PREFIX = "gitdir: "
 # The longest stderr excerpt a FailedError detail carries.
 STDERR_EXCERPT = 200
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -127,6 +135,95 @@ def git_entry_above(cwd: str) -> bool:
         except OSError:
             return True
         current = parent
+
+
+def candidate_dirs(cwd: str) -> list[str]:
+    """Every directory git could take for the git directory of ``cwd``, found without
+    running git (resolved): at ``cwd`` and every ancestor up to ``/`` (conservatively not
+    stopping at the first repository or a mount boundary), a ``.git`` directory, the
+    directory a ``.git`` file names (``gitdir: <path>``, relative to the file's directory),
+    and the directory itself when it holds a ``HEAD`` file (a bare repository, or ``cwd``
+    inside a git directory); each with the directory its ``commondir`` file names (a linked
+    worktree's common directory). Raises ``LaunchValidationError`` (``unsafe_cwd``) when a
+    ``.git`` entry or a ``commondir`` file cannot be read or is not one: the candidates are
+    then not known, and git, which would fail on it too, is not run."""
+    found: list[str] = []
+    current = os.path.realpath(cwd)
+    while True:
+        dot_git = os.path.join(current, ".git")
+        kind = _entry_type(dot_git)
+        if kind == "dir":
+            found += _with_common(dot_git)
+        elif kind == "file":
+            target = _read_small(dot_git)
+            if not target.startswith(GITFILE_PREFIX) or not target[len(GITFILE_PREFIX) :].strip():
+                raise _undeterminable(dot_git, "not a gitdir file")
+            found += _with_common(os.path.join(current, target[len(GITFILE_PREFIX) :].strip()))
+        elif kind is not None:
+            raise _undeterminable(dot_git, "neither a directory nor a file")
+        if _entry_type(os.path.join(current, "HEAD")) is not None:
+            found += _with_common(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            return list(dict.fromkeys(found))
+        current = parent
+
+
+def _entry_type(path: str) -> str | None:
+    """``dir``, ``file`` or ``other`` for an existing ``path`` (symlinks followed, as git
+    follows them), None when there is nothing there; ``unsafe_cwd`` when it cannot be
+    examined."""
+    try:
+        mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise _undeterminable(path, type(exc).__name__) from exc
+        raise _undeterminable(path, "a dangling symlink") from None
+    except OSError as exc:
+        raise _undeterminable(path, type(exc).__name__) from exc
+    if stat.S_ISDIR(mode):
+        return "dir"
+    return "file" if stat.S_ISREG(mode) else "other"
+
+
+def _with_common(git_dir: str) -> list[str]:
+    """``git_dir`` (resolved) and the directory its ``commondir`` file names, if any."""
+    resolved = os.path.realpath(git_dir)
+    found = [resolved]
+    common = os.path.join(resolved, "commondir")
+    kind = _entry_type(common)
+    if kind == "file":
+        target = _read_small(common).strip()
+        if not target:
+            raise _undeterminable(common, "empty")
+        found.append(os.path.realpath(os.path.join(resolved, target)))
+    elif kind is not None:
+        raise _undeterminable(common, "not a file")
+    return found
+
+
+def _read_small(path: str) -> str:
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(GITFILE_MAX + 1)
+    except OSError as exc:
+        raise _undeterminable(path, type(exc).__name__) from exc
+    if len(data) > GITFILE_MAX or b"\x00" in data:
+        raise _undeterminable(path, "too large or binary")
+    return data.decode("utf-8", "surrogateescape")
+
+
+def _undeterminable(path: str, why: str) -> LaunchValidationError:
+    shown = _CONTROL.sub("?", path)
+    return LaunchValidationError(
+        "the cwd's git directory cannot be determined without running git",
+        detail=f"{shown}: {why}",
+        end_reason="unsafe_cwd",
+    )
 
 
 def stored_value(dirs: GitDirs | None) -> str:

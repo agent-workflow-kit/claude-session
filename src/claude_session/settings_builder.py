@@ -26,7 +26,7 @@ give Isolation.tmpdir and sandbox_active. Step 7 (``launch.prepare``) calls buil
 writes the settings with SessionDirs.write_settings before claude is spawned. A
 LaunchValidationError ends the run not-started with its end_reason.
 TODO(#28): adoption reruns the step-5 checks.
-TODO(#27): the dry-run serializer reports build()'s settings and argv.
+``--dry-run`` reports build()'s settings and argv (``launch.generate``, ``dryrun``).
 """
 
 from __future__ import annotations
@@ -281,6 +281,18 @@ def check_cwd(cwd: str) -> None:
     ``permission_profiles.expand`` (so a bad cwd fails ``unsafe_cwd`` whether or not the
     profile uses ``${CWD}``); ``build_settings`` repeats it first for isolated runs."""
     _check_input("cwd", cwd, "unsafe_cwd", rule=True)
+
+
+def check_cwd_utf8(cwd: str) -> None:
+    """Every run: the cwd is recorded on the run and printed in JSON, so it must be valid
+    UTF-8 (the rule ``check_cwd`` applies, with its message). Raises
+    ``LaunchValidationError`` (``unsafe_cwd``)."""
+    try:
+        cwd.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise LaunchValidationError(
+            f"cwd is not valid UTF-8: {_shown(cwd)!r}", end_reason="unsafe_cwd"
+        ) from exc
 
 
 def check_interpreter(
