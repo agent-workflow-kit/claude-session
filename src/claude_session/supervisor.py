@@ -44,6 +44,12 @@ supervision fails and the internal-error path ends the child. A headless run wit
 ``session_start_missing`` and added to the run's ``warnings``); the run goes on.
 
 TODO(#20): deliver ``post-state-change`` events of the run in the poll loop and at the end.
+The process that wins the finalization compare-and-set (``finish``, or the internal-error
+path) writes the run's ``--outcome-file`` right after it (``outcomefile.write_run``, checked
+against the run's full session-writable set stored at launch step 5), before the secret
+index and the tmpdir are removed; a failure there is a run warning and never changes the exit
+code. Warnings known before the compare-and-set are recorded with it, so the file carries
+them; later ones (cleanup, the outcome-file warning itself) are stdout's only.
 ``post-state-change`` delivery (``toolhooks``): once ``claude`` is spawned (never before: the
 headless spawn must precede any thread), a background worker delivers the session's events in
 order; the poll loop only wakes it, so a slow hook never delays supervision. Once the run is
@@ -51,7 +57,6 @@ final the worker delivers what is left, the final event included, and stops (``e
 for it, each hook bounded by its own timeout). A launch-phase end is delivered synchronously
 by ``exec`` (``cli``). A SIGTERM, SIGINT or SIGHUP once the child was reaped cancels the
 remaining delivery (``ExecSignals.enter_delivery``; ``toolhooks``, Cancel).
-TODO(#21): write ``--outcome-file`` right after the finalization compare-and-set.
 """
 
 from __future__ import annotations
@@ -66,7 +71,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from . import endmap, fsutil, hookevent, launch, logs, outbox, secretindex, store, tmpdir, toolhooks
+from . import (
+    endmap,
+    fsutil,
+    hookevent,
+    launch,
+    logs,
+    outbox,
+    outcomefile,
+    secretindex,
+    store,
+    tmpdir,
+    toolhooks,
+)
 from .config import Config
 from .endmap import EXIT_CODES, HeadlessResult, Mapped
 from .errors import InternalError
@@ -496,9 +513,25 @@ def finish(
         try:
             # An interactive run has no result.json (and no cost: null in its outcome).
             parsed = endmap.read_result_file(run_fd) if mode == "headless" else HeadlessResult()
-            _finalize(
-                st, cfg, alloc, v, run_fd, parsed, returncode, implicit_done, pending, secret, mode
+            # The warnings known now are recorded with the compare-and-set, so the outcome
+            # file carries them.
+            known = tuple(warnings)
+            won = _finalize(
+                st,
+                cfg,
+                alloc,
+                v,
+                run_fd,
+                parsed,
+                returncode,
+                implicit_done,
+                pending,
+                secret,
+                mode,
+                known,
             )
+            if won:  # right after the compare-and-set, before anything else (hooks: #20)
+                outcomefile.write_run(st, sid, run_no)
         finally:
             _delete_index(run_fd, warnings)
             os.close(run_fd)
@@ -521,15 +554,17 @@ def _finalize(
     pending: bool,
     secret: str | None,
     mode: str,
-) -> None:
+    warnings: tuple[str, ...] = (),
+) -> bool:
     """Map the end (from the recorded ``pending_cause``) and finalize, requiring the report
     status it was mapped from: a report that landed in between is mapped again
-    (``FINALIZE_ATTEMPTS``)."""
+    (``FINALIZE_ATTEMPTS``); ``warnings`` are recorded in the same transaction. Returns
+    whether this call finalized the run."""
     sid, run_no = alloc.csession_id, alloc.run
     for _ in range(FINALIZE_ATTEMPTS):
         record = st.run_record(sid, run_no)
         if record["ended_at"] is not None:
-            return  # lost: another finalizer won
+            return False  # lost: another finalizer won
         if mode == "interactive":
             if returncode is None:
                 raise InternalError("an interactive run's end needs claude's exit status")
@@ -559,8 +594,9 @@ def _finalize(
                 continue  # a report was recorded meanwhile: map it
             mapped = accepted
             expected = "done" if accepted.outcome == "done" else None
-        if st.finalize_run(sid, run_no, _final(mapped, parsed), report_status=expected):
-            return
+        final = _final(mapped, parsed, warnings)
+        if st.finalize_run(sid, run_no, final, report_status=expected):
+            return True
     raise InternalError("the run's report kept changing while its end was mapped")
 
 
@@ -609,7 +645,7 @@ def _implicit(
 _FINAL_CAUSES = {"auto_exit": "auto_exit", "timeout": "timeout"}
 
 
-def _final(mapped: Mapped, parsed: HeadlessResult) -> store.Final:
+def _final(mapped: Mapped, parsed: HeadlessResult, warnings: tuple[str, ...] = ()) -> store.Final:
     is_error = None
     if parsed.final is not None and isinstance(parsed.final.get("is_error"), bool):
         is_error = parsed.final["is_error"]
@@ -625,6 +661,7 @@ def _final(mapped: Mapped, parsed: HeadlessResult) -> store.Final:
         cost_usd=parsed.cost_usd,
         num_turns=parsed.num_turns,
         is_error=is_error,
+        warnings=warnings,
     )
 
 
@@ -817,7 +854,8 @@ def _internal_error(
             except Exception:
                 pass
         try:
-            _finalize_internal_error(st, sid, run_no)
+            if _finalize_internal_error(st, sid, run_no):
+                outcomefile.write_run(st, sid, run_no)
         except Exception:  # the original error is re-raised by the caller
             pass
     finally:
@@ -839,11 +877,12 @@ def _internal_error(
             signal.signal(signal.SIGINT, previous)
 
 
-def _finalize_internal_error(st: store.Store, sid: str, run_no: int) -> None:
+def _finalize_internal_error(st: store.Store, sid: str, run_no: int) -> bool:
+    """Returns whether this call finalized the run."""
     for _ in range(FINALIZE_ATTEMPTS):
         record = st.run_record(sid, run_no)
         if record["ended_at"] is not None:
-            return
+            return False
         mapped = endmap.map_headless(
             pending_cause="internal_error",
             report_status=record["report_status"],
@@ -855,7 +894,8 @@ def _finalize_internal_error(st: store.Store, sid: str, run_no: int) -> None:
         if st.finalize_run(
             sid, run_no, _final(mapped, HeadlessResult()), report_status=record["report_status"]
         ):
-            return
+            return True
+    return False
 
 
 # The outcome object
