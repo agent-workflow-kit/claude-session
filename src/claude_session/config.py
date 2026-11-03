@@ -166,6 +166,13 @@ def _no_controls(value: str) -> str:
     return value
 
 
+def _no_nul(value: str) -> str:
+    """No NUL character (a hook ``cmd``: it becomes an ``sh -c`` argument)."""
+    if "\x00" in value:
+        raise ValueError("must not contain a NUL character")
+    return value
+
+
 def _no_control_items(value: list[str]) -> list[str]:
     """No item holds a control character (``notes_context_cmd``: argv, passed to exec)."""
     if any(_has_controls(item) for item in value):
@@ -350,7 +357,7 @@ class PermissionProfile(_Model):
 
 
 class PreLaunchHook(_Model):
-    cmd: str
+    cmd: Annotated[str, AfterValidator(_no_nul)]
     timeout: PositiveDuration = 30.0
     kinds: Annotated[list[KindName] | None, NotNull] = None
     exclude_kinds: Annotated[list[KindName] | None, NotNull] = None
