@@ -1,0 +1,11 @@
+{
+  "added": [],
+  "csession_id": "cs-abcd2345",
+  "dry_run": false,
+  "labels": [
+    "kind=implement"
+  ],
+  "removed": [
+    "team=core"
+  ]
+}

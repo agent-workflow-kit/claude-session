@@ -46,6 +46,13 @@ supervision fails and the internal-error path ends the child. A headless run wit
 ``SessionStart`` within ``session_start_timeout`` of the spawn gets a warning (logged
 ``session_start_missing`` and added to the run's ``warnings``); the run goes on.
 
+TODO(#20): deliver ``post-state-change`` events of the run in the poll loop and at the end.
+The process that wins the finalization compare-and-set (``finish``, or the internal-error
+path) writes the run's ``--outcome-file`` right after it (``outcomefile.write_run``, checked
+against the run's full session-writable set stored at launch step 5), before the secret
+index and the tmpdir are removed; a failure there is a run warning and never changes the exit
+code. Warnings known before the compare-and-set are recorded with it, so the file carries
+them; later ones (cleanup, the outcome-file warning itself) are stdout's only.
 ``post-state-change`` delivery (``toolhooks``): once ``claude`` is spawned (never before: the
 headless spawn must precede any thread), a background worker delivers the session's events in
 order; the poll loop only wakes it, so a slow hook never delays supervision. Once the run is
@@ -53,13 +60,6 @@ final the worker delivers what is left, the final event included, and stops (``e
 for it, each hook bounded by its own timeout). A launch-phase end is delivered synchronously
 by ``exec`` (``cli``). A SIGTERM, SIGINT or SIGHUP once the child was reaped cancels the
 remaining delivery (``ExecSignals.enter_delivery``; ``toolhooks``, Cancel).
-
-The process that wins the finalization compare-and-set (``finish``, or the internal-error
-path) writes the run's ``--outcome-file`` right after it (``outcomefile.write_run``, checked
-against the run's full session-writable set stored at launch step 5), before the secret
-index and the tmpdir are removed; a failure there is a run warning and never changes the exit
-code. Warnings known before the compare-and-set are recorded with it, so the file carries
-them; later ones (cleanup, the outcome-file warning itself) are stdout's only.
 """
 
 from __future__ import annotations
@@ -208,10 +208,10 @@ class Supervision:
         *,
         auto_exit: bool,
         monotonic: Any = time.monotonic,
+        deliver: Callable[[], None] | None = None,
         bound: float | None = None,
         session_start_timeout: float | None = None,
         spawned_at: float | None = None,
-        deliver: Callable[[], None] | None = None,
     ) -> None:
         self.st, self.cfg, self.alloc, self.child = st, cfg, alloc, child
         self.signals, self.log = signals, log
@@ -221,6 +221,7 @@ class Supervision:
         self.kill_at: float | None = None
         self.candidate: int | None = None  # the auto_exit_candidate event id
         self.due = 0.0
+        self.deliver = deliver  # wakes the post-state-change worker (never blocks)
         # The run's bound and the session_start_timeout check (None: none), both counted from
         # the spawn (``spawned_at`` on the ``monotonic`` clock; default: now).
         self.bound = bound
@@ -228,7 +229,6 @@ class Supervision:
         self.spawned_at = self.monotonic() if spawned_at is None else spawned_at
         self.session_start_checked = False
         self.session_start_logged = False
-        self.deliver = deliver  # wakes the post-state-change worker (never blocks)
 
     def wait(self) -> int:
         """Supervise until the child exits; its return code (negative: killed by that
@@ -577,6 +577,8 @@ def _finalize(
                 pending_cause=record["pending_cause"],
                 report_status=record["report_status"],
                 returncode=returncode,
+                session_started=record["session_started_at"] is not None,
+                session_end_reason=record["session_end_reason"],
             )
         else:
             mapped = endmap.map_headless(
@@ -771,11 +773,11 @@ def run_session(
             signals,
             log,
             auto_exit=auto_exit,
+            deliver=worker.wake,
             bound=bound,
             # Interactive runs are exempt: they may wait at the trust dialog.
             session_start_timeout=cfg.session_start_timeout if mode == "headless" else None,
             spawned_at=spawned_at,
-            deliver=worker.wake,
         ).wait()
         # The child is gone: later signals are recorded, and cancel the remaining delivery.
         signals.enter_delivery()
