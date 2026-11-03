@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from claude_session import config, kinds, launch, pathrules
-from claude_session.errors import InternalError, LaunchValidationError, UsageError
+from claude_session.errors import LaunchValidationError, UsageError
 from claude_session.gateway import SystemGateway
 
 from .fake_gateway import FakeGateway
@@ -73,10 +73,52 @@ def args(**given: Any) -> argparse.Namespace:
     return parsed
 
 
-def test_interactive_exec_is_not_implemented_yet(tmp_path: Path) -> None:
-    with pytest.raises(InternalError, match="--mode headless") as info:
-        launch.read_request(args(), load(tmp_path))
-    assert info.value.detail == "not_implemented"
+class _Stream:
+    def __init__(self, tty: bool) -> None:
+        self.tty = tty
+        self.buffer = self
+
+    def isatty(self) -> bool:
+        return self.tty
+
+
+@pytest.mark.parametrize(("stdin", "stdout"), [(False, False), (True, False), (False, True)])
+def test_interactive_mode_needs_a_terminal_on_stdin_and_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdin: bool, stdout: bool
+) -> None:
+    monkeypatch.setattr("sys.stdin", _Stream(stdin))
+    monkeypatch.setattr("sys.stdout", _Stream(stdout))
+    with pytest.raises(UsageError, match="terminal on stdin and stdout"):
+        launch.read_request(args(), load(tmp_path))  # interactive is the default mode
+    with pytest.raises(UsageError):
+        launch.read_request(args(mode="interactive"), load(tmp_path))
+
+
+def test_interactive_mode_with_a_terminal_reads_the_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sys.stdin", _Stream(True))
+    monkeypatch.setattr("sys.stdout", _Stream(True))
+    request = launch.read_request(args(), load(tmp_path))
+    assert request.mode == "interactive" and request.prompt is None
+
+
+def test_interactive_prompt_from_a_terminal_stdin_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sys.stdin", _Stream(True))
+    monkeypatch.setattr("sys.stdout", _Stream(True))
+    with pytest.raises(UsageError, match="--prompt-file -"):
+        launch.read_request(args(prompt_file="-"), load(tmp_path))
+
+
+def test_a_raised_unreadable_isatty_counts_as_no_terminal() -> None:
+    class Broken:
+        def isatty(self) -> bool:
+            raise ValueError("closed")
+
+    assert launch._isatty(Broken()) is False
+    assert launch._isatty(None) is False
 
 
 def test_read_request_reads_the_prompt_and_inputs_capped(tmp_path: Path) -> None:
@@ -153,6 +195,28 @@ def test_claude_inside_a_session_writable_path_is_refused(tmp_path: Path) -> Non
     assert info.value.end_reason == "unsafe_path"
 
 
+def test_a_claude_whose_interpreter_is_under_a_session_writable_path_is_refused(
+    tmp_path: Path,
+) -> None:
+    """An isolated run never lets ``claude --version`` (or the session) run a planted
+    ``#!`` interpreter; a trusted run (``NO_SANDBOX``) is unchanged."""
+    planted = executable(tmp_path / "cwd" / "cs-test-interp")
+    claude = tmp_path / "safe" / "claude"
+    claude.parent.mkdir()
+    claude.write_text(f"#!{planted}\n")
+    claude.chmod(0o755)
+    cfg = load(tmp_path, f"claude_bin: {claude}\n")
+    writable = pathrules.SessionWritable([str(tmp_path / "cwd")])
+    git = pathrules.resolve_tool("git", ["/usr/bin", "/bin"], launch.NO_SANDBOX)
+    with pytest.raises(LaunchValidationError) as info:
+        launch.check_tools(cfg, resolution(cfg), process(tmp_path), writable, git)
+    assert info.value.end_reason == "unsafe_path"
+    assert "interpreter" in info.value.message
+    claude.write_text("#!/usr/bin/env -S cs-test-interp\n")  # unknown: no check when trusted
+    tools = launch.check_tools(cfg, resolution(cfg), process(tmp_path), launch.NO_SANDBOX, git)
+    assert tools.claude.path == str(claude)
+
+
 def test_claude_resolves_to_its_realpath_with_its_name(tmp_path: Path) -> None:
     real = executable(tmp_path / "real" / "claude-2.1")
     link = tmp_path / "bin" / "claude"
@@ -164,6 +228,92 @@ def test_claude_resolves_to_its_realpath_with_its_name(tmp_path: Path) -> None:
     tools = launch.check_tools(cfg, resolution(cfg), proc, launch.NO_SANDBOX, git)
     assert tools.claude == pathrules.ResolvedTool(path=str(real), name="claude")
     assert tools.bwrap is None and tools.socat is None  # sandbox off: never looked up
+
+
+# The claude --version check
+
+
+def test_the_version_probe_path_is_the_tool_lookup_path_without_writable_entries(
+    tmp_path: Path,
+) -> None:
+    """``claude`` was looked up on ``env.path_prepend`` then the caller's ``PATH``; its
+    ``#!/usr/bin/env node`` line finds ``node`` there too, never under a writable path."""
+    prepend, unsafe = tmp_path / "prepend", tmp_path / "cwd" / "bin"
+    prepend.mkdir()
+    unsafe.mkdir(parents=True)
+    cfg = load(tmp_path, f"kinds:\n  implement:\n    env:\n      path_prepend: [{prepend}]\n")
+    proc = process(tmp_path, PATH=f"{unsafe}:rel:/usr/bin:/bin", ANTHROPIC_API_KEY="sk-secret")
+    gw = proc.gateway
+    assert isinstance(gw, FakeGateway)
+    gw.on(["claude", "--version"], stdout="2.1.312 (Claude Code)\n")
+    claude = pathrules.ResolvedTool("/opt/claude/claude", "claude")
+    writable = pathrules.SessionWritable([str(tmp_path / "cwd")])
+    text = launch.check_claude_version(cfg, resolution(cfg), proc, claude, writable)
+    assert text == "2.1.312 (Claude Code)"
+    (call,) = gw.calls
+    assert call.env is not None
+    assert call.env["PATH"] == f"{prepend}:/usr/bin:/bin"
+    assert "ANTHROPIC_API_KEY" not in call.env
+    assert (call.executable, call.argv, call.cwd) == (
+        "/opt/claude/claude",
+        ("claude", "--version"),
+        "/",
+    )
+
+
+def test_the_version_check_uses_the_configured_minimum(tmp_path: Path) -> None:
+    cfg = load(tmp_path, "min_claude_version: '3'\n")
+    proc = process(tmp_path)
+    assert isinstance(proc.gateway, FakeGateway)
+    proc.gateway.on(["claude", "--version"], stdout="2.9.999 (Claude Code)\n")
+    claude = pathrules.ResolvedTool("/opt/claude/claude", "claude")
+    with pytest.raises(LaunchValidationError) as info:
+        launch.check_claude_version(cfg, resolution(cfg), proc, claude, launch.NO_SANDBOX)
+    assert info.value.end_reason == "claude_too_old"
+
+
+def dry_run_version(
+    tmp_path: Path,
+    writable: pathrules.SessionWritable,
+    known: pathrules.SessionWritable | None,
+) -> tuple[list[str], FakeGateway]:
+    claude = executable(tmp_path / "tools" / "claude")
+    cfg = load(tmp_path, f"claude_bin: {claude}\n")
+    proc = process(tmp_path)
+    assert isinstance(proc.gateway, FakeGateway)
+    proc.gateway.on(["claude", "--version"], stdout="2.1.312 (Claude Code)\n")
+    tools = launch.Tools(
+        claude=pathrules.ResolvedTool(str(claude), "claude"), git=None, bwrap=None, socat=None
+    )
+    found = launch.Effects().claude_version(
+        cfg, resolution(cfg), proc, tools, writable, lambda: known
+    )
+    return found, proc.gateway
+
+
+def test_a_dry_run_probes_a_claude_outside_every_known_path(tmp_path: Path) -> None:
+    found, gw = dry_run_version(
+        tmp_path, pathrules.SessionWritable([]), pathrules.SessionWritable([])
+    )
+    assert found == [] and len(gw.calls) == 1
+
+
+@pytest.mark.parametrize("where", ["known", "writable"])
+def test_a_dry_run_never_runs_a_claude_under_a_known_or_run_path(
+    tmp_path: Path, where: str
+) -> None:
+    under = pathrules.SessionWritable([str(tmp_path / "tools")])
+    nothing = pathrules.SessionWritable([])
+    known, writable = (under, nothing) if where == "known" else (nothing, under)
+    found, gw = dry_run_version(tmp_path, writable, known)
+    assert gw.calls == []
+    (warning,) = found
+    assert warning.startswith("claude --version not run (not probed by a dry run")
+
+
+def test_a_dry_run_with_unknown_paths_runs_no_claude(tmp_path: Path) -> None:
+    found, gw = dry_run_version(tmp_path, pathrules.SessionWritable([]), None)
+    assert gw.calls == [] and "not known" in found[0]
 
 
 def test_a_git_that_changed_once_every_writable_path_is_known_is_refused(tmp_path: Path) -> None:
