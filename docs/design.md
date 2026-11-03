@@ -93,7 +93,7 @@ Five further runs against Claude Code 2.1.312 on Linux settled most of the earli
 | Safety re-review check (F1) | Read/Grep/Glob tools on a symlink planted by sandboxed Bash that points outside the allowed dirs: not run (the verification session was interrupted); live test in the plan | Conservative home-directory Read denies on every isolated run until F1 is verified (interface.md, Generated settings). |
 | Safety re-review check (F2) | /proc isolation inside the sandbox (private PID namespace; `/proc/<host pid>/root` and `environ` unreachable): not run; live test in the plan | Open; no generated change. |
 
-Still to verify (live tests): MCP elicitation detection; the manual macOS checklist; F1 (symlink followed by the Read tool) and F2 (`/proc` isolation). The full list is in section [Testing](#testing).
+Still to verify (live tests): MCP elicitation detection; the [manual macOS checklist](macos-checklist.md); F1 (symlink followed by the Read tool) and F2 (`/proc` isolation). The full list is in section [Testing](#testing).
 
 ## Decisions
 
@@ -746,7 +746,7 @@ Requests for other runs are discarded and logged; nothing is ingested for a run 
   - deny-root reads (E1): markers outside the allowlist are hidden, Bash, git, interpreters and the network bridge work with the TMPDIR in `allowWrite`;
   - planted project and nested `.claude/skills` do not load in a third-party-reading run (E2);
   - a fork with `--cwd` into another checkout records the transcript path from its SessionStart payload.
-- Manual macOS checklist before 1.0: Seatbelt sandbox (the deny-root reads with the allowlist and the TMPDIR in `allowWrite`, the git-dir deny, missing-path denies, plugin `--add-dir`), process start time, socket path length, `/tmp` resolution.
+- [Manual macOS checklist](macos-checklist.md) before 1.0: Seatbelt sandbox (the deny-root reads with the allowlist and the TMPDIR in `allowWrite`, the git-dir deny, missing-path denies, plugin `--add-dir`), process start time, socket path length, `/tmp` resolution.
 
 ## Platform notes
 

@@ -52,7 +52,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 - New API-using tests take the `live` fixture, zero-cost ones `cheap`; both come from `tests/live/conftest.py`. Put helpers in `tests/live/harness.py` and unit-test them in `tests/test_live_harness.py`, with the fake claude or `sh`.
 - `LiveEnv.headless(prompt, *flags)` runs a small-model `-p` with `stream-json`, the prompt after `--`. `LiveEnv.claude_run` runs with exactly the given argv (add `*live.budget()` to a `-p` argv). `spawn_headless` and `tmux_driver.Tmux` are for signals and interactive sessions; a new path that starts `claude` must call `spend_gate()` and `charge()`.
 - Probe hooks are `tests/fakeclaude.recorder(log, ...)` commands in a `--settings` file; read them with `harness.read_log` and `harness.events_named`. Read what tools returned with `harness.session_tool_results`, never the whole transcript (it holds the prompt).
-- Sandbox tests use `needs_sandbox` (`test_sandbox.py`); macOS-only checks belong in the manual checklist of #43.
+- Sandbox tests use `needs_sandbox` (`test_sandbox.py`); macOS-only checks belong in the [manual macOS checklist](macos-checklist.md) (#43), which also says what to read from this suite on a Mac.
 - New rows go in the tables below, with an owner when not covered.
 
 ## Coverage

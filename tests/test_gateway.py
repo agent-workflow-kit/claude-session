@@ -30,6 +30,8 @@ from claude_session.gateway import (
     sanitize_path,
 )
 
+from .conftest import TRUE_BIN
+
 PY = sys.executable
 linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux only")
 
@@ -414,7 +416,7 @@ def test_spawn_inherit_shares_our_stdin(
 def test_spawn_refuses_stdin_none(gw: SystemGateway) -> None:
     # None would silently inherit our stdin (the hook payload); INHERIT says so explicitly.
     with pytest.raises(TypeError):
-        gw.spawn(["/bin/true"], stdin=None)  # type: ignore[arg-type]
+        gw.spawn([TRUE_BIN], stdin=None)  # type: ignore[arg-type]
 
 
 def test_spawn_wait_times_out_with_none_and_signal_ends_the_child(gw: SystemGateway) -> None:
@@ -773,7 +775,7 @@ def test_run_with_empty_stdin_text_gives_eof(gw: SystemGateway) -> None:
 
 
 def test_run_survives_a_child_that_does_not_read_its_stdin(gw: SystemGateway) -> None:
-    proc = gw.run(["/bin/true"], stdin="x" * (1024 * 1024), timeout=30)
+    proc = gw.run([TRUE_BIN], stdin="x" * (1024 * 1024), timeout=30)
     assert proc.returncode == 0
 
 
@@ -823,7 +825,7 @@ def test_on_started_is_called_once_stdin_is_written_and_closed(gw: SystemGateway
 
 def test_on_started_without_stdin_is_called_at_once(gw: SystemGateway) -> None:
     seen: list[str] = []
-    gw.run(["/bin/true"], on_started=lambda: seen.append("started"))
+    gw.run([TRUE_BIN], on_started=lambda: seen.append("started"))
     assert seen == ["started"]
 
 
@@ -1066,7 +1068,7 @@ def test_die_with_parent_restores_the_callers_signal_mask(
     gw: SystemGateway, tmp_path: Path, usr1_blocked: None
 ) -> None:
     before = _sigmask()
-    child = gw.spawn(["/bin/true"], die_with_parent=True)
+    child = gw.spawn([TRUE_BIN], die_with_parent=True)
     assert _sigmask() == before
     assert child.wait(timeout=30) == 0
     with pytest.raises(FileNotFoundError):
@@ -1108,7 +1110,7 @@ def test_die_with_parent_restores_the_mask_when_blocking_raises(
 
     monkeypatch.setattr(gateway, "_c_pthread_sigmask", lambda: raising_after_blocking_all)
     with pytest.raises(Interrupted):
-        gw.spawn(["/bin/true"], die_with_parent=True)
+        gw.spawn([TRUE_BIN], die_with_parent=True)
     monkeypatch.undo()
     assert _sigmask() == before
 
@@ -1172,7 +1174,7 @@ def test_die_with_parent_restores_the_mask_before_a_pending_handler_can_run(
     before = _sigmask()
     monkeypatch.setattr(signal, "pthread_sigmask", handler_runs_first)
     try:
-        child = gw.spawn(["/bin/true"], die_with_parent=True)
+        child = gw.spawn([TRUE_BIN], die_with_parent=True)
     finally:
         monkeypatch.undo()
         assert _sigmask() == before
@@ -1431,7 +1433,7 @@ def test_without_kill_group_on_exit_run_still_reads_to_the_end_of_the_output(
 
 def test_kill_group_on_exit_needs_a_process_group(gw: SystemGateway) -> None:
     with pytest.raises(ValueError, match="kill_group_on_exit needs new_process_group"):
-        gw.run(["/bin/true"], kill_group_on_exit=True)
+        gw.run([TRUE_BIN], kill_group_on_exit=True)
 
 
 # --- gated spawn (the child execs only once released) -------------------------------------
@@ -1537,7 +1539,7 @@ def test_a_gated_spawn_of_a_missing_program_raises_at_once(
 
 
 def test_releasing_a_gated_child_that_already_died_is_not_an_error(gw: SystemGateway) -> None:
-    child = gw.spawn(["/bin/true"], gated=True)
+    child = gw.spawn([TRUE_BIN], gated=True)
     child.send_signal(signal.SIGKILL)
     deadline = time.monotonic() + 10
     while not _reaped_or_zombie(child.pid) and time.monotonic() < deadline:

@@ -125,16 +125,17 @@ def inspect_private_dir_at(dir_fd: int, name: str) -> tuple[bool, int | None]:
     except FileNotFoundError:
         return False, None
     except PermissionError:
-        if not sys.platform.startswith("linux"):
+        if sys.platform == "linux":  # == (not startswith) so pyright narrows O_PATH off Linux
+            # O_PATH needs no read permission (as in _repair_dir_mode_at).
+            flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            fd = os.open(name, flags, dir_fd=dir_fd)
+        else:
             info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
             if not stat.S_ISDIR(info.st_mode):
                 raise UnsafePathError(f"{name}: not a directory") from None
             if info.st_uid != os.geteuid():
                 raise UnsafePathError(f"{name}: owned by uid {info.st_uid}") from None
             return True, None
-        # O_PATH needs no read permission (as in _repair_dir_mode_at).
-        flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        fd = os.open(name, flags, dir_fd=dir_fd)
     try:
         check_private_dir_fd(fd, name)
         searchable = bool(os.fstat(fd).st_mode & stat.S_IXUSR)
@@ -159,9 +160,8 @@ def _repair_dir_mode_at(dir_fd: int, name: str) -> tuple[int, int]:
     Linux: open it ``O_PATH`` (needs no read permission), check it through that descriptor
     and chmod it through ``/proc/self/fd``. Elsewhere (macOS): a no-follow ``chmod`` relative
     to ``dir_fd``, after an ``lstat`` check; without one the repair fails."""
-    o_path = os.O_PATH if sys.platform.startswith("linux") else 0
-    if o_path:
-        flags = o_path | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    if sys.platform == "linux":  # == (not startswith) so pyright narrows O_PATH off Linux
+        flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         fd = os.open(name, flags, dir_fd=dir_fd)
         try:
             check_private_dir_fd(fd, name)

@@ -34,6 +34,7 @@ import pytest
 
 from claude_session.store import start_time
 
+from .conftest import linux_only
 from .fakeclaude import claude_bin, read_jsonl, wait_for, write_json
 from .test_exec_headless import (
     START,
@@ -337,6 +338,7 @@ def test_an_interactive_run_goes_to_permission_and_reported_then_auto_exits(
     assert gone(row["child_pid"])
 
 
+@linux_only  # reads /proc/<pid>/stat and /proc/<pid>/fd; Linux pty names
 def test_the_interactive_child_shares_the_terminal_and_the_foreground_group(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
@@ -678,6 +680,7 @@ def test_a_done_report_drained_by_the_stops_own_hook_auto_exits(
     assert fake_signals(term) == [("signal", "TERM")]
 
 
+@linux_only  # reads /proc/<pid>/status
 def test_an_inherited_ignored_sighup_stays_ignored_for_exec_and_claude(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
@@ -705,6 +708,7 @@ def test_an_inherited_ignored_sighup_stays_ignored_for_exec_and_claude(
     assert signals_not_sent(term) == []
 
 
+@linux_only  # reads /proc/<pid>/status
 def test_an_interactive_claude_inherits_an_ignored_sigterm(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
