@@ -149,7 +149,7 @@
           "flag-implied",
           "derived"
         ],
-        "description": "flag-implied: set by --reads-third-party (sandbox, setting_sources, mcp, env.inherit). derived: the repo id derived from the origin remote of the caller's cwd (or --cwd); never for kinds whose cwd is session-dir."
+        "description": "flag-implied: set by --reads-third-party (sandbox, setting_sources, mcp, env.inherit), or by a kind whose own reads_third_party is true over a carried --sandbox, --setting-sources or --env-allowlist-only (sandbox, setting_sources, env.inherit). derived: the repo id derived from the origin remote of the caller's cwd (or --cwd); never for kinds whose cwd is session-dir."
       },
       "description": "For every resolved setting, where its value came from."
     },

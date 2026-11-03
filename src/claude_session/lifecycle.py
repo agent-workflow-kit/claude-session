@@ -1289,7 +1289,7 @@ def adoption_plan(
         git=git,
         alloc=alloc,
     )
-    writable = dryrun.tool_writable(cfg, process, writable, git)
+    writable = dryrun.tool_writable(cfg, process, writable, dryrun.plan_cwd(found, resolved, alloc))
     sandbox = dryrun.plan_sandbox(process, resolution, found, writable, prerequisites)
     plan = dryrun.plan_json(
         cfg,

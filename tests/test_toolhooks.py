@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import config, ids, logs, store, toolhooks
+from claude_session import config, ids, launch, logs, store, toolhooks
 from claude_session.gateway import Result, SystemGateway
 from claude_session.store import Final, NewRun, Store
 from claude_session.toolhooks import Entry
@@ -320,7 +320,11 @@ def test_hook_env_clears_csession_and_secret_variables_and_sanitizes_path() -> N
         "BAD": "nul\x00value",
     }
     env = toolhooks.hook_env(
-        environ, secret_env=["VAULT_TOKEN"], hook="post-state-change", csession_id="cs-abcd2345"
+        environ,
+        secret_env=["VAULT_TOKEN"],
+        hook="post-state-change",
+        csession_id="cs-abcd2345",
+        guard=launch.NO_SANDBOX,
     )
     assert env == {
         "PATH": "/usr/bin:/bin",
@@ -332,14 +336,20 @@ def test_hook_env_clears_csession_and_secret_variables_and_sanitizes_path() -> N
 
 
 def test_hook_env_without_an_absolute_path_entry_uses_the_default() -> None:
-    env = toolhooks.hook_env({"PATH": "bin:."}, secret_env=[], hook="h", csession_id="cs-abcd2345")
+    env = toolhooks.hook_env(
+        {"PATH": "bin:."},
+        secret_env=[],
+        hook="h",
+        csession_id="cs-abcd2345",
+        guard=launch.NO_SANDBOX,
+    )
     assert env["PATH"] == "/usr/bin:/bin"
 
 
 def test_sh_is_resolved_to_an_absolute_path() -> None:
-    sh = toolhooks.resolve_sh({"PATH": "/usr/bin:/bin"})
+    sh = toolhooks.resolve_sh({"PATH": "/usr/bin:/bin"}, launch.NO_SANDBOX)
     assert sh is not None and os.path.isabs(sh)
-    assert toolhooks.resolve_sh({"PATH": "/nonexistent"}) is None
+    assert toolhooks.resolve_sh({"PATH": "/nonexistent"}, launch.NO_SANDBOX) is None
 
 
 def test_run_entry_uses_sh_c_its_own_group_the_timeout_and_no_output_pipes(tmp_path: Path) -> None:

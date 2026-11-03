@@ -562,6 +562,17 @@ def test_a_carried_sandbox_off_never_applies_to_a_resumed_review_kind(env: Env) 
     assert out["origins"]["sandbox"] == "flag"
 
 
+def test_a_real_resume_of_a_review_session_runs_with_sandbox_required(env: Env) -> None:
+    # Not only the plan: the resumed run itself is resolved (and stored) sandbox required,
+    # whether or not this host can then provide the sandbox.
+    sid = exec_session(env, "--kind", "review", "--sandbox", "off")["csession_id"]
+    _proc, out = resume(env, sid)
+    assert out["run"] == 2, out
+    resolved = json.loads(env.run_row(sid, 2)["resolved_json"])
+    assert resolved["profile"]["sandbox"] == "required"
+    assert resolved["origins"]["sandbox"] == "flag-implied"
+
+
 # The permission profile snapshot
 
 

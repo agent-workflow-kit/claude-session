@@ -13,11 +13,13 @@ An empty list selects literally (``kinds: []`` never matches); a selector or sto
 that does not parse never matches (the conservative reading).
 
 **Execution** (``run_entry``): ``sh -c <cmd>``, ``sh`` resolved to an absolute path on the
-sanitized ``PATH``, through ``gateway.run(..., new_process_group=True, kill_grace=...)`` with
-the payload on stdin and the state root as cwd: on timeout the hook's process group gets
-SIGTERM, then SIGKILL after ``kill_grace`` (the only group this tool signals). The environment
-(``hook_env``) is claude-session's minus every ``CSESSION_*`` and ``secret_env`` variable, with
-the sanitized ``PATH`` and ``CSESSION_HOOK``, ``CSESSION_ID``, ``CSESSION_OBJECT_TYPE=session``.
+sanitized ``PATH`` outside the launch's tool guard (``hook_guard``, ``resolve_sh``), through
+``gateway.run(..., new_process_group=True, kill_grace=...)`` with the payload on stdin and
+the state root as cwd: on timeout the hook's process group gets SIGTERM, then SIGKILL after
+``kill_grace`` (the only group this tool signals). The environment (``hook_env``) is
+claude-session's minus every ``CSESSION_*`` and ``secret_env`` variable, with the sanitized
+``PATH`` without the entries under the tool guard and ``CSESSION_HOOK``, ``CSESSION_ID``,
+``CSESSION_OBJECT_TYPE=session``.
 Hook output is untrusted and unused: stdout and stderr go to ``/dev/null``
 (``discard_output``), never logged, and an entry has finished when its ``sh`` has exited
 (processes it leaves in the background are not waited for). A failing or timed-out hook, or one
@@ -267,9 +269,15 @@ def selected(
 
 
 def hook_env(
-    environ: Mapping[str, str], *, secret_env: Iterable[str], hook: str, csession_id: str
+    environ: Mapping[str, str],
+    *,
+    secret_env: Iterable[str],
+    hook: str,
+    csession_id: str,
+    guard: Callable[[str], bool],
 ) -> dict[str, str]:
-    """A hook's environment (interface.md, Hooks: Execution)."""
+    """A hook's environment (interface.md, Hooks: Execution): its ``PATH`` is the sanitized
+    one without the entries under ``guard`` (``hook_guard``; resolved hop by hop)."""
     secret = set(secret_env)
     env = {
         name: value
@@ -281,20 +289,49 @@ def hook_env(
         and not name.startswith("CSESSION_")
         and name not in secret
     }
-    env["PATH"] = ":".join(pathrules.sanitize_path(environ.get("PATH", ""))) or DEFAULT_PATH
+    entries = [
+        entry
+        for entry in pathrules.sanitize_path(environ.get("PATH", ""))
+        if pathrules.writable_hop(entry, guard) is None
+    ]
+    env["PATH"] = ":".join(entries) or DEFAULT_PATH
     env["CSESSION_HOOK"] = hook
     env["CSESSION_ID"] = csession_id
     env["CSESSION_OBJECT_TYPE"] = OBJECT_TYPE
     return env
 
 
-def resolve_sh(env: Mapping[str, str]) -> str | None:
-    """The absolute path of ``sh`` on the hook environment's ``PATH``, or None."""
+def resolve_sh(env: Mapping[str, str], guard: Callable[[str], bool]) -> str | None:
+    """The absolute path (realpath) of ``sh`` on the hook environment's ``PATH``, or None:
+    not found, or refused because a step of resolving it lies under ``guard`` (the entry
+    fails closed: ``run_entry`` fails it, nothing runs)."""
     try:
-        tool = pathrules.resolve_tool("sh", env["PATH"].split(":"), lambda _path: False)
-    except Exception:  # an unusable PATH entry: no shell
+        tool = pathrules.resolve_tool("sh", env["PATH"].split(":"), guard)
+    except Exception:  # an unusable or refused PATH entry: no shell
         return None
     return None if tool is None else tool.path
+
+
+def hook_guard(cfg: Config, environ: Mapping[str, str], state_root: str) -> Callable[[str], bool]:
+    """What a ``post-state-change`` hook's ``sh`` and ``PATH`` must lie outside of: the
+    launch's tool guard for the current config (``launch.tool_guard``: every kind's
+    session-writable paths and those recorded on every isolated run, the event's run
+    included). When it is not known, everything counts as under it: no ``sh`` is found and
+    the hooks fail closed (``hook_failed``)."""
+    from . import launch  # launch imports this module
+
+    process = launch.Process(
+        environ=environ,
+        caller_cwd=state_root,
+        claude_session="",
+        interpreter="",
+        state_root=state_root,
+        gateway=None,  # type: ignore[arg-type]  # the guard runs nothing
+    )
+    try:
+        return launch.tool_guard(cfg, process, git_cwd=None)
+    except Exception:  # not known: fail closed
+        return lambda _path: True
 
 
 @dataclass(frozen=True)
@@ -324,7 +361,10 @@ def run_entry(
     ``on_started`` is called once ``sh`` has started and its stdin was written and closed;
     ``canceled`` ends the hook's group early (``Ran("canceled")``)."""
     if sh is None:
-        return Ran("failed", "sh not found on the sanitized PATH")
+        return Ran(
+            "failed",
+            "sh not found on the sanitized PATH, or under a session-writable path (refused)",
+        )
     try:
         result = gateway.run(
             ["sh", "-c", entry.cmd],
@@ -488,7 +528,10 @@ def run_captured(
     raised; a ``BaseException`` (a signal ending the launch) propagates once the gateway has
     ended the group."""
     if sh is None:
-        return Captured("failed", "sh not found on the sanitized PATH")
+        return Captured(
+            "failed",
+            "sh not found on the sanitized PATH, or under a session-writable path (refused)",
+        )
     try:
         result = gateway.run(
             ["sh", "-c", entry.cmd],
@@ -946,10 +989,15 @@ class Deliverer:
         ]
         if not chosen:
             return "done"
+        guard = hook_guard(self.cfg, self.environ, self.state_root)
         env = hook_env(
-            self.environ, secret_env=self.cfg.secret_env, hook=POST_STATE_CHANGE, csession_id=sid
+            self.environ,
+            secret_env=self.cfg.secret_env,
+            hook=POST_STATE_CHANGE,
+            csession_id=sid,
+            guard=guard,
         )
-        sh = resolve_sh(env)
+        sh = resolve_sh(env, guard)
         for entry in chosen:
             if self.canceled():
                 return "canceled"

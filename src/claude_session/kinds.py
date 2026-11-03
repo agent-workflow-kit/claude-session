@@ -426,10 +426,10 @@ def _apply_flags(
                 )
             put(key, value, "flag-implied")
     elif data["reads_third_party"]:
-        # The kind (built-in `review`, a configured kind or a per-repo override) makes the run
-        # third-party-reading: a carried flag never beats the implications either, exactly as
-        # for a carried `--reads-third-party`. A flag given now still does (it is audited
-        # `sandbox_lowered`).
+        # The kind (built-in `review` or a configured kind; a per-repo override cannot set it)
+        # makes the run third-party-reading: a carried flag never beats the implications
+        # either, exactly as for a carried `--reads-third-party`. A flag given now still does
+        # (it is audited `sandbox_lowered`).
         for key, value, flag in _IMPLIED:
             given = explicit.get(flag) if flag is not None else None
             if flag is None or given is None or given[1] != "previous_run":

@@ -290,8 +290,8 @@ def test_claude_inside_a_session_writable_path_is_refused(tmp_path: Path) -> Non
 def test_a_claude_whose_interpreter_is_under_a_session_writable_path_is_refused(
     tmp_path: Path,
 ) -> None:
-    """An isolated run never lets ``claude --version`` (or the session) run a planted
-    ``#!`` interpreter; a trusted run (``NO_SANDBOX``) is unchanged."""
+    """No run lets ``claude --version`` (or the session) run a planted ``#!`` interpreter;
+    a trusted run (``NO_SANDBOX``) checks it too, and refuses a line it cannot check."""
     planted = executable(tmp_path / "cwd" / "cs-test-interp")
     claude = tmp_path / "safe" / "claude"
     claude.parent.mkdir()
@@ -304,7 +304,11 @@ def test_a_claude_whose_interpreter_is_under_a_session_writable_path_is_refused(
         launch.check_tools(cfg, resolution(cfg), process(tmp_path), writable, git)
     assert info.value.end_reason == "unsafe_path"
     assert "interpreter" in info.value.message
-    claude.write_text("#!/usr/bin/env -S cs-test-interp\n")  # unknown: no check when trusted
+    claude.write_text("#!/usr/bin/env -S cs-test-interp\n")  # cannot be checked: refused
+    with pytest.raises(LaunchValidationError) as info:
+        launch.check_tools(cfg, resolution(cfg), process(tmp_path), launch.NO_SANDBOX, git)
+    assert info.value.end_reason == "unsafe_path"
+    claude.write_text("#!/bin/sh\n")
     tools = launch.check_tools(cfg, resolution(cfg), process(tmp_path), launch.NO_SANDBOX, git)
     assert tools.claude.path == str(claude)
 

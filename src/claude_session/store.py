@@ -3077,6 +3077,37 @@ def _string_list_json(value: str | None) -> list[str]:
     return items
 
 
+def recorded_writable(root: str) -> list[tuple[str, int, tuple[str, ...]]]:
+    """The session-writable paths stored on every run of the store under ``root`` that has
+    them (``runs.writable_json``: only isolated runs store them), live and past, as
+    ``(csession_id, run_no, paths)``. Read through a read-only connection of its own, so it
+    never creates, migrates or locks anything; no database (or one without the column) has
+    none. Raises ``sqlite3.Error``, ``OSError`` or ``ValueError`` (a stored value that is not
+    a list of strings) when they cannot be read: callers fail closed."""
+    path = db_path(root)
+    if not os.path.exists(path):
+        return []
+    conn = sqlite3.connect(
+        _db_uri(path).replace("?mode=rw", "?mode=ro"), timeout=BUSY_TIMEOUT, uri=True
+    )
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+        if "writable_json" not in columns:
+            return []
+        rows = conn.execute(
+            "SELECT csession_id, run_no, writable_json FROM runs WHERE writable_json IS NOT NULL"
+        ).fetchall()
+    finally:
+        conn.close()
+    found = []
+    for csession_id, run_no, text in rows:
+        paths = json.loads(text)
+        if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+            raise ValueError(f"run {csession_id} {run_no}: writable_json is not a list of paths")
+        found.append((str(csession_id), int(run_no), tuple(paths)))
+    return found
+
+
 def open_state(**kwargs: Any) -> Store:
     """Open ``state.db`` in the default state directory (see ``Store.open``)."""
     return Store.open(db_path(state_dir()), **kwargs)
