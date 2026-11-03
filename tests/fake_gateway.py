@@ -186,6 +186,7 @@ class FakeGateway:
             kill_grace, new_process_group=new_process_group, kill_group_on_exit=kill_group_on_exit
         )
         check_output_limit(output_limit)
+        check_kill_over_bytes(kill_over_bytes)
         args = tuple(argv)
         self.calls.append(
             Call(
