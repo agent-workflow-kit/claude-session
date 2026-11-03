@@ -11,7 +11,6 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
-import secrets
 import stat
 import sys
 import time
@@ -27,6 +26,13 @@ _SUBDIR_FLAGS = _DIR_FLAGS | os.O_NONBLOCK
 
 class UnsafePathError(OSError):
     """A directory that is not a real directory owned by this user."""
+
+
+def token_hex(nbytes: int) -> str:
+    """``nbytes`` random bytes as hex, as ``secrets.token_hex`` makes them and from the same
+    source: this module is imported on every hook, and importing ``secrets`` costs
+    milliseconds there."""
+    return os.urandom(nbytes).hex()
 
 
 def _check_segment(name: str) -> None:
@@ -89,6 +95,42 @@ def create_private_dir_at(dir_fd: int, name: str) -> int:
     _check_segment(name)
     os.mkdir(name, 0o700, dir_fd=dir_fd)
     return open_private_dir_at(dir_fd, name)
+
+
+def inspect_private_dir_at(dir_fd: int, name: str) -> tuple[bool, int | None]:
+    """The read-only counterpart of ``ensure_private_dir_at`` (a dry run): opens ``name``
+    the same way (no-follow, owner checked) and changes nothing. Returns ``(False, None)``
+    when it is missing (``ensure_private_dir_at`` would create it); ``(True, fd)`` for a
+    directory of ours whose entries can be looked up through ``fd`` (the caller closes it);
+    ``(True, None)`` for one of ours whose mode denies searching it (``open_private_dir_at``
+    would set 0700 first, so its entries cannot be inspected now). Raises the ``OSError``
+    (``UnsafePathError`` for the owner or type) ``ensure_private_dir_at`` would."""
+    _check_segment(name)
+    try:
+        fd = os.open(name, _SUBDIR_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return False, None
+    except PermissionError:
+        if not sys.platform.startswith("linux"):
+            info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode):
+                raise UnsafePathError(f"{name}: not a directory") from None
+            if info.st_uid != os.geteuid():
+                raise UnsafePathError(f"{name}: owned by uid {info.st_uid}") from None
+            return True, None
+        # O_PATH needs no read permission (as in _repair_dir_mode_at).
+        flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    try:
+        check_private_dir_fd(fd, name)
+        searchable = bool(os.fstat(fd).st_mode & stat.S_IXUSR)
+    except BaseException:
+        os.close(fd)
+        raise
+    if not searchable:
+        os.close(fd)
+        return True, None
+    return True, fd
 
 
 def _identity(fd: int) -> tuple[int, int]:
@@ -178,7 +220,7 @@ def write_private_file_at(
     removed) and ``ValueError`` when ``name`` is not one path segment."""
     _check_segment(name)
     tmp_fd = dir_fd if tmp_dir_fd is None else tmp_dir_fd
-    tmp_name = f".{secrets.token_hex(4)}.tmp"
+    tmp_name = f".{token_hex(4)}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(tmp_name, flags, 0o600, dir_fd=tmp_fd)
     try:

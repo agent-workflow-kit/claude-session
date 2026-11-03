@@ -1,26 +1,38 @@
-"""Headless supervision (design.md, Supervision; interface.md, exec and Outcome mapping).
+"""Supervision of a run's ``claude`` (design.md, Supervision; interface.md, exec, Signals and
+Outcome mapping).
 
-``run_headless`` spawns ``claude`` from the main thread (``die_with_parent``: Linux sets
-``PR_SET_PDEATHSIG(SIGTERM)`` in the child, and the kernel sends it when the *spawning thread*
-exits, so it must be a thread that lives as long as the process) in its own process group,
-with ``/dev/null`` as stdin, stdout redirected straight to the private ``result.json`` and
-stderr to ``stderr.log``. The spawn is the last step of the launch phase: a spawn that
-fails ends the run ``not-started`` (``launch_interrupted``, ``launch.end_launch``). It then
-records the child's PID and start time and the ``session`` phase, waits for the child to
-exit, then, in this order: drains the run's outbox (and ``claimed/``), maps the end
-(``endmap.map_headless``), accepts or rejects an implicit done (``result.md``), finalizes the
-run (the compare-and-set, which also requires the report status the end was mapped from; a
-report that landed meanwhile is mapped again), deletes the secret index and removes the
-private tmpdir.
+``run_session`` spawns ``claude``. **Headless**: from the main thread (``die_with_parent``:
+Linux sets ``PR_SET_PDEATHSIG(SIGTERM)`` in the child, and the kernel sends it when the
+*spawning thread* exits, so it must be a thread that lives as long as the process) in its own
+process group, with ``/dev/null`` as stdin, stdout redirected straight to the private
+``result.json`` and stderr to ``stderr.log``. **Interactive**: in this process's group (the
+terminal's foreground group, no ``setsid``), with the terminal inherited on stdin, stdout and
+stderr; it gets SIGINT, SIGTSTP and SIGHUP from the terminal itself. The spawn is the last
+step of the launch phase: a signal received since the launch steps, or a spawn that fails,
+ends the run ``not-started`` (``launch_interrupted``, or ``canceled`` after a ``stop``
+request; ``launch.end_launch``). It then records the child's PID and start time and the
+``session`` phase and supervises the child until it exits (``Supervision``): every signal
+``exec`` receives is handled per the signal table (``signals``; ``pending_cause`` recorded
+before the one forward to the exact child, SIGKILL to that same child after ``kill_grace``),
+and every ``poll_interval`` the auto-exit rule is checked. Then, in this order: drains the
+run's outbox (and ``claimed/``), maps the end (``endmap.map_headless`` or
+``endmap.map_interactive``, from the recorded ``pending_cause``), accepts or rejects an
+implicit done (``result.md``, headless only), finalizes the run (the compare-and-set, which
+also requires the report status the end was mapped from; a report that landed meanwhile is
+mapped again), deletes the secret index and removes the private tmpdir. A terminating signal
+received before the child was reaped (a terminal hangup also reaches ``claude``) still records
+its cause when the run has none, though nothing is sent; signals received after the reap are
+recorded and dropped: the run is finalized either way.
 
-If supervision hits an internal error after the spawn (any exception, ``KeyboardInterrupt``
-included until #17 installs the signal handlers), it ignores SIGINT while it cleans up,
-records ``pending_cause`` ``internal_error``, sends SIGTERM to the exact child it spawned
-(SIGKILL after ``kill_grace``, also when the wait is interrupted), finalizes the run directly
-(``killed``, ``internal_error``, unless a report exists; no drain, no result parsing, cost
-null), deletes the secret index and removes the tmpdir on every path, and re-raises.
+Only the exact child is ever signaled: ``Child`` is the unreaped ``Popen``, so its PID cannot
+have been reused, and it signals nothing once reaped.
 
-TODO(#17): the signal table (forwarded_term/hup/int, pending_cause before forwarding).
+If supervision hits an internal error after the spawn (any exception), it ignores SIGINT while
+it cleans up, records ``pending_cause`` ``internal_error``, sends SIGTERM to the exact child it
+spawned (SIGKILL after ``kill_grace``, also when the wait is interrupted), finalizes the run
+directly (``killed``, ``internal_error``, unless a report exists; no drain, no result parsing,
+cost null), deletes the secret index and removes the tmpdir on every path, and re-raises.
+
 TODO(#19): the run's bound (``timeout``) and the ``session_start_timeout`` warning in the poll
 loop.
 TODO(#20): deliver ``post-state-change`` events of the run in the poll loop and at the end.
@@ -33,14 +45,17 @@ import hashlib
 import json
 import os
 import signal
+import sqlite3
+import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import endmap, fsutil, hookevent, launch, outbox, secretindex, store, tmpdir
+from . import endmap, fsutil, hookevent, launch, logs, outbox, secretindex, store, tmpdir
 from .config import Config
 from .endmap import EXIT_CODES, HeadlessResult, Mapped
 from .errors import InternalError
-from .gateway import DEVNULL, Child
+from .gateway import DEVNULL, INHERIT, Child
+from .signals import ExecSignals, signal_name, stop_cause
 
 IMPLICIT_ARTIFACT = "result.md"
 # Final drains of one run at most (each claims and checks for up to outbox.DRAIN_BUDGET).
@@ -58,9 +73,33 @@ class Ended:
     warnings: tuple[str, ...]
 
 
-def spawn(prepared: launch.Prepared, v: launch.Validated, process: launch.Process) -> Child:
-    """Start headless ``claude`` (see the module docs). Closes the output descriptors."""
+# The longest wait for the child between two checks of the signals ``exec`` received.
+SIGNAL_SLICE = 0.05
+
+
+def spawn(
+    prepared: launch.Prepared,
+    v: launch.Validated,
+    process: launch.Process,
+    signals: ExecSignals,
+    *,
+    mode: str,
+) -> Child:
+    """Start ``claude`` (see the module docs), first raising a signal received since the
+    launch steps (``LaunchInterrupted``). Closes the output descriptors."""
     try:
+        signals.raise_pending()
+        if mode == "interactive":
+            return process.gateway.spawn(
+                prepared.argv,
+                executable=prepared.executable,
+                env=v.session_env.env,
+                cwd=v.cwd,
+                stdin=INHERIT,
+                stdout=INHERIT,
+                stderr=INHERIT,
+            )
+        assert prepared.stdout_fd is not None and prepared.stderr_fd is not None
         return process.gateway.spawn(
             prepared.argv,
             executable=prepared.executable,
@@ -73,18 +112,196 @@ def spawn(prepared: launch.Prepared, v: launch.Validated, process: launch.Proces
             die_with_parent=True,
         )
     finally:
-        os.close(prepared.stdout_fd)
-        os.close(prepared.stderr_fd)
+        for fd in (prepared.stdout_fd, prepared.stderr_fd):
+            if fd is not None:
+                os.close(fd)
 
 
-def wait_for_exit(child: Child, *, poll_interval: float) -> int:
-    """Wait until ``child`` exits; its return code (negative: killed by that signal)."""
-    while True:
-        code = child.wait(poll_interval)
-        if code is not None:
-            return code
-        # TODO(#19): check the run's bound and the session_start_timeout warning here.
-        # TODO(#20): deliver new events of the run (post-state-change) here.
+def _idle_stop(event: dict[str, Any]) -> bool:
+    """A Stop without background tasks (one with them keeps the activity ``working``)."""
+    return not event["final"] and event["cause"] == "Stop" and event["to_activity"] == "idle"
+
+
+def qualifying_stop(event: dict[str, Any] | None) -> bool:
+    """Whether ``event`` is a Stop without background tasks that left the run ``reported``
+    (a waiting prompt or an open escalation is ``needs-input``)."""
+    return event is not None and _idle_stop(event) and event["to_state"] == "reported"
+
+
+def auto_exit_candidate(latest: list[dict[str, Any]]) -> int | None:
+    """The id of the run's latest event when auto-exit acts on it (``latest``: the newest
+    events, newest first), else None: a qualifying Stop, or the ``report`` event of a report
+    the Stop's own hook ingested (that Stop, idle, is the event right before it, and the
+    report left the run ``reported`` and idle)."""
+    if not latest:
+        return None
+    event = latest[0]
+    if qualifying_stop(event):
+        return int(event["id"])
+    if (
+        len(latest) > 1
+        and not event["final"]
+        and event["cause"] == "report"
+        and event["to_state"] == "reported"
+        and event["to_activity"] == "idle"
+        and _idle_stop(latest[1])
+    ):
+        return int(event["id"])
+    return None
+
+
+class Supervision:
+    """The session phase of one run: waits for the exact ``child`` and, until it exits,
+    forwards the signals ``exec`` receives (interface.md, Signals), ends the child for
+    auto-exit and SIGKILLs it ``kill_grace`` after the first signal ``exec`` sent it.
+
+    ``exec`` signals the child once with a terminating signal (``ended`` records it), always
+    after recording its cause with ``store.set_pending_cause`` (an earlier cause, such as a
+    ``stop`` request's, stands). Later signals are logged and dropped."""
+
+    def __init__(
+        self,
+        st: store.Store,
+        cfg: Config,
+        alloc: launch.Allocated,
+        child: Child,
+        signals: ExecSignals,
+        log: logs.EventLog,
+        *,
+        auto_exit: bool,
+        monotonic: Any = time.monotonic,
+    ) -> None:
+        self.st, self.cfg, self.alloc, self.child = st, cfg, alloc, child
+        self.signals, self.log = signals, log
+        self.auto_exit = auto_exit
+        self.monotonic = monotonic
+        self.ended = False  # exec sent the child its terminating signal
+        self.kill_at: float | None = None
+        self.candidate: int | None = None  # the auto_exit_candidate event id
+        self.due = 0.0
+
+    def wait(self) -> int:
+        """Supervise until the child exits; its return code (negative: killed by that
+        signal)."""
+        next_poll = self.monotonic()
+        while True:
+            code = self.child.wait(min(SIGNAL_SLICE, self.cfg.poll_interval))
+            if code is not None:
+                for signum in self.signals.take():
+                    self.received_at_exit(signum)
+                return code
+            for signum in self.signals.take():
+                self.forward(signum)
+            now = self.monotonic()
+            if self.kill_at is not None and now >= self.kill_at:
+                self.kill()
+            if now >= next_poll:
+                next_poll = now + self.cfg.poll_interval
+                if self.auto_exit and not self.ended:
+                    self.check_auto_exit(now)
+                # TODO(#19): check the run's bound and the session_start_timeout warning here.
+                # TODO(#20): deliver new events of the run (post-state-change) here.
+
+    def forward(self, signum: int) -> None:
+        """Forward a signal ``exec`` received, once, its cause recorded first."""
+        if self.ended:
+            self._log_not_sent(signum, "received; not forwarded: the child was already signaled")
+            return
+        self.end(signum, self._cause(signum))
+
+    def received_at_exit(self, signum: int) -> None:
+        """A signal received before the child was reaped (e.g. a terminal hangup, which the
+        child got too): nothing is sent, but the first terminating one records its cause
+        (unless the run has one), as if it had been forwarded."""
+        if self.ended:
+            self._log_not_sent(signum, "received; not forwarded: the child was already signaled")
+            return
+        self.ended = True
+        cause = self._cause(signum)
+        self.st.set_pending_cause(self.alloc.csession_id, self.alloc.run, cause)
+        self._log_not_sent(signum, f"received; {cause}; not sent: the child had exited")
+
+    def _cause(self, signum: int) -> str:
+        record = self.st.run_record(self.alloc.csession_id, self.alloc.run)
+        return stop_cause(signum, record["stop_requested_at"] is not None)
+
+    def end(self, signum: int, cause: str, *, recorded: bool = False) -> None:
+        """Record ``cause`` (unless the run has one, or ``recorded``: the caller's
+        compare-and-set just did), then send ``signum`` to the exact child and arm the
+        SIGKILL after ``kill_grace``."""
+        if not recorded:
+            self.st.set_pending_cause(self.alloc.csession_id, self.alloc.run, cause)
+        self.ended = True
+        self.kill_at = self.monotonic() + self.cfg.kill_grace
+        self.child.send_signal(signum)
+        self._log_sent(signum, cause)
+
+    def kill(self) -> None:
+        """SIGKILL the same child after ``kill_grace`` (``Child`` signals nothing once it is
+        reaped, so a reused PID is never hit)."""
+        self.kill_at = None
+        if self.child.poll() is None:
+            self.child.send_signal(signal.SIGKILL)
+            self._log_sent(signal.SIGKILL, "kill_grace")
+
+    def check_auto_exit(self, now: float) -> None:
+        """Auto-exit (design.md, Supervision): once the run has a ``done`` report and its
+        latest event is a qualifying Stop (or the report the Stop's own hook ingested;
+        ``auto_exit_candidate``), wait ``auto_exit_delay``; then re-check that this event is
+        still the latest and the report still ``done`` (in the same compare-and-set that
+        records ``auto_exit``) and SIGTERM the child, with no further store write. A newer
+        event resets the wait to the next qualifying Stop; a busy store keeps the candidate
+        for the next poll."""
+        sid, run_no = self.alloc.csession_id, self.alloc.run
+        if self.st.run_record(sid, run_no)["report_status"] != "done":
+            self.candidate = None
+            return
+        event_id = auto_exit_candidate(self.st.latest_events(sid, run_no, 2))
+        if event_id is None:
+            self.candidate = None
+            return
+        if self.candidate != event_id:
+            self.candidate = event_id
+            self.due = now + self.cfg.auto_exit_delay
+        if now < self.due:
+            return
+        try:
+            recorded = self.st.set_auto_exit_cause(sid, run_no, event_id)
+        except sqlite3.OperationalError as exc:
+            self._log_not_sent(
+                signal.SIGTERM,
+                f"auto_exit; not sent: the store was busy ({exc}); retried",
+                level="warn",
+            )
+            return
+        if recorded:
+            self.end(signal.SIGTERM, "auto_exit", recorded=True)
+        else:
+            self.candidate = None
+
+    def _log_sent(self, signum: int, why: str) -> None:
+        launch.log_best_effort(
+            self.log,
+            "signal_sent",
+            csession_id=self.alloc.csession_id,
+            run=self.alloc.run,
+            pid=self.child.pid,
+            signal=signal_name(signum),
+            message=why,
+        )
+
+    def _log_not_sent(self, signum: int, why: str, *, level: str = "debug") -> None:
+        """A signal ``exec`` did not send (received and dropped, or held back): never
+        ``signal_sent``."""
+        launch.log_best_effort(
+            self.log,
+            "signal_not_sent",
+            level=level,
+            csession_id=self.alloc.csession_id,
+            run=self.alloc.run,
+            signal=signal_name(signum),
+            message=why,
+        )
 
 
 def end_child(child: Child, *, kill_grace: float) -> None:
@@ -165,10 +382,11 @@ def finish(
     returncode: int | None,
     implicit_done: bool,
     secret: str | None,
+    mode: str = "headless",
 ) -> Ended:
-    """After ``claude`` exited: final drain, end mapping, implicit done, finalization, then
-    the secret index deleted and the tmpdir removed (on every path). Returns the outcome's
-    exit code."""
+    """After ``claude`` exited: final drain, end mapping, implicit done (headless),
+    finalization, then the secret index deleted and the tmpdir removed (on every path).
+    Returns the outcome's exit code."""
     sid, run_no = alloc.csession_id, alloc.run
     warnings: list[str] = []
     try:
@@ -185,8 +403,11 @@ def finish(
             )
         run_fd = v.dirs.open_run_dir(run_no)
         try:
-            parsed = endmap.read_result_file(run_fd)
-            _finalize(st, cfg, alloc, v, run_fd, parsed, returncode, implicit_done, pending, secret)
+            # An interactive run has no result.json (and no cost: null in its outcome).
+            parsed = endmap.read_result_file(run_fd) if mode == "headless" else HeadlessResult()
+            _finalize(
+                st, cfg, alloc, v, run_fd, parsed, returncode, implicit_done, pending, secret, mode
+            )
         finally:
             _delete_index(run_fd, warnings)
             os.close(run_fd)
@@ -208,22 +429,33 @@ def _finalize(
     implicit_done: bool,
     pending: bool,
     secret: str | None,
+    mode: str,
 ) -> None:
-    """Map the end and finalize, requiring the report status it was mapped from: a report
-    that landed in between is mapped again (``FINALIZE_ATTEMPTS``)."""
+    """Map the end (from the recorded ``pending_cause``) and finalize, requiring the report
+    status it was mapped from: a report that landed in between is mapped again
+    (``FINALIZE_ATTEMPTS``)."""
     sid, run_no = alloc.csession_id, alloc.run
     for _ in range(FINALIZE_ATTEMPTS):
         record = st.run_record(sid, run_no)
         if record["ended_at"] is not None:
             return  # lost: another finalizer won
-        mapped = endmap.map_headless(
-            pending_cause=None,
-            report_status=record["report_status"],
-            result=parsed,
-            returncode=returncode,
-            session_started=record["session_started_at"] is not None,
-            implicit_done=implicit_done,
-        )
+        if mode == "interactive":
+            if returncode is None:
+                raise InternalError("an interactive run's end needs claude's exit status")
+            mapped = endmap.map_interactive(
+                pending_cause=record["pending_cause"],
+                report_status=record["report_status"],
+                returncode=returncode,
+            )
+        else:
+            mapped = endmap.map_headless(
+                pending_cause=record["pending_cause"],
+                report_status=record["report_status"],
+                result=parsed,
+                returncode=returncode,
+                session_started=record["session_started_at"] is not None,
+                implicit_done=implicit_done,
+            )
         expected = record["report_status"]
         if mapped.implicit and pending:
             # A report the agent filed may wait unprocessed: never read the run as done.
@@ -290,7 +522,9 @@ def _final(mapped: Mapped, parsed: HeadlessResult) -> store.Final:
         end_reason=mapped.end_reason,
         exit_code=EXIT_CODES[mapped.outcome],
         state=endmap.final_state(mapped.outcome),
-        cause="exit",
+        # The final event's cause (interface.md, State transitions): auto_exit when exec ended
+        # claude for auto-exit, else exit. TODO(#19): timeout for a bound's end.
+        cause="auto_exit" if mapped.end_reason == "auto_exit" else "exit",
         cost_usd=parsed.cost_usd,
         num_turns=parsed.num_turns,
         is_error=is_error,
@@ -318,10 +552,10 @@ def _delete_index(run_fd: int, warnings: list[str]) -> None:
         warnings.append(f"could not delete the run's secret index: {exc.strerror}")
 
 
-# The whole headless run
+# The whole run
 
 
-def run_headless(
+def run_session(
     st: store.Store,
     cfg: Config,
     alloc: launch.Allocated,
@@ -329,22 +563,29 @@ def run_headless(
     prepared: launch.Prepared,
     process: launch.Process,
     *,
+    mode: str,
     implicit_done: bool,
+    auto_exit: bool,
+    signals: ExecSignals,
 ) -> Ended:
     """Spawn, record, supervise and finish (see the module docs). A spawn that fails ends
-    the run in the launch phase (exit 12; a ``KeyboardInterrupt`` is re-raised)."""
+    the run in the launch phase (exit 12); so does a signal received before the spawn
+    (``LaunchInterrupted``, re-raised once the run is final, like a ``KeyboardInterrupt``)."""
     sid, run_no = alloc.csession_id, alloc.run
     secret = prepared.run_secret
+    signals.defer()  # nothing interrupts the spawn: a signal during it is forwarded after
     try:  # only the spawn here: its finally closes the output descriptors
-        child = spawn(prepared, v, process)
+        child = spawn(prepared, v, process, signals, mode=mode)
     except Exception as exc:
         error = launch.interrupted(exc, _not_started(exc))
         launch.end_launch(st, alloc, v, None, process, error, exc=exc)
         return Ended(exit_code=EXIT_CODES["not-started"], warnings=())
     except BaseException as exc:
-        launch.end_launch(st, alloc, v, None, process, launch.interrupted(exc), exc=exc)
+        error = launch.interrupted_by(st, alloc, exc)
+        launch.end_launch(st, alloc, v, None, process, error, exc=exc)
         raise
     try:
+        signals.enter_session(interactive=mode == "interactive")
         st.update_run(
             sid,
             run_no,
@@ -363,7 +604,8 @@ def run_headless(
             pid=child.pid,
             decision_ids=list(_decision_ids(record)),
         )
-        returncode = wait_for_exit(child, poll_interval=cfg.poll_interval)
+        returncode = Supervision(st, cfg, alloc, child, signals, log, auto_exit=auto_exit).wait()
+        signals.defer()  # the child is gone: later signals are recorded and dropped
     except BaseException:
         _internal_error(st, cfg, alloc, v, child)
         raise
@@ -377,6 +619,7 @@ def run_headless(
             returncode=returncode,
             implicit_done=implicit_done,
             secret=secret,
+            mode=mode,
         )
     except BaseException:
         _internal_error(st, cfg, alloc, v, None)
@@ -414,16 +657,16 @@ def _internal_error(
     child: Child | None,
 ) -> None:
     """``exec`` must exit after an internal error: with SIGINT ignored, record
-    ``internal_error`` before any signal, end the child, and finalize directly (``killed``,
+    ``internal_error`` before any signal (unless the run already has a cause, which stands),
+    end the child, and finalize directly (``killed``,
     or the report's outcome when one exists; cost null), then delete the secret index and
     remove the tmpdir on every path. Best effort: a failure here is left to the liveness
     check (#33), which finds the wrapper dead."""
     sid, run_no = alloc.csession_id, alloc.run
     previous = _ignore_sigint()
     try:
-        try:
-            if st.run_record(sid, run_no)["ended_at"] is None:
-                st.update_run(sid, run_no, pending_cause="internal_error")
+        try:  # unless the run is final or already has a cause (e.g. auto_exit), which stands
+            st.set_pending_cause(sid, run_no, "internal_error")
         except Exception:  # the child is ended either way
             pass
         if child is not None:
