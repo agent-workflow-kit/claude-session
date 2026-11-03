@@ -27,6 +27,7 @@ from claude_session.gateway import (
     GatewayTimeout,
     Inherit,
     Result,
+    _text,
     check_argv,
     check_kill_grace,
     check_kill_over_bytes,
@@ -73,7 +74,9 @@ class Response:
     given a ``timeout``: otherwise the fake fails, as the real call could not time out;
     carrying ``stderr``), a spawned child keeps running. ``error``: the call raises it.
     ``release_error``: a gated spawn's ``release`` raises it, as the real one does when the
-    exec fails (the child then exits ``GATE_EXEC_FAILED``)."""
+    exec fails (the child then exits ``GATE_EXEC_FAILED``). ``raw_stdout``: the bytes
+    ``Result.stdout_bytes`` returns (default: ``stdout`` encoded as UTF-8), for output that
+    is not valid UTF-8 or holds carriage returns."""
 
     returncode: int = 0
     stdout: str = ""
@@ -81,6 +84,7 @@ class Response:
     timeout: bool = False
     error: OSError | None = None
     release_error: OSError | None = None
+    raw_stdout: bytes | None = None
 
 
 @dataclass
@@ -168,12 +172,13 @@ class FakeGateway:
         timeout: bool = False,
         error: OSError | None = None,
         release_error: OSError | None = None,
+        raw_stdout: bytes | None = None,
         responses: Sequence[Response] | None = None,
     ) -> None:
         """Answer commands whose argv starts with ``prefix``, with one response (the keyword
         arguments) or ``responses`` in order (the last repeats). The most recent matching rule
         wins, so a test can override a fixture's default."""
-        single = Response(returncode, stdout, stderr, timeout, error, release_error)
+        single = Response(returncode, stdout, stderr, timeout, error, release_error, raw_stdout)
         if responses is None:
             scripted = [single]
         elif single != Response():
@@ -257,11 +262,16 @@ class FakeGateway:
         if kill_over_bytes is not None and len(response.stdout.encode()) > kill_over_bytes:
             raise GatewayOutputLimit(args, kill_over_bytes)
         out, err = response.stdout, response.stderr
+        if response.raw_stdout is not None:  # as the real gateway: decoded from the bytes
+            out = _text(response.raw_stdout)
         if kill_over_bytes is not None:
             err = err.encode()[:kill_over_bytes].decode(errors="ignore")
         if discard_output:
             out, err = "", ""
-        out_bytes, err_bytes = out.encode(), err.encode()
+        out_bytes = response.raw_stdout if response.raw_stdout is not None else out.encode()
+        err_bytes = err.encode()
+        if discard_output:
+            out_bytes = b""
         if output_limit is not None:  # as the real gateway: a byte prefix of each stream
             out_bytes, err_bytes = out_bytes[:output_limit], err_bytes[:output_limit]
             out = out_bytes.decode("utf-8", "replace")

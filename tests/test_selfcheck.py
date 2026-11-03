@@ -59,6 +59,7 @@ class FakeRunner(FakeGateway):
         on_started: Callable[[], None] | None = None,
         canceled: Callable[[], bool] | None = None,
         on_spawn: Callable[[int], None] | None = None,
+        keep_raw_stdout: bool = False,
     ) -> Result:
         self.probes.append({"argv": list(argv), "timeout": timeout, "env": env, "stdin": stdin})
         answer: int | BaseException | None = self.by_tool.get(Path(argv[0]).name)
