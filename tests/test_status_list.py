@@ -708,6 +708,18 @@ def test_display_escapes_controls_and_keeps_text() -> None:
     assert terminal.display("a b,c", extra=" ,") == "a\\x20b\\x2cc"
 
 
+def test_display_keeps_one_variation_selector_after_a_base_character() -> None:
+    """A single variation selector after a base character (emoji presentation) stays; one
+    at the start, after an escape or after another selector (hidden data) is escaped."""
+    assert terminal.display("\u2764\ufe0f ok") == "\u2764\ufe0f ok"
+    assert terminal.display("a\U000e0100") == "a\U000e0100"
+    assert terminal.display("a" + "\ufe01" * 8) == "a\ufe01" + "\\ufe01" * 7
+    assert terminal.display("\ufe0fa") == "\\ufe0fa"
+    assert terminal.display("\x1b\ufe0f") == "\\x1b\\ufe0f"
+    assert terminal.display("a\U000e0100\U000e0101") == "a\U000e0100\\U000e0101"
+    assert terminal.display("\u180b") == "\\u180b"
+
+
 def test_display_width_counts_wide_characters_twice() -> None:
     assert terminal.display_width("ab") == 2
     assert terminal.display_width("審査") == 4
