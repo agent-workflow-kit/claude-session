@@ -36,7 +36,7 @@ checks that they are absolute, executable regular files, and probes them by thei
 records ``sandbox_active`` on the run, adds the warnings to the run's warnings, passes
 ``tmpdir`` to ``settings_builder.Isolation`` and ``envbuild``, and maps a
 ``LaunchValidationError`` (with its ``hint`` as the outcome message) to a not-started run.
-TODO(#28): adoption calls both again.
+The adopting ``exec`` (``lifecycle``) makes both calls again through ``launch.checks``.
 ``--dry-run`` (``dryrun``, through ``launch.checks``) makes the same two calls with
 ``create=False``, for ``would_fail``, ``sandbox_active`` and ``warnings``.
 """

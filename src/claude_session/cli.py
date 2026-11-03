@@ -199,8 +199,7 @@ def _exec(args: argparse.Namespace) -> int:
     The signal handlers are installed before allocation and restored once the outcome is
     printed (until then a late signal is only recorded)."""
     if args.session_id is not None:
-        # TODO(#28): adoption of a pending run created by start.
-        raise InternalError("exec --session-id is not implemented yet", detail="not_implemented")
+        return _adopt(args)
     if args.dry_run:
         return _dry_run(args)
     from . import launch, supervisor
@@ -267,12 +266,60 @@ def _end_interrupted_launch(
         launch.end_launch(st, alloc, None, None, process, error, exc=exc)
 
 
+def _adopt(args: argparse.Namespace) -> int:
+    """``exec --session-id <id>``: adopt the pending run ``start`` created and launch it
+    (interface.md, Launch order); with ``--dry-run``, inspect it without adopting. The signal
+    handlers are installed first and restored once the outcome is printed, as for plain exec."""
+    from . import launch, lifecycle, supervisor
+    from .gateway import SystemGateway
+    from .signals import ExecSignals, LaunchInterrupted
+
+    signals = ExecSignals()
+    try:  # entered first: a signal during the install is handled and the handlers restored
+        try:
+            signals.install()
+            with store.open_state() as st:
+                process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+                if args.dry_run:
+                    return _print_dry_run(args, *lifecycle.adoption_plan(st, args, process))
+                signals.defer()  # a signal during the adoption's checks acts once the run is ours
+                outcome, code = lifecycle.adopt(
+                    st, args, process, supervise=supervisor.run_session, signals=signals
+                )
+        except LaunchInterrupted as exc:  # before the adoption: nothing to record
+            _die_of(exc.signum)
+        except KeyboardInterrupt:  # handlers not installed (not the main thread)
+            _die_of(signal.SIGINT)
+        signals.defer()  # until the outcome is printed, a signal is only recorded
+        try:
+            _print_outcome(outcome, args.json)
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+    finally:
+        signals.restore()
+    return code
+
+
 def _start(args: argparse.Namespace) -> int:
-    """``start``: only ``--dry-run`` of a new session so far."""
-    if args.dry_run and args.resume is None:
+    """``start`` of a new session (interface.md, start): steps 1 to 5, the run frozen and
+    left pending; prints the start object. A launch-validation failure exits 12 with
+    ``launch_failed``."""
+    if args.resume is not None:
+        # TODO(#29): start --resume (and its --dry-run), with the carry-over.
+        raise InternalError("start --resume is not implemented yet", detail="not_implemented")
+    if args.dry_run:
         return _dry_run(args)
-    # TODO(#28): start and start --resume (and its --dry-run, with #29's carry-over).
-    raise InternalError("start is not implemented yet", detail="not_implemented")
+    from . import config, launch, lifecycle
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    source = config.Source.of(args.config)
+    with store.open_state() as st:
+        process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+        result = lifecycle.start(st, args, cfg, source, process)
+    print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+    return 0
 
 
 def _dry_run(args: argparse.Namespace) -> int:
@@ -283,6 +330,12 @@ def _dry_run(args: argparse.Namespace) -> int:
 
     cfg = load_config(args)
     plan, message = dryrun.new_session_plan(args, cfg, dryrun.current_process(SystemGateway()))
+    return _print_dry_run(args, plan, message)
+
+
+def _print_dry_run(args: argparse.Namespace, plan: dict[str, Any], message: str | None) -> int:
+    from . import dryrun
+
     plan = dryrun.printable(plan)  # valid UTF-8 output, also for a non-UTF-8 path
     if args.json:
         print(json.dumps(plan, ensure_ascii=False, allow_nan=False))
