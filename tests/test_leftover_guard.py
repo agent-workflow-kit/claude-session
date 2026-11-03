@@ -31,14 +31,12 @@ class _Item:
 
 
 def _alive(pid: int) -> bool:
-    stat = _stat(pid)
-    if stat is None:
-        return False
     try:
         with open(f"/proc/{pid}/stat", "rb") as fh:
-            return fh.read().rpartition(b")")[2].split()[0] not in (b"Z", b"X")
-    except (FileNotFoundError, ProcessLookupError):  # gone before open, or mid-read
+            data = fh.read()
+    except (FileNotFoundError, ProcessLookupError):  # gone, or reaped between open and read
         return False
+    return data.rpartition(b")")[2].split()[0] not in (b"Z", b"X")
 
 
 def _stub(pid: int, returncode: int | None) -> subprocess.Popen[Any]:
@@ -106,7 +104,7 @@ def test_stat_of_an_unreadable_process_is_not_ours(monkeypatch: pytest.MonkeyPat
 
 
 def test_the_tracking_popen_is_restored_when_the_setup_fails(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
     real = subprocess.Popen
 
@@ -115,7 +113,7 @@ def test_the_tracking_popen_is_restored_when_the_setup_fails(
 
     monkeypatch.setattr(conftest.threading, "Thread", failing)
     request = SimpleNamespace(node=_Item())
-    guard = conftest.no_leftover_processes.__wrapped__(request)  # pyright: ignore[reportAttributeAccessIssue]
+    guard = conftest.no_leftover_processes.__wrapped__(request, tmp_path_factory)  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(RuntimeError):
         next(guard)
     assert subprocess.Popen is real

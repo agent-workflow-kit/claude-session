@@ -656,8 +656,7 @@ def test_a_signal_during_step_5_never_writes_a_path_the_full_set_rejects(
     sid = allocate(st, out, resolved=ISOLATED)
     full = (str(link.parent),)
 
-    def validate(*args: Any, **kwargs: Any) -> None:
-        guard = kwargs["guard"]
+    def validate(*args: Any, guard: Any, **kwargs: Any) -> None:
         guard.paths = full
         if known == "stored":
             st.update_run(sid, 1, writable_json=json.dumps(list(full)))

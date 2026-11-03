@@ -134,8 +134,9 @@ def _hook_event(argv: list[str]) -> int:
 
 
 def _state_dir_and_event(argv: list[str]) -> tuple[str | None, str | None]:
-    """The ``--state-dir`` value (absolute only) and the hook event name (known names only)
-    from hook-event's argv, without argparse. The first ``--state-dir`` wins."""
+    """The ``--state-dir`` value (absolute only; the caller skips one that is not UTF-8) and
+    the hook event name (known names only) from hook-event's argv, without argparse. The
+    first ``--state-dir`` wins."""
     state_dir: str | None = None
     event: str | None = None
     rest = iter(argv)
@@ -161,7 +162,10 @@ def _log_hook_event_failure(argv: list[str], exc: BaseException) -> None:
         state_dir, event = _state_dir_and_event(argv)
         if state_dir is None:
             return
-        from . import logs
+        from . import fsutil, logs
+
+        if not fsutil.is_utf8(state_dir):  # never a state root a launch made: not usable
+            return
 
         session = os.environ.get("CSESSION_ID", "")
         name = type(exc).__name__
