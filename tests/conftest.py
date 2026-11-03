@@ -10,9 +10,10 @@ returned, each one still running is SIGKILLed while it is still the process star
   only while the leader is still our unreaped child with the same start ticks (an unreaped
   leader pins the group ID; Linux cannot signal a group through a pidfd).
 
-Pidfds come from ``os.pidfd_open`` and ``signal.pidfd_send_signal`` where Python has them, and
-otherwise (Pythons built without them) straight from the syscalls through ``ctypes`` on x86_64
-and aarch64 Linux. Other machines and macOS have no pidfd.
+Pidfds come from ``gateway.pidfd_open`` and ``gateway.pidfd_send_signal``: ``os.pidfd_open`` and
+``signal.pidfd_send_signal`` where Python has them, and otherwise (Pythons built without them)
+straight from the syscalls through ``ctypes`` on x86_64 and aarch64 Linux. Other machines and
+macOS have no pidfd.
 
 The check before ``killpg``, and before ``kill`` where there is no pidfd, leaves a window: if
 the leader is reaped in it and its PID reused, the signal reaches the new process. Only a
@@ -37,7 +38,13 @@ Should a test run past its watchdog limit (``watchdog_seconds``: ``WATCHDOG_SECO
 watchdog writes the live tracked PIDs to stderr, SIGKILLs every tracked process that has a
 pidfd (exact: a pidfd never names a reused PID, so this cannot race the test's own wait), and
 the test fails at teardown. It sends no other signal: without pidfds it only reports, and a
-test hung on something else stays hung. This module is test-only; nothing under ``src/`` imports it.
+test hung on something else stays hung. This module is test-only; nothing under ``src/``
+imports it (it imports ``gateway``).
+
+The same ``Popen`` wrapper refuses, before anything starts, to run a ``crontab`` program
+that is not a fake under the pytest base temporary directory (``crontab_guard``), and
+``_crontab_tripwire`` puts a failing ``crontab`` first on every test's ``PATH`` for the
+processes that tests start, so no test ever reads or writes the user's real crontab.
 
 The other autouse fixtures keep every test off the user's real directories: its own
 ``XDG_STATE_HOME`` (``_private_state_dir``), ``HOME`` and ``XDG_CONFIG_HOME``
@@ -50,10 +57,7 @@ anything under the real ``/tmp/csession-<uid>``).
 from __future__ import annotations
 
 import contextlib
-import ctypes
-import errno
 import os
-import platform
 import select
 import shutil
 import signal
@@ -69,11 +73,25 @@ from typing import Any
 
 import pytest
 
-from claude_session import pathrules
+from claude_session import gateway, pathrules
 
 pytest_plugins = ["pytester"]  # test_leftover_guard.py runs the guard in a pytest of its own
 
 LINUX = sys.platform.startswith("linux")
+# Marks a test that needs Linux (/proc, pidfd, PR_SET_PDEATHSIG, bwrap): it skips elsewhere.
+linux_only = pytest.mark.skipif(not LINUX, reason="Linux only (/proc and other Linux APIs)")
+
+
+def _true_bin() -> str:
+    """``/bin/true`` on Linux; macOS has only ``/usr/bin/true``."""
+    found = shutil.which("true", path="/bin:/usr/bin")
+    if found is None:
+        raise RuntimeError("no `true` executable in /bin or /usr/bin; the tests need one")
+    return found
+
+
+# The `true` executable the tests spawn (never a hard-coded /bin/true).
+TRUE_BIN = _true_bin()
 # A test still running after this long is reported as hung and its pidfd processes killed.
 WATCHDOG_SECONDS = 60.0
 # The same for a `live` test (real claude, `make live`): its longest step is an end-to-end run
@@ -101,8 +119,10 @@ def _stat(pid: int) -> tuple[int, int, int] | None:
 def _unreaped_child(pid: int) -> bool:
     """Whether ``pid`` is a child of this process not yet reaped (running or a zombie), so the
     PID, and the group ID it leads, cannot have been reused."""
-    if not hasattr(os, "waitid"):
-        return True  # macOS: only Popen's own bookkeeping (returncode) is available
+    # os.waitid: POSIX, but on macOS only from Python 3.13 on, never on Windows. Plain
+    # sys.platform and version checks (not hasattr) let pyright narrow it for each platform.
+    if sys.platform == "win32" or (sys.platform == "darwin" and sys.version_info < (3, 13)):
+        return True  # no os.waitid: only Popen's own bookkeeping (returncode) is available
     try:
         os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
     except ChildProcessError:
@@ -110,66 +130,11 @@ def _unreaped_child(pid: int) -> bool:
     return True
 
 
-# (SYS_pidfd_open, SYS_pidfd_send_signal) by platform.machine(), for Pythons without the
-# os/signal wrappers. Any other machine gets no pidfd.
-_PIDFD_SYSCALLS = {"x86_64": (434, 424), "aarch64": (434, 424)}
-
-
-def _libc_syscall() -> Any:
-    """libc's ``syscall``, or ``None`` when it is not needed or not available."""
-    if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
-        return None
-    if not LINUX or platform.machine() not in _PIDFD_SYSCALLS:
-        return None
-    try:
-        fn = ctypes.CDLL(None, use_errno=True).syscall
-    except (OSError, AttributeError):
-        return None
-    fn.restype = ctypes.c_long
-    return fn
-
-
-_SYSCALL = _libc_syscall()
-# Whether exact pidfds are available here (natively or through the syscalls).
-PIDFD = (hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")) or (
-    _SYSCALL is not None
-)
-
-
-def _check(result: int) -> int:
-    if result < 0:
-        err = ctypes.get_errno() or errno.EIO  # never 0: set_errno(0) precedes every call
-        raise OSError(err, os.strerror(err))  # ESRCH arrives as ProcessLookupError
-    return result
-
-
-def _pidfd_open(pid: int) -> int:
-    if _SYSCALL is None:
-        return os.pidfd_open(pid)
-    ctypes.set_errno(0)
-    return _check(
-        _SYSCALL(
-            ctypes.c_long(_PIDFD_SYSCALLS[platform.machine()][0]),
-            ctypes.c_int(pid),
-            ctypes.c_uint(0),
-        )
-    )
-
-
-def _pidfd_send_signal(fd: int, sig: int) -> None:
-    if _SYSCALL is None:
-        signal.pidfd_send_signal(fd, sig)
-        return
-    ctypes.set_errno(0)
-    _check(
-        _SYSCALL(
-            ctypes.c_long(_PIDFD_SYSCALLS[platform.machine()][1]),
-            ctypes.c_int(fd),
-            ctypes.c_int(sig),
-            ctypes.c_void_p(None),
-            ctypes.c_uint(0),
-        )
-    )
+# Exact pidfds: ``gateway``'s (the os and signal functions, else the syscalls through ctypes
+# on x86_64 and aarch64 Linux). Whether they are available here:
+PIDFD = gateway.pidfd_support() is not None
+_pidfd_open = gateway.pidfd_open
+_pidfd_send_signal = gateway.pidfd_send_signal
 
 
 def _pidfd(pid: int) -> int | None:
@@ -263,11 +228,43 @@ def _end_leftover_fakes(directory: str) -> list[str]:
     return leftovers
 
 
-def _tracking_popen(started: list[_Started]) -> type[subprocess.Popen[Any]]:
+def crontab_guard(args: Any, kwargs: dict[str, Any], allowed_root: str) -> None:
+    """``pytest.fail`` (a ``BaseException``: no ``except Exception`` and no ``-O`` hides it)
+    when a ``Popen(args, **kwargs)`` about to start would run a ``crontab`` program that is
+    not a test fake under ``allowed_root`` (the pytest base temporary directory). A bare name
+    is resolved on the PATH the child would search; ``shell=True`` fails when the command
+    text mentions ``crontab`` at all."""
+    if kwargs.get("shell"):
+        text = args if isinstance(args, (str, bytes)) else " ".join(map(os.fsdecode, args))
+        if "crontab" in os.fsdecode(text):
+            pytest.fail(f"a test tried to run crontab through a shell: {text!r}", pytrace=False)
+        return
+    program = kwargs.get("executable")
+    if program is None:
+        program = args if isinstance(args, (str, bytes, os.PathLike)) else list(args)[0]
+    program = os.fsdecode(program)
+    if os.path.basename(program) != "crontab":
+        return
+    if os.sep not in program:
+        env = kwargs.get("env")
+        search = os.get_exec_path(env)  # the PATH Popen itself searches
+        program = shutil.which(program, path=os.pathsep.join(search)) or program
+    resolved = os.path.realpath(program)
+    root = os.path.realpath(allowed_root)
+    if os.path.commonpath([resolved, root]) != root:
+        pytest.fail(
+            f"a test tried to run a crontab outside the test temporary directory: {resolved}",
+            pytrace=False,
+        )
+
+
+def _tracking_popen(started: list[_Started], allowed_root: str) -> type[subprocess.Popen[Any]]:
     real = subprocess.Popen
 
     class TrackedPopen(real):  # type: ignore[valid-type,misc]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            # Before anything starts: never the user's real crontab (only test fakes).
+            crontab_guard(args[0] if args else kwargs.get("args"), kwargs, allowed_root)
             super().__init__(*args, **kwargs)
             stat = _stat(self.pid) if LINUX else None
             own = kwargs.get("process_group") == 0 or bool(kwargs.get("start_new_session"))
@@ -284,7 +281,9 @@ def watchdog_seconds(item: Any) -> float:
 
 
 @pytest.fixture(autouse=True)
-def no_leftover_processes(request: pytest.FixtureRequest) -> Iterator[list[_Started]]:
+def no_leftover_processes(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[list[_Started]]:
     limit = watchdog_seconds(request.node)
     started: list[_Started] = []
     real = subprocess.Popen
@@ -308,7 +307,9 @@ def no_leftover_processes(request: pytest.FixtureRequest) -> Iterator[list[_Star
     try:
         fakes_dir = tempfile.mkdtemp(prefix="cs-fakes-")
         os.environ[STARTED_ENV] = fakes_dir
-        subprocess.Popen = _tracking_popen(started)  # type: ignore[misc]
+        subprocess.Popen = _tracking_popen(  # type: ignore[misc]
+            started, str(tmp_path_factory.getbasetemp())
+        )
         thread = threading.Thread(target=watchdog, daemon=True)
         thread.start()
         yield started
@@ -366,6 +367,30 @@ def _private_home(
     (home / ".config").mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+
+
+TRIPWIRE_CRONTAB = """#!/bin/sh
+echo "tripwire crontab: a test ran crontab $*; it must use its own fake" >&2
+exit 97
+"""
+
+
+@pytest.fixture(scope="session")
+def _tripwire_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    directory = tmp_path_factory.mktemp("tripwire-bin")
+    program = directory / "crontab"
+    program.write_text(TRIPWIRE_CRONTAB, encoding="utf-8")
+    program.chmod(0o755)
+    return directory
+
+
+@pytest.fixture(autouse=True)
+def _crontab_tripwire(_tripwire_bin: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``crontab`` that only fails (exit 97) comes first on every test's ``PATH``, so a
+    process a test starts (``claude-session`` itself included, which the ``Popen`` guard does
+    not see) finds it instead of the user's real crontab. Tests of ``cron`` set their own
+    ``PATH`` to a fake."""
+    monkeypatch.setenv("PATH", f"{_tripwire_bin}{os.pathsep}{os.environ.get('PATH', '')}")
 
 
 def _remove_tree(path: str) -> None:

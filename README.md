@@ -56,7 +56,7 @@ Upgrade claude-session while no sessions are live.
 
 - `claude` (Claude Code CLI): binding A (hard); version 2.1.312 or later (config `min_claude_version`).
 - memoctl, optional, for session-start context: binding B (config `notes_context_cmd`, enabled per kind with `notes_context: true`). Install: `uv tool install git+https://github.com/agent-workflow-kit/memoctl`.
-- For sandboxed kinds (`review`, `gate-check`, `respond` by default) on Linux and WSL2: `bubblewrap` and `socat` (`sudo apt install bubblewrap socat`). macOS needs nothing extra.
+- For sandboxed kinds (`review`, `gate-check`, `respond` by default) on Linux and WSL2: `bubblewrap` and `socat` (`sudo apt install bubblewrap socat`). macOS needs nothing extra (see the [macOS manual checklist](docs/macos-checklist.md)).
 
 ## Install
 

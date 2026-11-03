@@ -52,7 +52,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 - New API-using tests take the `live` fixture, zero-cost ones `cheap`; both come from `tests/live/conftest.py`. Put helpers in `tests/live/harness.py` and unit-test them in `tests/test_live_harness.py`, with the fake claude or `sh`.
 - `LiveEnv.headless(prompt, *flags)` runs a small-model `-p` with `stream-json`, the prompt after `--`. `LiveEnv.claude_run` runs with exactly the given argv (add `*live.budget()` to a `-p` argv). `spawn_headless` and `tmux_driver.Tmux` are for signals and interactive sessions; a new path that starts `claude` must call `spend_gate()` and `charge()`.
 - Probe hooks are `tests/fakeclaude.recorder(log, ...)` commands in a `--settings` file; read them with `harness.read_log` and `harness.events_named`. Read what tools returned with `harness.session_tool_results`, never the whole transcript (it holds the prompt).
-- Sandbox tests use `needs_sandbox` (`test_sandbox.py`); macOS-only checks belong in the manual checklist of #43.
+- Sandbox tests use `needs_sandbox` (`test_sandbox.py`); macOS-only checks belong in the [manual macOS checklist](macos-checklist.md) (#43), which also says what to read from this suite on a Mac.
 - New rows go in the tables below, with an owner when not covered.
 
 ## Coverage
@@ -106,7 +106,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 
 | Item | Test or owner |
 |---|---|
-| Glob, Grep and LS under the review profile | Glob and Grep with the review permission keys built by hand: `test_open_items.py::test_search_tools_...`; LS is not a tool (see below) |
+| Glob, Grep and LS under the review profile | `test_open_items.py::test_search_tools_...` (LS is not a tool in the verified Claude Code; the `init` tool list is recorded) |
 | `--strict-mcp-config` drops a `--plugin-dir` plugin's MCP servers | `test_headless.py::test_strict_mcp_config_...` |
 | MCP elicitation (`elicitation_dialog`) | `test_interactive.py::test_an_mcp_elicitation_...` |
 | Background subagents: last `result` taken, cost and turns summed | Raw stream: `test_headless_signals.py::test_background_subagents_...`; the product's summing: #42 |
@@ -139,8 +139,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 | C (built-in write protections beyond the placeholder check), C2 (single-`*` glob ignored), C5 (uv tool install), C7 (`GIT_CONFIG_COUNT`), C8 (outbox/artifacts directory swap) | #42 | Sandbox internals on a Linux sandbox host. |
 | Respond isolation: network, tmux socket and SSH agent blocked | #42 | Needs an outside listener. |
 | Sandbox: TMPDIR socket length; `excludedCommands` matching; `.bash_profile` placeholder | #42 | Unit-tested in `selfcheck`; the live half needs a sandbox host. |
-| LS under the review profile | none | Not a tool in the Claude Code the design was verified against (design.md, D3); `test_open_items.py::test_search_tools_...` records the `init` tool list, so a later version that adds it shows up in the observations. Nothing asserts on it. |
-| Glob and Grep through the generated review settings end to end | none | Isolated runs refuse `--tools` in `claude_args` (`unsafe_claude_args`), and without it Glob and Grep are not offered, so the product cannot enable them. `test_open_items.py` builds the same permission keys by hand. |
+| Glob and Grep through the generated review settings end to end | n/a | Isolated runs refuse `--tools` in `claude_args` (`unsafe_claude_args`), so the product cannot enable them; `test_open_items.py` builds the same permission keys by hand. |
 | Managed settings (#56 (b), #59 item 13) | #42 | Needs a root-owned managed settings file (procedure below). |
 | macOS Seatbelt checks | #43 | Manual checklist (macOS only). |
 
@@ -150,7 +149,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 |---|---|
 | #55 Bedrock/Vertex truthy values | `test_provider_env.py` (zero cost; message patterns are guesses, see the docstring) |
 | #56 1 `--` before the prompt | `test_headless.py::test_double_dash_...` and the control (no prompt: `-p` fails for want of input) |
-| #56 2 Notification matchers | `test_interactive.py::test_permission_prompt_notifications_...` (`permission_prompt` and `idle_prompt`; `elicitation_dialog` is `test_interactive.py::test_an_mcp_elicitation_...`) |
+| #56 2 Notification matchers | `test_interactive.py::test_permission_prompt_notifications_...` (`permission_prompt` and `idle_prompt`; `elicitation_dialog`: `test_interactive.py::test_an_mcp_elicitation_...`) |
 | #56 3 Omitted `matcher` | `test_hooks.py::test_a_group_without_a_matcher_...` (PostToolUse and SessionStart; PermissionRequest is only ever seen unmatched in the interactive test) |
 | #56 4 Hook `timeout` unit | `test_hooks.py::test_hook_timeout_is_in_seconds` |
 | #56 5 `defaultMode` precedence | `test_settings.py::test_settings_default_mode_...` |
@@ -172,7 +171,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 | #59 9 `~/.gitconfig` re-opened under deny-root | #42 (sandbox host) |
 | #59 10 skills in `--add-dir` under `--setting-sources ""` | `test_isolation.py::test_skills_in_an_add_dir_directory_...` (records the answer) |
 | #59 11 `sandbox: off` vs user `enabled: true` | #42 (sandbox host) |
-| #59 12 Grep and Glob read denies | `test_open_items.py::test_search_tools_and_the_home_read_denies` (three variants; only `both`, which is what isolated runs generate, asserts, and only for Read and Grep content; the rest is recorded) |
+| #59 12 Grep and Glob read denies | `test_open_items.py::test_search_tools_and_the_home_read_denies` (three variants; only `both` asserts, for Read and Grep content; the rest is recorded) |
 | #60 `preferred` fallback: Claude Code runs unsandboxed when the sandbox is missing | `test_sandbox.py::test_without_a_sandbox_enabled_without_fail_if_unavailable_...` (Linux without a sandbox) |
 | #60 bwrap probe fidelity, socat, socket names, `TMPDIR` vs `CLAUDE_CODE_TMPDIR`, `/tmp` ownership | #42 (a sandbox host and a namespace); unit tests cover the probe |
 | #63 10 MiB artifact | `test_e2e.py::test_a_10_mib_artifact_...` |

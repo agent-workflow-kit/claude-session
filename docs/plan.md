@@ -13,7 +13,7 @@ Status: planned, 2026-10-29. Implements [interface.md](interface.md) (normative)
 
 ## Module map
 
-The plan splits seven modules out of design.md's module list to keep files focused: `ids` (from `cli`/`store`), `endmap` and `launch` (from `supervisor`), `pathrules` (from `settings_builder`), `lifecycle` (from `supervisor` and `reconcile`), `notes` (from `hookevent`) and `secretindex` (from `outbox`). Responsibilities are unchanged.
+The plan splits eight modules out of design.md's module list to keep files focused: `ids` (from `cli`/`store`), `endmap` and `launch` (from `supervisor`), `pathrules` (from `settings_builder`), `lifecycle` (from `supervisor` and `reconcile`), `cronblock` (from `reconcile`), `notes` (from `hookevent`) and `secretindex` (from `outbox`). Responsibilities are unchanged.
 
 | Module | Stage | Responsibility |
 |---|---|---|
@@ -37,7 +37,8 @@ The plan splits seven modules out of design.md's module list to keep files focus
 | `secretindex.py` | 3 | `contains_secret` keyed q-gram index: build, read, streamed scan (stdlib only: on the hook path) |
 | `pathrules.py` | 3 | path rules, session-writable paths, PATH sanitizing |
 | `lifecycle.py` | 4 | start/adoption, resume/fork carry-over, taint, stop, forget, liveness |
-| `reconcile.py` | 4 | reconcile, retention, cron block |
+| `reconcile.py` | 4 | reconcile, retention |
+| `cronblock.py` | 4 | `cron install`/`cron uninstall`: the managed crontab block |
 | `transcripts.py` | 5 | transcript discovery and rendering |
 | `notes.py` | 5 | notes-context command |
 | `tests/fakebin/claude` | 1 | scenario-driven fake Claude Code |
@@ -116,7 +117,7 @@ The plan splits seven modules out of design.md's module list to keep files focus
 
 - launch order steps 1–7, each failure's allocation behavior and exit code; `start` stores and freezes the spec, config path and per-invocation flags; adoption re-validation; `expired`, `already_adopted`; `never_adopted` after `lost_grace`.
 - carry-over table rows incl. `--reset`, kind change, mode change, `env_allow` vs `env_allowlist_only`; fork defaults, fork cwd rules, fork input copy (no-follow, regular, nlink 1); resume of a session without a captured Claude id starts fresh.
-- taint: committed at allocation; forks copy it; refusal and `--allow-tainted` (TTY or explicit human actor); audit `resume_tainted`.
+- taint: committed at allocation; forks copy it; refusal and `--allow-tainted` (human-only: an explicit `--actor` must be `human:<user>`, else a TTY); audit `resume_tainted`.
 - `pre-launch`: selectors; veto/escalate/timeout semantics; `decision_id` recording; `--override-escalation` targets only recorded escalating entries; audit `launch_escalation_override`.
 - stop: wrapper then child SIGTERM, SIGKILL child first after grace, `stop_requested_at` → `stopped`; pending run → `canceled`; CAS race with adoption; output fields.
 - forget: refuses live and pending new-session records; bulk `--older-than` with filters; audit per session; hides from prefix matching.

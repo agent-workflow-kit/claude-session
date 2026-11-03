@@ -34,8 +34,17 @@ child). In order:
 the outbox discard, the delivery (only events a delivery would deliver now: none behind a run
 whose wrapper is live) and the tmpdir removal would make (``detail``: ``dry run``).
 
-TODO(#34): forgotten sessions older than ``retention_days`` are deleted here (rows, both
-directories and the tmpdir, fd-based; the id kept in ``deleted_ids``), action ``deleted``.
+Between the delivery and the tmpdir removal, forgotten sessions past ``retention_days``
+(``Store.retention_due``) are deleted (``deleted``): the directories first (``sessions/<id>``
+and ``private/<id>``, fd-based, never following a symlink; ``sessiondir.delete_session_dirs``,
+with the lease heartbeat between entries), then the rows in one transaction that keeps the id in
+``deleted_ids`` (``Store.delete_session_rows``); the tmpdir step that follows removes the
+tmpdir and ``.stale-*`` entries of the deleted id (so retention runs before it). A directory
+that cannot be removed (a tree deeper than the depth cap, an entry of another owner) leaves
+the rows and a warning, every pass, so the next pass retries; a session with an event left
+to deliver or a run that is not final is not due (the first a warning with their count). At
+most ``DELETE_MAX`` sessions per pass, picked at random among those due so that sessions
+failing every pass cannot starve the rest; the lease is checked between them.
 TODO(#40): add ``upgrades.hook_interpreter_warning(run.hook_interpreter)`` to ``warnings``
 for every live run (on the #77 line).
 """
@@ -43,9 +52,11 @@ for every live run (on the #77 line).
 from __future__ import annotations
 
 import os
+import random
 import sqlite3
 import time
 from collections.abc import Mapping
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 from . import liveness, logs, outcomefile, secretindex, sessiondir, store, tmpdir, toolhooks
@@ -65,6 +76,10 @@ RENEW_EVERY = store.LEASE_RENEW_INTERVAL.total_seconds()
 # is left for the next pass and reported).
 DISCARD_BATCH = 100
 DISCARD_MAX = 2000
+# Forgotten sessions deleted per pass at most (the rest waits for the next pass), picked at
+# random among those due with ``_rng`` (tests seed it).
+DELETE_MAX = 100
+_rng = random.Random()
 
 
 class LeaseLost(Exception):
@@ -192,6 +207,7 @@ def _pass(
     for sid in st.sessions_with_undelivered():
         _deliver(st, cfg, sid, state_root, gateway, environ, checked, dry_run=dry_run, lease=lease)
         lease.renew()
+    _retention(st, cfg, state_root, checked, dry_run=dry_run, lease=lease)
     _tmpdirs(st, checked, dry_run=dry_run, lease=lease)
 
 
@@ -353,6 +369,63 @@ def _deliverable(st: store.Store, sid: str) -> int:
             break
         count += 1
     return count
+
+
+# Retention of forgotten sessions
+
+
+def _retention(
+    st: store.Store,
+    cfg: Config,
+    state_root: str,
+    checked: Checked,
+    *,
+    dry_run: bool,
+    lease: _Lease,
+) -> None:
+    cutoff = st.clock() - timedelta(days=cfg.retention_days)
+    held = st.retention_held(cutoff)
+    if held:
+        checked.warnings.append(
+            f"{held} forgotten session(s) past retention have events left to deliver;"
+            " their deletion waits"
+        )
+    due = st.retention_due(cutoff)
+    if len(due) > DELETE_MAX:
+        checked.warnings.append(
+            f"{len(due) - DELETE_MAX} forgotten session(s) past retention wait for the next pass"
+        )
+        # A random pick (kept oldest first): sessions that fail every pass cannot hold every
+        # slot forever and starve the others.
+        picked = sorted(_rng.sample(range(len(due)), DELETE_MAX))
+        due = [due[i] for i in picked]
+    for sid in due:
+        lease.heartbeat()
+        if lease.lost:
+            raise LeaseLost
+        if st.has_undelivered_events(sid):
+            checked.warnings.append(f"{sid}: events are left to deliver; its deletion waits")
+            continue
+        if dry_run:
+            checked.changes.append(Change(sid, None, "deleted", detail=DRY))
+            continue
+        try:
+            sessiondir.delete_session_dirs(state_root, sid, heartbeat=lease.heartbeat)
+        except (OSError, ValueError, sessiondir.SessionDirUnsafe) as exc:
+            checked.warnings.append(f"{sid}: its directories could not be deleted ({exc})")
+            continue
+        if lease.lost:
+            raise LeaseLost
+        try:
+            gone = st.delete_session_rows(sid, cutoff)
+        except sqlite3.Error as exc:
+            st.rollback_open_transaction()
+            checked.warnings.append(
+                f"{sid}: its record could not be deleted ({type(exc).__name__})"
+            )
+            continue
+        if gone:
+            checked.changes.append(Change(sid, None, "deleted"))
 
 
 # Private temporary directories
