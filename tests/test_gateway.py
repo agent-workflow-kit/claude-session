@@ -1058,3 +1058,31 @@ def test_prctl_failure_surfaces_as_oserror(
     with pytest.raises(OSError):
         gw.spawn(py(f"open({str(marker)!r}, 'w').close()"), die_with_parent=True)
     assert not marker.exists()
+
+
+@linux_only
+@pytest.mark.parametrize("kill_group", [False, True])
+def test_kill_group_on_exit_ends_descendants_left_by_a_leader_that_exited(
+    kill_group: bool,
+    gw: SystemGateway,
+    tmp_path: Path,
+    grandchildren: list[tuple[int, bytes | None]],
+) -> None:
+    """S7: a member that closed its output outlives a normal exit unless
+    ``kill_group_on_exit`` SIGKILLs the group (before the leader is reaped)."""
+    pidfile = tmp_path / "pid"
+    script = f"/bin/sleep 30 >/dev/null 2>&1 </dev/null & echo $! > {pidfile}; exit 0"
+    result = gw.run(
+        ["/bin/sh", "-c", script],
+        new_process_group=True,
+        timeout=30,
+        kill_group_on_exit=kill_group,
+    )
+    assert result.returncode == 0
+    member = _read_pid(pidfile, grandchildren)
+    assert _wait_dead(member, 5 if kill_group else 0.5) is kill_group
+
+
+def test_kill_group_on_exit_needs_a_process_group(gw: SystemGateway) -> None:
+    with pytest.raises(ValueError, match="kill_group_on_exit needs new_process_group"):
+        gw.run(["/bin/true"], kill_group_on_exit=True)
