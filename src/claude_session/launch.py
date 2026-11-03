@@ -1265,7 +1265,7 @@ class Effects:
     def record_git_dir(self, git_dirs: gitinfo.GitDirs | None) -> None:
         pass
 
-    def known_writable(self, paths: tuple[str, ...]) -> None:
+    def known_writable(self, paths: tuple[str, ...] | None) -> None:
         """The strongest session-writable set known before the profile file is read
         (isolated runs): kept for a launch-phase end (``WritableGuard``)."""
 
@@ -1374,7 +1374,7 @@ class Recording(Effects):
     def record_git_dir(self, git_dirs: gitinfo.GitDirs | None) -> None:
         self.st.update_session(self.alloc.csession_id, git_dir=gitinfo.stored_value(git_dirs))
 
-    def known_writable(self, paths: tuple[str, ...]) -> None:
+    def known_writable(self, paths: tuple[str, ...] | None) -> None:
         self.guard.paths = paths
 
     def record_writable(self, writable: pathrules.SessionWritable | None) -> None:
