@@ -64,6 +64,12 @@ INPUT_NAME = re.compile(r"[A-Za-z0-9._-]{1,128}")
 # Bytes of the payload kept for parsing. stdin is always read to its end (so Claude Code never
 # sees a broken pipe); a longer payload is refused by the events that need its fields.
 PAYLOAD_MAX_BYTES = 16 * 1024 * 1024
+# The SessionStart sources claude-session knows (interface.md, State transitions). Any other
+# string source is recorded and matched as ``other`` (notes.SOURCES), and the startup row
+# applies, so a source added by a later Claude Code release never fails the hook. Its raw
+# value is logged escaped (``ascii``) and cut to SOURCE_LOG_MAX_CHARS characters first.
+SESSION_START_SOURCES = ("startup", "resume", "fork", "clear", "compact")
+SOURCE_LOG_MAX_CHARS = 64
 PATH_MAX_CHARS = 4096
 SESSION_END_REASON_MAX_CHARS = 256
 HOOKCONF_NAME = "hookconf.json"
@@ -290,6 +296,7 @@ class Hook:
     transcript_path: str | None = None
     session_end_reason: str | None = None
     backstop_candidate: bool = False  # a Stop without background tasks
+    unknown_source: str | None = None  # the raw SessionStart source mapped to ``other``
 
 
 def classify(cause: str, data: bytes | None) -> Hook | None:
@@ -329,13 +336,14 @@ def classify(cause: str, data: bytes | None) -> Hook | None:
 
 
 def _session_start(payload: dict[str, Any]) -> Hook:
-    source = _text(payload, "source")
-    if source in ("startup", "resume", "fork"):
-        event = "session_start_new"
-    elif source in ("clear", "compact"):
-        event = "session_start_other"
-    else:
-        raise HookEventError("payload field source is not a SessionStart source")
+    raw_source = _text(payload, "source")
+    unknown = None
+    source = raw_source
+    if raw_source not in SESSION_START_SOURCES:
+        unknown, source = raw_source, "other"
+    # clear/compact keep the state; startup/resume/fork and other (it may be a new session's
+    # first SessionStart) move a starting run to its mode's activity.
+    event = "session_start_other" if source in ("clear", "compact") else "session_start_new"
     claude_id = _text(payload, "session_id")
     if CLAUDE_SESSION_ID.fullmatch(claude_id) is None:
         raise HookEventError("payload field session_id is not a Claude session id")
@@ -353,7 +361,18 @@ def _session_start(payload: dict[str, Any]) -> Hook:
         claude_session_id=claude_id,
         source=source,
         transcript_path=transcript,
+        unknown_source=unknown,
     )
+
+
+def unknown_source_message(source: str) -> str:
+    """The log message for an unknown SessionStart source: the payload's value cut to
+    ``SOURCE_LOG_MAX_CHARS`` characters, then escaped to printable ASCII (``ascii``), so the
+    message is bounded and holds no control, format or non-ASCII character."""
+    shown = ascii(source[:SOURCE_LOG_MAX_CHARS])
+    if len(source) > SOURCE_LOG_MAX_CHARS:
+        shown += " (truncated)"
+    return f"unknown SessionStart source {shown}; treated as other"
 
 
 # hookconf.json: hook-event's configuration, written by exec into the private run directory
@@ -836,7 +855,7 @@ class _Log:
         event: str,
         level: str,
         csession_id: str,
-        run_no: int,
+        run_no: int | None,
         *,
         reason: str | None = None,
         message: str | None = None,
@@ -1006,6 +1025,10 @@ def main(
             raise
     run = applied.run
     output = applied.output
+    if hook.unknown_source is not None:
+        message = unknown_source_message(hook.unknown_source)
+        run_no = None if run is None else run.run_no
+        log.write("session_start_source_unknown", "warn", csession_id, run_no, message=message)
     if drain is not None:
         drain.finish(committed=applied.drained)
         if applied.drained:

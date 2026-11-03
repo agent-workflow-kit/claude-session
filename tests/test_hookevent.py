@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from claude_session import __main__ as entry
-from claude_session import hookevent, ids, store
+from claude_session import hookevent, ids, notes, store
 from claude_session.fsutil import write_private_file
 from claude_session.hookevent import HookEventError
 from claude_session.store import Store
@@ -314,6 +314,129 @@ def test_every_session_start_source_emits_the_context_line(env: Env, source: str
     env.add(run_no=3, state="working", activity="working", started=True)
     env.write_hookconf(3, ["a.md"])
     assert context_of(start(env, source)).endswith("; run 3; inputs: inputs/3/a.md")
+
+
+# SessionStart: an unknown source is `other` (interface.md, State transitions)
+
+
+def log_records(env: Env) -> list[dict[str, Any]]:
+    path = env.root / hookevent.LOG_NAME
+    if not path.exists():
+        return []
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    return [r for r in records if r["event"] != "migration"]
+
+
+def unknown_source_message(env: Env) -> str:
+    (record,) = log_records(env)
+    assert (record["event"], record["level"]) == ("session_start_source_unknown", "warn")
+    assert record["csession_id"] == SID
+    return record["message"]
+
+
+def test_classify_maps_an_unknown_source_to_other() -> None:
+    data = json.dumps(common("SessionStart", source="reboot")).encode()
+    hook = hookevent.classify("SessionStart", data)
+    assert hook is not None
+    assert (hook.event, hook.source, hook.unknown_source) == (
+        "session_start_new",
+        "other",
+        "reboot",
+    )
+
+
+@pytest.mark.parametrize("source", sorted(hookevent.SESSION_START_SOURCES))
+def test_classify_keeps_a_known_source_and_flags_nothing(source: str) -> None:
+    data = json.dumps(common("SessionStart", source=source)).encode()
+    hook = hookevent.classify("SessionStart", data)
+    assert hook is not None
+    assert (hook.source, hook.unknown_source) == (source, None)
+
+
+def test_the_session_start_sources_are_the_notes_sources_but_other() -> None:
+    assert (*hookevent.SESSION_START_SOURCES, "other") == notes.SOURCES
+
+
+@pytest.mark.parametrize(("mode", "activity"), [("headless", "working"), ("interactive", "idle")])
+def test_an_unknown_source_applies_the_session_start_row(
+    env: Env, mode: str, activity: str
+) -> None:
+    env.add(mode=mode, inputs=["a.md"])
+    output = start(env, "reboot")
+    assert env.state() == (activity, None, activity)
+    (event,) = env.events()
+    assert (event["from_state"], event["to_state"], event["cause"]) == (
+        "starting",
+        activity,
+        "SessionStart",
+    )
+    (row,) = env.claude_ids()
+    assert (row["claude_session_id"], row["source"]) == (CLAUDE_ID, "other")
+    assert env.session()["claude_session_id"] == CLAUDE_ID
+    assert env.run()["session_started_at"] == row["seen_at"]
+    assert context_of(output) == (
+        f"claude-session directory: {env.csession_dir}; run 1; inputs: inputs/1/a.md"
+    )
+    assert unknown_source_message(env) == "unknown SessionStart source 'reboot'; treated as other"
+    (record,) = log_records(env)
+    assert record["run"] == 1
+
+
+def test_an_unknown_source_in_a_later_state_changes_nothing(env: Env) -> None:
+    env.add(state="idle", activity="idle", started=True, mode="interactive")
+    start(env, "reboot", session_id=OTHER_CLAUDE_ID)
+    assert env.state() == ("idle", None, "idle")
+    assert env.events() == []
+    assert env.session()["claude_session_id"] == OTHER_CLAUDE_ID
+    assert env.claude_ids()[0]["source"] == "other"
+
+
+def test_a_literal_other_source_is_unknown_too(env: Env) -> None:
+    env.add()
+    start(env, "other")
+    assert env.claude_ids()[0]["source"] == "other"
+    assert unknown_source_message(env) == "unknown SessionStart source 'other'; treated as other"
+
+
+def test_an_unknown_source_for_an_ignored_run_is_logged_without_a_run(env: Env) -> None:
+    env.add(ended=True)
+    assert start(env, "reboot") == ""
+    assert env.claude_ids() == []
+    (record,) = log_records(env)
+    assert record["event"] == "session_start_source_unknown"
+    assert "run" not in record
+
+
+@pytest.mark.parametrize(
+    ("source", "shown"),
+    [
+        ("", "''"),
+        ("a\x1b[31mb\nc\x00d\x7fe\x85", r"'a\x1b[31mb\nc\x00d\x7fe\x85'"),
+        ("\u202eevil\u200b", r"'\u202eevil\u200b'"),
+        ("\ud800", r"'\ud800'"),
+        ("\xfc\U0001f600", r"'\xfc\U0001f600'"),
+        ("x" * hookevent.SOURCE_LOG_MAX_CHARS, repr("x" * hookevent.SOURCE_LOG_MAX_CHARS)),
+        (
+            "x" * (hookevent.SOURCE_LOG_MAX_CHARS + 1),
+            repr("x" * hookevent.SOURCE_LOG_MAX_CHARS) + " (truncated)",
+        ),
+        (
+            "\U0001f600" * 1_000_000,
+            ascii("\U0001f600" * hookevent.SOURCE_LOG_MAX_CHARS) + " (truncated)",
+        ),
+    ],
+)
+def test_a_hostile_source_is_other_and_logged_escaped_and_capped(
+    env: Env, source: str, shown: str
+) -> None:
+    env.add()
+    start(env, source)
+    assert env.state() == ("working", None, "working")
+    assert env.claude_ids()[0]["source"] == "other"
+    message = unknown_source_message(env)
+    assert message == f"unknown SessionStart source {shown}; treated as other"
+    assert message.isascii() and message.isprintable()
+    assert len(message) <= 10 * hookevent.SOURCE_LOG_MAX_CHARS + 64
 
 
 def test_session_start_with_a_missing_hookconf_is_an_error_after_the_state_is_stored(
@@ -726,7 +849,17 @@ BAD_PAYLOADS: list[tuple[str, bytes]] = [
     ("SessionStart", b"[" * 100_000),
     ("SessionStart", json.dumps({"session_id": CLAUDE_ID}).encode()),
     ("SessionStart", json.dumps({"source": "startup"}).encode()),
-    ("SessionStart", json.dumps({"source": "reboot", "session_id": CLAUDE_ID}).encode()),
+    ("SessionStart", json.dumps({"source": 7, "session_id": CLAUDE_ID}).encode()),
+    ("SessionStart", json.dumps({"source": None, "session_id": CLAUDE_ID}).encode()),
+    ("SessionStart", json.dumps({"source": ["startup"], "session_id": CLAUDE_ID}).encode()),
+    ("SessionStart", json.dumps({"source": {"a": "b"}, "session_id": CLAUDE_ID}).encode()),
+    ("SessionStart", json.dumps({"source": "reboot", "session_id": "--help"}).encode()),
+    (
+        "SessionStart",
+        json.dumps(
+            {"source": "reboot", "session_id": CLAUDE_ID, "transcript_path": "rel/x"}
+        ).encode(),
+    ),
     ("SessionStart", json.dumps({"source": "startup", "session_id": "--help"}).encode()),
     ("SessionStart", json.dumps({"source": "startup", "session_id": CLAUDE_ID.upper()}).encode()),
     ("SessionStart", json.dumps({"source": "startup", "session_id": "ü" * 36}).encode()),
