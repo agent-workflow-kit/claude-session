@@ -1255,6 +1255,8 @@ def test_the_launch_spec_freezes_the_notes_context_config(env: Env) -> None:
         ("notes_context_timeout", -1),
         ("notes_context_timeout", "5s"),
         ("notes_context_timeout", True),
+        ("notes_context_timeout", 36500 * 86400.0 + 1),  # just over durations.MAX_SECONDS
+        ("notes_context_timeout", 1e308),
         ("notes_context_max_bytes", -1),
         ("notes_context_max_bytes", 1.5),
         ("notes_context_max_bytes", True),

@@ -18,11 +18,11 @@ fully resolved kind profile with its origins (``env.set`` values included, which
 ``resolved_json`` leaves out), the resolved cwd and plugin directories, the permission
 profile (content, or a file profile's snapshot), the config values a session uses beyond
 those the adopting ``exec`` reads from the config again (``claude_auth_env``,
-``secret_env`` and the caps), the resolved ``read_dirs``, ``write_dirs`` and profile write
-paths, and the per-invocation flags. It is private (never in the session directory) and
-0600, and it may hold credentials (``env.set`` values): it is deleted once the adopting
-``exec`` has read it, when ``start`` fails after writing it, and when the run expires
-unadopted (``discard_spec``).
+``secret_env``, the caps and the four ``notes_context_*`` settings), the resolved
+``read_dirs``, ``write_dirs`` and profile write paths, and the per-invocation flags. It is
+private (never in the session directory) and 0600, and it may hold credentials (``env.set``
+values): it is deleted once the adopting ``exec`` has read it, when ``start`` fails after
+writing it, and when the run expires unadopted (``discard_spec``).
 
 The adopting ``exec`` (``adopt``) runs the compare-and-set (``Store.adopt``; refusals exit 20
 ``already_adopted`` or ``expired``, an expired pending run is finalized ``never_adopted``
@@ -70,6 +70,7 @@ from typing import Any
 from . import (
     config,
     dryrun,
+    durations,
     gitinfo,
     ids,
     kinds,
@@ -853,19 +854,16 @@ def _invocation(record: Mapping[str, Any]) -> dict[str, Any]:
 
 def _notes_values_ok(values: Mapping[str, Any]) -> bool:
     """The frozen ``notes_context_*`` values, checked as the config checks them: a non-empty
-    argv of strings without control characters, a finite positive timeout, a size cap that is
-    a count and sources the notes code knows."""
+    argv of strings without control characters, a positive timeout of at most
+    ``durations.MAX_SECONDS``, a size cap that is a count and sources the notes code knows."""
     cmd, timeout = values["notes_context_cmd"], values["notes_context_timeout"]
     cap, sources = values["notes_context_max_bytes"], values["notes_context_sources"]
     return (
         isinstance(cmd, list)
         and bool(cmd)
-        and all(
-            isinstance(item, str) and not any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in item)
-            for item in cmd
-        )
+        and all(isinstance(item, str) and not config.has_controls(item) for item in cmd)
         and type(timeout) in (int, float)
-        and 0 < timeout < float("inf")
+        and 0 < timeout <= durations.MAX_SECONDS
         and type(cap) is int
         and 0 <= cap <= MAX_INTEGER
         and isinstance(sources, list)

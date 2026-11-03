@@ -165,7 +165,6 @@ def test_the_block_follows_the_context_line(env: Env) -> None:
     assert call.cwd == str(env.root)  # the state root
     assert call.env == {"PATH": "/usr/bin:/bin", "HOME": "/home/u"}
     assert (call.timeout, call.output_limit, call.new_process_group) == (5.0, 16385, True)
-    assert call.kill_over_bytes is None
     assert log_records(env) == []
 
 

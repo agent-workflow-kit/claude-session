@@ -363,7 +363,7 @@ def test_run_passes_argv_env_cwd_and_bounds_to_the_gateway(tmp_path: Path) -> No
     assert call.timeout == 5.0
     assert call.new_process_group is True
     assert call.kill_grace is None  # SIGKILL to the group, no grace
-    assert (call.output_limit, call.kill_over_bytes) == (16385, None)  # one past the cap
+    assert call.output_limit == 16385  # one past the cap
     assert call.stdin is None
 
 
@@ -428,7 +428,7 @@ def test_the_gateway_reads_one_byte_past_the_cap_and_never_kills_for_size(
     gw.on(["memoctl"], stdout="x\n")
     notes.run(gw, conf(max_bytes=10), cwd=str(tmp_path))
     (call,) = gw.calls
-    assert call.output_limit == 11 and call.kill_over_bytes is None
+    assert call.output_limit == 11
 
 
 def test_output_one_byte_under_the_cap_is_shown_whole(tmp_path: Path) -> None:
@@ -458,6 +458,52 @@ def test_a_multibyte_character_across_the_cap_is_dropped_whole(tmp_path: Path, c
 def test_a_four_byte_character_across_the_cap_is_dropped_whole(tmp_path: Path) -> None:
     body = body_of(run_block(tmp_path, "ab" + "\U0001f600" * 3, 4))
     assert body == "ab\n[truncated]\n"
+
+
+def raw_block(tmp_path: Path, raw: bytes, max_bytes: int) -> str | None:
+    gw = FakeGateway()
+    gw.on(["memoctl"], raw_stdout=raw)
+    return notes.run(gw, conf(max_bytes=max_bytes), cwd=str(tmp_path))
+
+
+def test_crlf_output_over_the_cap_is_marked(tmp_path: Path) -> None:
+    """The cap counts the raw bytes, not the text after ``\\r\\n`` became ``\\n``."""
+    assert body_of(raw_block(tmp_path, b"a\r\n" * 6, 10)) == "a\na\na\na\n[truncated]\n"
+
+
+def test_a_carriage_return_right_before_the_cap_is_a_newline(tmp_path: Path) -> None:
+    body = body_of(raw_block(tmp_path, b"abcdefghi\r\nxyz", 10))
+    assert body == "abcdefghi\n[truncated]\n"
+
+
+@pytest.mark.parametrize("raw", [b"abc\xe9defghi", b"ab\xe9", b"\xff" * 10])
+def test_invalid_bytes_within_the_cap_are_shown_whole_without_a_marker(
+    tmp_path: Path, raw: bytes
+) -> None:
+    """Each invalid byte shows as U+FFFD (3 bytes): output within the cap is never cut for
+    that growth."""
+    expected = raw.decode("utf-8", "replace") + "\n"
+    assert body_of(raw_block(tmp_path, raw, 10)) == expected
+
+
+def test_an_invalid_byte_inside_the_cut_keeps_the_bytes_after_it(tmp_path: Path) -> None:
+    body = body_of(raw_block(tmp_path, b"a\xffb" + b"c" * 20, 5))
+    assert body == "a\ufffdbcc\n[truncated]\n"
+
+
+def test_a_byte_past_the_cap_is_never_shown(tmp_path: Path) -> None:
+    assert body_of(raw_block(tmp_path, b"x" * 10 + b"\xff", 10)) == "x" * 10 + "\n[truncated]\n"
+
+
+@pytest.mark.parametrize("cap", [3, 4, 5, 6, 7])
+def test_raw_multibyte_across_the_cap_is_dropped_whole(tmp_path: Path, cap: int) -> None:
+    body = body_of(raw_block(tmp_path, "\u2603".encode() * 5, cap))
+    assert body == "\u2603" * (cap // 3) + "\n[truncated]\n"
+
+
+def test_a_cap_of_zero_gives_no_block(tmp_path: Path) -> None:
+    assert run_block(tmp_path, "x", 0) is None
+    assert run_block(tmp_path, "notes\n" * 10, 0) is None
 
 
 def test_a_character_ending_exactly_at_the_cap_is_kept(tmp_path: Path) -> None:
@@ -531,6 +577,23 @@ def test_a_real_command_over_the_cap_is_truncated(tmp_path: Path) -> None:
     assert (
         body_of(notes.run(SystemGateway(), c, cwd=str(tmp_path))) == "a" * 100 + "\n[truncated]\n"
     )
+
+
+def test_a_real_crlf_command_over_the_cap_is_marked(tmp_path: Path) -> None:
+    script = tmp_path / "crlf.sh"
+    script.write_text("#!/bin/sh\nprintf 'a\\r\\na\\r\\na\\r\\na\\r\\na\\r\\na\\r\\n'\n")
+    script.chmod(0o755)
+    c = conf(argv=("crlf.sh",), executable=str(script), max_bytes=10)
+    body = body_of(notes.run(SystemGateway(), c, cwd=str(tmp_path)))
+    assert body == "a\na\na\na\n[truncated]\n"
+
+
+def test_a_real_invalid_byte_at_the_cap_is_not_marked(tmp_path: Path) -> None:
+    script = tmp_path / "bad.sh"
+    script.write_text("#!/bin/sh\nprintf 'abc\\351defghi'\n")
+    script.chmod(0o755)
+    c = conf(argv=("bad.sh",), executable=str(script), max_bytes=10)
+    assert body_of(notes.run(SystemGateway(), c, cwd=str(tmp_path))) == "abc\ufffddefghi\n"
 
 
 def test_a_real_command_sees_only_the_given_env_and_cwd(tmp_path: Path) -> None:

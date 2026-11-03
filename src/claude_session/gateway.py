@@ -159,17 +159,6 @@ class Result:
     stderr_bytes: bytes
 
 
-class GatewayOutputLimit(Exception):
-    """``run``'s child wrote more than ``kill_over_bytes`` bytes to stdout. The child was ended as
-    on a timeout (see ``GatewayTimeout``) before this is raised, so an endless writer never
-    fills this process's memory."""
-
-    def __init__(self, argv: Sequence[str], limit: int) -> None:
-        super().__init__(f"{argv[0]} wrote more than {limit} bytes")
-        self.argv = tuple(argv)
-        self.limit = limit
-
-
 class GatewayTimeout(Exception):
     """``run`` exceeded its timeout. Before this is raised:
 
@@ -245,7 +234,6 @@ class Gateway(Protocol):
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
-        kill_over_bytes: int | None = None,
         kill_group_on_exit: bool = False,
         output_limit: int | None = None,
         discard_output: bool = False,
@@ -268,14 +256,12 @@ class Gateway(Protocol):
         signaled (best effort). An exception while waiting (a signal handler raising,
         ``KeyboardInterrupt`` included) ends the child the same way, then propagates (on
         Linux; best effort without ``os.waitid``, see ``GatewayTimeout``); one raised during
-        the grace still gets the group SIGKILL and the leader reaped first. ``kill_over_bytes``
-        bounds what is kept: more stdout than that ends the child the same way and raises
-        ``GatewayOutputLimit``; stderr past it is dropped. ``discard_output`` sends stdout and
-        stderr to ``/dev/null`` (the result has empty output) and only the child's own exit is
-        waited for; ``on_started`` and ``canceled``: see the module docs. ``on_spawn`` is called
-        with the child's PID once it exists, before its stdin is written (with
-        ``new_process_group``, the PID is its process group ID); an exception it raises ends the
-        child like any other. Raises
+        the grace still gets the group SIGKILL and the leader reaped first.
+        ``discard_output`` sends stdout and stderr to ``/dev/null`` (the result has empty
+        output) and only the child's own exit is waited for; ``on_started`` and ``canceled``:
+        see the module docs. ``on_spawn`` is called with the child's PID once it exists, before
+        its stdin is written (with ``new_process_group``, the PID is its process group ID); an
+        exception it raises ends the child like any other. Raises
         ``GatewayTimeout``, ``GatewayCanceled``, and ``OSError`` when the program cannot be
         started."""
         ...
@@ -390,12 +376,6 @@ def check_output_limit(output_limit: int | None) -> None:
         raise TypeError("output_limit must be an int")
     if output_limit < 0:
         raise ValueError(f"output_limit must not be negative, got {output_limit}")
-
-
-def check_kill_over_bytes(kill_over_bytes: int | None) -> None:
-    """``run``'s ``kill_over_bytes`` contract, shared with the fakes."""
-    if kill_over_bytes is not None and kill_over_bytes < 0:
-        raise ValueError(f"kill_over_bytes must not be negative, got {kill_over_bytes}")
 
 
 def _child_env(
@@ -831,10 +811,6 @@ def _drain(fds: Iterable[int], output: dict[int, list[bytes]], output_limit: int
             _keep(output[fd], chunk, output_limit)
 
 
-class _OutputLimit(Exception):
-    """stdout passed ``kill_over_bytes`` (``_exchange``)."""
-
-
 def _exchange(
     popen: subprocess.Popen[bytes],
     data: bytes | None,
@@ -842,7 +818,6 @@ def _exchange(
     output_limit: int | None = None,
     *,
     kill_group: bool = False,
-    kill_over_bytes: int | None = None,
     on_started: Callable[[], None] | None = None,
     canceled: Callable[[], bool] | None = None,
 ) -> tuple[bytes, bytes]:
@@ -850,18 +825,16 @@ def _exchange(
     are pipes) to EOF, wait for the exit; ``subprocess.TimeoutExpired`` after ``timeout``
     seconds, ``GatewayCanceled`` once ``canceled()``. Unlike it, the child is never reaped
     before it has exited, even when interrupted (see the module docs). With ``output_limit``,
-    at most that many bytes of each stream are kept. With ``kill_over_bytes``: ``_OutputLimit``
-    as soon as stdout passes it, and stderr past it is dropped as it arrives. With
-    ``kill_group`` (Linux), reading also ends once the leader has exited: its group is then
-    SIGKILLed and only what is already buffered is read (``_drain``). ``on_started`` is called
-    once stdin is written and closed (at once without stdin). The
-    ``subprocess.TimeoutExpired`` carries the output read so far (``output``, ``stderr``)."""
+    at most that many bytes of each stream are kept. With ``kill_group`` (Linux), reading also
+    ends once the leader has exited: its group is then SIGKILLed and only what is already
+    buffered is read (``_drain``). ``on_started`` is called once stdin is written and closed
+    (at once without stdin). The ``subprocess.TimeoutExpired`` carries the output read so far
+    (``output``, ``stderr``)."""
     deadline = None if timeout is None else time.monotonic() + timeout
     fds = [None if f is None else f.fileno() for f in (popen.stdout, popen.stderr)]
     out_fd, err_fd = fds
     readers = {f.fileno(): f for f in (popen.stdout, popen.stderr) if f is not None}
     output: dict[int, list[bytes]] = {fd: [] for fd in readers}
-    kept = {fd: 0 for fd in readers}
     pending = memoryview(data or b"")
     started = False
 
@@ -904,11 +877,6 @@ def _exchange(
                         continue
                     chunk = os.read(key.fd, _READ_SIZE)
                     if chunk:
-                        if kill_over_bytes is not None:
-                            if key.fd == out_fd and kept[key.fd] + len(chunk) > kill_over_bytes:
-                                raise _OutputLimit
-                            chunk = chunk[: max(0, kill_over_bytes - kept[key.fd])]
-                            kept[key.fd] += len(chunk)
                         _keep(output[key.fd], chunk, output_limit)
                         continue
                     selector.unregister(key.fd)
@@ -937,9 +905,14 @@ def _exchange(
     )
 
 
+def translate_newlines(text: str) -> str:
+    """``\\r\\n`` and a lone ``\\r`` as ``\\n``, as text mode reads them."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _text(data: bytes) -> str:
     """Decode as text mode would: invalid UTF-8 replaced, newlines translated to ``\\n``."""
-    return data.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+    return translate_newlines(data.decode("utf-8", "replace"))
 
 
 def _kill_and_reap(popen: subprocess.Popen[bytes]) -> None:
@@ -1066,7 +1039,6 @@ class SystemGateway:
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
-        kill_over_bytes: int | None = None,
         kill_group_on_exit: bool = False,
         output_limit: int | None = None,
         discard_output: bool = False,
@@ -1079,7 +1051,6 @@ class SystemGateway:
             kill_grace, new_process_group=new_process_group, kill_group_on_exit=kill_group_on_exit
         )
         check_output_limit(output_limit)
-        check_kill_over_bytes(kill_over_bytes)
         args = tuple(argv)
         data = None if stdin is None else stdin.encode("utf-8", "replace")
 
@@ -1118,17 +1089,12 @@ class SystemGateway:
                         timeout,
                         output_limit,
                         kill_group=kill_group_on_exit,
-                        kill_over_bytes=kill_over_bytes,
                         on_started=on_started,
                         canceled=canceled,
                     )
                 except subprocess.TimeoutExpired as exc:
                     _end(popen, group=new_process_group, kill_grace=kill_grace)
                     raise GatewayTimeout(args, timeout, stderr=exc.stderr or b"") from None
-                except _OutputLimit:
-                    assert kill_over_bytes is not None  # raised only with a limit
-                    _end(popen, group=new_process_group, kill_grace=kill_grace)
-                    raise GatewayOutputLimit(args, kill_over_bytes) from None
                 except BaseException:
                     _end(popen, group=new_process_group, kill_grace=kill_grace)
                     raise

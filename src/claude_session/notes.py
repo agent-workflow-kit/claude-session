@@ -33,6 +33,7 @@ or from any agent-writable file.
 
 from __future__ import annotations
 
+import codecs
 import math
 import os
 import re
@@ -284,9 +285,9 @@ def fence(
 
 def run(gw: Gateway, conf: NotesConf, *, cwd: str, max_chars: int | None = None) -> str | None:
     """Run the notes command and fence its output (``fence``, with ``max_chars``); None when
-    it has nothing to show. Output over ``conf.max_bytes`` is truncated, not refused. Raises
-    ``NotesFailure``."""
-    from .gateway import GatewayTimeout  # lazy: only when notes run
+    it has nothing to show. Output over ``conf.max_bytes`` raw bytes is truncated, not
+    refused. Raises ``NotesFailure``."""
+    from .gateway import GatewayTimeout, translate_newlines  # lazy: only when notes run
 
     try:
         result = gw.run(
@@ -306,11 +307,15 @@ def run(gw: Gateway, conf: NotesConf, *, cwd: str, max_chars: int | None = None)
         return None
     if result.returncode != 0:
         raise NotesFailure(f"exit {result.returncode}")
-    output, over = result.stdout, False
-    data = output.encode("utf-8")
-    if len(data) > conf.max_bytes:
-        # More than the cap was written (the gateway kept one byte past it). Cut to the cap
-        # on a character boundary: a character split by the cut, or by the gateway's own cut
-        # (decoded as U+FFFD), is dropped, never shown half.
-        output, over = data[: conf.max_bytes].decode("utf-8", "ignore"), True
-    return fence(output, max_bytes=conf.max_bytes, nonce=new_nonce(), max_chars=max_chars, cut=over)
+    # The cap counts the raw bytes (the gateway kept one past it), never the decoded text,
+    # where newline translation shrinks it and replacement characters grow it.
+    over = len(result.stdout_bytes) > conf.max_bytes
+    output = result.stdout
+    if over:
+        # Cut to the cap on a character boundary: an incomplete sequence the cut leaves at the
+        # end is dropped whole, never shown half (invalid bytes before it show as U+FFFD).
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        output = translate_newlines(decoder.decode(result.stdout_bytes[: conf.max_bytes]))
+    # Replacement characters do not count against the cap: only what sanitizing adds does.
+    limit = max(conf.max_bytes, len(output.encode("utf-8")))
+    return fence(output, max_bytes=limit, nonce=new_nonce(), max_chars=max_chars, cut=over)
