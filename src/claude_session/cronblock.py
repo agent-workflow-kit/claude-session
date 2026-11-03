@@ -252,6 +252,8 @@ class Crontab:
                 f"crontab -l failed (exit {result.returncode})", detail=_clean(result.stderr)
             )
         raw = result.stdout_bytes
+        if not isinstance(raw, bytes):  # never read as empty: that would overwrite it
+            raise FailedError("crontab -l output was not captured")
         try:
             # Strict, and without newline translation: carriage returns stay as they are.
             return raw.decode("utf-8")

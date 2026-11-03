@@ -329,3 +329,52 @@ def test_grace_bounds_match_the_schema() -> None:
     grace = schema["properties"]["inputs"]["oneOf"][0]["properties"]["grace"]
     assert grace["minimum"] == audit.GRACE_MIN
     assert grace["maximum"] == audit.GRACE_MAX
+
+
+# Record size (interface.md, Audit and log): a record longer than MAX_RECORD_BYTES cannot be
+# written, like any unwritable record, so the audited action is not taken.
+
+
+def line_length(path: Path, **kwargs: Any) -> int:
+    """The bytes (newline included) of the line ``write(path, **kwargs)`` appends."""
+    probe = path.with_name("probe.jsonl")
+    write(probe, **kwargs)
+    size = probe.stat().st_size
+    probe.unlink()
+    return size
+
+
+def test_max_record_bytes_is_4_mib() -> None:
+    assert audit.MAX_RECORD_BYTES == 4 * 1024 * 1024
+
+
+def test_a_record_exactly_at_the_limit_is_written(audit_path: Path) -> None:
+    now = datetime(2026, 10, 30, tzinfo=UTC)
+    base = line_length(audit_path, actor="human:", now=now)
+    actor = "human:" + "a" * (audit.MAX_RECORD_BYTES - base)
+    write(audit_path, actor=actor, now=now)
+    assert audit_path.stat().st_size == audit.MAX_RECORD_BYTES
+    [record] = records(audit_path)
+    assert record["actor"] == actor
+
+
+def test_a_record_one_byte_over_the_limit_is_refused_unwritten(audit_path: Path) -> None:
+    now = datetime(2026, 10, 30, tzinfo=UTC)
+    write(audit_path, target="cs-aaaa2222")
+    before = audit_path.read_bytes()
+    base = line_length(audit_path, actor="human:", now=now)
+    actor = "human:" + "a" * (audit.MAX_RECORD_BYTES - base + 1)
+    with pytest.raises(ValueError) as excinfo:
+        write(audit_path, actor=actor, now=now)
+    assert "a" * 10 not in str(excinfo.value)
+    assert audit_path.read_bytes() == before
+
+
+def test_escaping_counts_toward_the_limit(audit_path: Path) -> None:
+    """JSON escapes expand a control character to six bytes: an argv well under the limit
+    can still make a record over it."""
+    ids = ["\x01" * (128 * 1024 - 1)] * 6
+    assert sum(len(i) for i in ids) < audit.MAX_RECORD_BYTES / 4
+    with pytest.raises(ValueError):
+        write(audit_path, decision_ids=ids)
+    assert not audit_path.exists()

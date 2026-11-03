@@ -11,7 +11,7 @@ The 1.0 criteria are in [plan.md, Version roadmap](plan.md#version-roadmap) and 
 
 | Criterion | State | Evidence or what is left |
 |---|---|---|
-| Every command, flag, state, outcome, error code, exit code and schema in [interface.md](interface.md) is implemented and golden-tested | Partly automated | `tests/test_interface_audit.py` checks interface.md two ways against the implementation: commands and each command's flags against the parser, states and end reasons against the code, error codes against the schema and the error classes. Every output schema of an implemented command has at least one schema-validated golden (`tests/test_golden_commands.py`, `tests/test_golden_launch.py`). Not every outcome has a golden: outcomes other than those in the existing goldens (for example each end reason and state of `status`, `wait` and `report`) are covered by behavior tests only, and per-outcome goldens remain 1.0 work. Commands still on open pull requests are listed in `AWAITING` in the audit test and fail it as soon as they merge until they have goldens (see "Left for the 1.0 commit") |
+| Every command, flag, state, outcome, error code, exit code and schema in [interface.md](interface.md) is implemented and golden-tested | Partly automated | `tests/test_interface_audit.py` checks interface.md two ways against the implementation: commands and each command's flags against the parser, states and end reasons against the code, error codes against the schema and the error classes. Every output schema of an implemented command has at least one schema-validated golden (`tests/test_golden_commands.py`, `tests/test_golden_launch.py`). Not every outcome has a golden: outcomes other than those in the existing goldens (for example each end reason and state of `status`, `wait` and `report`) are covered by behavior tests only, and per-outcome goldens remain 1.0 work. `AWAITING` in the audit test is empty: every command of interface.md is implemented |
 | `make verify` passes; golden `--json` outputs validate against `schemas/` | Passes | `assert_golden` validates every golden output against its schema before comparing |
 | `make live` passes on Linux and WSL2 against the current Claude Code | Human step | Billed; see [live-tests.md](live-tests.md). Never run by an agent or in CI |
 | The macOS checklist has been run once | Human step | [macos-checklist.md](macos-checklist.md); its status line says "not run on macOS" until then |
@@ -67,14 +67,9 @@ Known limits at 1.0 are listed in [Residual risks](interface.md#residual-risks).
 
 In this order:
 
-1. Merge every open pull request of the stack (the maintainer does this, one by one, checking
-   CI after each). After the last one, `tests/test_interface_audit.py` is the guide:
-   - it fails while `AWAITING` names a command whose handler is real: empty `AWAITING`,
-     add a golden file for each new schema (`UPDATE_GOLDEN=1`, review the diff);
-   - it fails while the README table still marks a merged command as coming: update the
-     table and the "Also coming in the same release" paragraph, and the "Status" section's
-     "marked coming" wording; in the README also drop the `memoctl` and `claude` version
-     notes once notes context (#38) and the version check (#40) are in.
+1. Every pull request of the stack (#46 to this one, #93) is merged, and `AWAITING` in
+   `tests/test_interface_audit.py` is empty with a golden for every output schema. Nothing is
+   left to merge for this step.
 2. Resolve the open questions on issue #45, including the per-outcome goldens (see
    "Criteria"), and re-run `make verify`.
 3. Run `make live` on Linux and on WSL2 (billed), and the macOS checklist once; record the

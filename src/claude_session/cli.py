@@ -22,7 +22,14 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 from . import durations, fsutil, ids, outbox, outcomefile, store
 from .defaults import MAX_INTEGER
-from .errors import CliError, InternalError, OutcomeFileRejected, RefusedError, UsageError
+from .errors import (
+    CliError,
+    InternalError,
+    NotFoundError,
+    OutcomeFileRejected,
+    RefusedError,
+    UsageError,
+)
 from .terminal import display
 
 if TYPE_CHECKING:
@@ -86,6 +93,13 @@ SESSION_ID_ARGS: dict[str, str | None] = {
     "forked_from": "--forked-from",
 }
 KIND_ARGS = ("kind", "launch_kind", "run_kind")
+# interface.md, Exit codes: a verify-secret mismatch (any reason).
+VERIFY_SECRET_MISMATCH = 11
+# Every verify-secret usage error: the arguments are never named (one may be a secret).
+VERIFY_SECRET_USAGE = (
+    "unexpected arguments (verify-secret takes only <full id> and --json; "
+    "the secret is read from stdin)"
+)
 # argparse takes a token like this as an option value, not as an option.
 NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
 
@@ -95,10 +109,13 @@ class _Parser(argparse.ArgumentParser):
 
     # Leaf command name -> its parser (set on the top-level parser only).
     leaves: dict[str, _Parser]
+    # When set, replaces every usage error message: for a command whose argv must never be
+    # echoed (verify-secret: a secret given there by mistake).
+    fixed_error: str | None = None
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
-        raise UsageError(message)
+        raise UsageError(self.fixed_error or message)
 
 
 class _VersionAction(argparse.Action):
@@ -175,6 +192,79 @@ def _list(args: argparse.Namespace) -> int:
         print(json.dumps({"sessions": items}, allow_nan=False))
     else:
         print("\n".join(views.list_lines(items)))
+    return 0
+
+
+def _label(args: argparse.Namespace) -> int:
+    """``label add`` / ``label remove`` (interface.md, label add / label remove)."""
+    add = args.handler == "label add"
+    pairs = [ids.parse_label(text) for text in args.pairs]  # checked by the flag rules
+    with store.open_state() as st:
+        sid = ids.lookup_session_id(args.id, st.session_id_candidates)
+        change = st.change_labels(sid, pairs, add=add, dry_run=args.dry_run)
+    if change is None:  # forgotten (or deleted) since the id was resolved
+        raise NotFoundError(f"unknown session: {args.id}")
+    obj = {
+        "csession_id": sid,
+        "labels": [f"{key}={value}" for key, value in change.labels],
+        "added": [f"{key}={value}" for key, value in change.added],
+        "removed": [f"{key}={value}" for key, value in change.removed],
+        "dry_run": bool(args.dry_run),
+    }
+    if args.json:
+        print(json.dumps(obj))
+        return 0
+    action, done_key = ("add", "added") if add else ("remove", "removed")
+    changed = obj[done_key]
+    done = f"{done_key} {', '.join(changed)}" if changed else f"nothing to {action}"
+    prefix = "dry run: " if args.dry_run else ""
+    print(display(f"{sid}: {prefix}{done}"))
+    print(display(f"labels: {', '.join(obj['labels']) or '(none)'}"))
+    return 0
+
+
+def _verify_secret(args: argparse.Namespace) -> int:
+    """``verify-secret <full id>`` (interface.md, Internal commands): exit 0 on a match, 11
+    otherwise. The secret is read from stdin before the lookup, whatever the id; a terminal
+    on stdin is refused unread (the secret would be echoed), whatever the id."""
+    from . import secretcheck
+
+    if _is_terminal(sys.stdin.buffer):
+        raise UsageError("verify-secret reads the secret from a pipe; stdin is a terminal")
+    presented = secretcheck.read_secret(sys.stdin.buffer)
+    with store.open_state() as st:
+        match = secretcheck.matches(st, args.id, presented)
+    if args.json:
+        print(json.dumps({"match": match}))
+    return 0 if match else VERIFY_SECRET_MISMATCH
+
+
+def _is_terminal(stream: Any) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (OSError, ValueError):
+        return False
+
+
+def _export(args: argparse.Namespace) -> int:
+    """``export`` (interface.md, export): audit records, oldest first, filtered."""
+    from . import exporter
+
+    path = os.path.join(store.state_dir(), exporter.AUDIT_NAME)
+    since = None if args.since is None else since_threshold(args.since)
+    read = exporter.read_records(path, since=since, actions=frozenset(args.action or ()))
+    records = read.records
+    if read.skipped and not args.quiet:
+        lines = "line" if read.skipped == 1 else "lines"
+        print(
+            f"{PROG}: warning: skipped {read.skipped} unreadable {lines} in {exporter.AUDIT_NAME}",
+            file=sys.stderr,
+        )
+    if args.json:
+        print(json.dumps([exporter.json_record(r) for r in records], allow_nan=False))
+    else:
+        for record in records:
+            print(exporter.encodable(exporter.record_line(record), sys.stdout.encoding))
     return 0
 
 
@@ -784,6 +874,44 @@ def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
         print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
 
 
+def _transcript(args: argparse.Namespace) -> int:
+    """``transcript <id>`` (interface.md, transcript): rendered text by default, ``--raw``
+    bytes, ``--paths`` or ``--json`` file lists. state.db is closed before any file is read."""
+    from . import transcripts
+
+    with store.open_state() as state:
+        sid = ids.lookup_session_id(args.id, state.session_id_candidates)
+        record = state.status_record(sid)
+    if record is None or record.session.get("forgotten_at") is not None:
+        raise NotFoundError(f"unknown session: {args.id}")
+    if args.run is not None and not 1 <= args.run <= record.runs:
+        raise NotFoundError(f"session {sid} has no run {args.run}")
+    reader = transcripts.Reader()
+    warnings: list[str] = []
+    roots = transcripts.projects_roots(os.environ, warnings)
+    listing = transcripts.discover(sid, record.claude_ids, roots, reader, run_no=args.run)
+    warnings += listing.warnings
+    if args.json:
+        print(json.dumps(listing.as_json(), allow_nan=False))
+    elif args.paths:
+        warnings += transcripts.missing_warnings(listing, subagents=True)
+        for line in transcripts.path_lines(listing):
+            print(line)
+    elif args.raw:
+        warnings += transcripts.missing_warnings(listing, subagents=args.subagents)
+        sys.stdout.flush()
+        transcripts.write_raw(listing, reader, sys.stdout.buffer, subagents=args.subagents)
+        sys.stdout.buffer.flush()
+    else:
+        renderer = transcripts.Renderer(reader, subagents=args.subagents)
+        for line in renderer.lines(listing):
+            print(line)
+        warnings += renderer.warnings
+    for warning in warnings:
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
+    return 0
+
+
 # Command name (as typed, nested commands joined by a space) -> handler.
 HANDLERS: dict[str, Handler] = {
     "exec": _exec,
@@ -795,15 +923,15 @@ HANDLERS: dict[str, Handler] = {
     "status": _status,
     "list": _list,
     "kinds": _kinds,
-    "label add": _not_implemented,
-    "label remove": _not_implemented,
-    "transcript": _not_implemented,
+    "label add": _label,
+    "label remove": _label,
+    "transcript": _transcript,
     "forget": _forget,
     "reconcile": _reconcile,
-    "export": _not_implemented,
+    "export": _export,
     "cron install": _cron_install,
     "cron uninstall": _cron_uninstall,
-    "verify-secret": _not_implemented,
+    "verify-secret": _verify_secret,
 }
 
 
@@ -829,11 +957,16 @@ def _command(
     handler: str,
     help_text: str | None,
 ) -> _Parser:
-    """Add a leaf command; ``help_text=None`` keeps it out of ``--help`` (internal commands)."""
-    kwargs: dict[str, Any] = {"parents": [_global_flags()], "allow_abbrev": False}
+    """Add a leaf command; ``help_text=None`` keeps it out of ``--help`` and leaves out the
+    global flags (internal commands take only their documented argv)."""
+    kwargs: dict[str, Any] = {"allow_abbrev": False}
+    if help_text is not None:
+        kwargs["parents"] = [_global_flags()]
     if help_text is not None:
         kwargs["help"] = help_text
     parser = subparsers.add_parser(name, **kwargs)
+    if help_text is None:  # the global flags' values, for the code paths that read them
+        parser.set_defaults(json=False, config=None, verbose=False, quiet=False, yes=False)
     parser.set_defaults(handler=handler)
     leaves[handler] = parser
     return parser
@@ -990,6 +1123,8 @@ def build_parser() -> _Parser:
     # Internal: run by agent-spawn, not listed in --help.
     p = _command(commands, leaves, "verify-secret", "verify-secret", None)
     p.add_argument("id")
+    p.add_argument("--json", action="store_true")
+    p.fixed_error = VERIFY_SECRET_USAGE
     return parser
 
 
@@ -997,8 +1132,13 @@ def parse(parser: _Parser, argv: Sequence[str]) -> argparse.Namespace:
     """Parse ``argv``; leftover arguments are reported with the chosen command's usage."""
     args, extras = parser.parse_known_args(argv)
     if extras and args.handler in ("label add", "label remove"):
-        # Pairs given after an option (`label add <id> a=b --dry-run c=d`).
-        if not any(extra.startswith("-") for extra in extras):
+        # Pairs given after an option (`label add <id> a=b --dry-run c=d`), or after `--`
+        # there (`... --dry-run -- c=d`): those are pairs whatever they look like, and the
+        # label grammar refuses one that starts with `-`.
+        if extras[0] == "--":
+            args.pairs.extend(extras[1:])
+            extras = []
+        elif not any(extra.startswith("-") for extra in extras):
             args.pairs.extend(extras)
             extras = []
     if extras:
@@ -1458,29 +1598,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return code
 
 
-def _command_name(args: argparse.Namespace | None, argv: Sequence[str]) -> str | None:
-    """The command being run: the parsed handler, else the first argument."""
-    if args:
-        return str(args.handler)
-    return argv[0] if argv else None
-
-
-def _write_error_outcome_file(
-    args: argparse.Namespace | None, argv: Sequence[str], error: CliError
-) -> None:
-    """Write ``error``'s envelope to the ``--outcome-file`` given, if any."""
-    path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
-    if not path:
-        return
-    if not fsutil.is_utf8(path):  # a refused undecodable argv: no file at such a path
-        return
-    try:
-        writable = _envelope_writable(args, argv, store.state_dir())
-    except (OSError, ValueError):  # no cwd to refuse: fail closed
-        writable = None
-    _write_outcome_file(path, error, writable)
-
-
 # Traceback chunks laid out by the traceback module itself (headers, frames, the messages
 # between chained exceptions): their own newlines separate lines.
 _TRACEBACK_LAYOUT = ("Traceback ", "  File ", "\n", "  [Previous line repeated")
@@ -1503,6 +1620,29 @@ def _print_traceback() -> None:
         else:
             lines.append(display(text))
     print("\n".join(lines), file=sys.stderr)
+
+
+def _command_name(args: argparse.Namespace | None, argv: Sequence[str]) -> str | None:
+    """The command being run: the parsed handler, else the first argument."""
+    if args:
+        return str(args.handler)
+    return argv[0] if argv else None
+
+
+def _write_error_outcome_file(
+    args: argparse.Namespace | None, argv: Sequence[str], error: CliError
+) -> None:
+    """Write ``error``'s envelope to the ``--outcome-file`` given, if any."""
+    path = getattr(args, "outcome_file", None) if args else _outcome_file_from_argv(argv)
+    if not path:
+        return
+    if not fsutil.is_utf8(path):  # a refused undecodable argv: no file at such a path
+        return
+    try:
+        writable = _envelope_writable(args, argv, store.state_dir())
+    except (OSError, ValueError):  # no cwd to refuse: fail closed
+        writable = None
+    _write_outcome_file(path, error, writable)
 
 
 def _emit_error(error: CliError, json_mode: bool) -> None:

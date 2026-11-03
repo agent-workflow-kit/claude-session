@@ -23,12 +23,14 @@ from claude_session.gateway import (
     GATE_EXEC_FAILED,
     Child,
     Gateway,
+    GatewayOutputLimit,
     GatewayTimeout,
     Inherit,
     Result,
     _text,
     check_argv,
     check_kill_grace,
+    check_kill_over_bytes,
     check_output_limit,
     check_spawn_stdin,
 )
@@ -63,6 +65,7 @@ class Call:
     output_limit: int | None = None  # run only
     discard_output: bool = False  # run only
     gated: bool = False  # spawn only
+    kill_over_bytes: int | None = None  # run only
 
 
 @dataclass(frozen=True)
@@ -204,6 +207,7 @@ class FakeGateway:
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
+        kill_over_bytes: int | None = None,
         kill_group_on_exit: bool = False,
         output_limit: int | None = None,
         discard_output: bool = False,
@@ -216,6 +220,7 @@ class FakeGateway:
             kill_grace, new_process_group=new_process_group, kill_group_on_exit=kill_group_on_exit
         )
         check_output_limit(output_limit)
+        check_kill_over_bytes(kill_over_bytes)
         args = tuple(argv)
         self.calls.append(
             Call(
@@ -232,6 +237,7 @@ class FakeGateway:
                 executable=executable,
                 output_limit=output_limit,
                 discard_output=discard_output,
+                kill_over_bytes=kill_over_bytes,
             )
         )
         response = self._answer(args)
@@ -253,13 +259,19 @@ class FakeGateway:
             if output_limit is not None:
                 err_bytes = err_bytes[:output_limit]
             raise GatewayTimeout(args, timeout, stderr=err_bytes)
+        if kill_over_bytes is not None and len(response.stdout.encode()) > kill_over_bytes:
+            raise GatewayOutputLimit(args, kill_over_bytes)
         out, err = response.stdout, response.stderr
-        out_bytes = response.stdout.encode() if response.raw_stdout is None else response.raw_stdout
         if response.raw_stdout is not None:  # as the real gateway: decoded from the bytes
-            out = _text(out_bytes)
+            out = _text(response.raw_stdout)
+        if kill_over_bytes is not None:
+            err = err.encode()[:kill_over_bytes].decode(errors="ignore")
+        if discard_output:
+            out, err = "", ""
+        out_bytes = response.raw_stdout if response.raw_stdout is not None else out.encode()
         err_bytes = err.encode()
         if discard_output:
-            out, err, out_bytes, err_bytes = "", "", b"", b""
+            out_bytes = b""
         if output_limit is not None:  # as the real gateway: a byte prefix of each stream
             out_bytes, err_bytes = out_bytes[:output_limit], err_bytes[:output_limit]
             out, err = _text(out_bytes), _text(err_bytes)

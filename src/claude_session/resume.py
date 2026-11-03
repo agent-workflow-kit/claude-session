@@ -71,6 +71,8 @@ RESETS = {
     "permission-profile": "permission_profile",
     "auto-exit": "auto_exit",
 }
+# The prefix of a human actor (interface.md, Flag rules: human-only flags).
+HUMAN_ACTOR = "human:"
 # Dropped when the mode changes (interface.md, Resume and fork carry-over).
 MODE_BOUND = ("timeout", "max_turns")
 FRESH_WARNING = (

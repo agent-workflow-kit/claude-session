@@ -135,6 +135,26 @@ def _dead(pid: int) -> bool:
     return False
 
 
+@pytest.mark.skipif(not LINUX, reason="reads /proc")
+def test_dead_counts_a_process_reaped_between_open_and_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/proc/<pid>/stat`` can be opened and then fail with ESRCH once the process is reaped."""
+
+    class Reaped:
+        def __enter__(self) -> Reaped:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setitem(globals(), "open", lambda *args, **kwargs: Reaped())
+    assert _dead(os.getpid())
+
+
 def gone(pid: int, timeout: float = 10.0) -> bool:
     """Wait up to ``timeout`` seconds for ``pid`` to die."""
     deadline = time.monotonic() + timeout

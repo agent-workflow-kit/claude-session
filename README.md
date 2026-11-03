@@ -9,9 +9,7 @@ and watch sessions through the commands below.
 
 ## Status
 
-Pre-1.0. A few commands and features documented in [docs/interface.md](docs/interface.md) are
-still being merged and are marked **coming in the same release** below; until then they are not
-usable (the commands exit 1 with an `internal` error whose detail is `not_implemented`).
+Pre-1.0. Every command documented in [docs/interface.md](docs/interface.md) is available.
 [docs/interface.md](docs/interface.md) is the normative
 interface (launch order, state transitions, outcome mapping, isolation);
 [docs/design.md](docs/design.md) explains the design. Where this README differs from them, they win.
@@ -45,7 +43,7 @@ Prerequisites:
   and WSL2: `bubblewrap` and `socat` (`sudo apt install bubblewrap socat`). macOS needs nothing
   extra (see the [macOS manual checklist](docs/macos-checklist.md)). WSL1 has no sandbox. Keep the state directory on the Linux file system under WSL.
 - memoctl, optional, for session-start context (config `notes_context_cmd`, enabled per kind with
-  `notes_context: true`; **coming in the same release**):
+  `notes_context: true`):
   `uv tool install git+https://github.com/agent-workflow-kit/memoctl`.
 
 Upgrade claude-session while no sessions are live.
@@ -289,9 +287,8 @@ claude-session treats the agent as untrusted wherever a kind says so. At a user 
 - **Taint**: a session that has run a third-party-reading kind (one that reads content written by
   other people, such as a pull request) is *tainted*, permanently. `status --json` shows it and
   `list --tainted` filters on it. Resuming or forking a tainted session into a kind that is not
-  third-party-reading is refused (exit 20, `tainted`). The human override is `--allow-tainted` on
-  `resume` or `start --resume`: it needs a terminal on stdin or an explicit `--actor human:<user>`
-  (else exit 2), and each run it lets through is audited `resume_tainted`.
+  third-party-reading is refused (exit 20, `tainted`). The human override is `--allow-tainted`
+  (see [docs/interface.md](docs/interface.md)).
 - **Secrets**: reports, summaries and artifacts are scanned for the values of your authentication
   variables, your `secret_env` variables and the run secret before they are accepted. Kinds with
   `env.inherit: false` (the restricted built-ins) pass only a fixed base set (`PATH`, `HOME`,
@@ -319,20 +316,16 @@ The guarantees, their limits and the residual risks are in
 | `kinds` | effective kind profiles | available |
 | `reconcile` | repair recorded state against reality | available |
 | `stop <id> [--grace <d>]` | end a live run (SIGTERM, then SIGKILL) or cancel a pending one | available |
-| `label add\|remove <id> k=v...` | edit session labels | coming in the same release |
-| `transcript <id>` | show a session's transcripts | coming in the same release |
+| `label add\|remove <id> k=v...` | edit session labels | available |
+| `transcript <id>` | show a session's transcripts | available |
 | `forget <id>` / `forget --older-than <d>` | hide sessions | available |
 | `cron install\|uninstall` | run `reconcile` from cron | available |
-| `export` | print audit records | coming in the same release |
-| `verify-secret` | internal | coming in the same release |
+| `export` | print audit records | available |
+| `verify-secret` | internal | available |
 
-Also **coming in the same release**: secret verification (`verify-secret`) and label editing,
-session-start notes context, and the `claude` version check. They are specified in
-[docs/interface.md](docs/interface.md); this README does not describe them until they ship.
-`pre-launch` hooks (config `hooks.pre-launch`, or `--hook pre-launch=...` per run) are available:
-a hook that exits 13 escalates the launch (exit 13), any other non-zero exit vetoes it (exit 11),
-and a human can override an escalation with `resume <id> --override-escalation` (see
-[Hooks](docs/interface.md#hooks)).
+`pre-launch` hooks (config `hooks.pre-launch`, or `--hook pre-launch=...` per run, with
+`--override-escalation`) and `--allow-tainted` are available; see
+[docs/interface.md](docs/interface.md) for their rules.
 
 Full reference: [docs/interface.md](docs/interface.md).
 

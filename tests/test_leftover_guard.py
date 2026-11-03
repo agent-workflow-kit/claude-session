@@ -31,14 +31,12 @@ class _Item:
 
 
 def _alive(pid: int) -> bool:
-    stat = _stat(pid)
-    if stat is None:
-        return False
     try:
         with open(f"/proc/{pid}/stat", "rb") as fh:
-            return fh.read().rpartition(b")")[2].split()[0] not in (b"Z", b"X")
-    except (FileNotFoundError, ProcessLookupError):  # gone before open, or mid-read
+            data = fh.read()
+    except (FileNotFoundError, ProcessLookupError):  # gone, or reaped between open and read
         return False
+    return data.rpartition(b")")[2].split()[0] not in (b"Z", b"X")
 
 
 def _stub(pid: int, returncode: int | None) -> subprocess.Popen[Any]:

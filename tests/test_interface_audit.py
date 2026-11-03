@@ -31,17 +31,11 @@ SCHEMAS = ROOT / "schemas"
 SRC = ROOT / "src" / "claude_session"
 
 # Commands whose handler is not implemented on this line yet: command -> the issue that owns it.
-AWAITING = {
-    "label add": 36,
-    "label remove": 36,
-    "verify-secret": 36,
-    "transcript": 37,
-    "export": 39,
-}
+AWAITING: dict[str, int] = {}
 
 # End reasons in the schema that no code produces yet: reason -> the issue that owns it. An
 # entry fails the test the moment the code produces it (stale).
-AWAITING_END_REASONS = {"user_exit": 18, "claude_too_old": 40}
+AWAITING_END_REASONS: dict[str, int] = {}
 
 # Flags every command takes (Global flags), and argparse's own help flags.
 GLOBAL_FLAGS = {"--json", "--config", "--verbose", "--quiet", "--yes", "--version"}

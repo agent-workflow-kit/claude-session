@@ -95,6 +95,7 @@ from .errors import (
     RefusedError,
     UsageError,
 )
+from .kinds import Mode
 from .sessiondir import InputFile, SessionDirs
 from .signals import ExecSignals
 
@@ -371,6 +372,13 @@ def _texts(value: Any) -> list[str]:
     if not isinstance(value, list):
         raise TypeError("expected a list")
     return [_text(item) for item in value]
+
+
+def _mode(value: Any) -> Mode:
+    text = _text(value)
+    if text == "headless" or text == "interactive":
+        return text
+    raise ValueError("expected a run mode")
 
 
 def _bool(value: Any) -> bool:
@@ -887,7 +895,7 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
         inputs = tuple(InputFile(name=name, data=b"") for name in _texts(data["input_files"]))
         return launch.Request(
             kind=frozen.resolution.kind,
-            mode=launch.parse_mode(_text(data["mode"])),
+            mode=_mode(data["mode"]),
             skill=_optional_text(data["skill"]),
             prompt=b"" if _bool(data["has_prompt"]) else None,
             inputs=inputs,
@@ -902,9 +910,9 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
             hook_timeouts=tuple(_texts(data["hook_timeouts"])),
             outcome_file=record["outcome_file"],
             conversation=_conversation(data["conversation"], record),
+            override_escalation=_bool(data.get("override_escalation", False)),
             # From the run row, never the spec file: the store decides by the row too.
             allow_tainted=taint.AllowTainted.from_invocation(_invocation(record)),
-            override_escalation=_bool(data.get("override_escalation", False)),
         )
     except (KeyError, TypeError, ValueError, AttributeError, UsageError) as exc:
         raise sessiondir.SessionDirUnsafe(

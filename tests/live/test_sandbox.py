@@ -94,10 +94,10 @@ def test_deny_root_hides_files_outside_the_allowlist_and_tools_still_work(live: 
         " printed or the error it gave. Then reply DONE.",
         "--setting-sources", "", "--settings", str(settings), cwd=work,
     )  # fmt: skip
-    # Only tool_result blocks are read: the shells print computed values, which neither the
-    # command lines nor the prompt contain, and the marker's content must never be returned.
     text = session_tool_results(live.projects, run.session_id)
     live.observe("/bin is a symlink (usr-merged host)", os.path.islink("/bin"))
+    # The shells print computed values, which neither the command lines nor the prompt contain;
+    # they are looked for in what the tools returned, not in what the model said.
     assert "visible-content" in text and "shell-42" in text
     assert "bin-sh-42" in text, "/bin/sh (or its ELF loader) did not resolve under deny-root"
     assert SECRET not in text
