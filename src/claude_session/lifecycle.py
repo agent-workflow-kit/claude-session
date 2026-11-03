@@ -87,7 +87,9 @@ from .errors import (
     RefusedError,
     UsageError,
 )
+from .kinds import Mode
 from .sessiondir import InputFile, SessionDirs
+from .signals import ExecSignals, LaunchInterrupted
 
 SPEC_NAME = "launch-spec.json"
 SPEC_VERSION = 1
@@ -358,6 +360,13 @@ def _texts(value: Any) -> list[str]:
     if not isinstance(value, list):
         raise TypeError("expected a list")
     return [_text(item) for item in value]
+
+
+def _mode(value: Any) -> Mode:
+    text = _text(value)
+    if text == "headless" or text == "interactive":
+        return text
+    raise ValueError("expected a run mode")
 
 
 def _bool(value: Any) -> bool:
@@ -849,7 +858,7 @@ def _request(frozen: Frozen, record: Mapping[str, Any]) -> launch.Request:
         inputs = tuple(InputFile(name=name, data=b"") for name in _texts(data["input_files"]))
         return launch.Request(
             kind=frozen.resolution.kind,
-            mode=_text(data["mode"]),
+            mode=_mode(data["mode"]),
             skill=_optional_text(data["skill"]),
             prompt=b"" if _bool(data["has_prompt"]) else None,
             inputs=inputs,
@@ -949,6 +958,7 @@ def adopt(
     process: launch.Process,
     *,
     supervise: Callable[..., Any],
+    signals: ExecSignals,
 ) -> tuple[dict[str, Any], int]:
     """``exec --session-id <id>``: the compare-and-set, then the adopted run's launch (see
     the module docs). Returns the outcome object and the exit code. Refusals raise
@@ -1060,17 +1070,26 @@ def adopt(
 
     # TODO(#19): pass bound= to supervisor.run_session from the frozen resolution's timeout
     # for the run's mode, as a headless launch passes bound=resolution.timeout(req.mode).
-    ended = launch.run(
-        st,
-        adoption.cfg,
-        adoption.req,
-        adoption.resolved,
-        alloc,
-        process,
-        supervise=supervise,
-        effects=effects,
-        staged=True,
-    )
+    try:
+        ended = launch.run(
+            st,
+            adoption.cfg,
+            adoption.req,
+            adoption.resolved,
+            alloc,
+            process,
+            supervise=supervise,
+            signals=signals,
+            effects=effects,
+            staged=True,
+        )
+    except LaunchInterrupted as exc:
+        ended = None  # the run ended not-started: its outcome is in the store
+        signals.defer()
+        if st.run_record(sid, run)["ended_at"] is None:
+            launch.end_launch(
+                st, alloc, None, None, process, launch.interrupted_by(st, alloc, exc), exc=exc
+            )
     outcome, code = _outcome(st, sid, run)
     return outcome, code if ended is None else ended.exit_code
 

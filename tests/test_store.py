@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -41,7 +42,7 @@ DESIGN_COLUMNS = {
         "backstop_used report_status report_implicit report_summary report_reason "
         "artifact_name artifact_path artifact_sha256 artifact_size artifact_ingest_seq "
         "reported_at phase outcome end_reason exit_code cost_usd num_turns is_error "
-        "session_end_reason outcome_file outcome_file_written_at"
+        "session_end_reason outcome_file outcome_file_written_at writable_json"
     ),
     "claude_ids": "csession_id claude_session_id run_no source transcript_path seen_at",
     "labels": "csession_id key value",
@@ -249,6 +250,26 @@ def test_a_loose_db_is_tightened_to_0600(db: str) -> None:
     os.chmod(db, 0o644)
     open_as(db, ME).close()
     assert mode(db) == 0o600
+
+
+@pytest.mark.parametrize(("before", "after"), [(0o640, 0o600), (0o604, 0o600), (0o700, 0o700)])
+def test_tightening_only_clears_group_and_other_bits(db: str, before: int, after: int) -> None:
+    open_as(db, ME).close()
+    os.chmod(db, before)
+    open_as(db, ME).close()
+    assert mode(db) == after
+
+
+@pytest.mark.parametrize("before", [0o400, 0o444, 0o000])
+def test_tightening_never_adds_owner_bits(db: str, before: int) -> None:
+    open_as(db, ME).close()
+    os.chmod(db, before)
+    try:
+        with contextlib.suppress(FailedError):  # SQLite may refuse a read-only database
+            open_as(db, ME).close()
+        assert mode(db) == before & ~0o077
+    finally:
+        os.chmod(db, 0o600)
 
 
 def test_loose_wal_and_shm_files_are_tightened_to_0600(db: str) -> None:
@@ -1166,9 +1187,9 @@ def test_a_migration_is_logged(db: str) -> None:
     open_as(db, ME).close()
     log = Path(db).parent / "log.jsonl"
     records = [json.loads(line) for line in log.read_text().splitlines()]
-    assert [r["event"] for r in records] == ["migration"]
+    assert [r["event"] for r in records] == ["migration"] * len(store.MIGRATIONS)
     open_as(db, ME).close()  # nothing to migrate: nothing logged
-    assert len(log.read_text().splitlines()) == 1
+    assert len(log.read_text().splitlines()) == len(store.MIGRATIONS)
 
 
 # Concurrency: BEGIN IMMEDIATE with a busy timeout

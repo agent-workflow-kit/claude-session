@@ -450,6 +450,8 @@ INVALID: list[tuple[str, str]] = [
         "hooks.post-state-change.0.states",
     ),
     ("hooks: {on-exit: []}\n", "hooks.on-exit"),
+    ('hooks: {pre-launch: [{cmd: "a\\0b"}]}\n', "hooks.pre-launch.0.cmd"),
+    ('hooks: {post-state-change: [{cmd: "a\\0b"}]}\n', "hooks.post-state-change.0.cmd"),
     ("repos: {Example.com/x: {}}\n", "repos.<invalid repo id>"),
     ("repos: {example.com/../x: {}}\n", "repos.<invalid repo id>"),
     (
@@ -464,6 +466,9 @@ INVALID: list[tuple[str, str]] = [
     ("claude_bin: ''\n", "claude_bin"),
     ('claude_bin: "a\\x01b"\n', "claude_bin"),
     ('claude_bin: "a\\x85b"\n', "claude_bin"),
+    ('notes_context_cmd: ["memo\\x00ctl"]\n', "notes_context_cmd"),
+    ('notes_context_cmd: [memoctl, "a\\x01b"]\n', "notes_context_cmd"),
+    ('notes_context_cmd: [memoctl, "a\\x85"]\n', "notes_context_cmd"),
     ("retention_days: 3.5\n", "retention_days"),
     ("kinds: {implement: {max_turns: 1.5}}\n", "kinds.implement.max_turns"),
     ("summary_max_bytes: true\n", "summary_max_bytes"),

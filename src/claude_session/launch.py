@@ -17,8 +17,10 @@ Everything up to and including a successful spawn of ``claude`` is the launch ph
 validation normally catches first, becomes ``config_invalid``) ends the run ``not-started``
 with its end reason (``end_launch``); any other error before the spawn (the audit record
 cannot be written, ``claude`` cannot be started) ends it ``launch_interrupted``. Either way
-the command exits 12 with the outcome object; only a ``KeyboardInterrupt`` (SIGINT) is
-re-raised once the run is final.
+the command exits 12 with the outcome object. A signal (``signals.LaunchInterrupted``: SIGINT,
+SIGTERM or SIGHUP) ends it ``launch_interrupted``, or ``canceled`` for SIGTERM and SIGHUP after
+a ``stop`` request (``interrupted_by``), and is re-raised once the run is final, as is a
+``KeyboardInterrupt``.
 
 The step-5 helpers take every input explicitly and return values; the side effects of step 5
 are confined to ``open_dirs`` (the session's directories) and the ``Effects`` that
@@ -35,14 +37,13 @@ and ``staged=True`` (step 7 moves ``start``'s staged prompt and inputs into plac
 Resumes and forks (``resume``) build their request from the previous run (carry-over) and
 allocate with ``allocate_resume`` or ``allocate(fork=...)``; the rest is shared.
 TODO(#31): launch step 6, the ``pre-launch`` hooks, between ``validate`` and ``prepare``.
-TODO(#40): ``claude --version`` against ``min_claude_version`` (``claude_too_old``) in
-``validate``, after ``claude_bin`` is resolved.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import re
 import sys
@@ -52,12 +53,15 @@ from typing import Any
 
 from . import (
     audit,
+    claude_version,
     envbuild,
     gitinfo,
     hookevent,
     ids,
     kinds,
     logs,
+    notes,
+    outcomefile,
     pathrules,
     permission_profiles,
     secretindex,
@@ -71,14 +75,16 @@ from .config import Config
 from .endmap import EXIT_CODES
 from .errors import (
     FailedError,
-    InternalError,
     InvalidPermissionProfile,
     LaunchValidationError,
     RefusedError,
     UsageError,
 )
-from .gateway import Gateway
+from .gateway import Gateway, sanitize_path
+from .hookevent import HookConfTooLarge, HookEventError
+from .kinds import Mode
 from .sessiondir import InputFile, SessionDirs
+from .signals import STOP_SIGNALS, ExecSignals, LaunchInterrupted
 
 LOG_NAME = "log.jsonl"
 AUDIT_NAME = "audit.jsonl"
@@ -166,7 +172,7 @@ class Request:
     ``previous_run``) and the conversation it continues."""
 
     kind: str | None
-    mode: str
+    mode: Mode
     skill: str | None
     prompt: bytes | None = field(repr=False)
     inputs: tuple[InputFile, ...]
@@ -198,17 +204,42 @@ def _actor(given: str | None, cfg: Config) -> str:
     return "auto:unknown"
 
 
+TTY_HINT = "run it in a terminal, or pass --mode headless"
+
+
+def _isatty(stream: Any) -> bool:
+    try:
+        return stream is not None and stream.isatty()
+    except (OSError, ValueError):
+        return False
+
+
+def check_tty(mode: str, prompt_file: str | None) -> None:
+    """The TTY check of plain ``exec`` in interactive mode (launch step 2, exit 2): stdin and
+    stdout must be terminals, and ``--prompt-file -`` cannot read a terminal stdin."""
+    if mode != "interactive":
+        return
+    if not (_isatty(sys.stdin) and _isatty(sys.stdout)):
+        raise UsageError(f"interactive mode needs a terminal on stdin and stdout; {TTY_HINT}")
+    if prompt_file == "-":
+        raise UsageError("--prompt-file - cannot read the prompt from a terminal stdin")
+
+
+def _mode(given: str | None) -> Mode:
+    """``--mode`` (argparse choices), ``interactive`` by default."""
+    if given is None or given == "interactive":
+        return "interactive"
+    if given == "headless":
+        return "headless"
+    raise UsageError(f"unknown mode {given!r}")
+
+
 def read_request(args: argparse.Namespace, cfg: Config) -> Request:
-    """Launch step 2 for ``exec``: the flags (already checked by ``cli``'s flag rules), the
-    prompt and the input files read into memory (each at most ``input_max_bytes``; a bad file
-    is a ``UsageError``, exit 2). Only headless runs are implemented."""
-    mode = args.mode or "interactive"
-    if mode != "headless":
-        # TODO(#17): interactive supervision (exec's default mode).
-        raise InternalError(
-            "interactive exec is not implemented yet; pass --mode headless",
-            detail="not_implemented",
-        )
+    """Launch step 2 for ``exec``: the TTY check of interactive mode, the flags (already
+    checked by ``cli``'s flag rules), the prompt and the input files read into memory (each
+    at most ``input_max_bytes``; a bad file is a ``UsageError``, exit 2)."""
+    mode = _mode(args.mode)
+    check_tty(mode, args.prompt_file)
     cap = cfg.input_max_bytes
     prompt = None
     if args.prompt_file == "-":
@@ -232,7 +263,10 @@ def read_request(args: argparse.Namespace, cfg: Config) -> Request:
         decision_ids=tuple(args.decision_id or ()),
         hooks=tuple(args.hook or ()),
         hook_timeouts=tuple(args.hook_timeout or ()),
-        outcome_file=None if args.outcome_file is None else os.path.abspath(args.outcome_file),
+        # Joined, not abspath: `..` applies after symlinks, as when the file is written.
+        outcome_file=(
+            None if args.outcome_file is None else outcomefile.absolute(args.outcome_file)
+        ),
     )
 
 
@@ -596,6 +630,11 @@ class Checked:
     warnings: list[str] = field(default_factory=list)
     credential_warnings: tuple[str, ...] = ()
     sandbox_problems: tuple[str, ...] = ()  # why a preferred sandbox is unavailable
+    notes_tool: pathrules.ResolvedTool | None = None
+    notes_problem: str | None = None  # why a kind with notes_context gets none (logged)
+    # The run's session-writable paths (isolated runs; None for trusted ones): the
+    # outcome-file write is checked against them too.
+    writable: pathrules.SessionWritable | None = None
     # An open descriptor of the private tmpdir this run created (``tmpdir.create_pinned``):
     # its removal is identity-checked against it; closed with the session directories.
     tmpdir_pin: int | None = None
@@ -886,6 +925,122 @@ def select_profile(
     )
 
 
+def check_outcome_file(req: Request, resolved: Resolved, process: Process) -> None:
+    """Launch step 2: ``--outcome-file`` must not resolve through ``<state>/sessions`` or the
+    tmp root (every run), nor, for an isolated run, through the caller's cwd it will write
+    (``OutcomeFileRejected``, exit 2; nothing is allocated). The rest of the run's
+    session-writable paths are known at step 5 (``check_outcome_path``)."""
+    if req.outcome_file is not None:
+        pathrules.check_outcome_file(req.outcome_file, step2_outcome_writable(resolved, process))
+
+
+def step2_outcome_writable(resolved: Resolved, process: Process) -> pathrules.SessionWritable:
+    """What ``--outcome-file`` must not resolve through at step 2: ``<state>/sessions`` and the
+    tmp root, plus an isolated run's caller cwd."""
+    cwd = resolved.caller_cwd if resolved.resolution.isolated() else None
+    return outcomefile.baseline_writable(process.state_root, *([cwd] if cwd else []))
+
+
+def check_outcome_path(
+    outcome_file: str | None, writable: pathrules.SessionWritable | None
+) -> None:
+    """Launch step 5 (isolated runs), once every session-writable path is known: an
+    ``--outcome-file`` that resolves through one fails the launch (``UnsafeOutcomeFile``,
+    ``unsafe_path``, exit 12: the run is allocated, so a usage error is no longer possible);
+    ``fail_launch`` drops the path from the run in the finalization transaction, so it is
+    never written."""
+    if outcome_file is None or writable is None:
+        return
+    hop = pathrules.outcome_file_hop(outcome_file, writable)
+    if hop is not None:
+        raise UnsafeOutcomeFile(detail=hop)
+
+
+class UnsafeOutcomeFile(LaunchValidationError):
+    """``check_outcome_path`` failed: the launch-phase end drops the run's ``outcome_file``
+    atomically with the finalization."""
+
+    def __init__(self, *, detail: str) -> None:
+        super().__init__(
+            "--outcome-file is under a session-writable path of this run",
+            end_reason="unsafe_path",
+            detail=detail,
+        )
+
+
+@dataclass
+class WritableGuard:
+    """The strongest set of an isolated run's session-writable paths known so far in its
+    launch (realpaths), for a launch-phase end before step 5 knows the full set: the end
+    stores it on the run, so no outcome-file writer checks less. None: not determined (a
+    trusted run, or an entry that cannot be expanded yet); an isolated run's outcome file is
+    then not written (``outcomefile.UNDETERMINED``)."""
+
+    paths: tuple[str, ...] | None = None
+
+
+def known_writable(
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    cwd: str,
+    home: str,
+    content: Mapping[str, Any] | None,
+) -> tuple[str, ...] | None:
+    """An isolated run's session-writable paths as far as they are known before git runs:
+    the cwd, ``$CSESSION_DIR`` and its writable directories, the private tmpdir path, the
+    ``write_dirs`` and the profile ``content``'s write entries expanded with the variables
+    known (``${GIT_DIR}`` is not). None when that cannot be determined (fail closed): the
+    profile is not read yet (``content`` None), a ``write_dirs`` entry or a profile write
+    entry uses ``${GIT_DIR}``, or an entry does not expand."""
+    if content is None:
+        return None
+    entries = [*resolution.profile.write_dirs, *pathrules.profile_write_entries(content)]
+    if any(GIT_DIR_VARIABLE in entry for entry in entries):
+        return None
+    try:
+        variables = profile_variables(alloc, cwd, home, None)
+        write = pathrules.resolve_dirs(
+            resolution.profile.write_dirs, variables, home=home, key="write_dirs"
+        )
+        expanded = permission_profiles.expand(_without_git_dir(content), variables)
+        return pathrules.session_writable(
+            session_dir=alloc.session_dir,
+            cwd=cwd,
+            home=home,
+            tmpdir=tmpdir.run_path(alloc.csession_id),
+            write_dirs=write,
+            profile=expanded,
+        ).paths
+    except Exception:
+        return None
+
+
+def launch_guard(
+    cfg: Config, resolved: Resolved, alloc: Allocated, process: Process
+) -> WritableGuard:
+    """The ``WritableGuard`` of a launch before step 5 starts: for an isolated run, the
+    ``known_writable`` set with the configured permission profile (a profile file is not read
+    yet: not determined). Never raises."""
+    resolution = resolved.resolution
+    try:
+        if not resolution.isolated():
+            return WritableGuard()
+        content = None
+        if resolution.permission_profile_file is None:
+            content = permission_profiles.configured(cfg, resolution).content
+        home = os.path.realpath(process.environ.get("HOME", "/"))
+        return WritableGuard(
+            known_writable(resolution, alloc, _run_cwd(resolved, alloc), home, content)
+        )
+    except Exception:
+        return WritableGuard()
+
+
+def _run_cwd(resolved: Resolved, alloc: Allocated) -> str:
+    """The run's cwd, resolved (``validate`` records it on the run)."""
+    return os.path.realpath(resolved.caller_cwd or os.path.join(alloc.session_dir, sessiondir.WORK))
+
+
 def check_profile_file(
     resolution: kinds.Resolution, writable: pathrules.SessionWritable | None
 ) -> None:
@@ -1019,7 +1174,9 @@ def check_tools(
 ) -> Tools:
     """``claude_bin``, ``git``, ``bwrap`` and ``socat`` resolved on the sanitized PATH, outside
     the session-writable paths (``unsafe_path``); each runs from its realpath with ``argv[0]``
-    its name. ``claude_not_found`` when there is no ``claude_bin``. git must be the one the
+    its name. ``claude_not_found`` when there is no ``claude_bin``. With session-writable
+    paths (not ``NO_SANDBOX``) a script ``claude``'s ``#!`` interpreter is checked too
+    (``claude_version.check_interpreter``, on the version probe's ``PATH``). git must be the one the
     git directory was resolved with (it was looked up before the full set was known)."""
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
     claude = pathrules.resolve_tool(cfg.claude_bin, entries, writable)
@@ -1029,6 +1186,8 @@ def check_tools(
             end_reason="claude_not_found",
             hint=HINTS["claude_not_found"],
         )
+    if writable is not NO_SANDBOX:
+        claude_version.check_interpreter(claude, _probe_entries(entries, writable), writable)
     git = pathrules.resolve_tool("git", entries, writable)
     if git != git_before:
         raise LaunchValidationError(
@@ -1040,6 +1199,74 @@ def check_tools(
         bwrap = pathrules.resolve_tool("bwrap", entries, writable)
         socat = pathrules.resolve_tool("socat", entries, writable)
     return Tools(claude=claude, git=git, bwrap=bwrap, socat=socat)
+
+
+def _probe_entries(entries: Sequence[str], writable: Callable[[str], bool]) -> list[str]:
+    """The version probe's ``PATH`` entries for tools looked up on ``entries``."""
+    return claude_version.probe_path({"PATH": ":".join(entries)}, writable)
+
+
+def check_claude_version(
+    cfg: Config,
+    resolution: kinds.Resolution,
+    process: Process,
+    claude: pathrules.ResolvedTool,
+    writable: Callable[[str], bool],
+) -> str:
+    """``claude --version`` against ``min_claude_version`` (``claude_too_old``;
+    ``claude_not_found`` when it cannot run), with ``claude_version.require``: in ``/``, a
+    minimal environment and its own process group. Its ``PATH`` is the one the tools were
+    looked up on (``env.path_prepend``, then the caller's) without any entry under
+    ``writable``. Returns the version text."""
+    entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
+    environ = {**process.environ, "PATH": ":".join(entries)}
+    return claude_version.require(
+        claude, environ, process.gateway, cfg.min_claude_version, writable=writable
+    )
+
+
+def dry_run_writable(
+    resolution: kinds.Resolution,
+    profile: permission_profiles.Profile,
+    process: Process,
+    caller_cwd: str | None,
+    git_dirs: gitinfo.GitDirs | None,
+) -> pathrules.SessionWritable | None:
+    """The paths a dry run never runs a binary under, for trusted and isolated kinds alike:
+    the step-2 set (``step2_writable``) and the kind's paths known without a session
+    (``known_write_paths``, the git directory known). None when they are not known."""
+    known = known_write_paths(
+        resolution, profile, process, caller_cwd=caller_cwd, git_dirs=git_dirs, git_known=True
+    )
+    if known is None:
+        return None
+    return pathrules.SessionWritable([*step2_writable(process, caller_cwd).paths, *known.paths])
+
+
+VERSION_NOT_PROBED = "claude --version not run (not probed by a dry run: {why})"
+
+
+def resolve_notes(
+    cfg: Config,
+    resolution: kinds.Resolution,
+    process: Process,
+    writable: Callable[[str], bool],
+) -> tuple[pathrules.ResolvedTool | None, str | None]:
+    """The notes command's program, for a kind with ``notes_context``: resolved like the
+    other tools (the sanitized PATH, outside every session-writable path, run from its
+    realpath). A missing or unsafe program never fails the launch: the run gets no notes and
+    the second value says why (``prepare`` logs it as ``notes_failed``)."""
+    if not resolution.profile.notes_context:
+        return None, None
+    name = cfg.notes_context_cmd[0]
+    entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
+    try:
+        tool = pathrules.resolve_tool(name, entries, writable)
+    except LaunchValidationError as exc:
+        return None, f"notes command refused: {exc.message}"
+    if tool is None:
+        return None, f"notes command not found: {name!r}"
+    return tool, None
 
 
 def build_env(
@@ -1152,6 +1379,8 @@ class Effects:
       also when a later check fails).
     - ``warn``: each warning as ``checks`` finds it, in order (a dry run keeps them when a
       later check fails); ``Checked.warnings`` holds the same list either way.
+    - ``claude_version``: the version check; a dry run never runs a ``claude`` under the
+      paths it knows a session could write, also for trusted kinds (``dry_run_writable``).
     """
 
     planned = True
@@ -1167,6 +1396,14 @@ class Effects:
 
     def record_git_dir(self, git_dirs: gitinfo.GitDirs | None) -> None:
         pass
+
+    def known_writable(self, paths: tuple[str, ...] | None) -> None:
+        """The strongest session-writable set known before the profile file is read
+        (isolated runs): kept for a launch-phase end (``WritableGuard``)."""
+
+    def record_writable(self, writable: pathrules.SessionWritable | None) -> None:
+        """The run's full session-writable set (isolated runs): stored on the run before the
+        ``--outcome-file`` is checked against it."""
 
     def record_profile(self, profile: permission_profiles.Profile) -> None:
         pass
@@ -1196,6 +1433,56 @@ class Effects:
     ) -> selfcheck.SelfCheck:
         return check_sandbox(resolution, alloc, tools, process, create=False)
 
+    def claude_version(
+        self,
+        cfg: Config,
+        resolution: kinds.Resolution,
+        process: Process,
+        tools: Tools,
+        writable: Callable[[str], bool],
+        dry_run: Callable[[], pathrules.SessionWritable | None],
+    ) -> list[str]:
+        """The version check of a dry run: ``claude`` resolved again against the paths a
+        dry run never runs a binary under (``dry_run``, trusted kinds too, and the run's
+        own ``writable``); under one of them, or when they are not known, it is not run and
+        a warning says so (a trusted kind's launch would run it). So is a script ``claude``
+        whose ``#!`` interpreter, as the launch's probe would find it, is under one of them
+        or cannot be checked (``claude_version.check_interpreter``). Otherwise
+        ``check_claude_version`` as a launch makes it, the probe's ``PATH`` without those
+        paths either; a ``claude_not_found`` is then only a warning when that ``PATH`` lost
+        entries the launch's probe keeps (the launch may well run it)."""
+        known = dry_run()
+        if known is None:
+            why = "the permission profile or write_dirs are not known"
+            return [VERSION_NOT_PROBED.format(why=why)]
+
+        def guard(path: str) -> bool:
+            return known(path) or writable(path)
+
+        entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
+        try:
+            claude = pathrules.resolve_tool(cfg.claude_bin, entries, guard)
+            if claude is not None:
+                # The interpreter as the launch's probe would find it, checked against both.
+                claude_version.check_interpreter(claude, _probe_entries(entries, writable), guard)
+        except LaunchValidationError as error:
+            return [VERSION_NOT_PROBED.format(why=error.message)]
+        if claude is None:  # check_tools found it; it has gone since
+            raise LaunchValidationError(
+                f"claude not found: {cfg.claude_bin!r}",
+                end_reason="claude_not_found",
+                hint=HINTS["claude_not_found"],
+            )
+        try:
+            check_claude_version(cfg, resolution, process, claude, guard)
+        except LaunchValidationError as error:
+            dropped = set(_probe_entries(entries, writable)) - set(_probe_entries(entries, guard))
+            if error.end_reason != "claude_not_found" or not dropped:
+                raise
+            why = f"{error.message}; PATH entries under session-writable paths were dropped"
+            return [VERSION_NOT_PROBED.format(why=why)]
+        return []
+
 
 class Recording(Effects):
     """The effects of a real launch: the cwd and git directory recorded on the run and
@@ -1208,6 +1495,7 @@ class Recording(Effects):
         self.st = st
         self.alloc = alloc
         self.dirs = dirs
+        self.guard = WritableGuard()
 
     def record_cwd(self, cwd: str) -> None:
         self.st.update_run(self.alloc.csession_id, self.alloc.run, cwd=cwd)
@@ -1221,6 +1509,18 @@ class Recording(Effects):
         if self.alloc.check_git_dir:
             gitinfo.check_unchanged(self.alloc.stored_git_dir, git_dirs)
         self.st.update_session(self.alloc.csession_id, git_dir=gitinfo.stored_value(git_dirs))
+
+    def known_writable(self, paths: tuple[str, ...] | None) -> None:
+        self.guard.paths = paths
+
+    def record_writable(self, writable: pathrules.SessionWritable | None) -> None:
+        if writable is not None:
+            self.guard.paths = writable.paths
+            self.st.update_run(
+                self.alloc.csession_id,
+                self.alloc.run,
+                writable_json=json.dumps(list(writable.paths)),
+            )
 
     def create_write_dirs(self, write: pathrules.WriteDirs) -> None:
         create_write_dirs(self.dirs, write)
@@ -1239,6 +1539,20 @@ class Recording(Effects):
                 _discard_tmpdir(alloc.csession_id, check.tmpdir_pin)
                 raise
         return check
+
+    def claude_version(
+        self,
+        cfg: Config,
+        resolution: kinds.Resolution,
+        process: Process,
+        tools: Tools,
+        writable: Callable[[str], bool],
+        dry_run: Callable[[], pathrules.SessionWritable | None],
+    ) -> list[str]:
+        """The launch's version check: the ``claude`` ``check_tools`` accepted, its probe's
+        ``PATH`` without the run's session-writable paths (``writable``)."""
+        check_claude_version(cfg, resolution, process, tools.claude, writable)
+        return []
 
 
 def _discard_tmpdir(csession_id: str, pin: int | None) -> None:
@@ -1262,16 +1576,17 @@ def checks(
     process: Process,
     effects: Effects,
 ) -> Checked:
-    """Launch step 5 after the rule paths and the session directories, in the order
-    interface.md (Launch order) lists: ``$HOME``, the cwd, the permission profile read (its
-    write entries and ``write_dirs`` without ``${GIT_DIR}`` expanded), git and the git
-    directory, the profile expanded, ``read_dirs``/``write_dirs``, the profile file against
-    the full set, the profile's paths, plugin directories, the hook interpreter, the tmpdir,
-    the tools (``claude_bin``, ``git``, ``bwrap``, ``socat``), the session environment
-    (``PATH``), the generated read entries, ``claude_args``, setting sources and the sandbox
-    self-check, which creates the private tmpdir last. What a launch records and creates in
-    between goes through ``effects``. Raises ``LaunchValidationError``; the first failure
-    wins."""
+    """Launch step 5 after the rule paths and the session directories, in the order interface.md
+    (Launch order) lists: ``$HOME``, the cwd, the permission profile read (its write entries
+    and ``write_dirs`` without ``${GIT_DIR}`` expanded), git and the git directory, the
+    profile expanded, ``read_dirs``/``write_dirs``, the ``--outcome-file`` and the profile
+    file against the full set, the profile's paths, plugin directories, the hook
+    interpreter, the tmpdir, the tools (``claude_bin``, ``git``, ``bwrap``, ``socat``),
+    ``claude --version`` against ``min_claude_version`` (``effects.claude_version``), the
+    session environment (``PATH``), the generated read entries, ``claude_args``, setting
+    sources and the sandbox self-check, which creates the private tmpdir last. What a launch
+    records and creates in between goes through ``effects``. Raises
+    ``LaunchValidationError``; the first failure wins."""
     resolution = resolved.resolution
     if resolved.fork_cwd_unsupported:
         raise LaunchValidationError(
@@ -1289,6 +1604,8 @@ def checks(
         cfg, resolution, base_writable(resolution, alloc, cwd, home, tmp)
     )
     effects.record_profile(profile)
+    if isolated:
+        effects.known_writable(known_writable(resolution, alloc, cwd, home, profile.content))
     git_cwd = effects.git_cwd(cwd)
     before_git = git_writable(resolution, alloc, cwd, home, tmp, profile, git_cwd)
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
@@ -1304,6 +1621,8 @@ def checks(
     effects.warn(write.warnings)
     effects.create_write_dirs(write)
     writable = full_writable(resolution, alloc, cwd, home, tmp, write, expanded)
+    effects.record_writable(writable)
+    check_outcome_path(req.outcome_file, writable)
     check_profile_file(resolution, writable)
     check_paths(rules, writable, read, write, expanded)
     effects.record_dirs(lambda: run_dirs(read, write.dirs, expanded, cwd, home))
@@ -1312,6 +1631,17 @@ def checks(
     check_hook_interpreter(process, writable)
     check_tmpdir(resolution, alloc)
     tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool)
+    notes_tool, notes_problem = resolve_notes(cfg, resolution, process, writable or NO_SANDBOX)
+    version_warnings = effects.claude_version(
+        cfg,
+        resolution,
+        process,
+        tools,
+        writable or NO_SANDBOX,
+        lambda: dry_run_writable(resolution, profile, process, resolved.caller_cwd, git_dirs),
+    )
+    warnings += version_warnings
+    effects.warn(version_warnings)
     session_env = build_env(resolution, cfg, process, alloc, cwd, git_dirs, tmp, writable)
     generated = generated_entries(resolution, tools, git_dirs, process)
     if isolated:
@@ -1354,8 +1684,11 @@ def checks(
         tmpdir=check.tmpdir,
         warnings=warnings,
         credential_warnings=tuple(credential),
+        writable=writable,
         sandbox_problems=check.problems,
         tmpdir_pin=check.tmpdir_pin,
+        notes_tool=notes_tool,
+        notes_problem=notes_problem,
     )
 
 
@@ -1371,11 +1704,13 @@ def validate(
     process: Process,
     *,
     effects: EffectsFactory | None = None,
+    guard: WritableGuard | None = None,
     stage: bool = True,
 ) -> Validated:
     """Launch step 5, in the order interface.md (Launch order) lists: rule paths, the
     session directories (``open_dirs``), then ``checks`` with the effects of a real launch
-    (``Recording``, or ``effects``: ``start`` and the adopting ``exec``). Raises
+    (``Recording``, or ``effects``: ``start`` and the adopting ``exec``). ``guard`` (isolated
+    runs) is kept at the strongest session-writable set known. Raises
     ``LaunchValidationError``; the first failure wins.
 
     Once the directories are open, and before the checks, the run's prompt and inputs are
@@ -1397,6 +1732,8 @@ def validate(
                 alloc.csession_id, alloc.run, [f"{sessiondir.INPUTS}/{path}" for path in copied]
             )
         made = (effects or Recording)(st, alloc, dirs)
+        if guard is not None and isinstance(made, Recording):
+            made.guard = guard
         checked = checks(cfg, req, resolved, alloc, process, made)
     except BaseException:
         dirs.close()
@@ -1488,15 +1825,16 @@ def drain_previous(st: store.Store, alloc: Allocated, dirs: SessionDirs, process
 class Prepared:
     """What step 7 wrote and the supervisor needs: the ``claude`` argv (``argv[0]`` the
     tool's name, run from ``executable``), the run's secret values (for log redaction) and
-    the run secret (refused in an implicit ``result.md``), and the descriptors for its stdout
-    and stderr (the supervisor closes them)."""
+    the run secret (refused in an implicit ``result.md``), and, for a headless run, the
+    descriptors for its stdout and stderr (the supervisor closes them; None in interactive
+    mode, where ``claude`` inherits the terminal)."""
 
     argv: list[str]
     executable: str
     secrets: frozenset[str] = field(repr=False)
     run_secret: str = field(repr=False)
-    stdout_fd: int
-    stderr_fd: int
+    stdout_fd: int | None
+    stderr_fd: int | None
     warnings: list[str]
 
 
@@ -1514,6 +1852,77 @@ def secret_index(values: frozenset[str]) -> bytes:
             " to index for contains_secret",
             end_reason="config_invalid",
         ) from exc
+
+
+def notes_conf(
+    st: store.Store,
+    cfg: Config,
+    resolution: kinds.Resolution,
+    alloc: Allocated,
+    v: Validated,
+    process: Process,
+    secrets: frozenset[str],
+) -> tuple[notes.NotesConf | None, list[str]]:
+    """The run's notes command for ``hookconf.json`` (None: no notes) and the problems to log
+    at ``warn``: the resolved program, ``--repo`` and the session's labels as argv tokens
+    (a label whose value contains one of the run's secret values is left out, and logged by
+    key), a minimal environment holding no ``secret_env`` or ``claude_auth_env`` variable and
+    none of the run's secret values, with the session's ``PATH`` sanitized, the timeout bounded
+    by the hook's budget (``notes.TIMEOUT_MAX``), the size cap bounded by
+    ``notes.MAX_BYTES_MAX`` and the sources (duplicates dropped).
+
+    TODO(#28): ``start`` freezes ``notes_context_cmd``, ``notes_context_max_bytes`` and
+    ``notes_context_sources`` with the launch spec (``lifecycle.FROZEN_CONFIG``), and
+    adoption takes them from there: interface.md (start) lists only the notes timeout among
+    the values adoption reads from the current config. The kind's ``notes_context`` is
+    already part of the resolved profile."""
+    if v.notes_tool is None:
+        return None, []
+    labels, problems = [], []
+    for key, value in st.session_labels(alloc.csession_id):
+        if any(secret in value for secret in secrets):
+            problems.append(f"notes command: label {key!r} left out, its value holds a secret")
+        else:
+            labels.append((key, value))
+    argv = notes.command_argv(
+        v.notes_tool.name, cfg.notes_context_cmd, repo=resolution.repo, labels=labels
+    )
+    path = sanitize_path(v.session_env.env.get("PATH", ""))
+    names = frozenset((*cfg.secret_env, *cfg.claude_auth_env, *v.session_env.auth_names))
+    conf = notes.NotesConf(
+        argv=argv,
+        executable=v.notes_tool.path,
+        env=notes.command_env(process.environ, path=path, secrets=secrets, secret_names=names),
+        timeout=min(float(cfg.notes_context_timeout), notes.TIMEOUT_MAX),
+        max_bytes=min(cfg.notes_context_max_bytes, notes.MAX_BYTES_MAX),
+        sources=tuple(dict.fromkeys(cfg.notes_context_sources)),
+    )
+    return conf, problems
+
+
+def hookconf(
+    names: list[str], cfg: Config, conf: notes.NotesConf | None
+) -> tuple[bytes, str | None]:
+    """``hookconf.json`` with the notes command; without it (and the reason, for the log)
+    when that would make the file too large (a very long command or many labels) or the
+    settings are otherwise invalid (it never fails the launch)."""
+
+    def build(notes_conf: notes.NotesConf | None) -> bytes:
+        return hookevent.hookconf_bytes(
+            names,
+            summary_max_bytes=cfg.summary_max_bytes,
+            artifact_max_bytes=cfg.artifact_max_bytes,
+            notes=notes_conf,
+        )
+
+    if conf is not None:
+        try:
+            return build(conf), None
+        except HookConfTooLarge:
+            return build(None), "notes command settings too large"
+        except HookEventError:
+            return build(None), "notes command settings invalid"
+    return build(None), None
 
 
 def generate(
@@ -1595,15 +2004,19 @@ def prepare(
     )
     values = envbuild.secret_values(v.session_env, process.environ, run_secret=secret.value)
     dirs.write_private_run_file(run, secretindex.INDEX_NAME, secret_index(values))
-    dirs.write_private_run_file(
-        run,
-        hookevent.HOOKCONF_NAME,
-        hookevent.hookconf_bytes(
-            names,
-            summary_max_bytes=cfg.summary_max_bytes,
-            artifact_max_bytes=cfg.artifact_max_bytes,
-        ),
-    )
+    conf, label_problems = notes_conf(st, cfg, resolution, alloc, v, process, values)
+    data, notes_problem = hookconf(names, cfg, conf)
+    dirs.write_private_run_file(run, hookevent.HOOKCONF_NAME, data)
+    for problem in (v.notes_problem, *label_problems, notes_problem):
+        if problem is not None:  # never blocks the launch (design.md, Failure modes)
+            log_best_effort(
+                event_log(process, tuple(values)),
+                "notes_failed",
+                level="warn",
+                csession_id=sid,
+                run=run,
+                message=problem,
+            )
     snapshot = None
     if v.profile.is_file:
         # Adoption rewrites start's snapshot with the same bytes (read back with its label).
@@ -1619,12 +2032,14 @@ def prepare(
         fields["backstop_used"] = 1  # the kind turns the Stop backstop off: never taken
     st.update_run(sid, run, **fields)
     warnings = [*v.warnings, *generated.warnings]
-    stdout_fd = dirs.create_run_output(run, RESULT_FILE)
-    try:
-        stderr_fd = dirs.create_run_output(run, STDERR_FILE)
-    except BaseException:
-        os.close(stdout_fd)
-        raise
+    stdout_fd = stderr_fd = None
+    if req.mode == "headless":  # interactive claude inherits the terminal
+        stdout_fd = dirs.create_run_output(run, RESULT_FILE)
+        try:
+            stderr_fd = dirs.create_run_output(run, STDERR_FILE)
+        except BaseException:
+            os.close(stdout_fd)
+            raise
     return Prepared(
         argv=[v.claude.name, *generated.argv[1:]],
         executable=v.claude.path,
@@ -1652,12 +2067,19 @@ def failure_message(error: LaunchValidationError) -> str:
     return _CONTROL.sub("", text)[:MESSAGE_MAX]
 
 
-def fail_launch(st: store.Store, alloc: Allocated, error: LaunchValidationError) -> bool:
+def fail_launch(
+    st: store.Store,
+    alloc: Allocated,
+    error: LaunchValidationError,
+    writable: Sequence[str] | None = None,
+) -> bool:
     """End the run ``not-started`` with the error's end reason (exit 12) and its
-    ``failure_message``. Returns whether this call finalized the run.
+    ``failure_message``. Returns whether this call finalized the run. In the same
+    transaction: the run's session-writable paths ``writable`` are stored unless the run has
+    them already, and an ``UnsafeOutcomeFile`` drops the run's ``outcome_file``.
 
-    TODO(#20): the one final ``post-state-change`` of a launch-phase end.
-    TODO(#21): the ``--outcome-file`` of a launch-phase end, after the compare-and-set."""
+    The one final event it appends is delivered (``post-state-change``) by the caller's
+    delivery: ``exec`` delivers it synchronously once the launch ended (``toolhooks``)."""
     return st.finalize_run(
         alloc.csession_id,
         alloc.run,
@@ -1669,6 +2091,8 @@ def fail_launch(st: store.Store, alloc: Allocated, error: LaunchValidationError)
             state="not-started",
             cause=alloc.cause,
             message=failure_message(error),
+            writable=None if writable is None else tuple(writable),
+            drop_outcome_file=isinstance(error, UnsafeOutcomeFile),
         ),
     )
 
@@ -1678,9 +2102,26 @@ def interrupted(exc: BaseException, message: str | None = None) -> LaunchValidat
     if message is None:
         if isinstance(exc, KeyboardInterrupt):
             message = "launch interrupted by SIGINT"
+        elif isinstance(exc, LaunchInterrupted):
+            message = f"launch interrupted by {exc.name}"
         else:
             message = f"launch interrupted by an internal error ({type(exc).__name__})"
     return LaunchValidationError(message, end_reason="launch_interrupted")
+
+
+def interrupted_by(st: store.Store, alloc: Allocated, exc: BaseException) -> LaunchValidationError:
+    """The launch-phase end for ``exc``: ``canceled`` for a SIGTERM or SIGHUP after a ``stop``
+    request (``stop_requested_at`` set), else ``launch_interrupted`` (interface.md, Signals)."""
+    if isinstance(exc, LaunchInterrupted) and exc.signum in STOP_SIGNALS:
+        try:
+            stop_requested = st.run_record(alloc.csession_id, alloc.run)["stop_requested_at"]
+        except Exception:  # unreadable: the conservative end is the interruption
+            stop_requested = None
+        if stop_requested is not None:
+            return LaunchValidationError(
+                f"launch canceled by stop ({exc.name})", end_reason="canceled"
+            )
+    return interrupted(exc)
 
 
 def end_launch(
@@ -1692,16 +2133,24 @@ def end_launch(
     error: LaunchValidationError,
     *,
     exc: BaseException | None = None,
+    guard: WritableGuard | None = None,
 ) -> None:
-    """A launch-phase end: finalize the run (``fail_launch``), then, whatever happens, close
+    """A launch-phase end: finalize the run (``fail_launch``, with the strongest
+    session-writable set known: ``v``'s full set, else ``guard``'s), write its outcome file
+    right after the compare-and-set, then, whatever happens, close
     the output descriptors, delete the secret index, remove the private tmpdir and log the
     failure (``launch`` with the end reason; ``launch_interrupted`` with the exception type
-    for an ``exc``)."""
+    for an ``exc``). A transaction an interrupted store write left open is rolled back
+    first."""
     try:
-        fail_launch(st, alloc, error)
+        st.rollback_open_transaction()
+        if fail_launch(st, alloc, error, _known_writable(v, guard)):
+            outcomefile.write_run(st, alloc.csession_id, alloc.run)
     finally:
         if prepared is not None:
             for fd in (prepared.stdout_fd, prepared.stderr_fd):
+                if fd is None:
+                    continue
                 try:
                     os.close(fd)
                 except OSError:
@@ -1721,10 +2170,17 @@ def end_launch(
                 log,
                 "launch_interrupted",
                 level="error",
-                reason="launch_interrupted",
+                reason=error.end_reason,
                 message=type(exc).__name__,
                 **fields,
             )
+
+
+def _known_writable(v: Validated | None, guard: WritableGuard | None) -> tuple[str, ...] | None:
+    """The strongest session-writable set a launch-phase end knows (isolated runs)."""
+    if v is not None and v.writable is not None:
+        return v.writable.paths
+    return None if guard is None else guard.paths
 
 
 def log_credential_warnings(
@@ -1806,49 +2262,90 @@ def run(
     process: Process,
     *,
     supervise: Callable[..., Any],
+    signals: ExecSignals,
     effects: EffectsFactory | None = None,
     staged: bool = False,
 ) -> Any:
-    """Steps 5 and 7 of an allocated run, then ``supervise`` (``supervisor.run_headless``,
+    """Steps 5 and 7 of an allocated run, then ``supervise`` (``supervisor.run_session``,
     which spawns ``claude``). A launch validation failure (or an unsafe session directory)
     ends the run ``not-started`` and returns None (the outcome is in the store); so does any
     other error before ``claude`` is spawned (``launch_interrupted``), except a
-    ``KeyboardInterrupt`` (or another ``BaseException``), which is re-raised once the run is
-    final. The adopting ``exec`` passes its ``effects`` (``validate``) and ``staged``
-    (``start`` staged the prompt and inputs already)."""
+    ``LaunchInterrupted`` (a signal: ``launch_interrupted`` or ``canceled``), a
+    ``KeyboardInterrupt`` or another ``BaseException``, which is re-raised once the run is
+    final. ``signals`` enters the launch phase here (a signal received during allocation
+    raises now) and defers signals again before the hand-over (the supervisor checks them
+    right before the spawn). The adopting ``exec`` passes its ``effects`` (``validate``) and
+    ``staged`` (``start`` staged the prompt and inputs already)."""
     resolution = resolved.resolution
+    guard = launch_guard(cfg, resolved, alloc, process)
     v: Validated | None = None
     prepared: Prepared | None = None
+    ending = False  # an inner handler is ending the launch: the outer one must not again
     try:
+        # The outer handler also takes a signal that arrives while a launch failure is being
+        # handled, before the inner handler's defer() (the phase is still RAISE there).
         try:
-            v = validate(st, cfg, req, resolved, alloc, process, effects=effects, stage=not staged)
-            secrets = sorted(envbuild.secret_values(v.session_env, process.environ))
-            log_credential_warnings(process, alloc, v.credential_warnings, secrets)
-            # The audit record is written before the run secret exists (prepare rotates it),
-            # so it is redacted against the session's secret values only; prepared.secrets,
-            # used for the log from here on, is that set plus the run secret.
-            audit_sandbox_lowered(process, req, resolution, alloc, secrets)
-            st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
-            # TODO(#31): insert step 6 (pre-launch hooks) before this re-check.
-            recheck_fork_taint(st, alloc, resolution)
-            prepared = prepare(st, cfg, req, resolution, alloc, v, process)
-            st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
-        except LaunchValidationError as error:
-            end_launch(st, alloc, v, prepared, process, error)
-            return None
-        except RefusedError as refused:
-            # The fork source became tainted after allocation: the run ends not-started and
-            # the command exits 20 (tainted), as the refusal at step 3 would have.
-            end_launch(st, alloc, v, prepared, process, _refused_end(refused))
-            raise
-        except Exception as exc:
-            end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc)
-            return None
+            try:
+                signals.enter_launch()
+                v = validate(
+                    st,
+                    cfg,
+                    req,
+                    resolved,
+                    alloc,
+                    process,
+                    effects=effects,
+                    guard=guard,
+                    stage=not staged,
+                )
+                secrets = sorted(envbuild.secret_values(v.session_env, process.environ))
+                log_credential_warnings(process, alloc, v.credential_warnings, secrets)
+                # The audit record is written before the run secret exists (prepare rotates
+                # it), so it is redacted against the session's secret values only;
+                # prepared.secrets, used for the log from here on, is that set plus the run
+                # secret.
+                audit_sandbox_lowered(process, req, resolution, alloc, secrets)
+                st.add_run_warnings(alloc.csession_id, alloc.run, v.warnings)
+                # TODO(#31): insert step 6 (pre-launch hooks) before this re-check.
+                recheck_fork_taint(st, alloc, resolution)
+                prepared = prepare(st, cfg, req, resolution, alloc, v, process, staged=staged)
+                st.add_run_warnings(alloc.csession_id, alloc.run, prepared.warnings)
+                signals.defer()  # the supervisor raises a signal from here before the spawn
+            except LaunchValidationError as error:
+                signals.defer()  # a signal during the cleanup is only recorded
+                ending = True
+                end_launch(st, alloc, v, prepared, process, error, guard=guard)
+                return None
+            except RefusedError as refused:
+                # The fork source became tainted after allocation: the run ends not-started
+                # and the command exits 20 (tainted), as the refusal at step 3 would have.
+                signals.defer()
+                ending = True
+                end_launch(st, alloc, v, prepared, process, _refused_end(refused), guard=guard)
+                raise
+            except Exception as exc:
+                signals.defer()
+                ending = True
+                end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc, guard=guard)
+                return None
         except BaseException as exc:
-            end_launch(st, alloc, v, prepared, process, interrupted(exc), exc=exc)
+            signals.defer()  # a second signal during the cleanup is only recorded
+            if not ending:  # an inner end_launch that raised is not run again
+                error = interrupted_by(st, alloc, exc)
+                end_launch(st, alloc, v, prepared, process, error, exc=exc, guard=guard)
             raise
         return supervise(
-            st, cfg, alloc, v, prepared, process, implicit_done=resolution.profile.implicit_done
+            st,
+            cfg,
+            alloc,
+            v,
+            prepared,
+            process,
+            mode=req.mode,
+            implicit_done=resolution.profile.implicit_done,
+            auto_exit=resolution.profile.auto_exit,
+            signals=signals,
+            bound=resolution.timeout(req.mode),
         )
     finally:
         if v is not None:

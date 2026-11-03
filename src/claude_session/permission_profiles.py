@@ -142,18 +142,23 @@ def select(
             session_writable=session_writable,
             expected_label=expected_label,
         )
+    return configured(cfg, resolution)
+
+
+def configured(cfg: config.Config, resolution: kinds.Resolution) -> Profile:
+    """The config profile ``profile.permission_profile`` of ``resolution`` (no file is read),
+    validated for the run's isolation."""
+    isolated = resolution.isolated()
     name = resolution.profile.permission_profile
-    configured = cfg.permission_profiles.get(name)
-    if configured is None:  # kinds.resolve and config.load refuse this first
+    entry = cfg.permission_profiles.get(name)
+    if entry is None:  # kinds.resolve and config.load refuse this first
         raise InvalidPermissionProfile(
             "unknown permission profile",
             detail=f"{name}: names no built-in or configured permission profile",
         )
     # Only the unset sections are left out; values inside them (including nulls) are kept.
     content = {
-        key: copy.deepcopy(value)
-        for key in SECTIONS
-        if (value := getattr(configured, key)) is not None
+        key: copy.deepcopy(value) for key in SECTIONS if (value := getattr(entry, key)) is not None
     }
     validate(content, isolated=isolated, source=f"permission profile {name}")
     return Profile(name=name, content=content)

@@ -4,6 +4,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import sqlite3
 import stat
 import tomllib
 from collections.abc import Callable
@@ -12,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import __version__, cli
+from claude_session import __version__, cli, outcomefile, terminal
 from claude_session.cli import build_parser, main
 from claude_session.errors import (
     AmbiguousError,
@@ -278,8 +279,10 @@ def test_label_pairs_after_an_option_are_collected() -> None:
     assert (args.pairs, args.dry_run) == (["a=b", "c=d"], True)
 
 
-@pytest.mark.parametrize("name", sorted(FULL_INVOCATIONS))
+@pytest.mark.parametrize("name", sorted(set(FULL_INVOCATIONS) - {"verify-secret"}))
 def test_yes_is_accepted_as_a_no_op(name: str) -> None:
+    """Every command but the internal ones (verify-secret refuses global flags; see
+    test_verify_secret)."""
     without = vars(parse(FULL_INVOCATIONS[name]))
     with_yes = vars(parse([*FULL_INVOCATIONS[name], "--yes"]))
     assert with_yes.pop("yes") is True
@@ -352,21 +355,31 @@ def test_json_after_double_dash_is_a_positional(
 
 
 def test_unimplemented_command_is_internal_not_implemented(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Every command is implemented eventually: route one through the placeholder handler.
+    monkeypatch.setitem(cli.HANDLERS, "export", cli._not_implemented)
     code, envelope, err = run_json(["export", "--json"], capsys)
     assert code == 1
     assert_golden(envelope, "error-not-implemented")
     assert "not implemented" in err
 
 
-def test_exec_without_mode_headless_is_internal_not_implemented(
-    capsys: pytest.CaptureFixture[str],
+def test_interactive_exec_without_a_terminal_is_a_usage_error_before_allocation(
+    capsys: pytest.CaptureFixture[str], _private_state_dir: Path
 ) -> None:
+    """interface.md, Launch order step 2: plain exec in interactive mode (the default) needs
+    a TTY on stdin and stdout; without one it exits 2 with a hint and allocates nothing."""
     code, envelope, _ = run_json(["exec", "--json"], capsys)
-    assert code == 1
-    assert envelope["error"]["code"] == "internal"
-    assert envelope["error"]["detail"] == "not_implemented"
+    assert code == 2
+    assert envelope["error"]["code"] == "usage"
+    assert "--mode headless" in envelope["error"]["message"]
+    db = _private_state_dir / "claude-session" / "state.db"
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM runs").fetchone() == (0,)
+    finally:
+        conn.close()
 
 
 # --json error envelopes
@@ -471,8 +484,8 @@ def test_internal_error_traceback_only_with_verbose(
 # Human output sanitization
 
 
-def test_sanitize_escapes_c0_and_c1_controls() -> None:
-    assert cli.sanitize("a\x1b[31mb\x85c\td\x7f") == "a\\x1b[31mb\\x85c\\x09d\\x7f"
+def test_display_escapes_c0_and_c1_controls() -> None:
+    assert terminal.display("a\x1b[31mb\x85c\td\x7f") == "a\\x1b[31mb\\x85c\\x09d\\x7f"
 
 
 def test_human_error_message_is_sanitized(
@@ -512,12 +525,15 @@ def test_parse_error_is_written_to_outcome_file_from_argv(
     assert read_envelope(out)["error"]["message"] == "unrecognized arguments: --bogus"
 
 
-def test_relative_outcome_file_is_made_absolute(
+def test_an_outcome_file_in_the_cwd_is_refused_before_the_kind_is_known(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """An isolated kind's agent may write the cwd, and the kind is not resolved yet: the
+    envelope is not written there (fail closed), with a warning; the exit code stands."""
     monkeypatch.chdir(tmp_path)
     assert main(["start", "--outcome-file", "o.json"]) == 2
-    assert read_envelope(tmp_path / "o.json")["error"]["message"] == "start requires --json"
+    assert outcomefile.REJECTED in capsys.readouterr().err
+    assert not (tmp_path / "o.json").exists()
 
 
 def test_refusal_is_written_to_outcome_file(
@@ -532,10 +548,20 @@ def test_refusal_is_written_to_outcome_file(
 def test_not_found_is_not_written_to_outcome_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    monkeypatch.setitem(cli.HANDLERS, "resume", raising(NotFoundError("unknown")))
+    out = tmp_path / "outcome.json"
+    assert main(["resume", SID, "--outcome-file", str(out)]) == 10
+    assert not out.exists()
+
+
+def test_wait_writes_any_error_envelope_to_its_outcome_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``wait --outcome-file`` is wait's own output, error envelopes included."""
     monkeypatch.setitem(cli.HANDLERS, "wait", raising(NotFoundError("unknown")))
     out = tmp_path / "outcome.json"
     assert main(["wait", SID, "--outcome-file", str(out)]) == 10
-    assert not out.exists()
+    assert read_envelope(out) == {"error": {"code": "not_found", "message": "unknown"}}
 
 
 def test_outcome_file_ignored_for_commands_without_it(
@@ -581,8 +607,9 @@ def test_outcome_file_dotdot_is_resolved_after_symlinks(
 ) -> None:
     (tmp_path / "deep" / "real").mkdir(parents=True)
     (tmp_path / "link").symlink_to(tmp_path / "deep" / "real")
-    monkeypatch.chdir(tmp_path)
-    assert main(["exec", "--timeout", "0", "--outcome-file", "link/../o.json"]) == 2
+    (tmp_path / "cwd").mkdir()
+    monkeypatch.chdir(tmp_path / "cwd")
+    assert main(["exec", "--timeout", "0", "--outcome-file", f"{tmp_path}/link/../o.json"]) == 2
     assert read_envelope(tmp_path / "deep" / "o.json")["error"]["code"] == "usage"
     assert not (tmp_path / "o.json").exists()
 
@@ -592,16 +619,20 @@ def test_outcome_file_prescan_accepts_a_negative_number(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     assert main(["exec", "--bogus", "--outcome-file", "-1"]) == 2
-    assert read_envelope(tmp_path / "-1")["error"]["code"] == "usage"
+    # Taken as the path (and refused: it is in the cwd, see above).
+    assert outcomefile.REJECTED in capsys.readouterr().err
+    assert not (tmp_path / "-1").exists()
 
 
-@pytest.mark.parametrize("value", [".", "sub/.."])
+@pytest.mark.parametrize("value", ["", "/sub/.."])
 def test_outcome_file_naming_a_directory_is_a_warning(
     value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     (tmp_path / "sub").mkdir()
-    monkeypatch.chdir(tmp_path)
-    assert main(["exec", "--timeout", "0", "--outcome-file", value, "--json"]) == 2
+    (tmp_path / "cwd").mkdir()
+    monkeypatch.chdir(tmp_path / "cwd")
+    path = f"{tmp_path}{value}"
+    assert main(["exec", "--timeout", "0", "--outcome-file", path, "--json"]) == 2
     captured = capsys.readouterr()
     assert json.loads(captured.out)["error"]["code"] == "usage"
     assert "warning: could not write --outcome-file" in captured.err
