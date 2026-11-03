@@ -109,7 +109,7 @@
         "reconcile",
         "liveness"
       ],
-      "description": "Claude Code hook event or internal cause. report: a report was ingested (also when only the report's status or reported_at changed); forget: a run finalized by forget's own liveness check before it hides the session; reconcile: a change made by reconcile; liveness: a change made by the inline liveness check of status, list, wait, resume, start --resume or stop. Events delivered late keep their original cause."
+      "description": "Claude Code hook event or internal cause. report: a report was ingested (also when only the report's status or reported_at changed); forget: a run finalized by forget's own liveness check before it hides the session; reconcile: a change made by reconcile; liveness: a change made by the inline liveness check of status, list, wait, resume, start --resume or stop, except that a run finalized by reconcile or a liveness check whose recorded pending cause is timeout or auto_exit keeps that cause as its final event's cause. Events delivered late keep their original cause."
     },
     "outcome_value": {
       "type": [

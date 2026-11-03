@@ -39,7 +39,8 @@ before the agent can file a report; its final drain reads it (``hookevent.final_
 it checks an implicit-done ``result.md`` with ``SecretIndex.contains`` (``result_rejected``
 on a hit) and deletes ``secret-index`` at run end (``supervisor.finish``; the file is
 secret-equivalent).
-TODO(#33): salvage of a run whose wrapper is lost drains with the index, then deletes it.
+The salvage of a run whose wrapper is lost (``liveness``) drains with the index, then deletes
+it.
 """
 
 from __future__ import annotations

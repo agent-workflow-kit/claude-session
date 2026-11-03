@@ -406,6 +406,38 @@ def test_an_expired_pending_run_is_finalized_and_its_prompt_carried(env: Env) ->
     assert (env.state / "sessions" / sid / "prompts" / "2.md").read_text() == "Do the task.\n"
 
 
+def test_an_expired_pending_run_finalized_by_resume_gets_its_outcome_file_and_hooks(
+    env: Env,
+) -> None:
+    hooked = env.tmp_path / "hooked.jsonl"
+    hook = f"hooks:\n  post-state-change:\n    - cmd: cat >> {hooked}; echo >> {hooked}\n"
+    env.write_config("lost_grace: 0.2s\n" + hook)
+    target = env.tmp_path / "outcome.json"
+    sid = env.started("--mode", "headless", "--outcome-file", str(target))["csession_id"]
+    import time
+
+    time.sleep(0.5)
+    env.write_config(hook)
+    proc, _out = resume(env, sid, "--mode", "headless")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(target.read_text())["end_reason"] == "never_adopted"
+    finals = [
+        (p["run"], p["cause"])
+        for p in map(json.loads, filter(None, hooked.read_text().splitlines()))
+        if p["final"]
+    ]
+    assert finals == [(1, "liveness"), (2, "exit")]
+    assert env.rows("SELECT COUNT(*) FROM events WHERE delivered_at IS NULL") == [(0,)]
+
+
+def test_a_resume_outcome_file_under_the_sessions_directory_exits_2(env: Env) -> None:
+    sid = exec_session(env)["csession_id"]
+    target = env.state / "sessions" / sid / "out.json"
+    proc, out = resume(env, sid, "--outcome-file", str(target))
+    assert (proc.returncode, out["error"]["code"]) == (2, "usage")
+    assert env.rows("SELECT COUNT(*) FROM runs") == [(1,)]
+
+
 def test_a_live_session_refuses_a_second_resume(env: Env) -> None:
     sid = exec_session(env)["csession_id"]
     gate = env.tmp_path / "running"
