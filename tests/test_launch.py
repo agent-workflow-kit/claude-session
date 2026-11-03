@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -193,6 +195,28 @@ def test_claude_inside_a_session_writable_path_is_refused(tmp_path: Path) -> Non
     assert info.value.end_reason == "unsafe_path"
 
 
+def test_a_claude_whose_interpreter_is_under_a_session_writable_path_is_refused(
+    tmp_path: Path,
+) -> None:
+    """An isolated run never lets ``claude --version`` (or the session) run a planted
+    ``#!`` interpreter; a trusted run (``NO_SANDBOX``) is unchanged."""
+    planted = executable(tmp_path / "cwd" / "cs-test-interp")
+    claude = tmp_path / "safe" / "claude"
+    claude.parent.mkdir()
+    claude.write_text(f"#!{planted}\n")
+    claude.chmod(0o755)
+    cfg = load(tmp_path, f"claude_bin: {claude}\n")
+    writable = pathrules.SessionWritable([str(tmp_path / "cwd")])
+    git = pathrules.resolve_tool("git", ["/usr/bin", "/bin"], launch.NO_SANDBOX)
+    with pytest.raises(LaunchValidationError) as info:
+        launch.check_tools(cfg, resolution(cfg), process(tmp_path), writable, git)
+    assert info.value.end_reason == "unsafe_path"
+    assert "interpreter" in info.value.message
+    claude.write_text("#!/usr/bin/env -S cs-test-interp\n")  # unknown: no check when trusted
+    tools = launch.check_tools(cfg, resolution(cfg), process(tmp_path), launch.NO_SANDBOX, git)
+    assert tools.claude.path == str(claude)
+
+
 def test_claude_resolves_to_its_realpath_with_its_name(tmp_path: Path) -> None:
     real = executable(tmp_path / "real" / "claude-2.1")
     link = tmp_path / "bin" / "claude"
@@ -204,6 +228,92 @@ def test_claude_resolves_to_its_realpath_with_its_name(tmp_path: Path) -> None:
     tools = launch.check_tools(cfg, resolution(cfg), proc, launch.NO_SANDBOX, git)
     assert tools.claude == pathrules.ResolvedTool(path=str(real), name="claude")
     assert tools.bwrap is None and tools.socat is None  # sandbox off: never looked up
+
+
+# The claude --version check
+
+
+def test_the_version_probe_path_is_the_tool_lookup_path_without_writable_entries(
+    tmp_path: Path,
+) -> None:
+    """``claude`` was looked up on ``env.path_prepend`` then the caller's ``PATH``; its
+    ``#!/usr/bin/env node`` line finds ``node`` there too, never under a writable path."""
+    prepend, unsafe = tmp_path / "prepend", tmp_path / "cwd" / "bin"
+    prepend.mkdir()
+    unsafe.mkdir(parents=True)
+    cfg = load(tmp_path, f"kinds:\n  implement:\n    env:\n      path_prepend: [{prepend}]\n")
+    proc = process(tmp_path, PATH=f"{unsafe}:rel:/usr/bin:/bin", ANTHROPIC_API_KEY="sk-secret")
+    gw = proc.gateway
+    assert isinstance(gw, FakeGateway)
+    gw.on(["claude", "--version"], stdout="2.1.312 (Claude Code)\n")
+    claude = pathrules.ResolvedTool("/opt/claude/claude", "claude")
+    writable = pathrules.SessionWritable([str(tmp_path / "cwd")])
+    text = launch.check_claude_version(cfg, resolution(cfg), proc, claude, writable)
+    assert text == "2.1.312 (Claude Code)"
+    (call,) = gw.calls
+    assert call.env is not None
+    assert call.env["PATH"] == f"{prepend}:/usr/bin:/bin"
+    assert "ANTHROPIC_API_KEY" not in call.env
+    assert (call.executable, call.argv, call.cwd) == (
+        "/opt/claude/claude",
+        ("claude", "--version"),
+        "/",
+    )
+
+
+def test_the_version_check_uses_the_configured_minimum(tmp_path: Path) -> None:
+    cfg = load(tmp_path, "min_claude_version: '3'\n")
+    proc = process(tmp_path)
+    assert isinstance(proc.gateway, FakeGateway)
+    proc.gateway.on(["claude", "--version"], stdout="2.9.999 (Claude Code)\n")
+    claude = pathrules.ResolvedTool("/opt/claude/claude", "claude")
+    with pytest.raises(LaunchValidationError) as info:
+        launch.check_claude_version(cfg, resolution(cfg), proc, claude, launch.NO_SANDBOX)
+    assert info.value.end_reason == "claude_too_old"
+
+
+def dry_run_version(
+    tmp_path: Path,
+    writable: pathrules.SessionWritable,
+    known: pathrules.SessionWritable | None,
+) -> tuple[list[str], FakeGateway]:
+    claude = executable(tmp_path / "tools" / "claude")
+    cfg = load(tmp_path, f"claude_bin: {claude}\n")
+    proc = process(tmp_path)
+    assert isinstance(proc.gateway, FakeGateway)
+    proc.gateway.on(["claude", "--version"], stdout="2.1.312 (Claude Code)\n")
+    tools = launch.Tools(
+        claude=pathrules.ResolvedTool(str(claude), "claude"), git=None, bwrap=None, socat=None
+    )
+    found = launch.Effects().claude_version(
+        cfg, resolution(cfg), proc, tools, writable, lambda: known
+    )
+    return found, proc.gateway
+
+
+def test_a_dry_run_probes_a_claude_outside_every_known_path(tmp_path: Path) -> None:
+    found, gw = dry_run_version(
+        tmp_path, pathrules.SessionWritable([]), pathrules.SessionWritable([])
+    )
+    assert found == [] and len(gw.calls) == 1
+
+
+@pytest.mark.parametrize("where", ["known", "writable"])
+def test_a_dry_run_never_runs_a_claude_under_a_known_or_run_path(
+    tmp_path: Path, where: str
+) -> None:
+    under = pathrules.SessionWritable([str(tmp_path / "tools")])
+    nothing = pathrules.SessionWritable([])
+    known, writable = (under, nothing) if where == "known" else (nothing, under)
+    found, gw = dry_run_version(tmp_path, writable, known)
+    assert gw.calls == []
+    (warning,) = found
+    assert warning.startswith("claude --version not run (not probed by a dry run")
+
+
+def test_a_dry_run_with_unknown_paths_runs_no_claude(tmp_path: Path) -> None:
+    found, gw = dry_run_version(tmp_path, pathrules.SessionWritable([]), None)
+    assert gw.calls == [] and "not known" in found[0]
 
 
 def test_a_git_that_changed_once_every_writable_path_is_known_is_refused(tmp_path: Path) -> None:
@@ -317,3 +427,85 @@ def test_fail_launch_records_the_hint_as_the_message(tmp_path: Path) -> None:
         "no bwrap; install",
     )
     assert row["phase"] == "launch" and row["session_state"] == "not-started"
+
+
+# The notes command (resolved like the tools; never fails the launch)
+
+
+def test_notes_command_resolves_on_the_path_to_its_realpath(tmp_path: Path) -> None:
+    real = executable(tmp_path / "real" / "memoctl-1.0")
+    link = tmp_path / "bin" / "memoctl"
+    link.parent.mkdir()
+    link.symlink_to(real)
+    cfg = load(tmp_path)
+    proc = process(tmp_path, PATH=f"rel:{tmp_path / 'bin'}:/usr/bin")
+    tool, problem = launch.resolve_notes(cfg, resolution(cfg), proc, launch.NO_SANDBOX)
+    assert (tool, problem) == (pathrules.ResolvedTool(path=str(real), name="memoctl"), None)
+
+
+def test_a_missing_notes_command_is_a_problem_not_an_error(tmp_path: Path) -> None:
+    cfg = load(tmp_path, "notes_context_cmd: [no-such-notes-command, context]\n")
+    tool, problem = launch.resolve_notes(cfg, resolution(cfg), process(tmp_path), launch.NO_SANDBOX)
+    assert tool is None
+    assert problem == "notes command not found: 'no-such-notes-command'"
+
+
+@pytest.mark.parametrize("name", ["bin/memoctl", "./memoctl"])
+def test_a_relative_notes_command_path_is_refused(tmp_path: Path, name: str) -> None:
+    cfg = load(tmp_path, f"notes_context_cmd: [{name}]\n")
+    tool, problem = launch.resolve_notes(cfg, resolution(cfg), process(tmp_path), launch.NO_SANDBOX)
+    assert tool is None and problem is not None and problem.startswith("notes command refused")
+
+
+def test_a_notes_command_in_a_session_writable_path_is_refused(tmp_path: Path) -> None:
+    cmd = executable(tmp_path / "cwd" / "memoctl")
+    cfg = load(tmp_path, f"notes_context_cmd: [{cmd}]\n")
+    writable = pathrules.SessionWritable([str(tmp_path / "cwd")])
+    tool, problem = launch.resolve_notes(cfg, resolution(cfg), process(tmp_path), writable)
+    assert tool is None and problem is not None and "session-writable" in problem
+
+
+def test_a_kind_without_notes_context_resolves_nothing(tmp_path: Path) -> None:
+    cfg = load(tmp_path, "notes_context_cmd: [/no/such]\n")
+    tool, problem = launch.resolve_notes(
+        cfg, resolution(cfg, "audit"), process(tmp_path), launch.NO_SANDBOX
+    )
+    assert (tool, problem) == (None, None)
+
+
+def test_hookconf_drops_notes_settings_too_large_for_the_file(tmp_path: Path) -> None:
+    from claude_session import notes
+
+    cfg = load(tmp_path)
+    big = notes.NotesConf(
+        argv=("m", *(f"--label=k{i}={'v' * 250}" for i in range(300))),
+        executable="/usr/bin/m",
+        env={"PATH": "/bin"},
+        timeout=5.0,
+        max_bytes=10,
+        sources=("startup",),
+    )
+    data, problem = launch.hookconf([], cfg, big)
+    assert problem == "notes command settings too large"
+    assert json.loads(data)["notes"] is None
+    data, problem = launch.hookconf([], cfg, dataclasses.replace(big, argv=("m",)))
+    assert problem is None and json.loads(data)["notes"]["argv"] == ["m"]
+
+
+def test_hookconf_drops_invalid_notes_settings_without_calling_them_too_large(
+    tmp_path: Path,
+) -> None:
+    from claude_session import notes
+
+    cfg = load(tmp_path)
+    bad = notes.NotesConf(
+        argv=("m", "a\x00b"),
+        executable="/usr/bin/m",
+        env={"PATH": "/bin"},
+        timeout=5.0,
+        max_bytes=10,
+        sources=("startup",),
+    )
+    data, problem = launch.hookconf([], cfg, bad)
+    assert problem == "notes command settings invalid"
+    assert json.loads(data)["notes"] is None
