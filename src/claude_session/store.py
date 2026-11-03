@@ -60,6 +60,7 @@ APPLICATION_ID = 0x43536573
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # A session id or a prefix of one (ids.SESSION_ID is the full grammar).
 _SESSION_ID_PREFIX = re.compile(r"cs-[a-z2-7]{1,8}")
+_SESSION_ID = re.compile(r"cs-[a-z2-7]{8}")
 # Held while state.db is checked and, when missing, created: closing the create descriptor
 # drops this process's POSIX locks, so no other thread may connect before that close. Any
 # thread that takes it after the creator finds the file and closed descriptor; it is never
@@ -164,8 +165,9 @@ def _check_db_file(path: str, info: os.stat_result) -> None:
 
 
 def _prepare_db_file(path: str, *, migrate: bool) -> None:
-    """Check ``path`` without opening it; with ``migrate``, create it when missing and
-    tighten it (and an existing ``-wal``/``-shm``) to 0600.
+    """Check ``path`` without opening it; with ``migrate``, create it (0600) when missing and
+    tighten it (and an existing ``-wal``/``-shm``): group and other bits are cleared, owner
+    bits never added, so a mode is only ever tightened.
 
     No descriptor is ever held on an existing database: POSIX ``close`` drops all of this
     process's ``fcntl`` locks on the file, including those of live SQLite connections. A
@@ -189,20 +191,22 @@ def _prepare_db_file(path: str, *, migrate: bool) -> None:
     _check_db_file(path, info)
     if not migrate:
         return
-    if stat.S_IMODE(info.st_mode) != 0o600:
-        os.chmod(path, 0o600)
+    _tighten(path, info)
     for sidecar in (path + "-wal", path + "-shm"):
         try:
             side = os.lstat(sidecar)
         except FileNotFoundError:
             continue
         # Anything else is skipped: SQLite refuses a symlinked -wal/-shm itself.
-        if (
-            stat.S_ISREG(side.st_mode)
-            and side.st_uid == os.geteuid()
-            and stat.S_IMODE(side.st_mode) != 0o600
-        ):
-            os.chmod(sidecar, 0o600)
+        if stat.S_ISREG(side.st_mode) and side.st_uid == os.geteuid():
+            _tighten(sidecar, side)
+
+
+def _tighten(path: str, info: os.stat_result) -> None:
+    """Clear the group and other bits of ``path`` (never adds a bit)."""
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        os.chmod(path, mode & ~0o077)
 
 
 def _unsafe(path: str, cause: str) -> FailedError:
@@ -288,13 +292,18 @@ def current_holder() -> Holder:
     return Holder(pid=os.getpid(), start=start_time(os.getpid()))
 
 
+# The largest PID the kernel's pid_t can hold; a larger stored value names no process.
+MAX_PID = 2**31 - 1
+
+
 def pid_exists(pid: int) -> bool:
-    """Whether a process with ``pid`` exists (one we may not signal counts)."""
-    if pid <= 0:
+    """Whether a process with ``pid`` exists (one we may not signal counts). A PID outside
+    1..``MAX_PID`` names none."""
+    if not 0 < pid <= MAX_PID:
         return False
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
+    except (ProcessLookupError, OverflowError):
         return False
     except PermissionError:
         return True
@@ -318,6 +327,22 @@ def pid_alive(pid: int, start: str) -> bool:
     except (ProcInfoError, OSError, GatewayTimeout):
         return True
     except ValueError:  # not a valid PID
+        return False
+
+
+def pid_known_alive(pid: int, start: str) -> bool:
+    """Whether the exact process ``pid`` with the start-time token ``start`` is known to run:
+    for showing the processes of a run that has ended. Unlike ``pid_alive``, an unknown start
+    (``""``) or a check the platform cannot answer counts as gone: nothing is decided by it,
+    and a reused PID must not show an ended run's wrapper as alive."""
+    if start == "" or not 0 < pid <= MAX_PID:
+        return False
+    from .gateway import GatewayTimeout
+    from .procinfo import ProcInfoError
+
+    try:
+        return bool(system_procinfo().is_alive(pid, start))
+    except (ProcInfoError, OSError, GatewayTimeout, ValueError):
         return False
 
 
@@ -605,6 +630,7 @@ class Store:
         holder: Holder | None,
         liveness: Liveness,
         clock: Clock,
+        known_liveness: Liveness = pid_known_alive,
     ) -> None:
         self.conn = conn
         self.path = path
@@ -613,6 +639,8 @@ class Store:
         # Lease ownership is (pid, start, token): two stores of one process never share one.
         self.token = uuid.uuid4().hex
         self.liveness = liveness
+        # For display only (an ended run's processes): "cannot tell" counts as gone.
+        self.known_liveness = known_liveness
         self.clock = clock
 
     @classmethod
@@ -627,6 +655,7 @@ class Store:
         liveness: Liveness | None = None,
         clock: Clock | None = None,
         migrate_wait: float = MIGRATE_WAIT,
+        known_liveness: Liveness | None = None,
     ) -> Store:
         """Open (creating it, mode 0600 in a 0700 directory) the database at ``path``.
 
@@ -648,6 +677,7 @@ class Store:
             holder=holder,
             liveness=liveness or pid_alive,
             clock=clock or utc_now,
+            known_liveness=known_liveness or pid_known_alive,
         )
         try:
             if migrate:
@@ -919,28 +949,150 @@ class Store:
         A range comparison on the primary key (``prefix <= id < upper``, where ``upper`` is
         ``prefix`` with its last character incremented), never ``LIKE``. Callers normalize
         and validate the prefix first (``ids.lookup_session_id``); a prefix outside
-        ``cs-[a-z2-7]{1,8}`` raises ``ValueError``.
+        ``cs-[a-z2-7]{1,8}`` raises ``ValueError``. Stored ids are decoded leniently and a
+        row whose id is not a valid session id (corrupt) is skipped, so it never breaks the
+        lookup of the others.
         """
         if _SESSION_ID_PREFIX.fullmatch(prefix) is None:
             raise ValueError(f"not a session id prefix: {prefix!r}")
         upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
-        rows = self.conn.execute(
-            "SELECT csession_id, forgotten_at IS NOT NULL FROM sessions "
-            "WHERE csession_id >= ? AND csession_id < ? ORDER BY csession_id",
-            (prefix, upper),
-        ).fetchall()
-        return [(sid, bool(forgotten)) for sid, forgotten in rows]
+        with self._lenient_decoding():
+            rows = self.conn.execute(
+                "SELECT csession_id, forgotten_at IS NOT NULL FROM sessions "
+                "WHERE csession_id >= ? AND csession_id < ? ORDER BY csession_id",
+                (prefix, upper),
+            ).fetchall()
+        return [
+            (sid, bool(forgotten))
+            for sid, forgotten in rows
+            if isinstance(sid, str) and _SESSION_ID.fullmatch(sid) is not None
+        ]
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """Sessions that are not forgotten, most recently updated first (raw ``sessions``
-        rows)."""
-        # TODO(#16): join the current run and labels, apply the list filters.
+        rows). ``list_records`` adds each one's current run, labels and run kinds."""
         cursor = self.conn.execute(
             "SELECT * FROM sessions WHERE forgotten_at IS NULL "
             "ORDER BY updated_at DESC, csession_id DESC"
         )
         names = [column[0] for column in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+    # Read views (status, list). One read transaction each, so a view is one snapshot; text
+    # is decoded leniently (``_lenient_text``) so stored bytes that are not UTF-8 never fail.
+
+    @contextmanager
+    def _lenient_decoding(self) -> Iterator[None]:
+        """Lenient text decoding on the shared connection (restored afterwards); usable
+        inside a caller's transaction."""
+        previous = self.conn.text_factory
+        self.conn.text_factory = _lenient_text
+        try:
+            yield
+        finally:
+            self.conn.text_factory = previous
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """A deferred read transaction with lenient text decoding (restored afterwards)."""
+        with self._lenient_decoding():
+            self.conn.execute("BEGIN")
+            try:
+                yield self.conn
+            finally:
+                if self.conn.in_transaction:
+                    self.conn.execute("ROLLBACK")  # nothing was written
+
+    def status_record(self, csession_id: str, run_no: int | None = None) -> StatusRecord | None:
+        """The rows ``status`` shows: the session (forgotten or not; the caller resolved the
+        id), run ``run_no`` (default: the current run; None when it does not exist), the run
+        count, labels, Claude session ids and the last ``STATUS_EVENTS`` events (oldest
+        first). None when the session does not exist."""
+        with self._read_snapshot() as conn:
+            session = _one_dict(conn, "SELECT * FROM sessions WHERE csession_id = ?", csession_id)
+            if session is None:
+                return None
+            wanted = session["current_run"] if run_no is None else run_no
+            run = None
+            if isinstance(wanted, int) and 1 <= wanted <= MAX_SQLITE_INTEGER:
+                run = _one_dict(
+                    conn,
+                    "SELECT * FROM runs WHERE csession_id = ? AND run_no = ?",
+                    csession_id,
+                    wanted,
+                )
+            current = session["current_run"]
+            current_run = run
+            if run_no is not None and run_no != current:
+                current_run = _one_dict(
+                    conn,
+                    "SELECT * FROM runs WHERE csession_id = ? AND run_no = ?",
+                    csession_id,
+                    current,
+                )
+            (runs,) = conn.execute(
+                "SELECT COUNT(*) FROM runs WHERE csession_id = ?", (csession_id,)
+            ).fetchone()
+            labels = _labels(conn, csession_id)
+            claude_ids = _all_dicts(
+                conn,
+                "SELECT claude_session_id, run_no, source, transcript_path, seen_at "
+                "FROM claude_ids WHERE csession_id = ? ORDER BY seen_at, claude_session_id",
+                csession_id,
+            )
+            events = _all_dicts(
+                conn,
+                "SELECT * FROM (SELECT id, run_no, event_ts, from_state, to_state, "
+                "from_activity, to_activity, needs_input_reason, cause, final, delivered_at "
+                "FROM events WHERE csession_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id",
+                csession_id,
+                STATUS_EVENTS,
+            )
+        return StatusRecord(
+            session=session,
+            run=run,
+            current_run=current_run,
+            runs=int(runs),
+            labels=labels,
+            claude_ids=claude_ids,
+            events=events,
+        )
+
+    def list_records(self) -> list[ListRecord]:
+        """Every session that is not forgotten, in ``list_sessions`` order, with its current
+        run, labels and the kinds of all its runs. A session whose current-run row is
+        missing (corrupt) is skipped, as ``status`` does not find it."""
+        with self._read_snapshot() as conn:
+            sessions = self.list_sessions()
+            runs = _all_dicts(
+                conn,
+                "SELECT r.* FROM runs r JOIN sessions s ON s.csession_id = r.csession_id "
+                "AND r.run_no = s.current_run WHERE s.forgotten_at IS NULL",
+            )
+            labels: dict[str, list[str]] = {}
+            for sid, key, value in conn.execute(
+                "SELECT l.csession_id, l.key, l.value FROM labels l JOIN sessions s "
+                "ON s.csession_id = l.csession_id WHERE s.forgotten_at IS NULL "
+                "ORDER BY l.csession_id, l.key, l.value"
+            ):
+                labels.setdefault(sid, []).append(f"{key}={value}")
+            kinds: dict[str, set[str]] = {}
+            for sid, kind in conn.execute(
+                "SELECT DISTINCT r.csession_id, r.run_kind FROM runs r JOIN sessions s "
+                "ON s.csession_id = r.csession_id WHERE s.forgotten_at IS NULL"
+            ):
+                kinds.setdefault(sid, set()).add(kind)
+        current = {row["csession_id"]: row for row in runs}
+        return [
+            ListRecord(
+                session=session,
+                run=current[session["csession_id"]],
+                labels=labels.get(session["csession_id"], []),
+                run_kinds=frozenset(kinds.get(session["csession_id"], set())),
+            )
+            for session in sessions
+            if session["csession_id"] in current
+        ]
 
     # Runs
 
@@ -1509,6 +1661,66 @@ class HookRun:
     secret_sha256: str | None = None
     outbox_dev_ino: str | None = None
     artifacts_dev_ino: str | None = None
+
+
+@dataclass(frozen=True)
+class StatusRecord:
+    """``Store.status_record``: raw rows (column name -> value) for ``status``."""
+
+    session: dict[str, Any]
+    # The selected run (None: no such run) and the session's current run.
+    run: dict[str, Any] | None
+    current_run: dict[str, Any] | None
+    runs: int
+    labels: list[str]
+    claude_ids: list[dict[str, Any]]
+    events: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ListRecord:
+    """``Store.list_records``: one session for ``list``."""
+
+    session: dict[str, Any]
+    run: dict[str, Any] | None
+    labels: list[str]
+    run_kinds: frozenset[str]
+
+
+# ``status`` shows this many of a session's latest events (design.md, Data model).
+STATUS_EVENTS = 20
+# The largest value SQLite stores as an INTEGER; larger Python ints cannot be bound.
+MAX_SQLITE_INTEGER = 2**63 - 1
+
+
+def _lenient_text(raw: bytes) -> str:
+    """TEXT values for the read views: bytes that are not UTF-8 become U+FFFD, never an
+    error, so status and list print any stored value."""
+    return raw.decode("utf-8", errors="replace")
+
+
+def _one_dict(conn: sqlite3.Connection, sql: str, *params: Any) -> dict[str, Any] | None:
+    cursor = conn.execute(sql, params)
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return dict(zip([column[0] for column in cursor.description], row, strict=True))
+
+
+def _all_dicts(conn: sqlite3.Connection, sql: str, *params: Any) -> list[dict[str, Any]]:
+    cursor = conn.execute(sql, params)
+    names = [column[0] for column in cursor.description]
+    return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+
+def _labels(conn: sqlite3.Connection, csession_id: str) -> list[str]:
+    return [
+        f"{key}={value}"
+        for key, value in conn.execute(
+            "SELECT key, value FROM labels WHERE csession_id = ? ORDER BY key, value",
+            (csession_id,),
+        )
+    ]
 
 
 def open_state(**kwargs: Any) -> Store:
