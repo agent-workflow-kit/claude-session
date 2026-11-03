@@ -1,0 +1,15 @@
+{
+  "added": [
+    "prio=high",
+    "a.b_c-d=x:y/z#1@2+3,4"
+  ],
+  "csession_id": "cs-abcd2345",
+  "dry_run": false,
+  "labels": [
+    "a.b_c-d=x:y/z#1@2+3,4",
+    "kind=implement",
+    "prio=high",
+    "team=core"
+  ],
+  "removed": []
+}

@@ -25,8 +25,8 @@ pathrules.session_writable(...) and its .paths; tmpdir.check() and selfcheck.sel
 give Isolation.tmpdir and sandbox_active. Step 7 (``launch.prepare``) calls build() and
 writes the settings with SessionDirs.write_settings before claude is spawned. A
 LaunchValidationError ends the run not-started with its end_reason.
-TODO(#28): adoption reruns the step-5 checks.
-TODO(#27): the dry-run serializer reports build()'s settings and argv.
+The adopting ``exec`` reruns the step-5 checks (``lifecycle``).
+``--dry-run`` reports build()'s settings and argv (``launch.generate``, ``dryrun``).
 """
 
 from __future__ import annotations
@@ -283,6 +283,18 @@ def check_cwd(cwd: str) -> None:
     _check_input("cwd", cwd, "unsafe_cwd", rule=True)
 
 
+def check_cwd_utf8(cwd: str) -> None:
+    """Every run: the cwd is recorded on the run and printed in JSON, so it must be valid
+    UTF-8 (the rule ``check_cwd`` applies, with its message). Raises
+    ``LaunchValidationError`` (``unsafe_cwd``)."""
+    try:
+        cwd.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise LaunchValidationError(
+            f"cwd is not valid UTF-8: {_shown(cwd)!r}", end_reason="unsafe_cwd"
+        ) from exc
+
+
 def check_interpreter(
     interpreter: str,
     *,
@@ -324,8 +336,8 @@ def check_interpreter(
     (``sys.prefix != sys.base_prefix``), its own site-packages.
 
     ``exec`` calls this for isolated runs at launch (``launch.check_hook_interpreter``) with
-    current_interpreter(), pathrules.session_writable(...) and its .paths.
-    TODO(#28): adoption calls it again."""
+    current_interpreter(), pathrules.session_writable(...) and its .paths, and the adopting
+    exec again with its own interpreter."""
     import site
 
     if prefixes is None:
@@ -1047,8 +1059,8 @@ def sandbox_lowered_inputs(resolution: Resolution, *, run: int) -> dict[str, Any
 
     ``exec`` writes the audit record and the sandbox_lowered log event at launch
     (``launch.audit_sandbox_lowered``; a plain exec is its own adoption) and adds
-    isolation_warnings() to the run's warnings. TODO(#28): the same when start's pending run
-    is adopted."""
+    isolation_warnings() to the run's warnings; the adopting exec does the same when start's
+    pending run is adopted (start only warns)."""
     if not resolution.sandbox_lowered():
         raise ValueError("the run's sandbox is not lowered")
     return {
