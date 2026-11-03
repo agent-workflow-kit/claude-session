@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "claude-session/cli/exec-dry-run.json",
   "title": "claude-session exec|resume|start --dry-run --json",
-  "description": "Printed for exit 0, 12 (would_fail set, would_refuse null) and 20 (would_refuse set; checked first). A dry run allocates nothing, runs no hooks and never finalizes a run. schema_newer and failed still print the error envelope.",
+  "description": "Printed for exit 0, 12 (would_fail set, would_refuse null) and 20 (would_refuse set; checked first). A dry run allocates nothing, runs no hooks and never finalizes a run. schema_newer and failed still print the error envelope, and so does exec --session-id --dry-run of a record without a usable launch spec (refused, exit 20, or failed, exit 12).",
   "type": "object",
   "properties": {
     "dry_run": {
@@ -134,7 +134,7 @@
     },
     "profile": {
       "$ref": "kinds.json#/$defs/profile",
-      "description": "Effective kind profile."
+      "description": "Effective kind profile. Its path is the computed PATH claude would receive and the one environment value shown. Its permission_profile is the plan's label, or the --permission-profile value as given when that file could not be read."
     },
     "origins": {
       "type": "object",
@@ -162,7 +162,7 @@
       "items": {
         "type": "string"
       },
-      "description": "argv for claude; session paths shown as they would be created."
+      "description": "argv for claude (argv[0] the bare name a launch executes); session paths shown as they would be created."
     },
     "env_names": {
       "type": "array",

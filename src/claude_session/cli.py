@@ -8,6 +8,7 @@ path).
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -25,6 +26,7 @@ from .terminal import display
 
 if TYPE_CHECKING:
     from .config import Config
+    from .launch import Allocated, Process
 
 PROG = "claude-session"
 DESCRIPTION = "Runs and supervises Claude Code sessions (terminal-agnostic)."
@@ -252,53 +254,226 @@ def _report(args: argparse.Namespace) -> int:
 
 
 def _exec(args: argparse.Namespace) -> int:
-    """``exec`` of a new headless session: launch steps 2 to 7, then supervision (interface.md,
-    Launch order and exec). A launch-phase end exits 12 with the outcome object."""
+    """``exec`` of a new session: launch steps 2 to 7, then supervision (interface.md, Launch
+    order, exec and Signals). A launch-phase end exits 12 with the outcome object, also when a
+    signal interrupted the launch; a signal before allocation ends ``exec`` by that signal.
+    The signal handlers are installed before allocation and restored once the outcome is
+    printed (until then a late signal is only recorded)."""
     if args.session_id is not None:
-        # TODO(#28): adoption of a pending run created by start.
-        raise InternalError("exec --session-id is not implemented yet", detail="not_implemented")
+        return _adopt(args)
     if args.dry_run:
-        # TODO(#27): the dry-run plan.
-        raise InternalError("exec --dry-run is not implemented yet", detail="not_implemented")
-    if args.mode != "headless":
-        # TODO(#17): interactive supervision (exec's default mode).
-        raise InternalError(
-            "interactive exec is not implemented yet; pass --mode headless",
-            detail="not_implemented",
-        )
+        return _dry_run(args)
     from . import launch, supervisor
+    from .gateway import SystemGateway
+    from .signals import ExecSignals, LaunchInterrupted
+
+    cfg = load_config(args)
+    signals = ExecSignals()
+    try:  # entered first: a signal during the install is handled and the handlers restored
+        try:
+            signals.install()  # before allocation (interface.md, Signals)
+            with store.open_state() as st:
+                process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+                req = launch.read_request(args, cfg)
+                resolved = launch.resolve_kind(req, cfg, process)
+                signals.defer()  # a signal during allocation acts once the run exists
+                alloc = launch.allocate(st, req, resolved, process)
+                try:
+                    ended = launch.run(
+                        st,
+                        cfg,
+                        req,
+                        resolved,
+                        alloc,
+                        process,
+                        supervise=supervisor.run_session,
+                        signals=signals,
+                    )
+                except LaunchInterrupted as exc:
+                    ended = None  # the run ended not-started: its outcome is in the store
+                    signals.defer()
+                    _end_interrupted_launch(st, alloc, process, exc)
+                outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
+        except LaunchInterrupted as exc:  # before allocation: nothing to record
+            _die_of(exc.signum)
+        except KeyboardInterrupt:  # handlers not installed (not the main thread)
+            _die_of(signal.SIGINT)
+        signals.defer()  # until the outcome is printed, a signal is only recorded
+        try:
+            _print_outcome(outcome, args.json)
+        except OSError as exc:
+            # A terminal that hung up (interactive SIGHUP) cannot take the outcome: the run
+            # is final and stored, and the exit code still carries it.
+            if exc.errno != errno.EIO:
+                raise
+    finally:
+        signals.restore()
+    if ended is not None:
+        return ended.exit_code
+    if outcome["exit_code"] is None:  # a run that is still not final: never read as a code
+        raise InternalError("the run has no outcome after its launch was interrupted")
+    return int(outcome["exit_code"])
+
+
+def _end_interrupted_launch(
+    st: store.Store, alloc: Allocated, process: Process, exc: BaseException
+) -> None:
+    """Backstop: a ``LaunchInterrupted`` that reached ``exec`` with the run not final (it
+    escaped the launch's own handling) ends the run ``not-started`` here."""
+    from . import launch
+
+    if st.run_record(alloc.csession_id, alloc.run)["ended_at"] is None:
+        error = launch.interrupted_by(st, alloc, exc)
+        launch.end_launch(st, alloc, None, None, process, error, exc=exc)
+
+
+def _adopt(args: argparse.Namespace) -> int:
+    """``exec --session-id <id>``: adopt the pending run ``start`` created and launch it
+    (interface.md, Launch order); with ``--dry-run``, inspect it without adopting. The signal
+    handlers are installed first and restored once the outcome is printed, as for plain exec."""
+    from . import launch, lifecycle, supervisor
+    from .gateway import SystemGateway
+    from .signals import ExecSignals, LaunchInterrupted
+
+    signals = ExecSignals()
+    try:  # entered first: a signal during the install is handled and the handlers restored
+        try:
+            signals.install()
+            with store.open_state() as st:
+                process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+                if args.dry_run:
+                    return _print_dry_run(args, *lifecycle.adoption_plan(st, args, process))
+                signals.defer()  # a signal during the adoption's checks acts once the run is ours
+                outcome, code = lifecycle.adopt(
+                    st, args, process, supervise=supervisor.run_session, signals=signals
+                )
+        except LaunchInterrupted as exc:  # before the adoption: nothing to record
+            _die_of(exc.signum)
+        except KeyboardInterrupt:  # handlers not installed (not the main thread)
+            _die_of(signal.SIGINT)
+        signals.defer()  # until the outcome is printed, a signal is only recorded
+        try:
+            _print_outcome(outcome, args.json)
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+    finally:
+        signals.restore()
+    return code
+
+
+def _start(args: argparse.Namespace) -> int:
+    """``start`` of a new session (interface.md, start): steps 1 to 5, the run frozen and
+    left pending; prints the start object. A launch-validation failure exits 12 with
+    ``launch_failed``."""
+    if args.resume is not None:
+        # TODO(#29): start --resume (and its --dry-run), with the carry-over.
+        raise InternalError("start --resume is not implemented yet", detail="not_implemented")
+    if args.dry_run:
+        return _dry_run(args)
+    from . import config, launch, lifecycle
     from .gateway import SystemGateway
 
     cfg = load_config(args)
-    # TODO(#17): install the signal handlers (interface.md, Signals) here, before allocation.
-    try:
-        with store.open_state() as st:
-            process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
-            req = launch.read_request(args, cfg)
-            resolved = launch.resolve_kind(req, cfg, process)
-            alloc = launch.allocate(st, req, resolved, process)
-            ended = launch.run(
-                st, cfg, req, resolved, alloc, process, supervise=supervisor.run_headless
-            )
-            outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
-    except KeyboardInterrupt:
-        # TODO(#17): SIGINT is then forwarded and mapped forwarded_int (headless) or ignored
-        # (interactive); exec exits with the run's stored exit_code instead of dying by it.
-        _die_of_sigint()
-    _print_outcome(outcome, args.json)
-    return int(outcome["exit_code"]) if ended is None else ended.exit_code
+    source = config.Source.of(args.config)
+    with store.open_state() as st:
+        process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+        result = lifecycle.start(st, args, cfg, source, process)
+    print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+    return 0
 
 
-def _die_of_sigint() -> NoReturn:
-    """Exit by SIGINT (the run is already final) without a traceback: restore the default
-    action and signal this process itself."""
+def _dry_run(args: argparse.Namespace) -> int:
+    """``exec``/``start --dry-run`` of a new session (interface.md, Dry run): the plan, exit
+    20 with ``would_refuse``, 12 with ``would_fail``, else 0. Nothing is allocated."""
+    from . import dryrun
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    plan, message = dryrun.new_session_plan(args, cfg, dryrun.current_process(SystemGateway()))
+    return _print_dry_run(args, plan, message)
+
+
+def _print_dry_run(args: argparse.Namespace, plan: dict[str, Any], message: str | None) -> int:
+    from . import dryrun
+
+    plan = dryrun.printable(plan)  # valid UTF-8 output, also for a non-UTF-8 path
+    if args.json:
+        print(json.dumps(plan, ensure_ascii=False, allow_nan=False))
+    else:
+        _print_plan(plan, dryrun.printable(message))
+    return dryrun.exit_code(plan)
+
+
+def _print_plan(plan: dict[str, Any], message: str | None) -> None:
+    """The short human-readable summary of a dry-run plan (untrusted strings escaped)."""
+    profile = plan["profile"]
+    kind = plan["run_kind"] + (" (unknown: review profile)" if profile["fallback"] else "")
+    sandbox = plan["sandbox"]
+    state = "available" if sandbox["available"] else "unavailable"
+    if sandbox["mode"] == "off":
+        state = "not used"
+    lines = [
+        f"dry run: kind {kind}, mode {plan['mode']}",
+        f"cwd: {plan['cwd']}",
+        f"sandbox: {sandbox['mode']} ({state})",
+        f"permission profile: {plan['permission_profile'] or 'from file'}",
+    ]
+    if plan["would_refuse"] is not None:
+        lines.append(f"result: a launch would be refused ({plan['would_refuse']})")
+    elif plan["would_fail"] is not None:
+        lines.append(f"result: a launch would fail ({plan['would_fail']}): {message or ''}")
+    else:
+        lines.append("result: a launch would pass the launch validations")
+    lines += [f"warning: {w}" for w in plan["warnings"] if not w.startswith("a launch would fail")]
+    for line in lines:
+        print(display(line))
+
+
+def _kinds(args: argparse.Namespace) -> int:
+    """``kinds`` (interface.md, kinds): the effective kind profiles."""
+    from . import dryrun
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    process = dryrun.current_process(SystemGateway())
+    report = dryrun.printable(dryrun.kinds_report(cfg, process, kind=args.kind, repo=args.repo))
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, allow_nan=False))
+        return 0
+    claude = report["claude_bin_resolved"] or "not found"
+    version = report["claude_version"] or "unknown"
+    ok = {True: "ok", False: "too old", None: "unknown"}[report["claude_version_ok"]]
+    lines = [
+        f"claude: {claude} (version {version}, minimum {report['min_claude_version']}: {ok})",
+        f"default kind: {report['default_kind']}",
+    ]
+    for profile in report["kinds"]:
+        available = profile["sandbox_available"]
+        sandbox = profile["sandbox"] + (
+            "" if available is None else (" available" if available else " unavailable")
+        )
+        lines.append(
+            f"{profile['name']}: profile {profile['permission_profile']}, sandbox {sandbox},"
+            f" cwd {profile['cwd']}, third-party {'yes' if profile['reads_third_party'] else 'no'}"
+        )
+        lines += [f"  warning: {w}" for w in profile["warnings"]]
+    lines += [f"warning: {w}" for w in [*report["state_dir_warnings"], *report["warnings"]]]
+    for line in lines:
+        print(display(line))
+    return 0
+
+
+def _die_of(signum: int) -> NoReturn:
+    """Exit by ``signum`` without a traceback: restore its default action and signal this
+    process itself (its exact PID)."""
     try:
         sys.stdout.flush()
     except (OSError, ValueError):
         pass
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    os.kill(os.getpid(), signal.SIGINT)
-    raise KeyboardInterrupt  # not reached: SIGINT ends the process
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+    raise KeyboardInterrupt  # not reached: the signal ends the process
 
 
 def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
@@ -320,14 +495,15 @@ def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
 # Command name (as typed, nested commands joined by a space) -> handler.
 HANDLERS: dict[str, Handler] = {
     "exec": _exec,
-    "start": _not_implemented,
+    "start": _start,
+    # TODO(#29): resume (and resume --dry-run).
     "resume": _not_implemented,
     "stop": _not_implemented,
     "wait": _not_implemented,
     "report": _report,
     "status": _status,
     "list": _list,
-    "kinds": _not_implemented,
+    "kinds": _kinds,
     "label add": _label,
     "label remove": _label,
     "transcript": _not_implemented,

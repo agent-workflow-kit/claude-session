@@ -4,6 +4,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import sqlite3
 import stat
 import tomllib
 from collections.abc import Callable
@@ -347,19 +348,27 @@ def test_json_after_double_dash_is_a_positional(
 def test_unimplemented_command_is_internal_not_implemented(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    code, envelope, err = run_json(["kinds", "--json"], capsys)
+    code, envelope, err = run_json(["export", "--json"], capsys)
     assert code == 1
     assert_golden(envelope, "error-not-implemented")
     assert "not implemented" in err
 
 
-def test_exec_without_mode_headless_is_internal_not_implemented(
-    capsys: pytest.CaptureFixture[str],
+def test_interactive_exec_without_a_terminal_is_a_usage_error_before_allocation(
+    capsys: pytest.CaptureFixture[str], _private_state_dir: Path
 ) -> None:
+    """interface.md, Launch order step 2: plain exec in interactive mode (the default) needs
+    a TTY on stdin and stdout; without one it exits 2 with a hint and allocates nothing."""
     code, envelope, _ = run_json(["exec", "--json"], capsys)
-    assert code == 1
-    assert envelope["error"]["code"] == "internal"
-    assert envelope["error"]["detail"] == "not_implemented"
+    assert code == 2
+    assert envelope["error"]["code"] == "usage"
+    assert "--mode headless" in envelope["error"]["message"]
+    db = _private_state_dir / "claude-session" / "state.db"
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM runs").fetchone() == (0,)
+    finally:
+        conn.close()
 
 
 # --json error envelopes
