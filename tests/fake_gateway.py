@@ -28,6 +28,7 @@ from claude_session.gateway import (
     Result,
     check_argv,
     check_kill_grace,
+    check_kill_over_bytes,
     check_output_limit,
     check_spawn_stdin,
 )
