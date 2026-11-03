@@ -1420,17 +1420,17 @@ def checks(
     process: Process,
     effects: Effects,
 ) -> Checked:
-    """Launch step 5 after the rule paths and the session directories, in the order
-    interface.md (Launch order) lists: ``$HOME``, the cwd, the permission profile read (its
-    write entries and ``write_dirs`` without ``${GIT_DIR}`` expanded), git and the git
-    directory, the profile expanded, ``read_dirs``/``write_dirs``, the ``--outcome-file`` and the
-    profile file against the full set, the profile's paths, plugin directories, the hook
+    """Launch step 5 after the rule paths and the session directories, in the order interface.md
+    (Launch order) lists: ``$HOME``, the cwd, the permission profile read (its write entries
+    and ``write_dirs`` without ``${GIT_DIR}`` expanded), git and the git directory, the
+    profile expanded, ``read_dirs``/``write_dirs``, the ``--outcome-file`` and the profile
+    file against the full set, the profile's paths, plugin directories, the hook
     interpreter, the tmpdir, the tools (``claude_bin``, ``git``, ``bwrap``, ``socat``),
     ``claude --version`` against ``min_claude_version`` (``effects.claude_version``), the
-    session environment (``PATH``), the generated read entries, ``claude_args``, setting sources and the sandbox
-    self-check, which creates the private tmpdir last. What a launch records and creates in
-    between goes through ``effects``. Raises ``LaunchValidationError``; the first failure
-    wins."""
+    session environment (``PATH``), the generated read entries, ``claude_args``, setting
+    sources and the sandbox self-check, which creates the private tmpdir last. What a launch
+    records and creates in between goes through ``effects``. Raises
+    ``LaunchValidationError``; the first failure wins."""
     resolution = resolved.resolution
     isolated = resolution.isolated()
     home = os.path.realpath(process.environ.get("HOME", "/"))
