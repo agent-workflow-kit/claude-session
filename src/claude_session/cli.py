@@ -267,11 +267,6 @@ def _end_interrupted_launch(
         launch.end_launch(st, alloc, None, None, process, error, exc=exc)
 
 
-def _die_of(signum: int) -> NoReturn:
-    """Exit by ``signum`` without a traceback: restore its default action and signal this
-    process itself (its exact PID)."""
-
-
 def _start(args: argparse.Namespace) -> int:
     """``start``: only ``--dry-run`` of a new session so far."""
     if args.dry_run and args.resume is None:
@@ -355,9 +350,9 @@ def _kinds(args: argparse.Namespace) -> int:
     return 0
 
 
-def _die_of_sigint() -> NoReturn:
-    """Exit by SIGINT (the run is already final) without a traceback: restore the default
-    action and signal this process itself."""
+def _die_of(signum: int) -> NoReturn:
+    """Exit by ``signum`` without a traceback: restore its default action and signal this
+    process itself (its exact PID)."""
     try:
         sys.stdout.flush()
     except (OSError, ValueError):
