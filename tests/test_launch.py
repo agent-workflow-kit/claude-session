@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from claude_session import config, kinds, launch, pathrules
-from claude_session.errors import InternalError, LaunchValidationError, UsageError
+from claude_session.errors import LaunchValidationError, UsageError
 from claude_session.gateway import SystemGateway
 
 from .fake_gateway import FakeGateway
@@ -71,10 +71,52 @@ def args(**given: Any) -> argparse.Namespace:
     return parsed
 
 
-def test_interactive_exec_is_not_implemented_yet(tmp_path: Path) -> None:
-    with pytest.raises(InternalError, match="--mode headless") as info:
-        launch.read_request(args(), load(tmp_path))
-    assert info.value.detail == "not_implemented"
+class _Stream:
+    def __init__(self, tty: bool) -> None:
+        self.tty = tty
+        self.buffer = self
+
+    def isatty(self) -> bool:
+        return self.tty
+
+
+@pytest.mark.parametrize(("stdin", "stdout"), [(False, False), (True, False), (False, True)])
+def test_interactive_mode_needs_a_terminal_on_stdin_and_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdin: bool, stdout: bool
+) -> None:
+    monkeypatch.setattr("sys.stdin", _Stream(stdin))
+    monkeypatch.setattr("sys.stdout", _Stream(stdout))
+    with pytest.raises(UsageError, match="terminal on stdin and stdout"):
+        launch.read_request(args(), load(tmp_path))  # interactive is the default mode
+    with pytest.raises(UsageError):
+        launch.read_request(args(mode="interactive"), load(tmp_path))
+
+
+def test_interactive_mode_with_a_terminal_reads_the_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sys.stdin", _Stream(True))
+    monkeypatch.setattr("sys.stdout", _Stream(True))
+    request = launch.read_request(args(), load(tmp_path))
+    assert request.mode == "interactive" and request.prompt is None
+
+
+def test_interactive_prompt_from_a_terminal_stdin_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sys.stdin", _Stream(True))
+    monkeypatch.setattr("sys.stdout", _Stream(True))
+    with pytest.raises(UsageError, match="--prompt-file -"):
+        launch.read_request(args(prompt_file="-"), load(tmp_path))
+
+
+def test_a_raised_unreadable_isatty_counts_as_no_terminal() -> None:
+    class Broken:
+        def isatty(self) -> bool:
+            raise ValueError("closed")
+
+    assert launch._isatty(Broken()) is False
+    assert launch._isatty(None) is False
 
 
 def test_read_request_reads_the_prompt_and_inputs_capped(tmp_path: Path) -> None:
