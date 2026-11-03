@@ -485,6 +485,7 @@ def _tmpdirs(st: store.Store, checked: Checked, *, dry_run: bool, lease: _Lease)
         sessions, stale = tmpdir.session_entries(extra_roots=extra_roots, problems=problems)
     except OSError as exc:
         checked.warnings.append(f"the private temporary directories could not be listed: {exc}")
+        checked.warnings.extend(problems)
         return
     checked.warnings.extend(problems)
     for sid in sessions:

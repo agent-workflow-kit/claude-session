@@ -1003,6 +1003,28 @@ def test_reconcile_warns_about_an_unsafe_fallback_root_and_leaves_it(
     )
 
 
+def test_reconcile_keeps_the_unsafe_fallback_warning_when_no_root_can_be_listed(
+    tmp_path: Path, st: Store, root: str, procs: Procs
+) -> None:
+    runtime = private_runtime(tmp_path)
+    sid = session(st, root, wrapper=procs.live())
+    st.finalize_run(sid, 1, Final("session", "lost", "lost", 17, "lost", "exit"))
+    primary = Path(tmpdir.root_path())
+    (primary / sid).mkdir(parents=True)
+    primary.chmod(0o755)
+    fallback = runtime / "csession"
+    (fallback / sid).mkdir(parents=True)
+    fallback.chmod(0o755)
+    st.update_session(sid, tmp_dir=str(fallback / sid))
+    result = reconcile.run(st, cfg_of(tmp_path), gateway=SystemGateway(), environ=os.environ)
+    assert (primary / sid).is_dir() and (fallback / sid).is_dir()
+    warnings = result["warnings"]
+    assert any("could not be listed" in w for w in warnings), warnings
+    skipped = [w for w in warnings if str(fallback) in w and "unsafe and was skipped" in w]
+    assert len(skipped) == 1, warnings
+    assert not any(c["action"] == "tmpdir_removed" for c in result["changes"])
+
+
 @pytest.mark.parametrize(
     "name",
     [
