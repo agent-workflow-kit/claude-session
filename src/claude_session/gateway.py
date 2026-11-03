@@ -214,8 +214,8 @@ class Gateway(Protocol):
         Linux; best effort without ``os.waitid``, see ``GatewayTimeout``); one raised during
         the grace still gets the group SIGKILL and the leader reaped first. ``kill_over_bytes``
         bounds what is kept: more stdout than that ends the child the same way and raises
-        ``GatewayOutputLimit``; stderr past it is dropped. Raises ``GatewayTimeout``, and ``OSError`` when the
-        program cannot be started."""
+        ``GatewayOutputLimit``; stderr past it is dropped. Raises ``GatewayTimeout``, and
+        ``OSError`` when the program cannot be started."""
         ...
 
     def spawn(
