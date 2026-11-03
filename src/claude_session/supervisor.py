@@ -50,6 +50,13 @@ against the run's full session-writable set stored at launch step 5), before the
 index and the tmpdir are removed; a failure there is a run warning and never changes the exit
 code. Warnings known before the compare-and-set are recorded with it, so the file carries
 them; later ones (cleanup, the outcome-file warning itself) are stdout's only.
+``post-state-change`` delivery (``toolhooks``): once ``claude`` is spawned (never before: the
+headless spawn must precede any thread), a background worker delivers the session's events in
+order; the poll loop only wakes it, so a slow hook never delays supervision. Once the run is
+final the worker delivers what is left, the final event included, and stops (``exec`` waits
+for it, each hook bounded by its own timeout). A launch-phase end is delivered synchronously
+by ``exec`` (``cli``). A SIGTERM, SIGINT or SIGHUP once the child was reaped cancels the
+remaining delivery (``ExecSignals.enter_delivery``; ``toolhooks``, Cancel).
 """
 
 from __future__ import annotations
@@ -60,6 +67,7 @@ import os
 import signal
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,6 +82,7 @@ from . import (
     secretindex,
     store,
     tmpdir,
+    toolhooks,
 )
 from .config import Config
 from .endmap import EXIT_CODES, HeadlessResult, Mapped
@@ -194,6 +203,7 @@ class Supervision:
         *,
         auto_exit: bool,
         monotonic: Any = time.monotonic,
+        deliver: Callable[[], None] | None = None,
         bound: float | None = None,
         session_start_timeout: float | None = None,
         spawned_at: float | None = None,
@@ -206,6 +216,7 @@ class Supervision:
         self.kill_at: float | None = None
         self.candidate: int | None = None  # the auto_exit_candidate event id
         self.due = 0.0
+        self.deliver = deliver  # wakes the post-state-change worker (never blocks)
         # The run's bound and the session_start_timeout check (None: none), both counted from
         # the spawn (``spawned_at`` on the ``monotonic`` clock; default: now).
         self.bound = bound
@@ -235,7 +246,8 @@ class Supervision:
                     self.check_auto_exit(now)
                 self.check_bound(now)
                 self.check_session_start(now)
-                # TODO(#20): deliver new events of the run (post-state-change) here.
+                if self.deliver is not None:
+                    self.deliver()  # post-state-change: the worker delivers new events
 
     def forward(self, signum: int) -> None:
         """Forward a signal ``exec`` received, once, its cause recorded first."""
@@ -560,6 +572,8 @@ def _finalize(
                 pending_cause=record["pending_cause"],
                 report_status=record["report_status"],
                 returncode=returncode,
+                session_started=record["session_started_at"] is not None,
+                session_end_reason=record["session_end_reason"],
             )
         else:
             mapped = endmap.map_headless(
@@ -707,6 +721,7 @@ def run_session(
         error = launch.interrupted_by(st, alloc, exc)
         launch.end_launch(st, alloc, v, None, process, error, exc=exc)
         raise
+    worker: toolhooks.Worker | None = None
     try:
         signals.enter_session(interactive=mode == "interactive")
         st.update_run(
@@ -727,6 +742,7 @@ def run_session(
             pid=child.pid,
             decision_ids=list(_decision_ids(record)),
         )
+        worker = _start_worker(st, cfg, alloc, process, signals)
         returncode = Supervision(
             st,
             cfg,
@@ -735,14 +751,20 @@ def run_session(
             signals,
             log,
             auto_exit=auto_exit,
+            deliver=worker.wake,
             bound=bound,
             # Interactive runs are exempt: they may wait at the trust dialog.
             session_start_timeout=cfg.session_start_timeout if mode == "headless" else None,
             spawned_at=spawned_at,
         ).wait()
-        signals.defer()  # the child is gone: later signals are recorded and dropped
+        # The child is gone: later signals are recorded, and cancel the remaining delivery.
+        signals.enter_delivery()
     except BaseException:
-        _internal_error(st, cfg, alloc, v, child)
+        try:
+            _internal_error(st, cfg, alloc, v, child)
+        finally:
+            if worker is not None:
+                worker.close()
         raise
     try:
         return finish(
@@ -759,6 +781,28 @@ def run_session(
     except BaseException:
         _internal_error(st, cfg, alloc, v, None)
         raise
+    finally:
+        worker.close()  # after finalization (and the outcome file): the final event too
+
+
+def _start_worker(
+    st: store.Store,
+    cfg: Config,
+    alloc: launch.Allocated,
+    process: launch.Process,
+    signals: ExecSignals,
+) -> toolhooks.Worker:
+    """The started ``post-state-change`` worker of the run's session (after the spawn); a
+    signal after the child was reaped cancels its remaining delivery."""
+    return toolhooks.start_worker(
+        st,
+        cfg,
+        alloc.csession_id,
+        gateway=process.gateway,
+        environ=process.environ,
+        state_root=process.state_root,
+        cancel=signals.delivery_canceled,
+    )
 
 
 def _not_started(exc: BaseException) -> str:

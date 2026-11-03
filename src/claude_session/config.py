@@ -15,11 +15,14 @@ Never imported by the hook path (design.md, Hook-event fast path): it needs Pyda
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 import os
 import re
 import stat
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
@@ -151,10 +154,29 @@ def _no_leading_dash(value: str) -> str:
     return value
 
 
+def _has_controls(value: str) -> bool:
+    """Whether ``value`` holds a C0 (NUL included), DEL or C1 control character."""
+    return any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value)
+
+
 def _no_controls(value: str) -> str:
     """Non-empty, no C0, DEL or C1 control characters (``claude_bin``, ``model``)."""
-    if not value or any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value):
+    if not value or _has_controls(value):
         raise ValueError("must be non-empty and contain no control characters")
+    return value
+
+
+def _no_nul(value: str) -> str:
+    """No NUL character (a hook ``cmd``: it becomes an ``sh -c`` argument)."""
+    if "\x00" in value:
+        raise ValueError("must not contain a NUL character")
+    return value
+
+
+def _no_control_items(value: list[str]) -> list[str]:
+    """No item holds a control character (``notes_context_cmd``: argv, passed to exec)."""
+    if any(_has_controls(item) for item in value):
+        raise ValueError("items must contain no control characters")
     return value
 
 
@@ -335,7 +357,7 @@ class PermissionProfile(_Model):
 
 
 class PreLaunchHook(_Model):
-    cmd: str
+    cmd: Annotated[str, AfterValidator(_no_nul)]
     timeout: PositiveDuration = 30.0
     kinds: Annotated[list[KindName] | None, NotNull] = None
     exclude_kinds: Annotated[list[KindName] | None, NotNull] = None
@@ -366,7 +388,7 @@ class Config(_Model):
     default_kind: KindName  # also names a built-in or configured kind (checked by ``load``)
     claude_auth_env: list[EnvName]
     secret_env: list[EnvName]
-    notes_context_cmd: Annotated[list[str], Field(min_length=1)]
+    notes_context_cmd: Annotated[list[str], Field(min_length=1), AfterValidator(_no_control_items)]
     notes_context_timeout: PositiveDuration
     notes_context_max_bytes: Count
     notes_context_sources: list[Literal["startup", "resume", "fork", "clear", "compact", "other"]]
@@ -429,27 +451,66 @@ def default_path(env: Mapping[str, str] | None = None) -> Path:
     return Path(base) / TOOL / CONFIG_FILE
 
 
+@dataclass(frozen=True)
+class Source:
+    """Where a config was loaded from, as ``start`` stores it for the adopting ``exec``
+    (interface.md, Flags at start and adoption): the absolute path of the main file, and
+    whether it was the default ``config.yaml`` (then missing is fine and its ``config.d/``
+    drop-ins are read too; a ``--config`` file is read alone and must exist)."""
+
+    path: str
+    default: bool
+
+    @classmethod
+    def of(cls, given: str | None, env: Mapping[str, str] | None = None) -> Source:
+        """The source of ``--config`` (made absolute against the current directory, its
+        directory resolved as the file system resolves it: a symlink followed by ``..``
+        leaves the symlink's target, not the symlink's parent) or, when not given, of the
+        default path."""
+        if given is not None:
+            path = os.path.join(os.getcwd(), given)
+            parent = os.path.realpath(os.path.dirname(path))
+            return cls(path=os.path.join(parent, os.path.basename(path)), default=False)
+        return cls(path=str(default_path(env)), default=True)
+
+    def load(self, env: Mapping[str, str] | None = None) -> Config:
+        """Load the config from this source again (the adopting ``exec``)."""
+        return load(self.path, env=env, required=not self.default, dropins=self.default)
+
+
+def config_hash(cfg: Config) -> str:
+    """The SHA-256 of the validated config as canonical JSON (sorted keys): the effective
+    configuration, ``CSESSION_*`` overrides included, independent of formatting and
+    comments. ``start`` freezes it; the adopting ``exec`` warns when it changed."""
+    data = json.dumps(
+        cfg.model_dump(mode="json"), sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
 def load(
     path: str | os.PathLike[str] | None = None,
     *,
     env: Mapping[str, str] | None = None,
     required: bool | None = None,
+    dropins: bool | None = None,
 ) -> Config:
     """Load and validate the config. Without ``path``: ``default_path`` (missing is fine) and
     its ``config.d/`` drop-ins. With ``path`` (``--config``): only that file, which must exist
-    unless ``required`` is false.
-
-    TODO(#28): ``start`` also needs the absolute config path used and a ``config_hash``.
-    """
+    unless ``required`` is false. ``dropins`` (default: only without ``path``) also reads the
+    ``config.d/`` next to ``path``: the adopting ``exec`` reloading the default config from
+    the path ``start`` stored (``Source.load``)."""
     env = os.environ if env is None else env
     if required is None:
         required = path is not None
+    if dropins is None:
+        dropins = path is None
     main = Path(path) if path is not None else default_path(env)
     sources: list[tuple[str, dict[str, Any]]] = []
     data = _read(main, required=required)
     if data is not None:
         sources.append((str(main), data))
-    if path is None:
+    if dropins:
         for dropin in _dropins(main.parent / DROPIN_DIR):
             sources.append((str(dropin), _read(dropin, required=True) or {}))
 
