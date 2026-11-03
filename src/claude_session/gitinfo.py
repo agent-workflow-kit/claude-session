@@ -15,8 +15,8 @@ the session, calls ``check_git_cwd`` for the run kind and ``credential_warnings`
 third-party-reading runs with a git directory. The origin lookup stays in
 ``kinds.git_origin_url`` (``kinds`` resolves the repo before a launch has a git directory).
 The adopting ``exec`` calls ``check_unchanged`` against the value ``start`` stored
-(``lifecycle.FrozenChecks``).
-TODO(#29): every resume calls ``check_unchanged`` against the stored value.
+(``lifecycle.FrozenChecks``), and so does every resume, and a fork that runs in its
+source's cwd, against the session's (the source's) stored value (``launch.Recording``).
 """
 
 from __future__ import annotations

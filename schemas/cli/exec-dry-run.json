@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "claude-session/cli/exec-dry-run.json",
   "title": "claude-session exec|resume|start --dry-run --json",
-  "description": "Printed for exit 0, 12 (would_fail set, would_refuse null) and 20 (would_refuse set; checked first). A dry run allocates nothing, runs no hooks and never finalizes a run. schema_newer and failed still print the error envelope, and so does exec --session-id --dry-run of a record without a usable launch spec (refused, exit 20, or failed, exit 12).",
+  "description": "Printed for exit 0, 12 (would_fail set, would_refuse null) and 20 (would_refuse set; checked first). A dry run allocates nothing, runs no hooks and never finalizes a run. schema_newer and failed still print the error envelope, and so does exec --session-id --dry-run of a record without a usable launch spec (refused, exit 20, or failed, exit 12) or with a --run that is not the current run (refused, reason expired, exit 20).",
   "type": "object",
   "properties": {
     "dry_run": {

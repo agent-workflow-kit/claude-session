@@ -212,7 +212,7 @@
         {
           "hooks": [
             {
-              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session Notification",
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session --run 1 Notification",
               "timeout": 30,
               "type": "command"
             }
@@ -222,7 +222,7 @@
         {
           "hooks": [
             {
-              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session Notification",
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session --run 1 Notification",
               "timeout": 30,
               "type": "command"
             }
@@ -232,7 +232,7 @@
         {
           "hooks": [
             {
-              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session Notification",
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session --run 1 Notification",
               "timeout": 30,
               "type": "command"
             }
@@ -244,7 +244,7 @@
         {
           "hooks": [
             {
-              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session PermissionRequest",
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session --run 1 PermissionRequest",
               "timeout": 30,
               "type": "command"
             }
@@ -255,7 +255,7 @@
         {
           "hooks": [
             {
-              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session PostToolUse",
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session --run 1 PostToolUse",
               "timeout": 60,
               "type": "command"
             }
@@ -266,7 +266,7 @@
         {
           "hooks": [
             {
-              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session SessionEnd",
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session --run 1 SessionEnd",
               "timeout": 30,
               "type": "command"
             }
@@ -277,7 +277,7 @@
         {
           "hooks": [
             {
-              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session SessionStart",
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session --run 1 SessionStart",
               "timeout": 30,
               "type": "command"
             }
@@ -288,7 +288,7 @@
         {
           "hooks": [
             {
-              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session Stop",
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session --run 1 Stop",
               "timeout": 60,
               "type": "command"
             }
@@ -299,7 +299,7 @@
         {
           "hooks": [
             {
-              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session UserPromptSubmit",
+              "command": "/opt/claude-session/bin/python3 -I -m claude_session hook-event --state-dir /home/user/.local/state/claude-session --run 1 UserPromptSubmit",
               "timeout": 30,
               "type": "command"
             }

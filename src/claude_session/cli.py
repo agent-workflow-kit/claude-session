@@ -80,7 +80,7 @@ RESETTABLE = {
     "auto-exit": "auto_exit",
 }
 # The only flags `exec --session-id` accepts (interface.md, Exit codes, exit 2).
-ADOPTION_FLAGS = {"json", "dry_run", "outcome_file", "verbose", "quiet", "yes"}
+ADOPTION_FLAGS = {"json", "dry_run", "outcome_file", "verbose", "quiet", "yes", "run"}
 OUTCOME_FILE_COMMANDS = ("exec", "start", "resume", "wait")
 # Session id arguments (dest -> flag; None for the positional id). verify-secret is not
 # listed: it requires the full id and answers a mismatch with exit 11, never a usage error.
@@ -489,11 +489,8 @@ def _start(args: argparse.Namespace) -> int:
     """``start`` of a new session (interface.md, start): steps 1 to 5, the run frozen and
     left pending; prints the start object. A launch-validation failure exits 12 with
     ``launch_failed``."""
-    if args.resume is not None:
-        # TODO(#29): start --resume (and its --dry-run), with the carry-over.
-        raise InternalError("start --resume is not implemented yet", detail="not_implemented")
     if args.dry_run:
-        return _dry_run(args)
+        return _resume_dry_run(args) if args.resume is not None else _dry_run(args)
     from . import config, launch, lifecycle
     from .gateway import SystemGateway
 
@@ -504,6 +501,82 @@ def _start(args: argparse.Namespace) -> int:
         result = lifecycle.start(st, args, cfg, source, process)
     print(json.dumps(result, ensure_ascii=False, allow_nan=False))
     return 0
+
+
+def _resume(args: argparse.Namespace) -> int:
+    """``resume <id>`` (interface.md, resume): a new run of the session (or with ``--fork`` a
+    new session's run 1) built from the previous run (carry-over), launched and supervised
+    in the foreground like ``exec``; exits with the run's outcome code. The signal handlers
+    are installed before allocation and restored once the outcome is printed."""
+    if args.dry_run:
+        return _resume_dry_run(args)
+    from . import launch, resume, supervisor
+    from .gateway import SystemGateway
+    from .signals import ExecSignals, LaunchInterrupted
+
+    cfg = load_config(args)
+    signals = ExecSignals()
+    try:  # entered first: a signal during the install is handled and the handlers restored
+        try:
+            signals.install()  # before allocation (interface.md, Signals)
+            with store.open_state() as st:
+                process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+                planned = resume.prepare(st, args, cfg, process)
+                launch.check_outcome_file(planned.req, planned.resolved, process)
+                # From here an error envelope's outcome file is checked as the run's is.
+                args.outcome_file_writable = launch.step2_outcome_writable(
+                    planned.resolved, process
+                )
+                signals.defer()  # a signal during allocation acts once the run exists
+                alloc = resume.allocate(st, planned, process)
+                try:
+                    ended = launch.run(
+                        st,
+                        cfg,
+                        planned.req,
+                        planned.resolved,
+                        alloc,
+                        process,
+                        supervise=supervisor.run_session,
+                        signals=signals,
+                    )
+                except LaunchInterrupted as exc:
+                    ended = None  # the run ended not-started: its outcome is in the store
+                    signals.defer()
+                    _end_interrupted_launch(st, alloc, process, exc)
+                signals.enter_delivery()  # a signal now cancels the remaining delivery
+                _deliver_rest(st, cfg, alloc, process, signals.delivery_canceled)
+                outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
+        except LaunchInterrupted as exc:  # before allocation: nothing to record
+            _die_of(exc.signum)
+        except KeyboardInterrupt:  # handlers not installed (not the main thread)
+            _die_of(signal.SIGINT)
+        signals.defer()  # until the outcome is printed, a signal is only recorded
+        try:
+            _print_outcome(outcome, args.json)
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+    finally:
+        signals.restore()
+    if ended is not None:
+        return ended.exit_code
+    if outcome["exit_code"] is None:  # a run that is still not final: never read as a code
+        raise InternalError("the run has no outcome after its launch was interrupted")
+    return int(outcome["exit_code"])
+
+
+def _resume_dry_run(args: argparse.Namespace) -> int:
+    """``resume --dry-run`` and ``start --resume --dry-run``: the plan of the run a launch
+    would allocate, with ``would_refuse``; nothing allocated or finalized."""
+    from . import dryrun, resume
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    with store.open_state() as st:
+        process = dryrun.current_process(SystemGateway())
+        plan, message = resume.plan(st, args, cfg, process)
+    return _print_dry_run(args, plan, message)
 
 
 def _dry_run(args: argparse.Namespace) -> int:
@@ -657,8 +730,7 @@ def _transcript(args: argparse.Namespace) -> int:
 HANDLERS: dict[str, Handler] = {
     "exec": _exec,
     "start": _start,
-    # TODO(#29): resume (and resume --dry-run).
-    "resume": _not_implemented,
+    "resume": _resume,
     "stop": _not_implemented,
     "wait": _wait,
     "report": _report,
@@ -766,6 +838,7 @@ def build_parser() -> _Parser:
     p = _command(commands, leaves, "exec", "exec", "run a session in the foreground")
     _add_launch_flags(p, resumable=False)
     p.add_argument("--session-id", metavar="ID", help="adopt a pending run created by start")
+    p.add_argument("--run", type=int, metavar="N", help="with --session-id: the run to adopt")
 
     p = _command(commands, leaves, "start", "start", "prepare a session for another process")
     _add_launch_flags(p, resumable=True)
@@ -1000,6 +1073,11 @@ def _check_new_headless(args: argparse.Namespace) -> None:
 
 
 def _check_exec(args: argparse.Namespace) -> None:
+    if args.run is not None:
+        if args.session_id is None:
+            raise UsageError("--run requires --session-id")
+        if not 1 <= args.run <= MAX_INTEGER:
+            raise UsageError(f"--run must be a positive integer (at most {MAX_INTEGER})")
     if args.session_id is not None:
         defaults = vars(build_parser().parse_args(["exec"]))
         for dest, value in vars(args).items():

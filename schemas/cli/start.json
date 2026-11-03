@@ -17,8 +17,9 @@
       "items": {
         "type": "string"
       },
-      "minItems": 4,
-      "description": "[<absolute claude-session path>, 'exec', '--session-id', <id>]; place it in a terminal or process."
+      "minItems": 6,
+      "maxItems": 6,
+      "description": "[<absolute claude-session path>, 'exec', '--session-id', <id>, '--run', <n>] (<n> the pending run); place it in a terminal or process."
     },
     "run": {
       "type": "integer",

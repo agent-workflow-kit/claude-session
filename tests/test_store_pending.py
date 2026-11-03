@@ -132,6 +132,28 @@ def test_adoption_sets_the_wrapper_once(st: Store) -> None:
     assert st.conn.execute("SELECT COUNT(*) FROM events").fetchone() == (1,)
 
 
+@pytest.mark.parametrize("run", [2, 5])
+def test_adoption_of_a_run_that_is_not_the_current_one_is_expired_and_changes_nothing(
+    st: Store, clock: Clock, run: int
+) -> None:
+    sid = pending(st, outcome_file="/b/out.json")
+    clock.now = T0 + timedelta(seconds=60)  # even past the deadline: nothing is finalized
+    result = st.adopt(sid, wrapper_pid=11, wrapper_start="a:1", outcome_file="/a/o", run_no=run)
+    assert (result.outcome, result.run_no, result.expired_now) == ("expired", run, False)
+    row = st.run_record(sid, 1)
+    assert (row["wrapper_pid"], row["ended_at"], row["outcome_file"]) == (
+        None,
+        None,
+        "/b/out.json",
+    )
+
+
+def test_adoption_of_the_current_run_by_number_wins(st: Store) -> None:
+    sid = pending(st)
+    result = st.adopt(sid, wrapper_pid=11, wrapper_start="b:1", run_no=1)
+    assert (result.outcome, result.run_no) == ("adopted", 1)
+
+
 def test_adoption_overrides_the_outcome_file_only_when_given(st: Store) -> None:
     sid = pending(st, outcome_file="/a/out.json")
     st.adopt(sid, wrapper_pid=11, wrapper_start="b:1")

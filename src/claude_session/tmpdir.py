@@ -35,7 +35,18 @@ passes the path as ``Isolation.tmpdir`` and ``envbuild``'s ``tmpdir``, and calls
 when the run ends (``supervisor.finish``; a not-started run's in ``launch.end_launch``).
 ``start`` removes the tmpdir its self-check created; the adopting ``exec`` calls ``check``
 and ``create`` again (``launch.checks``).
-TODO(#29): reconcile calls ``remove`` for leftover tmpdirs of final runs and of deleted
+A resume's self-check creates the tmpdir again (``create`` clears a leftover of an earlier
+run first).
+Removal is identity-checked: ``create_pinned`` returns an open descriptor of the created
+directory (the **pin**; it keeps the inode from being reused while it is open) and a run's
+``remove`` passes it, so a late removal by run n (it is finalized, then cleans up) never
+deletes the directory run n + 1 of the same session created in between: an entry that is not
+the pinned directory is left alone. The removal renames the entry aside before it compares
+it with the pin and removes it under the aside name, so run n + 1 creating its directory at
+any moment in between is never affected; an entry that is not the pinned one is renamed
+back when the session's name is still free (else left aside, like other ``.stale-*``
+entries). The caller closes the pin after the removal.
+TODO(#33): reconcile calls ``remove`` for leftover tmpdirs of final runs and of deleted
 sessions.
 """
 
@@ -45,6 +56,7 @@ import errno
 import os
 import secrets
 import stat
+from typing import NamedTuple
 
 from . import fsutil, ids, pathrules
 from .errors import LaunchValidationError
@@ -76,6 +88,16 @@ class TmpdirLeftover(OSError):
         self.path = path
         self.stale_path = stale_path
         self.hint = hint
+
+
+class Created(NamedTuple):
+    """What ``create_pinned`` made: the path, a leftover renamed aside and left there (None
+    when nothing was left) and the pin, an open descriptor of the new directory (for
+    ``remove``; the caller closes it)."""
+
+    path: str
+    stale_path: str | None
+    pin: int
 
 
 class _Refusal(fsutil.UnsafePathError):
@@ -141,6 +163,15 @@ def create(csession_id: str, *, base: str | None = None) -> str:
 def create_reporting(csession_id: str, *, base: str | None = None) -> tuple[str, str | None]:
     """``create``, also returning the full path of a leftover that was renamed aside and could
     not be removed under its new name either (None when nothing was left)."""
+    created = create_pinned(csession_id, base=base)
+    os.close(created.pin)
+    return created.path, created.stale_path
+
+
+def create_pinned(csession_id: str, *, base: str | None = None) -> Created:
+    """``create_reporting``, also returning the pin: an open descriptor of the created
+    directory, which the run's ``remove`` passes so that it never removes a directory
+    another run created. The caller closes it."""
     stale_path: str | None = None
     path = run_path(csession_id, base)
     root = os.path.dirname(path)
@@ -155,22 +186,27 @@ def create_reporting(csession_id: str, *, base: str | None = None) -> tuple[str,
             if _exists_at(root_fd, csession_id):
                 stale_path = _clear_leftover(root_fd, root, csession_id)
             try:
-                os.close(fsutil.create_private_dir_at(root_fd, csession_id))
+                run_fd = fsutil.create_private_dir_at(root_fd, csession_id)
             except OSError as exc:
                 raise _refusal(path, exc, _run_hint(path)) from exc
         finally:
             os.close(root_fd)
     except _Refusal as exc:
         raise _unsafe(exc) from exc
-    return path, stale_path
+    return Created(path, stale_path, run_fd)
 
 
-def remove(csession_id: str, *, base: str | None = None) -> bool:
+def remove(csession_id: str, *, base: str | None = None, pin: int | None = None) -> bool:
     """Remove the session's private temporary directory and everything in it, never
     following a symlink. Returns False when there was nothing to remove (idempotent; a
-    missing root is not created). Raises ``OSError``: ``fsutil.UnsafePathError`` for an
-    unsafe base or root, which is left untouched; ``TmpdirLeftover`` when the directory
-    could not be removed (it is renamed aside first, so the session's path is free)."""
+    missing root is not created). With ``pin`` (``create_pinned``), the entry is first
+    renamed aside and the renamed entry compared with the pin, so a directory another run of
+    the session creates meanwhile is never removed: an entry that is not the pinned
+    directory is renamed back when its name is still free (else left aside as a
+    ``.stale-*`` entry) and False returned. Raises ``OSError``:
+    ``fsutil.UnsafePathError`` for an unsafe base or root, which is left untouched;
+    ``TmpdirLeftover`` when the directory could not be removed (it is renamed aside first,
+    so the session's path is free)."""
     path = run_path(csession_id, base)
     root = os.path.dirname(path)
     base_fd = _open_base(os.path.dirname(root))
@@ -181,22 +217,36 @@ def remove(csession_id: str, *, base: str | None = None) -> bool:
     if root_fd is None:
         return False
     try:
-        if not _exists_at(root_fd, csession_id):
+        name = csession_id
+        if pin is not None:
+            # Move the entry aside first and check what was moved: run n + 1 may create its
+            # own directory under the session's name at any moment, so the removal below
+            # must never go by that name once the identity is checked.
+            try:
+                name = _rename_aside(root_fd, csession_id)
+            except FileNotFoundError:
+                return False
+            pinned = os.fstat(pin)
+            if _identity_at(root_fd, name) != (pinned.st_dev, pinned.st_ino):
+                _put_back(root_fd, name, csession_id)
+                return False
+        elif _identity_at(root_fd, csession_id) is None:
             return False
         try:
-            fsutil.remove_tree_at(root_fd, csession_id)
+            fsutil.remove_tree_at(root_fd, name)
         except OSError as exc:
             reason = _reason(exc)
-            try:
-                stale = _rename_aside(root_fd, csession_id)
-            except OSError:
-                raise TmpdirLeftover(
-                    f"private temporary directory {path} could not be removed: {reason}",
-                    path=path,
-                    stale_path=None,
-                    hint=_leftover_hint(path),
-                ) from exc
-            stale_path = os.path.join(root, stale)
+            if name == csession_id:
+                try:
+                    name = _rename_aside(root_fd, csession_id)
+                except OSError:
+                    raise TmpdirLeftover(
+                        f"private temporary directory {path} could not be removed: {reason}",
+                        path=path,
+                        stale_path=None,
+                        hint=_leftover_hint(path),
+                    ) from exc
+            stale_path = os.path.join(root, name)
             raise TmpdirLeftover(
                 f"private temporary directory {path} could not be removed ({reason});"
                 f" it was moved aside to {stale_path}",
@@ -321,7 +371,7 @@ def _clear_leftover(root_fd: int, root: str, name: str) -> str | None:
             f" aside ({_reason(rename_error)})",
             _leftover_hint(path),
         ) from removal_error
-    # TODO(#29): reconcile removes .stale-* entries under the per-uid root.
+    # TODO(#33): reconcile removes .stale-* entries under the per-uid root.
     try:
         fsutil.remove_tree_at(root_fd, stale)
     except OSError:
@@ -337,12 +387,32 @@ def _rename_aside(root_fd: int, name: str) -> str:
     return stale
 
 
+def _put_back(root_fd: int, stale: str, name: str) -> None:
+    """Rename the entry ``stale`` that ``remove`` moved aside but did not create back to
+    ``name`` when that name is still free; otherwise (or when the rename fails) it stays
+    aside, a ``.stale-*`` entry like any other (TODO(#33): reconcile removes those)."""
+    if _exists_at(root_fd, name):
+        return
+    try:
+        os.rename(stale, name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+    except OSError:
+        pass
+
+
 def _exists_at(dir_fd: int, name: str) -> bool:
     try:
         os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:
         return False
     return True
+
+
+def _identity_at(dir_fd: int, name: str) -> tuple[int, int] | None:
+    try:
+        info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return info.st_dev, info.st_ino
 
 
 def _reason(exc: OSError) -> str:

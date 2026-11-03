@@ -91,6 +91,9 @@ class Previous:
 
     repo: str | None
     flags: Mapping[str, Any] = field(default_factory=dict)
+    # The recorded label (``file:<prefix>``) of a carried snapshot (``flags``'
+    # ``permission_profile`` is then the snapshot path): re-reading it must give this label.
+    permission_profile_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,10 +130,10 @@ class Resolution:
     # (the kind's config env.allow) can (envbuild.build, step 3).
     env_allow: tuple[str, ...] = ()
     env_allowlist_only: tuple[str, ...] | None = None
-    # TODO(#29): resume stores the snapshot path as the --permission-profile flag value (the
-    # docstring above relies on it) and passes the stored permission_profile label as
-    # expected_label when re-reading a carried snapshot (permission_profiles.select).
     permission_profile_file: str | None = None
+    # A carried snapshot's recorded label (origin ``previous_run``): ``launch.select_profile``
+    # passes it as ``expected_label``, so an edited snapshot fails the launch.
+    permission_profile_label: str | None = None
 
     def isolated(self) -> bool:
         """Whether the run is isolated: third-party-reading or its sandbox is not ``off``
@@ -205,6 +208,15 @@ def resolve(
     explicit = _explicit(previous.flags if previous else {}, flags or {})
     extra: dict[str, Any] = {}
     profile = _apply_flags(profile, explicit, origins, mode, extra, warnings)
+    if origins.get("permission_profile_file") == "previous_run":
+        assert previous is not None
+        if previous.permission_profile_label is None:
+            # A carried profile file is its snapshot, never re-read without its label.
+            raise UsageError(
+                "the previous run's permission profile file has no recorded snapshot",
+                detail="use --reset permission-profile or give --permission-profile",
+            )
+        extra["permission_profile_label"] = previous.permission_profile_label
     _check_profile_name(cfg, profile, origins)
     return Resolution(
         kind=name,

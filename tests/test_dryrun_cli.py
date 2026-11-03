@@ -400,12 +400,12 @@ def test_a_dry_run_still_applies_usage_checks(tmp_path: Path, tools: Path, work:
         ["start", "--resume", "cs-abcd2345", "--dry-run", "--json"],
     ],
 )
-def test_dry_runs_of_existing_sessions_are_not_implemented_yet(
+def test_dry_runs_of_unknown_sessions_exit_10(
     args: list[str], tmp_path: Path, tools: Path, work: Path
 ) -> None:
     proc = cli(args, cwd=work, tools=tools, tmp_path=tmp_path)
-    assert proc.returncode == 1
-    assert error_of(proc)["error"]["code"] == "internal"
+    assert proc.returncode == 10
+    assert error_of(proc)["error"]["code"] == "not_found"
 
 
 def test_the_adoption_dry_run_of_an_unknown_session_exits_10(

@@ -122,6 +122,9 @@ class SelfCheck:
     tmpdir: str | None
     warnings: tuple[str, ...] = ()
     problems: tuple[str, ...] = ()
+    # An open descriptor of the created tmpdir (``tmpdir.create_pinned``), for the run's
+    # identity-checked removal; the run closes it once the tmpdir is removed.
+    tmpdir_pin: int | None = None
 
 
 def detect_platform(sys_platform: str | None = None, release: str | None = None) -> str:
@@ -222,9 +225,10 @@ def self_check(
         )
     check_socket_path(tmpdir.run_path(csession_id or _PLACEHOLDER_ID, tmp_base), platform)
     path = None if csession_id is None else tmpdir.run_path(csession_id, tmp_base)
+    pin = None
     if create:
         assert csession_id is not None
-        path, stale = tmpdir.create_reporting(csession_id, base=tmp_base)
+        path, stale, pin = tmpdir.create_pinned(csession_id, base=tmp_base)
         if stale is not None:
             warnings.append(
                 f"leftover private temporary directory moved aside: {stale};"
@@ -235,6 +239,7 @@ def self_check(
         tmpdir=path,
         warnings=tuple(warnings),
         problems=problems,
+        tmpdir_pin=pin,
     )
 
 
