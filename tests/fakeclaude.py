@@ -10,12 +10,15 @@ Two ways in, both starting the real fake process:
 
 Every test that starts a fake that hangs or ignores SIGTERM relies on the autouse
 ``no_leftover_processes`` fixture in ``conftest.py`` (the process is started through
-``subprocess.Popen`` in the test process) and should still end it itself by exact PID.
+``subprocess.Popen`` in the test process) and should still end it itself by exact PID. A fake
+started by a process the test started (``claude-session exec``) is found through its start
+record instead; the fixture fails any test that leaves one running.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 import time
@@ -92,10 +95,16 @@ def write_json(path: Path, data: object) -> Path:
 
 
 def fake_env(scenario: Path, log: Path | None = None) -> dict[str, str]:
-    """The variables that point the fake at its scenario and log (``extra_env``)."""
+    """The variables that point the fake at its scenario and log (``extra_env``), and the
+    current test's start-record directory (``FAKE_CLAUDE_STARTED_DIR``, set by the
+    ``no_leftover_processes`` fixture), which ``claude_bin`` thus bakes into its wrapper: the
+    environment ``exec`` builds for ``claude`` does not carry it."""
     env = {"FAKE_CLAUDE_SCENARIO": str(scenario)}
     if log is not None:
         env["FAKE_CLAUDE_LOG"] = str(log)
+    started = os.environ.get("FAKE_CLAUDE_STARTED_DIR")
+    if started:
+        env["FAKE_CLAUDE_STARTED_DIR"] = started
     return env
 
 

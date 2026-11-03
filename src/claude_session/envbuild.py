@@ -182,9 +182,10 @@ def build(
     session-writable path, and ``ValueError`` for an ``exe_dir`` that is not one absolute
     path.
     """
-    # TODO(#15): exec passes exe_dir (from the absolute argv[0]), git_dir (from gitinfo) and
-    # the private tmpdir (#25), and builds the redaction set and the contains_secret index
-    # (secretindex.write_at) from secret_values(session_env, environ, run_secret).
+    # exec (launch.build_env) passes exe_dir (from the absolute argv[0]), git_dir (from
+    # gitinfo) and the private tmpdir, and builds the log and audit redaction set and the
+    # contains_secret index (launch.prepare) from secret_values(session_env, environ,
+    # run_secret).
     _check_path_entry(exe_dir, ValueError, "the claude-session executable directory")
     profile = resolution.profile
     isolated = resolution.isolated()

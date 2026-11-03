@@ -21,11 +21,28 @@ such a test. Nothing else is ever signalled: the members of a group whose leader
 reaped are left to the tests that started them (see ``grandchildren`` in test_gateway.py), which
 record them by exact PID.
 
+A fake ``claude`` (``tests/fakebin``) started by a process the test started, such as
+``claude-session exec``, is a grandchild: ``Popen`` never sees it, and one that ignores
+``exec``'s die-with-parent SIGTERM outlives ``exec``. So the fixture also points
+``FAKE_CLAUDE_STARTED_DIR`` at a directory of its own, where every fake records its PID and
+start ticks as it starts (``fakeclaude.fake_env`` bakes the variable into ``claude_bin``
+wrappers). At teardown, after the processes above are ended, a recorded fake still running
+with those start ticks after ``LEFTOVER_FAKE_GRACE`` (time to act on the SIGTERM) is
+SIGKILLed through a pidfd opened before its start ticks are checked again, so the pidfd names
+that exact fake; and the test fails, so a leak is never silently cleaned up. Without a pidfd
+it is only reported.
+
 Should a test run past ``WATCHDOG_SECONDS``, the watchdog writes the live tracked PIDs to
 stderr, SIGKILLs every tracked process that has a pidfd (exact: a pidfd never names a reused
 PID, so this cannot race the test's own wait), and the test fails at teardown. It sends no
 other signal: without pidfds it only reports, and a test hung on something else stays hung.
 This module is test-only; nothing under ``src/`` imports it.
+
+The other autouse fixtures keep every test off the user's real directories: its own
+``XDG_STATE_HOME`` (``_private_state_dir``), ``HOME`` and ``XDG_CONFIG_HOME``
+(``_private_home``; not for ``live`` tests, which need the real Claude Code login) and
+temporary-directory root (``private_tmp_root``: ``pathrules.TMP_ROOT``, so no run creates
+anything under the real ``/tmp/csession-<uid>``).
 """
 
 from __future__ import annotations
@@ -35,10 +52,14 @@ import ctypes
 import errno
 import os
 import platform
+import select
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,11 +67,19 @@ from typing import Any
 
 import pytest
 
+from claude_session import pathrules
+
 pytest_plugins = ["pytester"]  # test_leftover_guard.py runs the guard in a pytest of its own
 
 LINUX = sys.platform.startswith("linux")
 # A test still running after this long is reported as hung and its pidfd processes killed.
 WATCHDOG_SECONDS = 60.0
+# The production base of the per-uid temporary-directory root, read before any test patches it.
+REAL_TMP_ROOT = pathrules.TMP_ROOT
+# Where the fake claude writes its start records (tests/fakebin/fake_claude.py).
+STARTED_ENV = "FAKE_CLAUDE_STARTED_DIR"
+# How long a recorded fake may take to exit at teardown before it counts as left over.
+LEFTOVER_FAKE_GRACE = 5.0
 
 
 def _stat(pid: int) -> tuple[int, int, int] | None:
@@ -186,6 +215,49 @@ class _Started:
             os.close(self.pidfd)
 
 
+def _running_ticks(pid: int) -> int | None:
+    """Start ticks of a running process (not a zombie), or ``None``."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            fields = fh.read().rpartition(b")")[2].split()
+    except OSError:
+        return None
+    return None if fields[0] in (b"Z", b"X") else int(fields[19])
+
+
+def _end_leftover_fakes(directory: str) -> list[str]:
+    """End the fakes recorded in ``directory`` that still run (see the module docstring);
+    returns a description of each one left over."""
+    records: list[tuple[int, int]] = []
+    for name in os.listdir(directory):
+        pid, _, ticks = name.partition(".")
+        records.append((int(pid), int(ticks)))
+    deadline = time.monotonic() + LEFTOVER_FAKE_GRACE
+    while True:
+        records = [(pid, ticks) for pid, ticks in records if _running_ticks(pid) == ticks]
+        if not records or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    leftovers: list[str] = []
+    for pid, ticks in records:
+        fd = _pidfd(pid)
+        if fd is None:
+            if _running_ticks(pid) == ticks:
+                leftovers.append(f"{pid} (no pidfd: not signalled)")
+            continue
+        try:
+            # Checked after the pidfd was opened: it names the recorded fake, never a reuse.
+            if _running_ticks(pid) != ticks:
+                continue
+            with contextlib.suppress(ProcessLookupError):
+                _pidfd_send_signal(fd, signal.SIGKILL)
+            select.select([fd], [], [], 5.0)  # readable once the process has exited
+            leftovers.append(f"{pid} (SIGKILLed)")
+        finally:
+            os.close(fd)
+    return leftovers
+
+
 def _tracking_popen(started: list[_Started]) -> type[subprocess.Popen[Any]]:
     real = subprocess.Popen
 
@@ -219,7 +291,12 @@ def no_leftover_processes() -> Iterator[list[_Started]]:
                 record.kill_exact()
 
     thread: threading.Thread | None = None
+    fakes_dir: str | None = None
+    previous_env = os.environ.get(STARTED_ENV)
+    leftover_fakes: list[str] = []
     try:
+        fakes_dir = tempfile.mkdtemp(prefix="cs-fakes-")
+        os.environ[STARTED_ENV] = fakes_dir
         subprocess.Popen = _tracking_popen(started)  # type: ignore[misc]
         thread = threading.Thread(target=watchdog, daemon=True)
         thread.start()
@@ -235,8 +312,22 @@ def no_leftover_processes() -> Iterator[list[_Started]]:
                 with contextlib.suppress(subprocess.TimeoutExpired, ChildProcessError):
                     proc.popen.wait(timeout=5)
             proc.close()
+        try:
+            if fakes_dir is not None:
+                leftover_fakes = _end_leftover_fakes(fakes_dir)
+                shutil.rmtree(fakes_dir, ignore_errors=True)
+        finally:
+            if previous_env is None:
+                os.environ.pop(STARTED_ENV, None)
+            else:
+                os.environ[STARTED_ENV] = previous_env
     if fired.is_set():
         pytest.fail(f"watchdog fired: the test was still running after {WATCHDOG_SECONDS} s")
+    if leftover_fakes:
+        pytest.fail(
+            "fake claude processes outlived the test (started by a process the test started;"
+            f" ended here): {', '.join(leftover_fakes)}"
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -249,3 +340,54 @@ def _private_state_dir(
     state_home = tmp_path_factory.mktemp("xdg") / "state"
     monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
     return state_home
+
+
+@pytest.fixture(autouse=True)
+def _private_home(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every test (and every subprocess it starts) gets its own empty ``HOME`` and
+    ``XDG_CONFIG_HOME``, so no test reads or writes the user's real configuration. ``live``
+    tests keep the real ones: real Claude Code needs its login."""
+    if request.node.get_closest_marker("live") is not None:
+        return
+    home = tmp_path_factory.mktemp("home")
+    (home / ".config").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+
+
+def _remove_tree(path: str) -> None:
+    """Remove a test's tree even where it left a directory without write or search
+    permission (the tests own every entry in it)."""
+
+    def retry(func: Any, failed: str, exc: BaseException) -> None:
+        os.chmod(os.path.dirname(failed), 0o700)
+        with contextlib.suppress(OSError):
+            os.chmod(failed, 0o700)
+        func(failed)
+
+    shutil.rmtree(path, onexc=retry)
+
+
+@pytest.fixture(autouse=True)
+def private_tmp_root(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Every test gets its own base for the per-uid temporary-directory root
+    (``pathrules.TMP_ROOT``), so no run creates anything under the real
+    ``/tmp/csession-<uid>``. Subprocesses do not inherit the patch: tests that start the
+    ``claude-session`` executable pass the path on (see ``test_exec_headless.run_exec``).
+
+    The base is 0700 and owned by the test user, which passes tmpdir's base checks (owner root
+    or the user; group- or other-writable only with the sticky bit). It is a short directory
+    directly in the system temporary directory rather than under ``tmp_path``: the private
+    tmpdir under it must leave room for Claude Code's socket names (``selfcheck``'s socket
+    path limit), and ``tmp_path`` is too long for that."""
+    base = tempfile.mkdtemp(prefix="cs-t-", dir="/tmp")
+    os.chmod(base, 0o700)
+    monkeypatch.setattr(pathrules, "TMP_ROOT", base)
+    try:
+        yield Path(base)
+    finally:
+        _remove_tree(base)

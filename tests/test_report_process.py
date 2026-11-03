@@ -2,9 +2,9 @@
 runs ``claude-session report`` in its session, then Claude Code runs the injected
 ``PostToolUse`` hook (``/bin/sh -c '<interpreter> -I -m claude_session hook-event ...'``).
 
-TODO(#15): the same flow through the fake claude (#8) once exec launches it: a ``report``
-step with a heredoc, a rejected report refiled from the next ``on_block``, and the Stop
-backstop after a rejection.
+The same flow through the fake claude (#8) launched by ``exec`` (a ``report`` step with a
+heredoc, a rejected report refiled from its ``on_block``, and the Stop backstop after a
+rejection) is in ``test_exec_headless.py``.
 """
 
 from __future__ import annotations

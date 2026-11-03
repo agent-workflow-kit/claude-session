@@ -6,23 +6,27 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from claude_session import fsutil, gateway, selfcheck, tmpdir
+from claude_session import fsutil, selfcheck, tmpdir
 from claude_session.errors import LaunchValidationError
+from claude_session.gateway import GatewayTimeout, Result
 from claude_session.selfcheck import Prerequisites
+
+from .fake_gateway import FakeGateway
 
 SID = "cs-abcd2345"
 REPO = Path(__file__).resolve().parent.parent
 
 
-class FakeRunner:
-    """Records every call; answers with ``returncode`` or raises ``error``. ``by_tool`` maps
-    the basename of ``argv[0]`` to a return code or an exception for that tool only."""
+class FakeRunner(FakeGateway):
+    """A gateway whose ``run`` records every call and answers with ``returncode`` or raises
+    ``error``. ``by_tool`` maps the basename of ``argv[0]`` to a return code or an exception
+    for that tool only."""
 
     def __init__(
         self,
@@ -33,26 +37,29 @@ class FakeRunner:
         self.returncode = returncode
         self.error = error
         self.by_tool = dict(by_tool or {})
-        self.calls: list[dict[str, Any]] = []
+        super().__init__()
+        self.probes: list[dict[str, Any]] = []
 
-    def __call__(
+    def run(
         self,
-        argv: list[str],
+        argv: Sequence[str],
         *,
+        env: Mapping[str, str] | None = None,
+        extra_env: Mapping[str, str] | None = None,
+        cwd: str | None = None,
         stdin: str | None = None,
         timeout: float | None = None,
-        env: Mapping[str, str] | None = None,
-    ) -> gateway.Result:
-        self.calls.append({"argv": list(argv), "timeout": timeout, "env": env, "stdin": stdin})
+        new_process_group: bool = False,
+        kill_grace: float | None = None,
+        executable: str | None = None,
+    ) -> Result:
+        self.probes.append({"argv": list(argv), "timeout": timeout, "env": env, "stdin": stdin})
         answer: int | BaseException | None = self.by_tool.get(Path(argv[0]).name)
         if answer is None:
             answer = self.error if self.error is not None else self.returncode
         if isinstance(answer, BaseException):
             raise answer
-        return gateway.Result(tuple(argv), answer, "", "probe stderr")
-
-
-UNDECODABLE = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        return Result(tuple(argv), answer, "", "probe stderr")
 
 
 def executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> str:
@@ -145,9 +152,9 @@ def test_linux_prerequisites_present_and_probe_succeeds(
     platform: str, tools: tuple[str, str]
 ) -> None:
     runner = FakeRunner(0)
-    result = selfcheck.check_prerequisites(platform, bwrap=tools[0], socat=tools[1], runner=runner)
+    result = selfcheck.check_prerequisites(platform, bwrap=tools[0], socat=tools[1], gw=runner)
     assert result == Prerequisites(available=True, problem=None, hint=None)
-    socat_call, call = runner.calls
+    socat_call, call = runner.probes
     assert socat_call["argv"] == [tools[1], "-V"]
     assert socat_call["timeout"] == selfcheck.PROBE_TIMEOUT
     assert socat_call["env"] == {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
@@ -167,19 +174,19 @@ def test_linux_missing_tool_is_unavailable_with_install_hint(
     runner = FakeRunner(0)
     bwrap = None if missing in ("bwrap", "both") else tools[0]
     socat = None if missing in ("socat", "both") else tools[1]
-    result = selfcheck.check_prerequisites("linux", bwrap=bwrap, socat=socat, runner=runner)
+    result = selfcheck.check_prerequisites("linux", bwrap=bwrap, socat=socat, gw=runner)
     assert not result.available
     assert result.problem is not None
     assert result.hint is not None and "apt install bubblewrap socat" in result.hint
-    assert runner.calls == []  # nothing is probed without both tools
+    assert runner.probes == []  # nothing is probed without both tools
 
 
 def test_linux_relative_tool_path_is_unavailable(tools: tuple[str, str]) -> None:
     runner = FakeRunner(0)
-    result = selfcheck.check_prerequisites("linux", bwrap="bwrap", socat=tools[1], runner=runner)
+    result = selfcheck.check_prerequisites("linux", bwrap="bwrap", socat=tools[1], gw=runner)
     assert not result.available
     assert result.problem is not None and "absolute" in result.problem
-    assert runner.calls == []
+    assert runner.probes == []
 
 
 def test_linux_tool_that_is_not_executable_is_unavailable(
@@ -189,7 +196,7 @@ def test_linux_tool_that_is_not_executable_is_unavailable(
     socat.write_text("")
     socat.chmod(0o644)
     result = selfcheck.check_prerequisites(
-        "linux", bwrap=tools[0], socat=str(socat), runner=FakeRunner(0)
+        "linux", bwrap=tools[0], socat=str(socat), gw=FakeRunner(0)
     )
     assert not result.available
 
@@ -198,14 +205,14 @@ def test_linux_tool_that_is_a_directory_is_unavailable(
     tmp_path: Path, tools: tuple[str, str]
 ) -> None:
     result = selfcheck.check_prerequisites(
-        "linux", bwrap=str(tmp_path), socat=tools[1], runner=FakeRunner(0)
+        "linux", bwrap=str(tmp_path), socat=tools[1], gw=FakeRunner(0)
     )
     assert not result.available
 
 
 def test_linux_failing_probe_means_no_user_namespaces(tools: tuple[str, str]) -> None:
     result = selfcheck.check_prerequisites(
-        "linux", bwrap=tools[0], socat=tools[1], runner=FakeRunner(by_tool={"bwrap": 1})
+        "linux", bwrap=tools[0], socat=tools[1], gw=FakeRunner(by_tool={"bwrap": 1})
     )
     assert not result.available
     assert result.problem is not None and "namespace" in result.problem
@@ -215,48 +222,38 @@ def test_linux_failing_probe_means_no_user_namespaces(tools: tuple[str, str]) ->
 @pytest.mark.parametrize(
     "error",
     [
-        gateway.GatewayTimeout(["bwrap"], 10),
+        GatewayTimeout(["/usr/bin/bwrap"], 10),
         FileNotFoundError(2, "No such file or directory"),
         PermissionError(13, "Permission denied"),
-        UNDECODABLE,
     ],
 )
 def test_linux_probe_that_cannot_run_is_unavailable(
     tools: tuple[str, str], error: BaseException
 ) -> None:
     result = selfcheck.check_prerequisites(
-        "linux", bwrap=tools[0], socat=tools[1], runner=FakeRunner(by_tool={"bwrap": error})
+        "linux", bwrap=tools[0], socat=tools[1], gw=FakeRunner(by_tool={"bwrap": error})
     )
     assert not result.available
     assert result.problem is not None and result.problem.startswith("bubblewrap")
-
-
-def test_probe_with_undecodable_output_is_a_probe_failure(tools: tuple[str, str]) -> None:
-    result = selfcheck.check_prerequisites(
-        "linux", bwrap=tools[0], socat=tools[1], runner=FakeRunner(by_tool={"bwrap": UNDECODABLE})
-    )
-    assert not result.available
-    assert result.problem is not None and "probe output undecodable" in result.problem
 
 
 @pytest.mark.parametrize(
     "answer",
     [
         1,
-        gateway.GatewayTimeout(["socat"], 10),
+        GatewayTimeout(["/usr/bin/socat"], 10),
         PermissionError(13, "Permission denied"),
-        UNDECODABLE,
     ],
 )
 def test_linux_socat_that_does_not_run_is_unavailable(
     tools: tuple[str, str], answer: int | BaseException
 ) -> None:
     runner = FakeRunner(by_tool={"socat": answer})
-    result = selfcheck.check_prerequisites("linux", bwrap=tools[0], socat=tools[1], runner=runner)
+    result = selfcheck.check_prerequisites("linux", bwrap=tools[0], socat=tools[1], gw=runner)
     assert not result.available
     assert result.problem is not None and result.problem.startswith("socat does not run: ")
     assert result.hint is not None and "socat" in result.hint
-    assert [Path(call["argv"][0]).name for call in runner.calls] == ["socat"]
+    assert [Path(call["argv"][0]).name for call in runner.probes] == ["socat"]
 
 
 def test_failing_socat_with_the_real_gateway(tmp_path: Path, tools: tuple[str, str]) -> None:
@@ -288,20 +285,20 @@ def test_failing_probe_with_the_real_gateway(tmp_path: Path, tools: tuple[str, s
 
 def test_wsl1_has_no_sandbox(tools: tuple[str, str]) -> None:
     runner = FakeRunner(0)
-    result = selfcheck.check_prerequisites("wsl1", bwrap=tools[0], socat=tools[1], runner=runner)
+    result = selfcheck.check_prerequisites("wsl1", bwrap=tools[0], socat=tools[1], gw=runner)
     assert not result.available
     assert result.hint is not None and "WSL2" in result.hint
-    assert runner.calls == []
+    assert runner.probes == []
 
 
 def test_macos_with_sandbox_exec(tmp_path: Path) -> None:
     sandbox_exec = executable(tmp_path / "sandbox-exec")
     runner = FakeRunner(0)
     result = selfcheck.check_prerequisites(
-        "macos", bwrap=None, socat=None, runner=runner, sandbox_exec=sandbox_exec
+        "macos", bwrap=None, socat=None, gw=runner, sandbox_exec=sandbox_exec
     )
     assert result.available
-    (call,) = runner.calls
+    (call,) = runner.probes
     assert call["argv"][0] == sandbox_exec
     assert call["argv"][1] == "-p"
 
@@ -313,27 +310,25 @@ def test_macos_default_sandbox_exec_path_is_fixed() -> None:
 def test_macos_without_sandbox_exec(tmp_path: Path) -> None:
     runner = FakeRunner(0)
     result = selfcheck.check_prerequisites(
-        "macos", bwrap=None, socat=None, runner=runner, sandbox_exec=str(tmp_path / "missing")
+        "macos", bwrap=None, socat=None, gw=runner, sandbox_exec=str(tmp_path / "missing")
     )
     assert not result.available
-    assert runner.calls == []
+    assert runner.probes == []
 
 
 def test_macos_failing_probe(tmp_path: Path) -> None:
     sandbox_exec = executable(tmp_path / "sandbox-exec")
     result = selfcheck.check_prerequisites(
-        "macos", bwrap=None, socat=None, runner=FakeRunner(71), sandbox_exec=sandbox_exec
+        "macos", bwrap=None, socat=None, gw=FakeRunner(71), sandbox_exec=sandbox_exec
     )
     assert not result.available
 
 
 def test_unsupported_platform_has_no_sandbox(tools: tuple[str, str]) -> None:
     runner = FakeRunner(0)
-    result = selfcheck.check_prerequisites(
-        "unsupported", bwrap=tools[0], socat=tools[1], runner=runner
-    )
+    result = selfcheck.check_prerequisites("unsupported", bwrap=tools[0], socat=tools[1], gw=runner)
     assert not result.available
-    assert runner.calls == []
+    assert runner.probes == []
 
 
 # The whole self-check
@@ -355,7 +350,7 @@ def run_check(
         bwrap=tools[0],
         socat=tools[1],
         platform=platform,
-        runner=runner,
+        gw=runner,
         tmp_base=str(base),
         create=create,
     )
@@ -365,7 +360,7 @@ def test_off_checks_and_creates_nothing(base: Path, tools: tuple[str, str]) -> N
     runner = FakeRunner(0)
     result = run_check("off", base, (None, None), runner)
     assert result == selfcheck.SelfCheck(sandbox_active=False, tmpdir=None, warnings=())
-    assert runner.calls == []
+    assert runner.probes == []
     assert list(base.iterdir()) == []
 
 

@@ -261,4 +261,5 @@ def test_hook_event_works_with_a_newer_additive_schema_and_never_migrates(
         assert store.format_version(s.schema_version()) == newer
         row = s.conn.execute("SELECT state, activity FROM sessions").fetchone()
     assert row == ("working", "working")
-    assert not Path(state_root, "log.jsonl").exists()  # no hook_event_failed
+    log = Path(state_root, "log.jsonl")
+    assert "hook_event_failed" not in (log.read_text() if log.exists() else "")

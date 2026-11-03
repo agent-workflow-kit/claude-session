@@ -25,18 +25,18 @@ command that removes it.
   limited to about 108 bytes).
 - ``off``: nothing is checked or created.
 
-Prerequisite probes run through ``gateway`` (an injected runner in tests), by absolute path
+Prerequisite probes run through the #51 ``Gateway`` (a fake one in tests), by absolute path
 and with a fixed minimal environment.
 
-TODO(#15): exec calls ``tmpdir.check`` at the temporary-directory slot of launch step 5 and
-``self_check`` after the ``claude_args`` check (and both again at adoption) with the
-resolved ``bwrap`` and ``socat``, records ``sandbox_active`` on the run, adds the warnings to
-the run's warnings, passes ``tmpdir`` to ``settings_builder.Isolation`` and ``envbuild``, and
-maps a ``LaunchValidationError`` (with its ``hint``) to a not-started run. Switch the default
-runner to #51's ``Gateway`` there.
-TODO(#24): ``bwrap`` and ``socat`` come from the PATH sanitizing's absolute tool resolution
-(outside session-writable paths); this module only checks that they are absolute,
-executable regular files.
+``exec`` (``launch.check_tmpdir``) calls ``tmpdir.check`` at the temporary-directory slot of
+launch step 5 and (``launch.check_sandbox``) ``self_check`` after the ``claude_args`` check,
+as the last action of step 5, with ``bwrap`` and ``socat``
+resolved by ``pathrules.resolve_tool`` (outside session-writable paths; this module only
+checks that they are absolute, executable regular files, and probes them by their realpath),
+records ``sandbox_active`` on the run, adds the warnings to the run's warnings, passes
+``tmpdir`` to ``settings_builder.Isolation`` and ``envbuild``, and maps a
+``LaunchValidationError`` (with its ``hint`` as the outcome message) to a not-started run.
+TODO(#28): adoption calls both again.
 TODO(#27): ``--dry-run`` calls ``tmpdir.check`` at the temporary-directory slot of launch
 step 5, then ``self_check(..., create=False)`` after the ``claude_args`` check, for
 ``would_fail``, ``sandbox_active`` and ``warnings``.
@@ -47,12 +47,11 @@ from __future__ import annotations
 import os
 import stat
 import sys
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
-from . import gateway, tmpdir
+from . import tmpdir
 from .errors import LaunchValidationError
+from .gateway import Gateway, GatewayTimeout, SystemGateway
 
 END_REASONS = ("tmpdir_unsafe", "sandbox_unavailable", "socket_path_too_long")
 SANDBOX_MODES = ("required", "preferred", "off")
@@ -104,10 +103,7 @@ _MACOS_HINT = f"the macOS Seatbelt sandbox needs {SANDBOX_EXEC}"
 _UNSUPPORTED_HINT = "Claude Code has no sandbox on this platform; set sandbox to preferred or off"
 _SOCKET_HINT = "use a shorter temporary directory path (the private TMPDIR lives under /tmp)"
 
-Runner = Callable[..., gateway.Result]
-
-
-_GATEWAY_RUN: Runner = gateway.SystemGateway().run
+_SYSTEM_GATEWAY = SystemGateway()
 
 
 @dataclass(frozen=True)
@@ -165,14 +161,14 @@ def check_prerequisites(
     *,
     bwrap: str | None,
     socat: str | None,
-    runner: Runner = _GATEWAY_RUN,
+    gw: Gateway = _SYSTEM_GATEWAY,
     sandbox_exec: str = SANDBOX_EXEC,
 ) -> Prerequisites:
     """Whether the sandbox can run here: the tools present and a probe that succeeds."""
     if platform in ("linux", "wsl2"):
-        return _linux(bwrap, socat, runner)
+        return _linux(bwrap, socat, gw)
     if platform == "macos":
-        return _macos(sandbox_exec, runner)
+        return _macos(sandbox_exec, gw)
     if platform == "wsl1":
         return Prerequisites(False, "WSL1 has no sandbox", _WSL1_HINT)
     return Prerequisites(False, f"no sandbox on platform {platform!r}", _UNSUPPORTED_HINT)
@@ -185,8 +181,8 @@ def self_check(
     bwrap: str | None,
     socat: str | None,
     platform: str | None = None,
-    runner: Runner = _GATEWAY_RUN,
-    tmp_base: str = tmpdir.DEFAULT_BASE,
+    gw: Gateway = _SYSTEM_GATEWAY,
+    tmp_base: str | None = None,  # None: pathrules.TMP_ROOT
     create: bool = True,
     sandbox_exec: str = SANDBOX_EXEC,
 ) -> SelfCheck:
@@ -207,7 +203,7 @@ def self_check(
     if platform is None:
         platform = detect_platform()
     prerequisites = check_prerequisites(
-        platform, bwrap=bwrap, socat=socat, runner=runner, sandbox_exec=sandbox_exec
+        platform, bwrap=bwrap, socat=socat, gw=gw, sandbox_exec=sandbox_exec
     )
     warnings: list[str] = []
     if not prerequisites.available:
@@ -238,25 +234,25 @@ def self_check(
 _PLACEHOLDER_ID = "cs-aaaaaaaa"
 
 
-def _linux(bwrap: str | None, socat: str | None, runner: Runner) -> Prerequisites:
+def _linux(bwrap: str | None, socat: str | None, gw: Gateway) -> Prerequisites:
     for name, path in (("bwrap", bwrap), ("socat", socat)):
         problem = _tool_problem(name, path)
         if problem is not None:
             return Prerequisites(False, problem, _INSTALL_HINT)
     assert bwrap is not None and socat is not None
-    problem = _probe([socat, *SOCAT_PROBE_ARGS], runner)
+    problem = _probe([socat, *SOCAT_PROBE_ARGS], gw)
     if problem is not None:
         return Prerequisites(False, f"socat does not run: {problem}", _SOCAT_HINT)
-    problem = _probe([bwrap, *BWRAP_PROBE_ARGS], runner)
+    problem = _probe([bwrap, *BWRAP_PROBE_ARGS], gw)
     if problem is not None:
         return Prerequisites(False, f"bubblewrap cannot create namespaces: {problem}", _USERNS_HINT)
     return Prerequisites(True)
 
 
-def _macos(sandbox_exec: str, runner: Runner) -> Prerequisites:
+def _macos(sandbox_exec: str, gw: Gateway) -> Prerequisites:
     problem = _tool_problem("sandbox-exec", sandbox_exec)
     if problem is None:
-        problem = _probe([sandbox_exec, *SANDBOX_EXEC_PROBE_ARGS], runner)
+        problem = _probe([sandbox_exec, *SANDBOX_EXEC_PROBE_ARGS], gw)
     if problem is not None:
         return Prerequisites(False, problem, _MACOS_HINT)
     return Prerequisites(True)
@@ -276,18 +272,15 @@ def _tool_problem(name: str, path: str | None) -> str | None:
     return None
 
 
-def _probe(argv: list[str], runner: Runner) -> str | None:
+def _probe(argv: list[str], gw: Gateway) -> str | None:
     """Run a probe; None when it exits 0, else what went wrong (no output: it may hold
     paths of the host, and the exit status is enough)."""
-    kwargs: dict[str, Any] = {"timeout": PROBE_TIMEOUT, "env": dict(PROBE_ENV)}
     try:
-        result = runner(argv, **kwargs)
-    except gateway.GatewayTimeout:
+        result = gw.run(argv, timeout=PROBE_TIMEOUT, env=dict(PROBE_ENV))
+    except GatewayTimeout:
         return f"probe timed out after {PROBE_TIMEOUT:g} s"
     except OSError as exc:
         return f"probe could not run: {exc.strerror or exc}"
-    except UnicodeDecodeError:
-        return "probe output undecodable"
     except ValueError as exc:
         return f"probe could not run: {exc}"
     if result.returncode != 0:

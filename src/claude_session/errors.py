@@ -141,8 +141,8 @@ class LaunchValidationError(FailedError):
     for bubblewrap and socat); the launch path reports it with the run, never in the
     ``failed`` envelope."""
 
-    # TODO(#15): the launch path maps LaunchValidationError to a not-started run (end_reason,
-    # exit 12; start: LaunchFailedError) instead of the plain `failed` envelope.
+    # exec maps it to a not-started run (launch.fail_launch: end_reason, its message, detail
+    # and hint as the outcome message, exit 12). TODO(#28): start maps it to LaunchFailedError.
 
     end_reason: str
 

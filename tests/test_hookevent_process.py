@@ -2,8 +2,8 @@
 hook-event --state-dir <root> <Event>'`` with the payload on stdin (design.md, Generated
 settings and Hook-event fast path).
 
-TODO(#15): an end-to-end run through the fake claude (#8), which reads the generated
-``--settings`` and fires these hooks itself.
+The end-to-end run through the fake claude (#8), which reads the generated ``--settings`` and
+fires these hooks itself, is in ``test_exec_headless.py``.
 """
 
 from __future__ import annotations
@@ -63,7 +63,9 @@ def log_records(env: Env) -> list[dict[str, Any]]:
     path = env.root / "log.jsonl"
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text().splitlines()]
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    # The store logs its own migration when it creates the database (not a hook record).
+    return [r for r in records if r["event"] != "migration"]
 
 
 def test_session_start_prints_exactly_the_context_json(env: Env) -> None:

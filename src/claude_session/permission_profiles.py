@@ -174,7 +174,7 @@ def read_file(
     opened at that real path without following symlinks, so a swap after the check fails. At
     most ``MAX_FILE_BYTES``; regular files only. With ``expected_label`` (a carried snapshot's
     recorded ``file:<prefix>``), a file whose label differs fails."""
-    # The check is pathrules.session_writable(...) (TODO(#15): the launch path passes it).
+    # The check is pathrules.session_writable(...) (launch.select_profile passes it).
     _require_check(isolated, session_writable)
     problem: str | None = None
     try:
@@ -257,11 +257,11 @@ def write_snapshot(
     """Write the snapshot of a file profile to ``path`` (absolute; normally
     ``private/<id>/runs/<n>/permission-profile.json``) with ``write`` (default: atomic, mode
     0600, no-follow)."""
-    # TODO(#15): the launch path passes the run's private directory from the session-directory
-    # helpers (#11) and records the label and snapshot path in the run row. It reads and
-    # snapshots the file at `start` (a relative path resolves against the caller's cwd there,
-    # never at a later `exec`) and rewrites the stored --permission-profile flag value to the
-    # snapshot path.
+    # exec writes the snapshot with SessionDirs.write_private_run_file (launch.prepare) and
+    # records the label and snapshot path in the run row; this helper writes to a path.
+    # TODO(#28): start reads and snapshots the file (a relative path resolves against the
+    # caller's cwd there, never at a later exec). TODO(#29): a resume stores the snapshot path
+    # as the --permission-profile flag value.
     write(path, profile.snapshot_bytes())
 
 

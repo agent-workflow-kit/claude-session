@@ -11,8 +11,9 @@ from typing import Any
 
 import pytest
 
-from claude_session import gateway, gitinfo
+from claude_session import gitinfo
 from claude_session.errors import FailedError, LaunchValidationError
+from claude_session.gateway import Result
 from claude_session.gitinfo import GitDirs
 
 GIT = shutil.which("git")
@@ -78,22 +79,27 @@ def test_resolve_linked_worktree(repo: Path, tmp_path: Path) -> None:
     )
 
 
+class FakeRun:
+    """A gateway whose ``run`` records its calls and answers with one canned result."""
+
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+    def run(self, argv: list[str], **kw: Any) -> Result:
+        self.calls.append({"argv": argv, **kw})
+        return Result(tuple(argv), self.returncode, self.stdout, self.stderr)
+
+
 def fake(returncode: int, stdout: str = "", stderr: str = "") -> Any:
-    calls: list[dict[str, Any]] = []
-
-    def run(argv: list[str], **kw: Any) -> gateway.Result:
-        calls.append({"argv": argv, **kw})
-        return gateway.Result(tuple(argv), returncode, stdout, stderr)
-
-    run.calls = calls  # type: ignore[attr-defined]
-    return run
+    return FakeRun(returncode, stdout, stderr)
 
 
 def test_resolve_is_hardened_and_absolute(tmp_path: Path) -> None:
     (tmp_path / "r" / ".git").mkdir(parents=True)
     cwd = str(tmp_path / "r")
     run = fake(0, ".git\n.git\n")
-    dirs = gitinfo.resolve(cwd, git="/usr/bin/git", environ={"GIT_DIR": "/x"}, run=run)
+    dirs = gitinfo.resolve(cwd, git="/usr/bin/git", environ={"GIT_DIR": "/x"}, gw=run)
     assert dirs == GitDirs(common_dir=os.path.realpath(tmp_path / "r" / ".git"))
     call = run.calls[0]
     assert call["argv"][0] == "/usr/bin/git"
@@ -101,6 +107,7 @@ def test_resolve_is_hardened_and_absolute(tmp_path: Path) -> None:
     assert "GIT_DIR" not in call["env"] and call["env"]["GIT_CONFIG_NOSYSTEM"] == "1"
     assert call["env"]["LC_ALL"] == "C"
     assert call["timeout"] == gitinfo.GIT_TIMEOUT
+    assert "stdin" not in call  # the gateway gives git /dev/null
 
 
 @pytest.mark.parametrize(
@@ -116,15 +123,17 @@ def test_resolve_failures_are_never_recorded_as_no_git_dir(
     result: tuple[int, str, str], error: type[Exception]
 ) -> None:
     with pytest.raises(error):
-        gitinfo.resolve("/w", git="/usr/bin/git", environ={}, run=fake(*result))
+        gitinfo.resolve("/w", git="/usr/bin/git", environ={}, gw=fake(*result))
 
 
 def test_resolve_git_that_cannot_run() -> None:
-    def run(argv: list[str], **kw: Any) -> Any:
-        raise FileNotFoundError(argv[0])
+    class Missing:
+        def run(self, argv: list[str], **kw: Any) -> Any:
+            raise FileNotFoundError(argv[0])
 
+    missing: Any = Missing()
     with pytest.raises(FailedError):
-        gitinfo.resolve("/w", git="/missing/git", environ={}, run=run)
+        gitinfo.resolve("/w", git="/missing/git", environ={}, gw=missing)
 
 
 NOT_A_REPO = "fatal: not a git repository (or any of the parent directories): .git"
@@ -134,7 +143,7 @@ def test_not_a_repository_is_none(tmp_path: Path) -> None:
     plain = tmp_path / "plain"
     plain.mkdir()
     run = fake(128, "", NOT_A_REPO)
-    assert gitinfo.resolve(str(plain), git="/usr/bin/git", environ={}, run=run) is None
+    assert gitinfo.resolve(str(plain), git="/usr/bin/git", environ={}, gw=run) is None
 
 
 # git_dir_changed and no_git_cwd
@@ -271,7 +280,7 @@ def test_no_credential_warning_for_a_clean_repository(repo: Path, tmp_path: Path
 
 
 def test_credential_warning_when_git_fails() -> None:
-    warnings = gitinfo.credential_warnings("/w", git="/g", environ={}, run=fake(1))
+    warnings = gitinfo.credential_warnings("/w", git="/g", environ={}, gw=fake(1))
     assert warnings == ["could not read the repository git config to check it for credentials"]
 
 
@@ -281,7 +290,7 @@ def test_credential_warning_when_git_fails() -> None:
 def test_git_failure_detail_holds_the_sanitized_first_stderr_line() -> None:
     stderr = "fatal: \x1b[31mbad\x07 thing " + "x" * 400 + "\nsecond line\n"
     with pytest.raises(FailedError) as info:
-        gitinfo.resolve("/w", git="/usr/bin/git", environ={}, run=fake(128, "", stderr))
+        gitinfo.resolve("/w", git="/usr/bin/git", environ={}, gw=fake(128, "", stderr))
     detail = info.value.detail or ""
     assert "fatal: ?[31mbad? thing" in detail
     assert "\x1b" not in detail and "\x07" not in detail
@@ -293,12 +302,12 @@ def test_git_output_with_extra_lines_fails(tmp_path: Path) -> None:
     (tmp_path / ".git").mkdir()
     for stdout in (".git\n.git\nextra\n", ".git\n.git", ".git\n"):
         with pytest.raises(FailedError):
-            gitinfo.resolve(str(tmp_path), git="/g", environ={}, run=fake(0, stdout))
+            gitinfo.resolve(str(tmp_path), git="/g", environ={}, gw=fake(0, stdout))
 
 
 def test_git_dirs_must_exist(tmp_path: Path) -> None:
     with pytest.raises(FailedError):
-        gitinfo.resolve(str(tmp_path), git="/g", environ={}, run=fake(0, "missing\nmissing\n"))
+        gitinfo.resolve(str(tmp_path), git="/g", environ={}, gw=fake(0, "missing\nmissing\n"))
 
 
 @needs_git
@@ -365,7 +374,7 @@ def test_not_a_repository_message_must_start_the_line(tmp_path: Path) -> None:
     plain.mkdir()
     stderr = "fatal: cannot change to '/x/not a git repository': No such file or directory\n"
     with pytest.raises(FailedError):
-        gitinfo.resolve(str(plain), git="/g", environ={}, run=fake(128, "", stderr))
+        gitinfo.resolve(str(plain), git="/g", environ={}, gw=fake(128, "", stderr))
 
 
 @needs_git
@@ -380,15 +389,23 @@ def test_not_a_repository_with_a_git_entry_above_is_a_failure(tmp_path: Path) ->
     (tmp_path / ".git").write_text("gitdir: /nowhere\n")
     (tmp_path / "sub").mkdir()
     with pytest.raises(FailedError):
-        gitinfo.resolve(str(tmp_path / "sub"), git="/g", environ={}, run=fake(128, "", NOT_A_REPO))
+        gitinfo.resolve(str(tmp_path / "sub"), git="/g", environ={}, gw=fake(128, "", NOT_A_REPO))
 
 
 def test_credential_warning_wording() -> None:
-    def run(argv: list[str], **kw: Any) -> gateway.Result:
-        return gateway.Result(tuple(argv), 0, listing(("local", "imap.pass", TOKEN)), "")
-
-    warnings = gitinfo.credential_warnings("/w", git="/g", environ={}, run=run)
+    run = fake(0, listing(("local", "imap.pass", TOKEN)))
+    warnings = gitinfo.credential_warnings("/w", git="/g", environ={}, gw=run)
     assert warnings == [
         "the repository git config may hold a credential in imap.pass; the session can read it"
         " (use a credential helper instead)"
     ]
+
+
+def test_a_resolved_git_runs_from_its_path_with_argv0_its_name(tmp_path: Path) -> None:
+    (tmp_path / "r" / ".git").mkdir(parents=True)
+    run = fake(0, ".git\n.git\n")
+    gitinfo.resolve(str(tmp_path / "r"), git="/opt/real/git", environ={}, gw=run, git_name="git")
+    gitinfo.credential_warnings("/w", git="/opt/real/git", environ={}, gw=run, git_name="git")
+    for call in run.calls:
+        assert call["argv"][0] == "git"
+        assert call["executable"] == "/opt/real/git"

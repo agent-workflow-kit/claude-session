@@ -19,6 +19,8 @@ from claude_session.errors import (
 )
 from claude_session.pathrules import Host, PathRules
 
+from .conftest import REAL_TMP_ROOT
+
 SID = "cs-abcd2345"
 OTHER = "cs-zzzz2345"
 
@@ -727,8 +729,13 @@ def test_host_from_environ() -> None:
     host = Host.from_environ(environ, state_root="/s", uid=42, path_prepend=["/pre"])
     assert host.path_dirs == ("/pre", "/usr/bin", "/opt/x")
     assert host.xdg_dirs == ("/cfg",)
-    assert host.tmp_parent == "/tmp/csession-42"
-    assert pathrules.tmp_parent(7) == "/tmp/csession-7"
+    # conftest.private_tmp_root moves TMP_ROOT (production: /tmp) for every test.
+    assert host.tmp_parent == os.path.join(pathrules.TMP_ROOT, "csession-42")
+    assert pathrules.tmp_parent(7) == os.path.join(pathrules.TMP_ROOT, "csession-7")
+
+
+def test_the_tmp_root_is_slash_tmp_in_production() -> None:
+    assert REAL_TMP_ROOT == "/tmp"
 
 
 @pytest.mark.parametrize("home", [None, "", "relative/home"])

@@ -292,7 +292,7 @@
             "string",
             "null"
           ],
-          "description": "Launch hint or pre-launch hook stderr (control characters stripped, capped at 2 KiB); never agent text."
+          "description": "Launch failure message (the error, its detail, then the hint when there is one) or pre-launch hook stderr (control characters stripped, capped at 2 KiB); never agent text."
         },
         "stop_requested_at": {
           "type": [
@@ -332,7 +332,8 @@
           "type": "boolean"
         },
         "backstop_used": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Whether the headless Stop backstop was used (it blocks once per run). True from launch for a kind with backstop: false, so its runs are never blocked."
         },
         "report": {
           "$ref": "outcome.json#/$defs/report"
@@ -369,7 +370,7 @@
             "number",
             "null"
           ],
-          "description": "Headless: the sum of total_cost_usd over all result objects of the run; null for interactive runs and launch-phase ends."
+          "description": "Headless: the sum of total_cost_usd over all result objects of the run (values that are not finite non-negative numbers left out); null for interactive runs, launch-phase ends, and a headless run with no result object, no usable cost or a sum that is not finite."
         },
         "num_turns": {
           "type": [

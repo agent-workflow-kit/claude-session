@@ -1,5 +1,5 @@
 """The private temporary directory of sandboxed runs (interface.md, Isolation; design.md,
-Session directories). Standard library only.
+Session directories). No third-party dependencies.
 
 Layout: ``<base>/<root_name(euid)>/<csession_id>/`` (``root_name``: ``csession-<euid>``) with
 ``<base>`` the realpath of ``/tmp`` (macOS: ``/private/tmp``). The base is world-writable, so
@@ -28,10 +28,12 @@ symlink or FIFO in its place, or create it with a mode that lets them in.
   type for the message only (a root another user created is reported as such even when it
   cannot be opened); the no-follow open and ``fstat`` checks stay authoritative.
 
-TODO(#15): exec calls ``check`` at the temporary-directory slot of launch step 5 and
-``create`` (through ``selfcheck.self_check``, after the ``claude_args`` check) at launch and
-again at adoption, passes the path as ``Isolation.tmpdir`` and ``envbuild``'s ``tmpdir``,
-and calls ``remove`` when the run ends (also not-started runs, after the run is final).
+``exec`` (``launch.check_tmpdir``) calls ``check`` at the temporary-directory slot of launch
+step 5 and ``create`` (through ``selfcheck.self_check`` in ``launch.check_sandbox``, the last
+action of step 5),
+passes the path as ``Isolation.tmpdir`` and ``envbuild``'s ``tmpdir``, and calls ``remove``
+when the run ends (``supervisor.finish``; a not-started run's in ``launch.end_launch``).
+TODO(#28): adoption calls ``check`` and ``create`` again.
 TODO(#29): reconcile calls ``remove`` for leftover tmpdirs of final runs and of deleted
 sessions.
 """
@@ -43,13 +45,9 @@ import os
 import secrets
 import stat
 
-from . import fsutil, ids
+from . import fsutil, ids, pathrules
 from .errors import LaunchValidationError
 
-DEFAULT_BASE = "/tmp"
-# The per-uid root's name is defined here only: ``root_name`` (and ``root_path`` from it).
-# TODO(#15): dedupe with pathrules.tmp_parent from #24 when both are merged.
-ROOT_PREFIX = "csession-"
 # Leftover run directories that cannot be removed are renamed to ".stale-<id>-<hex>": the
 # leading dot keeps the name outside the session id grammar.
 STALE_PREFIX = ".stale-"
@@ -90,24 +88,29 @@ class _Refusal(fsutil.UnsafePathError):
 
 
 def root_name(uid: int) -> str:
-    """The name of the per-uid root of ``uid`` in the base: ``csession-<uid>``."""
-    return f"{ROOT_PREFIX}{uid}"
+    """The name of the per-uid root of ``uid`` in the base: ``csession-<uid>``, as
+    ``pathrules.tmp_parent`` names it (the single definition)."""
+    return pathrules.tmp_root_name(uid)
 
 
-def root_path(base: str = DEFAULT_BASE) -> str:
-    """``<realpath(base)>/<root_name(euid)>``; ``base`` must be absolute."""
+def root_path(base: str | None = None) -> str:
+    """``<realpath(base)>/<root_name(euid)>``; ``base`` must be absolute. ``base`` defaults to
+    ``pathrules.TMP_ROOT``, read at call time: the one seam the test suite patches to keep its
+    runs out of the real per-uid root (nothing else, and no environment variable, moves it)."""
+    if base is None:
+        base = pathrules.TMP_ROOT
     if not os.path.isabs(base):
         raise ValueError(f"base must be absolute: {base!r}")
     return os.path.join(os.path.realpath(base), root_name(os.geteuid()))
 
 
-def run_path(csession_id: str, base: str = DEFAULT_BASE) -> str:
+def run_path(csession_id: str, base: str | None = None) -> str:
     """The private temporary directory of session ``csession_id`` (not checked or created)."""
     _check_id(csession_id)
     return os.path.join(root_path(base), csession_id)
 
 
-def check(csession_id: str | None, *, base: str = DEFAULT_BASE) -> str | None:
+def check(csession_id: str | None, *, base: str | None = None) -> str | None:
     """Validate the base and, when it exists, the per-uid root, creating and changing nothing
     (``--dry-run``, and the temporary-directory slot of launch step 5); returns the tmpdir
     path (None without a session id). Raises ``TmpdirUnsafe``."""
@@ -126,7 +129,7 @@ def check(csession_id: str | None, *, base: str = DEFAULT_BASE) -> str | None:
     return path
 
 
-def create(csession_id: str, *, base: str = DEFAULT_BASE) -> str:
+def create(csession_id: str, *, base: str | None = None) -> str:
     """Create the session's private temporary directory, empty and 0700, under a checked
     per-uid root (created when missing); a leftover directory (or any entry) of that name is
     removed first without following symlinks, or renamed aside when it cannot be removed.
@@ -134,7 +137,7 @@ def create(csession_id: str, *, base: str = DEFAULT_BASE) -> str:
     return create_reporting(csession_id, base=base)[0]
 
 
-def create_reporting(csession_id: str, *, base: str = DEFAULT_BASE) -> tuple[str, str | None]:
+def create_reporting(csession_id: str, *, base: str | None = None) -> tuple[str, str | None]:
     """``create``, also returning the full path of a leftover that was renamed aside and could
     not be removed under its new name either (None when nothing was left)."""
     stale_path: str | None = None
@@ -161,7 +164,7 @@ def create_reporting(csession_id: str, *, base: str = DEFAULT_BASE) -> tuple[str
     return path, stale_path
 
 
-def remove(csession_id: str, *, base: str = DEFAULT_BASE) -> bool:
+def remove(csession_id: str, *, base: str | None = None) -> bool:
     """Remove the session's private temporary directory and everything in it, never
     following a symlink. Returns False when there was nothing to remove (idempotent; a
     missing root is not created). Raises ``OSError``: ``fsutil.UnsafePathError`` for an

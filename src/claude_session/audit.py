@@ -161,8 +161,8 @@ def append(
     cannot be written. Never swallow either: the audited action must not be taken without its
     record.
     """
-    # TODO(#3): callers build secrets with logs.secret_values from config's secret_env and
-    # claude_auth_env names (and the run secret where they have one).
+    # Callers pass the values of the configured secret_env and claude_auth_env variables
+    # (envbuild.secret_values; exec's launch does) and the run secret where they have one.
     if action not in ACTIONS:
         raise ValueError("unknown audit action")
     if result not in RESULTS:

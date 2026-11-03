@@ -69,6 +69,42 @@ def test_refusal_names_only_the_program_never_its_arguments(gw: SystemGateway) -
     assert "s3cr3t-token" not in str(info.value)
 
 
+# --- executable: run a resolved tool from its realpath with argv[0] = its bare name ---------
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_executable_runs_the_given_path_with_argv0_as_given(gw: SystemGateway) -> None:
+    script = "tr '\\0' ' ' < /proc/$$/cmdline"
+    result = gw.run(["shim-name", "-c", script], executable="/bin/sh")
+    assert result.stdout.split()[0] == "shim-name", result.stderr
+
+
+def test_executable_argv0_reaches_a_shell_script(gw: SystemGateway, tmp_path: Path) -> None:
+    script = tmp_path / "real-tool"
+    script.write_text('#!/bin/sh\necho "$0"\n')
+    script.chmod(0o755)
+    # A #! script sees its own path as $0 (the kernel passes the script path), so check with
+    # /bin/sh -c instead: $0 is the argument after the command string.
+    result = gw.run(["shim-name", "-c", 'echo "$0"', "zero"], executable="/bin/sh")
+    assert result.stdout == "zero\n"
+    child = gw.spawn(["shim-name"], executable=str(script), stdout=DEVNULL)
+    assert child.wait(10) == 0
+
+
+@pytest.mark.parametrize("executable", ["sh", "./bin/sh", ""])
+def test_executable_must_be_absolute(gw: SystemGateway, executable: str) -> None:
+    with pytest.raises(ValueError):
+        gw.run(["sh"], executable=executable)
+    with pytest.raises(ValueError):
+        gw.spawn(["sh"], executable=executable)
+
+
+@pytest.mark.parametrize("argv0", ["", "a\x00b"])
+def test_executable_needs_a_usable_argv0(gw: SystemGateway, argv0: str) -> None:
+    with pytest.raises(ValueError):
+        gw.run([argv0], executable="/bin/sh")
+
+
 def test_env_and_extra_env_are_exclusive() -> None:
     with pytest.raises(ValueError):
         check_argv([PY], env={"A": "1"}, extra_env={"B": "2"})

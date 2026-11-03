@@ -17,21 +17,15 @@ session-writable paths) are in ``pathrules``, which the launch validations apply
 build(). ``_check_isolation_inputs`` repeats the lexical part as a backstop (``/``, ``$HOME``
 and its ancestors, credential paths, state-root containment).
 
-TODO(#15): before build(), the launch validations call the pathrules checks (cwd, read_dirs,
-write_dirs, profile, plugin directories, generated read entries; see pathrules) and pass
-pathrules.session_writable(...) and its .paths to check_interpreter().
-TODO(#15): exec calls tmpdir.check() at the temporary-directory slot of launch step 5 and
-selfcheck.self_check() after the claude_args check (and both again at adoption):
-self_check creates the private tmpdir (tmpdir.create) that becomes Isolation.tmpdir, gives
-sandbox_active, and returns the warning of a `preferred` run without a working sandbox.
-
-TODO(#15): exec calls build() in launch step 7 and writes the settings with
-SessionDirs.write_settings before spawning claude. Before allocation, the step-5 launch
-validations call check_rule_paths() (state root and claude-session path) and, for isolated
-runs, check_cwd() before permission_profiles.expand(), so a bad cwd fails unsafe_cwd whether
-or not the profile uses ${CWD}; a LaunchValidationError there, or from build(), ends the run
-not-started with its end_reason (unsafe_path, unsafe_cwd, unsafe_setting_sources,
-invalid_permission_profile, ...).
+``exec`` wires these in ``launch``: the step-5 validations (``launch.validate``) call
+check_rule_paths() (every run) and, for isolated runs, check_cwd() before
+permission_profiles.expand() (so a bad cwd fails unsafe_cwd whether or not the profile uses
+${CWD}), the pathrules checks, check_setting_sources() and check_interpreter() with
+pathrules.session_writable(...) and its .paths; tmpdir.check() and selfcheck.self_check()
+give Isolation.tmpdir and sandbox_active. Step 7 (``launch.prepare``) calls build() and
+writes the settings with SessionDirs.write_settings before claude is spawned. A
+LaunchValidationError ends the run not-started with its end_reason.
+TODO(#28): adoption reruns the step-5 checks.
 TODO(#27): the dry-run serializer reports build()'s settings and argv.
 """
 
@@ -329,8 +323,9 @@ def check_interpreter(
     the agent. Default: the package directory and, in a virtual environment
     (``sys.prefix != sys.base_prefix``), its own site-packages.
 
-    TODO(#15): exec calls this for isolated runs at launch, and #28 at adoption, with
-    current_interpreter(), pathrules.session_writable(...) and its .paths."""
+    ``exec`` calls this for isolated runs at launch (``launch.check_hook_interpreter``) with
+    current_interpreter(), pathrules.session_writable(...) and its .paths.
+    TODO(#28): adoption calls it again."""
     import site
 
     if prefixes is None:
@@ -1050,9 +1045,10 @@ def isolation_warnings(resolution: Resolution) -> tuple[str, ...]:
 def sandbox_lowered_inputs(resolution: Resolution, *, run: int) -> dict[str, Any]:
     """The ``inputs`` of the ``sandbox_lowered`` audit record (schemas/audit.json).
 
-    TODO(#15): exec writes the audit record (and the sandbox_lowered log event) at adoption
-    with the #7 writers, and adds isolation_warnings() to the run's warnings; #28 does the
-    same when start's pending run is adopted."""
+    ``exec`` writes the audit record and the sandbox_lowered log event at launch
+    (``launch.audit_sandbox_lowered``; a plain exec is its own adoption) and adds
+    isolation_warnings() to the run's warnings. TODO(#28): the same when start's pending run
+    is adopted."""
     if not resolution.sandbox_lowered():
         raise ValueError("the run's sandbox is not lowered")
     return {

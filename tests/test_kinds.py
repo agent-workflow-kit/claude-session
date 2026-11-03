@@ -4,7 +4,7 @@ carry-over)."""
 from __future__ import annotations
 
 import json
-import os
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
@@ -13,8 +13,11 @@ from typing import Any
 import pytest
 import yaml
 
-from claude_session import cli, config, defaults, gateway, kinds
+from claude_session import cli, config, defaults, kinds
 from claude_session.errors import UsageError
+from claude_session.gateway import SystemGateway
+
+from .fake_gateway import FakeGateway
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE = ROOT / "config.example.yaml"
@@ -898,40 +901,20 @@ def test_invalid_repo_ids_are_usage_errors(cfg_dir: Path, repo: str) -> None:
 # git origin lookup
 
 
-class FakeRun:
-    def __init__(self, result: subprocess.CompletedProcess[str] | Exception) -> None:
-        self.result = result
-        self.calls: list[tuple[list[str], float | None]] = []
-        self.envs: list[dict[str, str] | None] = []
-
-    def __call__(
-        self,
-        argv: list[str],
-        *,
-        stdin: str | None = None,
-        timeout: float | None = None,
-        env: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        self.calls.append((argv, timeout))
-        self.envs.append(env)
-        if isinstance(self.result, Exception):
-            raise self.result
-        return self.result
-
-    run = __call__
+GIT = "/usr/bin/git"
 
 
-def completed(code: int, out: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess([], code, stdout=out, stderr="")
+def origin(gw: FakeGateway, cwd: str = "/w") -> str | None:
+    return kinds.git_origin_url(cwd, git=GIT, gw=gw)
 
 
-def test_git_origin_url_runs_hardened_read_only_git(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = FakeRun(completed(0, "git@example.com:a/b.git\n"))
-    monkeypatch.setattr(kinds, "GATEWAY", fake)
-    assert kinds.git_origin_url("/work/-dir") == "git@example.com:a/b.git"
-    ((argv, timeout),) = fake.calls
-    assert os.path.isabs(argv[0])
-    assert os.path.basename(argv[0]) == "git"
+def test_git_origin_url_runs_hardened_read_only_git() -> None:
+    gw = FakeGateway()
+    gw.on([GIT], stdout="git@example.com:a/b.git\n")
+    assert origin(gw, "/work/-dir") == "git@example.com:a/b.git"
+    (call,) = gw.calls
+    argv = list(call.argv)
+    assert argv[0] == GIT
     assert argv[-5:] == ["-C", "/work/-dir", "remote", "get-url", "origin"]
     for setting in (
         "core.fsmonitor=",
@@ -942,7 +925,7 @@ def test_git_origin_url_runs_hardened_read_only_git(monkeypatch: pytest.MonkeyPa
         "core.pager=cat",
     ):
         assert argv[argv.index(setting) - 1] == "-c"
-    assert timeout is not None and timeout > 0
+    assert call.timeout is not None and call.timeout > 0
 
 
 GIT_DISCOVERY_VARIABLES = (
@@ -971,15 +954,18 @@ def test_git_origin_url_ignores_the_callers_git_environment(
     for name in GIT_DISCOVERY_VARIABLES:
         monkeypatch.setenv(name, "/elsewhere")
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "0")
+    monkeypatch.setenv("LC_ALL", "de_DE.ISO-8859-1")
     monkeypatch.setenv("CSESSION_KEEP_ME", "1")
-    fake = FakeRun(completed(0, "https://example.com/a/b\n"))
-    monkeypatch.setattr(kinds, "GATEWAY", fake)
-    kinds.git_origin_url("/w")
-    (env,) = fake.envs
+    gw = FakeGateway()
+    gw.on([GIT], stdout="https://example.com/a/b\n")
+    origin(gw)
+    (call,) = gw.calls
+    env = call.env
     assert env is not None
     for name in GIT_DISCOVERY_VARIABLES:
         assert name not in env
     assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["LC_ALL"] == "C"
     assert env["CSESSION_KEEP_ME"] == "1"
 
 
@@ -998,28 +984,56 @@ def test_real_git_lookup_ignores_git_dir(
         subprocess.run([*git, "remote", "add", "origin", url], check=True)
         repos[name] = path
     monkeypatch.setenv("GIT_DIR", str(repos["other"] / ".git"))
-    assert kinds.git_origin_url(str(repos["work"])) == "https://example.com/group/project"
+    real_git = shutil.which("git")
+    assert real_git is not None
+    got = kinds.git_origin_url(str(repos["work"]), git=real_git, gw=SystemGateway())
+    assert got == "https://example.com/group/project"
 
 
-def test_git_origin_url_trims_only_one_newline(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(kinds, "GATEWAY", FakeRun(completed(0, "https://example.com/a\n\n")))
-    assert kinds.git_origin_url("/w") == "https://example.com/a\n"
+def test_real_git_origin_is_decoded_as_utf8_with_replacement(tmp_path: Path) -> None:
+    """Through the real gateway: a non-UTF-8 origin is decoded with replacement (never
+    silently "no origin"), and a carriage return is normalized, whatever the locale."""
+    work = tmp_path / "work"
+    work.mkdir()
+    git = ["git", "-c", "core.hooksPath=/dev/null", "-C", str(work)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    config_file = work / ".git" / "config"
+    with config_file.open("ab") as fh:
+        fh.write(b'[remote "origin"]\n\turl = https://example.com/caf\xe9\r/x\n')
+    real_git = shutil.which("git")
+    assert real_git is not None
+    got = kinds.git_origin_url(str(work), git=real_git, gw=SystemGateway())
+    assert got is not None
+    assert "\ufffd" in got and "\r" not in got
+
+
+def test_git_origin_url_trims_only_one_newline() -> None:
+    gw = FakeGateway()
+    gw.on([GIT], stdout="https://example.com/a\n\n")
+    assert origin(gw) == "https://example.com/a\n"
 
 
 @pytest.mark.parametrize(
-    "result",
+    "response",
     [
-        completed(2, ""),
-        completed(128, "fatal: not a git repository\n"),
-        FileNotFoundError("git"),
-        gateway.GatewayTimeout(["git"], 10),
+        {"returncode": 2},
+        {"returncode": 128, "stdout": "fatal: not a git repository\n"},
+        {"error": FileNotFoundError("git")},
+        {"timeout": True},
     ],
 )
-def test_git_origin_url_failures_give_none(
-    monkeypatch: pytest.MonkeyPatch, result: subprocess.CompletedProcess[str] | Exception
+def test_git_origin_url_failures_give_none(response: dict[str, Any]) -> None:
+    gw = FakeGateway()
+    gw.on([GIT], **response)
+    assert origin(gw) is None
+
+
+def test_default_lookup_without_git_on_path_gives_no_repo(
+    cfg_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(kinds, "GATEWAY", FakeRun(result))
-    assert kinds.git_origin_url("/w") is None
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    result = kinds.resolve(load(cfg_dir), "implement", mode="headless", cwd=str(tmp_path))
+    assert result.repo is None
 
 
 def test_default_lookup_derives_from_a_real_repository(cfg_dir: Path, tmp_path: Path) -> None:
@@ -1081,3 +1095,11 @@ def test_unknown_profile_name_given_now_has_no_reset_hint(cfg_dir: Path) -> None
     with pytest.raises(UsageError) as info:
         resolve(load(cfg_dir), "implement", flags={"permission_profile": "gone"})
     assert "--reset" not in str(info.value.detail)
+
+
+def test_git_origin_url_runs_a_resolved_git_by_name() -> None:
+    gw = FakeGateway()
+    gw.on(["git"], stdout="https://example.com/a/b\n")
+    assert kinds.git_origin_url("/w", git="/opt/real/git", git_name="git", gw=gw)
+    (call,) = gw.calls
+    assert call.argv[0] == "git" and call.executable == "/opt/real/git"

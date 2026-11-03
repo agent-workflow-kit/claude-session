@@ -32,12 +32,14 @@ secret alone is also refused in any letter case, by ``outbox`` itself.
 
 Standard library only, plus ``fsutil``: ``hook-event`` imports this module.
 
-TODO(#15): exec writes the index at launch (``write_at`` in the private run directory, values
-from ``envbuild.secret_values``; ``build``'s ``ValueError`` for a set over
-``VALUES_MAX_BYTES`` fails the launch), gives ``read_at`` to its final drain and salvage,
-checks an implicit-done ``result.md`` with ``SecretIndex.contains`` before accepting it
-(``result_rejected`` on a hit), and deletes ``secret-index`` at run end, after the final drain
-and salvage (the file is secret-equivalent).
+``exec`` writes the index at launch step 7 (``launch.prepare``: ``build`` over
+``envbuild.secret_values``, written into the private run directory; ``build``'s
+``ValueError`` for a set over ``VALUES_MAX_BYTES`` fails the launch, ``config_invalid``),
+before the agent can file a report; its final drain reads it (``hookevent.final_drain``),
+it checks an implicit-done ``result.md`` with ``SecretIndex.contains`` (``result_rejected``
+on a hit) and deletes ``secret-index`` at run end (``supervisor.finish``; the file is
+secret-equivalent).
+TODO(#33): salvage of a run whose wrapper is lost drains with the index, then deletes it.
 """
 
 from __future__ import annotations

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_session import fsutil, ids, tmpdir
+from claude_session import fsutil, ids, pathrules, tmpdir
 from claude_session.errors import LaunchValidationError
 from claude_session.tmpdir import TmpdirLeftover, TmpdirUnsafe
 
@@ -414,6 +414,13 @@ def test_create_reporting_reports_nothing_without_a_stale_entry(base: Path) -> N
 
 def test_root_name_is_the_single_root_definition() -> None:
     assert tmpdir.root_name(1000) == "csession-1000"
+    assert pathrules.tmp_parent(1000) == os.path.join(pathrules.TMP_ROOT, tmpdir.root_name(1000))
+    assert pathrules.tmp_parent() == os.path.join(
+        pathrules.TMP_ROOT, tmpdir.root_name(os.geteuid())
+    )
+    assert tmpdir.root_path() == os.path.join(
+        os.path.realpath(pathrules.TMP_ROOT), tmpdir.root_name(os.geteuid())
+    )
 
 
 def test_create_removes_the_moved_aside_leftover_when_it_can(
