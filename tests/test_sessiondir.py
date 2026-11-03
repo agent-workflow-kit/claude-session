@@ -1177,3 +1177,74 @@ def test_ensure_session_subdir_refuses_a_symlinked_component(root: Path, dirs: S
     with pytest.raises(SessionDirUnsafe):
         dirs.ensure_session_subdir(str(sdir(root) / "work" / "lnk" / "deeper"))
     assert list(outside.iterdir()) == []
+
+
+# Private run files read and removed without opening the directories (a dry run; R1-4, R1-5)
+
+
+def _spec(root: Path, dirs: SessionDirs) -> Path:
+    dirs.prepare_run(1)
+    dirs.write_private_run_file(1, "spec.json", b"{}")
+    return pdir(root) / "runs" / "1" / "spec.json"
+
+
+def test_a_private_run_file_is_read_only_through_a_symlinked_state_root(
+    tmp_path: Path, root: Path, dirs: SessionDirs
+) -> None:
+    _spec(root, dirs)
+    link = tmp_path / "link"
+    link.symlink_to(root)
+    assert sessiondir.read_private_run_file(str(link), SID, 1, "spec.json", 10) == b"{}"
+
+
+@pytest.mark.parametrize("hop", ["private", "session", "runs", "run"])
+def test_a_symlinked_directory_on_the_way_to_a_private_run_file_is_refused(
+    tmp_path: Path, root: Path, dirs: SessionDirs, hop: str
+) -> None:
+    spec = _spec(root, dirs)
+    where = {
+        "private": root / "private",
+        "session": pdir(root),
+        "runs": pdir(root) / "runs",
+        "run": spec.parent,
+    }[hop]
+    moved = tmp_path / "moved"
+    where.rename(moved)
+    where.symlink_to(moved)
+    with pytest.raises(sessiondir.SessionDirUnsafe):
+        sessiondir.read_private_run_file(str(root), SID, 1, "spec.json", 10)
+    with pytest.raises(sessiondir.SessionDirUnsafe):
+        sessiondir.remove_private_run_file(str(root), SID, 1, "spec.json")
+    assert (moved / spec.relative_to(where)).exists()  # the target is untouched
+
+
+def test_reading_a_private_run_file_read_only_creates_nothing(root: Path) -> None:
+    with pytest.raises(sessiondir.SessionDirUnsafe):
+        sessiondir.read_private_run_file(str(root), SID, 1, "spec.json", 10)
+    sessiondir.remove_private_run_file(str(root), SID, 1, "spec.json")  # nothing to remove
+    assert list(root.iterdir()) == []
+
+
+def test_a_private_run_file_over_its_cap_or_with_two_links_is_refused(
+    root: Path, dirs: SessionDirs
+) -> None:
+    spec = _spec(root, dirs)
+    with pytest.raises(sessiondir.SessionDirUnsafe, match="larger than 1 bytes"):
+        sessiondir.read_private_run_file(str(root), SID, 1, "spec.json", 1)
+    os.link(spec, root / "extra")
+    with pytest.raises(sessiondir.SessionDirUnsafe, match="2 links"):
+        sessiondir.read_private_run_file(str(root), SID, 1, "spec.json", 10)
+
+
+def test_a_private_run_file_is_removed_without_following_a_symlink(
+    tmp_path: Path, root: Path, dirs: SessionDirs
+) -> None:
+    spec = _spec(root, dirs)
+    sessiondir.remove_private_run_file(str(root), SID, 1, "spec.json")
+    assert not spec.exists()
+    target = tmp_path / "target"
+    target.write_text("keep")
+    spec.symlink_to(target)
+    dirs.remove_private_run_file(1, "spec.json")
+    assert not os.path.lexists(spec) and target.read_text() == "keep"
+    dirs.remove_private_run_file(1, "spec.json")  # missing: fine

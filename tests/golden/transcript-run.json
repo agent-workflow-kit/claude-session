@@ -1,0 +1,13 @@
+{
+  "csession_id": "cs-aaaaaaaa",
+  "files": [
+    {
+      "claude_session_id": "33333333-3333-4333-8333-333333333333",
+      "exists": true,
+      "path": "$HOME/.claude/projects/-work-fork/33333333-3333-4333-8333-333333333333.jsonl",
+      "run": 2,
+      "source": "fork",
+      "subagents": []
+    }
+  ]
+}

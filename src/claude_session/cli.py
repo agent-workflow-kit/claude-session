@@ -8,6 +8,7 @@ path).
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -20,11 +21,12 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 from . import durations, fsutil, ids, outbox, store
 from .defaults import MAX_INTEGER
-from .errors import CliError, InternalError, RefusedError, UsageError
+from .errors import CliError, InternalError, NotFoundError, RefusedError, UsageError
 from .terminal import display
 
 if TYPE_CHECKING:
     from .config import Config
+    from .launch import Allocated, Process
 
 PROG = "claude-session"
 DESCRIPTION = "Runs and supervises Claude Code sessions (terminal-agnostic)."
@@ -80,6 +82,13 @@ SESSION_ID_ARGS: dict[str, str | None] = {
     "forked_from": "--forked-from",
 }
 KIND_ARGS = ("kind", "launch_kind", "run_kind")
+# interface.md, Exit codes: a verify-secret mismatch (any reason).
+VERIFY_SECRET_MISMATCH = 11
+# Every verify-secret usage error: the arguments are never named (one may be a secret).
+VERIFY_SECRET_USAGE = (
+    "unexpected arguments (verify-secret takes only <full id> and --json; "
+    "the secret is read from stdin)"
+)
 # argparse takes a token like this as an option value, not as an option.
 NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
 
@@ -89,10 +98,13 @@ class _Parser(argparse.ArgumentParser):
 
     # Leaf command name -> its parser (set on the top-level parser only).
     leaves: dict[str, _Parser]
+    # When set, replaces every usage error message: for a command whose argv must never be
+    # echoed (verify-secret: a secret given there by mistake).
+    fixed_error: str | None = None
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
-        raise UsageError(message)
+        raise UsageError(self.fixed_error or message)
 
 
 class _VersionAction(argparse.Action):
@@ -172,6 +184,57 @@ def _list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _label(args: argparse.Namespace) -> int:
+    """``label add`` / ``label remove`` (interface.md, label add / label remove)."""
+    add = args.handler == "label add"
+    pairs = [ids.parse_label(text) for text in args.pairs]  # checked by the flag rules
+    with store.open_state() as st:
+        sid = ids.lookup_session_id(args.id, st.session_id_candidates)
+        change = st.change_labels(sid, pairs, add=add, dry_run=args.dry_run)
+    if change is None:  # forgotten (or deleted) since the id was resolved
+        raise NotFoundError(f"unknown session: {args.id}")
+    obj = {
+        "csession_id": sid,
+        "labels": [f"{key}={value}" for key, value in change.labels],
+        "added": [f"{key}={value}" for key, value in change.added],
+        "removed": [f"{key}={value}" for key, value in change.removed],
+        "dry_run": bool(args.dry_run),
+    }
+    if args.json:
+        print(json.dumps(obj))
+        return 0
+    action, done_key = ("add", "added") if add else ("remove", "removed")
+    changed = obj[done_key]
+    done = f"{done_key} {', '.join(changed)}" if changed else f"nothing to {action}"
+    prefix = "dry run: " if args.dry_run else ""
+    print(display(f"{sid}: {prefix}{done}"))
+    print(display(f"labels: {', '.join(obj['labels']) or '(none)'}"))
+    return 0
+
+
+def _verify_secret(args: argparse.Namespace) -> int:
+    """``verify-secret <full id>`` (interface.md, Internal commands): exit 0 on a match, 11
+    otherwise. The secret is read from stdin before the lookup, whatever the id; a terminal
+    on stdin is refused unread (the secret would be echoed), whatever the id."""
+    from . import secretcheck
+
+    if _is_terminal(sys.stdin.buffer):
+        raise UsageError("verify-secret reads the secret from a pipe; stdin is a terminal")
+    presented = secretcheck.read_secret(sys.stdin.buffer)
+    with store.open_state() as st:
+        match = secretcheck.matches(st, args.id, presented)
+    if args.json:
+        print(json.dumps({"match": match}))
+    return 0 if match else VERIFY_SECRET_MISMATCH
+
+
+def _is_terminal(stream: Any) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (OSError, ValueError):
+        return False
+
+
 def _export(args: argparse.Namespace) -> int:
     """``export`` (interface.md, export): audit records, oldest first, filtered."""
     from . import exporter
@@ -213,53 +276,226 @@ def _report(args: argparse.Namespace) -> int:
 
 
 def _exec(args: argparse.Namespace) -> int:
-    """``exec`` of a new headless session: launch steps 2 to 7, then supervision (interface.md,
-    Launch order and exec). A launch-phase end exits 12 with the outcome object."""
+    """``exec`` of a new session: launch steps 2 to 7, then supervision (interface.md, Launch
+    order, exec and Signals). A launch-phase end exits 12 with the outcome object, also when a
+    signal interrupted the launch; a signal before allocation ends ``exec`` by that signal.
+    The signal handlers are installed before allocation and restored once the outcome is
+    printed (until then a late signal is only recorded)."""
     if args.session_id is not None:
-        # TODO(#28): adoption of a pending run created by start.
-        raise InternalError("exec --session-id is not implemented yet", detail="not_implemented")
+        return _adopt(args)
     if args.dry_run:
-        # TODO(#27): the dry-run plan.
-        raise InternalError("exec --dry-run is not implemented yet", detail="not_implemented")
-    if args.mode != "headless":
-        # TODO(#17): interactive supervision (exec's default mode).
-        raise InternalError(
-            "interactive exec is not implemented yet; pass --mode headless",
-            detail="not_implemented",
-        )
+        return _dry_run(args)
     from . import launch, supervisor
+    from .gateway import SystemGateway
+    from .signals import ExecSignals, LaunchInterrupted
+
+    cfg = load_config(args)
+    signals = ExecSignals()
+    try:  # entered first: a signal during the install is handled and the handlers restored
+        try:
+            signals.install()  # before allocation (interface.md, Signals)
+            with store.open_state() as st:
+                process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+                req = launch.read_request(args, cfg)
+                resolved = launch.resolve_kind(req, cfg, process)
+                signals.defer()  # a signal during allocation acts once the run exists
+                alloc = launch.allocate(st, req, resolved, process)
+                try:
+                    ended = launch.run(
+                        st,
+                        cfg,
+                        req,
+                        resolved,
+                        alloc,
+                        process,
+                        supervise=supervisor.run_session,
+                        signals=signals,
+                    )
+                except LaunchInterrupted as exc:
+                    ended = None  # the run ended not-started: its outcome is in the store
+                    signals.defer()
+                    _end_interrupted_launch(st, alloc, process, exc)
+                outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
+        except LaunchInterrupted as exc:  # before allocation: nothing to record
+            _die_of(exc.signum)
+        except KeyboardInterrupt:  # handlers not installed (not the main thread)
+            _die_of(signal.SIGINT)
+        signals.defer()  # until the outcome is printed, a signal is only recorded
+        try:
+            _print_outcome(outcome, args.json)
+        except OSError as exc:
+            # A terminal that hung up (interactive SIGHUP) cannot take the outcome: the run
+            # is final and stored, and the exit code still carries it.
+            if exc.errno != errno.EIO:
+                raise
+    finally:
+        signals.restore()
+    if ended is not None:
+        return ended.exit_code
+    if outcome["exit_code"] is None:  # a run that is still not final: never read as a code
+        raise InternalError("the run has no outcome after its launch was interrupted")
+    return int(outcome["exit_code"])
+
+
+def _end_interrupted_launch(
+    st: store.Store, alloc: Allocated, process: Process, exc: BaseException
+) -> None:
+    """Backstop: a ``LaunchInterrupted`` that reached ``exec`` with the run not final (it
+    escaped the launch's own handling) ends the run ``not-started`` here."""
+    from . import launch
+
+    if st.run_record(alloc.csession_id, alloc.run)["ended_at"] is None:
+        error = launch.interrupted_by(st, alloc, exc)
+        launch.end_launch(st, alloc, None, None, process, error, exc=exc)
+
+
+def _adopt(args: argparse.Namespace) -> int:
+    """``exec --session-id <id>``: adopt the pending run ``start`` created and launch it
+    (interface.md, Launch order); with ``--dry-run``, inspect it without adopting. The signal
+    handlers are installed first and restored once the outcome is printed, as for plain exec."""
+    from . import launch, lifecycle, supervisor
+    from .gateway import SystemGateway
+    from .signals import ExecSignals, LaunchInterrupted
+
+    signals = ExecSignals()
+    try:  # entered first: a signal during the install is handled and the handlers restored
+        try:
+            signals.install()
+            with store.open_state() as st:
+                process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+                if args.dry_run:
+                    return _print_dry_run(args, *lifecycle.adoption_plan(st, args, process))
+                signals.defer()  # a signal during the adoption's checks acts once the run is ours
+                outcome, code = lifecycle.adopt(
+                    st, args, process, supervise=supervisor.run_session, signals=signals
+                )
+        except LaunchInterrupted as exc:  # before the adoption: nothing to record
+            _die_of(exc.signum)
+        except KeyboardInterrupt:  # handlers not installed (not the main thread)
+            _die_of(signal.SIGINT)
+        signals.defer()  # until the outcome is printed, a signal is only recorded
+        try:
+            _print_outcome(outcome, args.json)
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+    finally:
+        signals.restore()
+    return code
+
+
+def _start(args: argparse.Namespace) -> int:
+    """``start`` of a new session (interface.md, start): steps 1 to 5, the run frozen and
+    left pending; prints the start object. A launch-validation failure exits 12 with
+    ``launch_failed``."""
+    if args.resume is not None:
+        # TODO(#29): start --resume (and its --dry-run), with the carry-over.
+        raise InternalError("start --resume is not implemented yet", detail="not_implemented")
+    if args.dry_run:
+        return _dry_run(args)
+    from . import config, launch, lifecycle
     from .gateway import SystemGateway
 
     cfg = load_config(args)
-    # TODO(#17): install the signal handlers (interface.md, Signals) here, before allocation.
-    try:
-        with store.open_state() as st:
-            process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
-            req = launch.read_request(args, cfg)
-            resolved = launch.resolve_kind(req, cfg, process)
-            alloc = launch.allocate(st, req, resolved, process)
-            ended = launch.run(
-                st, cfg, req, resolved, alloc, process, supervise=supervisor.run_headless
-            )
-            outcome = supervisor.outcome_object(st, alloc.csession_id, alloc.run)
-    except KeyboardInterrupt:
-        # TODO(#17): SIGINT is then forwarded and mapped forwarded_int (headless) or ignored
-        # (interactive); exec exits with the run's stored exit_code instead of dying by it.
-        _die_of_sigint()
-    _print_outcome(outcome, args.json)
-    return int(outcome["exit_code"]) if ended is None else ended.exit_code
+    source = config.Source.of(args.config)
+    with store.open_state() as st:
+        process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+        result = lifecycle.start(st, args, cfg, source, process)
+    print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+    return 0
 
 
-def _die_of_sigint() -> NoReturn:
-    """Exit by SIGINT (the run is already final) without a traceback: restore the default
-    action and signal this process itself."""
+def _dry_run(args: argparse.Namespace) -> int:
+    """``exec``/``start --dry-run`` of a new session (interface.md, Dry run): the plan, exit
+    20 with ``would_refuse``, 12 with ``would_fail``, else 0. Nothing is allocated."""
+    from . import dryrun
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    plan, message = dryrun.new_session_plan(args, cfg, dryrun.current_process(SystemGateway()))
+    return _print_dry_run(args, plan, message)
+
+
+def _print_dry_run(args: argparse.Namespace, plan: dict[str, Any], message: str | None) -> int:
+    from . import dryrun
+
+    plan = dryrun.printable(plan)  # valid UTF-8 output, also for a non-UTF-8 path
+    if args.json:
+        print(json.dumps(plan, ensure_ascii=False, allow_nan=False))
+    else:
+        _print_plan(plan, dryrun.printable(message))
+    return dryrun.exit_code(plan)
+
+
+def _print_plan(plan: dict[str, Any], message: str | None) -> None:
+    """The short human-readable summary of a dry-run plan (untrusted strings escaped)."""
+    profile = plan["profile"]
+    kind = plan["run_kind"] + (" (unknown: review profile)" if profile["fallback"] else "")
+    sandbox = plan["sandbox"]
+    state = "available" if sandbox["available"] else "unavailable"
+    if sandbox["mode"] == "off":
+        state = "not used"
+    lines = [
+        f"dry run: kind {kind}, mode {plan['mode']}",
+        f"cwd: {plan['cwd']}",
+        f"sandbox: {sandbox['mode']} ({state})",
+        f"permission profile: {plan['permission_profile'] or 'from file'}",
+    ]
+    if plan["would_refuse"] is not None:
+        lines.append(f"result: a launch would be refused ({plan['would_refuse']})")
+    elif plan["would_fail"] is not None:
+        lines.append(f"result: a launch would fail ({plan['would_fail']}): {message or ''}")
+    else:
+        lines.append("result: a launch would pass the launch validations")
+    lines += [f"warning: {w}" for w in plan["warnings"] if not w.startswith("a launch would fail")]
+    for line in lines:
+        print(display(line))
+
+
+def _kinds(args: argparse.Namespace) -> int:
+    """``kinds`` (interface.md, kinds): the effective kind profiles."""
+    from . import dryrun
+    from .gateway import SystemGateway
+
+    cfg = load_config(args)
+    process = dryrun.current_process(SystemGateway())
+    report = dryrun.printable(dryrun.kinds_report(cfg, process, kind=args.kind, repo=args.repo))
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, allow_nan=False))
+        return 0
+    claude = report["claude_bin_resolved"] or "not found"
+    version = report["claude_version"] or "unknown"
+    ok = {True: "ok", False: "too old", None: "unknown"}[report["claude_version_ok"]]
+    lines = [
+        f"claude: {claude} (version {version}, minimum {report['min_claude_version']}: {ok})",
+        f"default kind: {report['default_kind']}",
+    ]
+    for profile in report["kinds"]:
+        available = profile["sandbox_available"]
+        sandbox = profile["sandbox"] + (
+            "" if available is None else (" available" if available else " unavailable")
+        )
+        lines.append(
+            f"{profile['name']}: profile {profile['permission_profile']}, sandbox {sandbox},"
+            f" cwd {profile['cwd']}, third-party {'yes' if profile['reads_third_party'] else 'no'}"
+        )
+        lines += [f"  warning: {w}" for w in profile["warnings"]]
+    lines += [f"warning: {w}" for w in [*report["state_dir_warnings"], *report["warnings"]]]
+    for line in lines:
+        print(display(line))
+    return 0
+
+
+def _die_of(signum: int) -> NoReturn:
+    """Exit by ``signum`` without a traceback: restore its default action and signal this
+    process itself (its exact PID)."""
     try:
         sys.stdout.flush()
     except (OSError, ValueError):
         pass
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    os.kill(os.getpid(), signal.SIGINT)
-    raise KeyboardInterrupt  # not reached: SIGINT ends the process
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+    raise KeyboardInterrupt  # not reached: the signal ends the process
 
 
 def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
@@ -278,26 +514,65 @@ def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
         print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
 
 
+def _transcript(args: argparse.Namespace) -> int:
+    """``transcript <id>`` (interface.md, transcript): rendered text by default, ``--raw``
+    bytes, ``--paths`` or ``--json`` file lists. state.db is closed before any file is read."""
+    from . import transcripts
+
+    with store.open_state() as state:
+        sid = ids.lookup_session_id(args.id, state.session_id_candidates)
+        record = state.status_record(sid)
+    if record is None or record.session.get("forgotten_at") is not None:
+        raise NotFoundError(f"unknown session: {args.id}")
+    if args.run is not None and not 1 <= args.run <= record.runs:
+        raise NotFoundError(f"session {sid} has no run {args.run}")
+    reader = transcripts.Reader()
+    warnings: list[str] = []
+    roots = transcripts.projects_roots(os.environ, warnings)
+    listing = transcripts.discover(sid, record.claude_ids, roots, reader, run_no=args.run)
+    warnings += listing.warnings
+    if args.json:
+        print(json.dumps(listing.as_json(), allow_nan=False))
+    elif args.paths:
+        warnings += transcripts.missing_warnings(listing, subagents=True)
+        for line in transcripts.path_lines(listing):
+            print(line)
+    elif args.raw:
+        warnings += transcripts.missing_warnings(listing, subagents=args.subagents)
+        sys.stdout.flush()
+        transcripts.write_raw(listing, reader, sys.stdout.buffer, subagents=args.subagents)
+        sys.stdout.buffer.flush()
+    else:
+        renderer = transcripts.Renderer(reader, subagents=args.subagents)
+        for line in renderer.lines(listing):
+            print(line)
+        warnings += renderer.warnings
+    for warning in warnings:
+        print(f"{PROG}: warning: {display(warning)}", file=sys.stderr)
+    return 0
+
+
 # Command name (as typed, nested commands joined by a space) -> handler.
 HANDLERS: dict[str, Handler] = {
     "exec": _exec,
-    "start": _not_implemented,
+    "start": _start,
+    # TODO(#29): resume (and resume --dry-run).
     "resume": _not_implemented,
     "stop": _not_implemented,
     "wait": _not_implemented,
     "report": _report,
     "status": _status,
     "list": _list,
-    "kinds": _not_implemented,
-    "label add": _not_implemented,
-    "label remove": _not_implemented,
-    "transcript": _not_implemented,
+    "kinds": _kinds,
+    "label add": _label,
+    "label remove": _label,
+    "transcript": _transcript,
     "forget": _not_implemented,
     "reconcile": _not_implemented,
     "export": _export,
     "cron install": _not_implemented,
     "cron uninstall": _not_implemented,
-    "verify-secret": _not_implemented,
+    "verify-secret": _verify_secret,
 }
 
 
@@ -323,11 +598,16 @@ def _command(
     handler: str,
     help_text: str | None,
 ) -> _Parser:
-    """Add a leaf command; ``help_text=None`` keeps it out of ``--help`` (internal commands)."""
-    kwargs: dict[str, Any] = {"parents": [_global_flags()], "allow_abbrev": False}
+    """Add a leaf command; ``help_text=None`` keeps it out of ``--help`` and leaves out the
+    global flags (internal commands take only their documented argv)."""
+    kwargs: dict[str, Any] = {"allow_abbrev": False}
+    if help_text is not None:
+        kwargs["parents"] = [_global_flags()]
     if help_text is not None:
         kwargs["help"] = help_text
     parser = subparsers.add_parser(name, **kwargs)
+    if help_text is None:  # the global flags' values, for the code paths that read them
+        parser.set_defaults(json=False, config=None, verbose=False, quiet=False, yes=False)
     parser.set_defaults(handler=handler)
     leaves[handler] = parser
     return parser
@@ -483,6 +763,8 @@ def build_parser() -> _Parser:
     # Internal: run by agent-spawn, not listed in --help.
     p = _command(commands, leaves, "verify-secret", "verify-secret", None)
     p.add_argument("id")
+    p.add_argument("--json", action="store_true")
+    p.fixed_error = VERIFY_SECRET_USAGE
     return parser
 
 
@@ -490,8 +772,13 @@ def parse(parser: _Parser, argv: Sequence[str]) -> argparse.Namespace:
     """Parse ``argv``; leftover arguments are reported with the chosen command's usage."""
     args, extras = parser.parse_known_args(argv)
     if extras and args.handler in ("label add", "label remove"):
-        # Pairs given after an option (`label add <id> a=b --dry-run c=d`).
-        if not any(extra.startswith("-") for extra in extras):
+        # Pairs given after an option (`label add <id> a=b --dry-run c=d`), or after `--`
+        # there (`... --dry-run -- c=d`): those are pairs whatever they look like, and the
+        # label grammar refuses one that starts with `-`.
+        if extras[0] == "--":
+            args.pairs.extend(extras[1:])
+            extras = []
+        elif not any(extra.startswith("-") for extra in extras):
             args.pairs.extend(extras)
             extras = []
     if extras:

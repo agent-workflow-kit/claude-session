@@ -259,9 +259,9 @@ def write_snapshot(
     0600, no-follow)."""
     # exec writes the snapshot with SessionDirs.write_private_run_file (launch.prepare) and
     # records the label and snapshot path in the run row; this helper writes to a path.
-    # TODO(#28): start reads and snapshots the file (a relative path resolves against the
-    # caller's cwd there, never at a later exec). TODO(#29): a resume stores the snapshot path
-    # as the --permission-profile flag value.
+    # start reads the file (a relative path resolves against start's cwd, never at the
+    # adopting exec), snapshots it and freezes the profile in its launch spec (lifecycle).
+    # TODO(#29): a resume stores the snapshot path as the --permission-profile flag value.
     write(path, profile.snapshot_bytes())
 
 
