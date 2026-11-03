@@ -2,11 +2,12 @@
 and ingestion; interface.md, ``report``).
 
 ``exec`` builds the index at launch from the run's secret values (``envbuild.secret_values``:
-the passed ``claude_auth_env`` values, the ``secret_env`` values of its own environment and the
-run secret, 8 characters or more) and writes it to ``private/<id>/runs/<n>/secret-index``
-(mode 0600). It holds a fresh random key, then for each value its length and a keyed BLAKE2b
-hash of the whole value, and a keyed BLAKE2b hash (8 bytes) of every 8-byte q-gram of every
-value with the value and offset it comes from.
+the passed ``claude_auth_env`` credential values (``envbuild.is_secret_auth``), the
+``secret_env`` values of its own environment and the run secret, 8 characters or more) and
+writes it to ``private/<id>/runs/<n>/secret-index`` (mode 0600). It holds a fresh random
+key, then for each value its length and a keyed BLAKE2b hash of the whole value, and a keyed
+BLAKE2b hash (8 bytes) of every 8-byte q-gram of every value with the value and offset it
+comes from.
 
 The index is secret-equivalent: the key sits in the file, and with the key, the offsets and
 the 7-byte overlap of consecutive q-grams a reader recovers every value one byte at a time.

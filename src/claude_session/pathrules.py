@@ -116,18 +116,26 @@ def tmp_parent(uid: int | None = None) -> str:
 RUNTIME_ROOT_NAME = "csession"
 
 
+def usable_runtime_dir(value: str) -> bool:
+    """Whether ``value`` can be the parent of the fallback root: non-empty, absolute,
+    normalized (no ``..`` or ``.`` component, no doubled, leading double or trailing slash),
+    not ``/``, and without control characters (below 0x20, or 0x7f; NUL included), which
+    would make the path unsafe to print in a command."""
+    return (
+        bool(value)
+        and not any(ord(c) < 0x20 or c == "\x7f" for c in value)
+        and os.path.isabs(value)
+        and value != "/"
+        and not value.startswith("//")
+        and os.path.normpath(value) == value
+    )
+
+
 def runtime_tmp_parent(environ: Mapping[str, str] | None = None) -> str | None:
     """``$XDG_RUNTIME_DIR/csession`` as given (not resolved), or None when the variable is
-    unset or unusable: empty, relative, holding NUL, not normalized (``..``, ``.``, doubled
-    or trailing slashes) or ``/``. ``environ`` defaults to ``os.environ``."""
+    unset or unusable (``usable_runtime_dir``). ``environ`` defaults to ``os.environ``."""
     value = (os.environ if environ is None else environ).get("XDG_RUNTIME_DIR", "")
-    if (
-        not value
-        or "\x00" in value
-        or not os.path.isabs(value)
-        or value == "/"
-        or os.path.normpath(value) != value
-    ):
+    if not usable_runtime_dir(value):
         return None
     return os.path.join(value, RUNTIME_ROOT_NAME)
 

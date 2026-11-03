@@ -981,3 +981,233 @@ def test_remove_checked_and_listing_cover_both_roots(
     assert tmpdir.remove_stale(stale[0], base=str(base)) is True
     assert tmpdir.remove_stale(stale[0], base=str(base)) is False
     assert tmpdir.session_entries(base=str(base)) == ([sid2], [])
+
+
+# Review round 1 (#95): the root is chosen once; lookups by recorded path; hardening
+
+
+def test_the_root_chosen_at_the_check_is_the_only_one_created_in(
+    base: Path, runtime: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmpdir.select_root(str(base))
+    assert root == str(root_of(base))
+    assert tmpdir.check(SID, base=str(base), root=root) == str(root_of(base) / SID)
+    squat(base, monkeypatch)  # another user creates the per-uid root before the creation
+    with pytest.raises(TmpdirUnsafe) as info:
+        tmpdir.create_pinned(SID, base=str(base), root=root)
+    assert str(root_of(base)) in str(info.value)
+    assert "no other root is tried" in str(info.value)
+    assert not runtime_root(runtime).exists()  # never silently moved to the fallback
+
+
+def test_check_refuses_when_the_usable_root_is_not_the_chosen_one(
+    base: Path, runtime: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmpdir.select_root(str(base))
+    squat(base, monkeypatch)
+    with pytest.raises(TmpdirUnsafe) as info:
+        tmpdir.check(SID, base=str(base), root=root)
+    assert f"{runtime_root(runtime)} is the usable root now" in str(info.value)
+
+
+def test_a_chosen_fallback_root_is_created_there_only(
+    base: Path, runtime: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with monkeypatch.context() as patched:
+        squat(base, patched)
+        root = tmpdir.select_root(str(base))
+    root_of(base).rmdir()  # the per-uid root became usable again in between
+    created = tmpdir.create_pinned(SID, base=str(base), root=root)
+    os.close(created.pin)
+    assert created.path == str(runtime_root(runtime) / SID)
+    assert not root_of(base).exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write anywhere")
+def test_a_base_we_cannot_write_selects_the_fallback_up_front(base: Path, runtime: Path) -> None:
+    base.chmod(0o555)
+    try:
+        assert tmpdir.select_root(str(base)) == str(runtime_root(runtime))
+    finally:
+        base.chmod(0o1777)
+
+
+def test_unset_runtime_dir_lookups_use_the_recorded_fallback_root(
+    base: Path, runtime: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid2, sid3 = "cs-bcde2345", "cs-cdef2345"
+    with monkeypatch.context() as patched:
+        squat(base, patched)
+        recorded = tmpdir.create(SID, base=str(base))
+        tmpdir.create(sid2, base=str(base))
+        tmpdir.create(sid3, base=str(base))
+    stale = f"{tmpdir.STALE_PREFIX}{SID}-ab12"
+    (runtime_root(runtime) / stale).mkdir(mode=0o700)
+    monkeypatch.delenv("XDG_RUNTIME_DIR")  # reconcile from cron or ssh
+    found = tmpdir.recorded_root(recorded)
+    assert found is not None and found == str(runtime_root(runtime))
+    extra = [found]
+    assert tmpdir.session_entries(base=str(base)) == ([], [])
+    assert tmpdir.session_entries(base=str(base), extra_roots=extra) == (
+        [SID, sid2, sid3],
+        [stale],
+    )
+    assert tmpdir.remove_checked(SID, lambda: True, base=str(base), extra_roots=extra)
+    assert tmpdir.remove(sid2, base=str(base), extra_roots=extra)
+    assert tmpdir.remove_stale(stale, base=str(base), extra_roots=extra)
+    assert sorted(os.listdir(runtime_root(runtime))) == [sid3]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/run/user/1000/csession/not-an-id",
+        "/run/user/1000/other/cs-abcd2345",
+        "relative/csession/cs-abcd2345",
+        "//run/csession/cs-abcd2345",
+        "/run/../x/csession/cs-abcd2345",
+        "/csession/cs-abcd2345",
+        "/run/a\nb/csession/cs-abcd2345",
+        f"/tmp/csession-{os.geteuid()}/cs-abcd2345",
+    ],
+)
+def test_recorded_root_takes_only_fallback_shaped_paths(path: str) -> None:
+    assert tmpdir.recorded_root(path) is None
+
+
+def test_an_unsafe_recorded_root_is_skipped_and_reported(
+    base: Path, runtime: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root(runtime).mkdir(mode=0o755)
+    runtime_root(runtime).chmod(0o755)
+    (runtime_root(runtime) / SID).mkdir()
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+    problems: list[str] = []
+    extra = [str(runtime_root(runtime))]
+    assert tmpdir.session_entries(base=str(base), extra_roots=extra, problems=problems) == (
+        [],
+        [],
+    )
+    assert len(problems) == 1 and str(runtime_root(runtime)) in problems[0]
+    assert "unsafe" in problems[0] and "0755" in problems[0]
+    assert (runtime_root(runtime) / SID).is_dir()  # never touched
+
+
+def test_an_unsafe_env_fallback_root_is_reported_and_a_missing_one_is_not(
+    base: Path, runtime: Path
+) -> None:
+    problems: list[str] = []
+    tmpdir.session_entries(base=str(base), problems=problems)
+    assert problems == []
+    runtime_root(runtime).mkdir(mode=0o700)
+    runtime.chmod(0o777)
+    tmpdir.session_entries(base=str(base), problems=problems)
+    assert len(problems) == 1 and str(runtime_root(runtime)) in problems[0]
+
+
+def test_remove_checked_removes_the_session_from_every_root(
+    base: Path, runtime: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with monkeypatch.context() as patched:
+        squat(base, patched)
+        tmpdir.create(SID, base=str(base))
+    root_of(base).rmdir()
+    tmpdir.create(SID, base=str(base))  # the same session, now in the per-uid root
+    assert tmpdir.remove_checked(SID, lambda: True, base=str(base)) is True
+    assert not (root_of(base) / SID).exists()
+    assert not (runtime_root(runtime) / SID).exists()
+
+
+@pytest.mark.parametrize("mode_", [0o777, 0o770])
+def test_a_runtime_dir_under_an_ancestor_others_can_write_is_refused(
+    tmp_path: Path, base: Path, monkeypatch: pytest.MonkeyPatch, mode_: int
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    runtime = shared / "run"
+    runtime.mkdir(mode=0o700)
+    shared.chmod(mode_)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    squat(base, monkeypatch)
+    with pytest.raises(TmpdirUnsafe) as info:
+        tmpdir.create(SID, base=str(base))
+    assert f"its ancestor {shared} is writable by others and without the sticky bit" in str(
+        info.value
+    )
+    assert not (runtime / "csession").exists()
+
+
+def test_a_runtime_dir_under_a_sticky_shared_ancestor_is_accepted(
+    tmp_path: Path, base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    runtime = shared / "run"
+    runtime.mkdir(mode=0o700)
+    shared.chmod(0o1777)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    squat(base, monkeypatch)
+    assert tmpdir.create(SID, base=str(base)) == str(runtime / "csession" / SID)
+
+
+def test_a_runtime_dir_under_an_ancestor_another_user_owns_is_refused(
+    tmp_path: Path, base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owned = tmp_path / "theirs"
+    owned.mkdir()
+    runtime = owned / "run"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    root = root_of(base)
+    root.mkdir(mode=0o700)
+    appear_owned_by_another_user(monkeypatch, root, owned)
+    with pytest.raises(TmpdirUnsafe) as info:
+        tmpdir.create(SID, base=str(base))
+    assert f"its ancestor {owned} is owned by uid 4242" in str(info.value)
+
+
+def test_an_unusable_runtime_dir_message_does_not_claim_it_is_relative_for_slash(
+    base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    squat(base, monkeypatch)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/")
+    with pytest.raises(TmpdirUnsafe) as info:
+        tmpdir.create(SID, base=str(base))
+    assert "not an absolute normalized path" not in str(info.value)
+    assert (
+        "$XDG_RUNTIME_DIR is unusable (relative, not normalized, /, or holding control"
+        " characters), so no fallback" in str(info.value)
+    )
+
+
+def test_a_newline_in_the_runtime_dir_gives_no_fallback(
+    tmp_path: Path, base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "run\nx"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    assert tmpdir.runtime_root_path() is None
+    squat(base, monkeypatch)
+    with pytest.raises(TmpdirUnsafe):
+        tmpdir.create(SID, base=str(base))
+    assert not (runtime / "csession").exists()
+
+
+def test_printed_rm_commands_quote_the_path(tmp_path: Path, low_depth_cap: int) -> None:
+    spaced = tmp_path / "a b;c"
+    spaced.mkdir()
+    spaced.chmod(0o1777)
+    created = tmpdir.create_pinned(SID, base=str(spaced))
+    try:
+        deep_tree(Path(created.path), 5)
+        with pytest.raises(TmpdirLeftover) as info:
+            tmpdir.remove(SID, base=str(spaced), pin=created.pin)
+    finally:
+        os.close(created.pin)
+    assert info.value.stale_path is not None
+    assert info.value.hint == f"remove it: rm -rf '{info.value.stale_path}'"
+    root = root_of(spaced)
+    root.chmod(0o755)
+    with pytest.raises(TmpdirUnsafe) as unsafe:
+        tmpdir.check(SID, base=str(spaced))
+    assert unsafe.value.hint is not None and f"rm -rf '{root}'" in unsafe.value.hint

@@ -665,3 +665,63 @@ def test_sandbox_unavailable_still_precedes_the_tmpdir(
         run_check("required", squatted_base, (None, None), FakeRunner(0))
     assert info.value.end_reason == "sandbox_unavailable"
     assert not (short_runtime / "csession").exists()
+
+
+def test_the_tmpdir_is_created_only_in_the_root_chosen_at_the_check(
+    base: Path, short_runtime: Path, tools: tuple[str, str]
+) -> None:
+    root = tmpdir.select_root(str(base))
+    assert root == str(base / f"csession-{os.geteuid()}")
+    # The per-uid root becomes unusable between the check and the self-check.
+    Path(root).mkdir(mode=0o700)
+    Path(root).chmod(0o755)
+    with pytest.raises(LaunchValidationError) as info:
+        selfcheck.self_check(
+            "required",
+            SID,
+            bwrap=tools[0],
+            socat=tools[1],
+            platform="linux",
+            gw=FakeRunner(0),
+            tmp_base=str(base),
+            tmp_root=root,
+        )
+    assert info.value.end_reason == "tmpdir_unsafe"
+    assert not (short_runtime / "csession").exists()
+
+
+def test_the_socket_path_is_measured_in_the_chosen_root(
+    base: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tools: tuple[str, str]
+) -> None:
+    deep = tmp_path / ("d" * 80)
+    deep.mkdir(mode=0o700)
+    with pytest.raises(LaunchValidationError) as info:
+        selfcheck.self_check(
+            "required",
+            SID,
+            bwrap=tools[0],
+            socat=tools[1],
+            platform="linux",
+            gw=FakeRunner(0),
+            tmp_base=str(base),
+            tmp_root=str(deep / "csession"),
+            create=False,
+        )
+    assert info.value.end_reason == "socket_path_too_long"
+    assert str(deep / "csession") in str(info.value)
+
+
+def test_a_leftover_warning_quotes_its_rm_command(
+    base: Path, tools: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stale = "/tmp/a b/.stale-x"
+    monkeypatch.setattr(
+        tmpdir, "create_pinned", lambda *a, **k: tmpdir.Created(str(base / SID), stale, -1)
+    )
+    monkeypatch.setattr(tmpdir, "select_root", lambda base_=None: str(base))
+    result = selfcheck.self_check(
+        "required", SID, bwrap=tools[0], socat=tools[1], platform="linux", gw=FakeRunner(0)
+    )
+    assert result.warnings == (
+        f"leftover private temporary directory moved aside: {stale}; remove it: rm -rf '{stale}'",
+    )

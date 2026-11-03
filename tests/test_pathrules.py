@@ -1293,7 +1293,23 @@ def test_swapped_final_component_through_a_symlinked_ancestor_loses_the_exceptio
 
 @pytest.mark.parametrize(
     "value",
-    ["", "run/user/1", "./run", "/run/../tmp", "/run//user", "/run/user/", "/", "/run/\x00x"],
+    [
+        "",
+        "run/user/1",
+        "./run",
+        "/run/../tmp",
+        "/run//user",
+        "/run/user/",
+        "/",
+        "/run/\x00x",
+        # R1-7: normpath keeps a leading "//".
+        "//run/user/1000",
+        # R1-5: control characters would break the printed rm -rf commands.
+        "/run/user\n1000",
+        "/run/a\tb",
+        "/run/\x7fx",
+        "/run/\x1bx",
+    ],
 )
 def test_an_unusable_runtime_dir_gives_no_fallback_root(value: str) -> None:
     assert pathrules.runtime_tmp_parent({"XDG_RUNTIME_DIR": value}) is None

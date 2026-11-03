@@ -1132,8 +1132,12 @@ def test_bedrock_settings_are_passed_but_not_secrets(cfg_dir: Path) -> None:
         assert result.env[name] == BEDROCK_ENV_VARS[name]
         assert name in result.auth_names and name not in result.credential_names
     values = envbuild.secret_values(result, BEDROCK_ENV_VARS)
-    # The access key id is an identifier, not a credential by name.
-    assert values == {"secret-access-key-0123456789", "session-token-0123456789"}
+    # The access key id has a KEY component: redacted too (over-redaction is accepted).
+    assert values == {
+        "AKIAEXAMPLE000000",
+        "secret-access-key-0123456789",
+        "session-token-0123456789",
+    }
 
 
 def test_a_summary_naming_the_region_and_model_passes_the_index(cfg_dir: Path) -> None:
@@ -1157,7 +1161,10 @@ def test_vertex_region_is_not_a_secret_but_its_credentials_are(cfg_dir: Path) ->
         "GOOGLE_API_KEY": "google-api-key-0123456789",
     }
     result = build(load(cfg_dir), "rank", environ)
-    assert envbuild.secret_values(result, environ) == {"google-api-key-0123456789"}
+    assert envbuild.secret_values(result, environ) == {
+        "google-api-key-0123456789",
+        "/home/u/creds.json",  # GOOGLE_APPLICATION_CREDENTIALS: a credential by name
+    }
 
 
 def test_configured_extra_names_are_secrets_whatever_their_spelling(cfg_dir: Path) -> None:
@@ -1174,21 +1181,46 @@ def test_an_extra_that_is_a_builtin_setting_name_becomes_a_secret(cfg_dir: Path)
     assert envbuild.secret_values(build(cfg, "rank", environ), environ) == {"private-model-name"}
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "AWS_BEARER_TOKEN_BEDROCK",
-        "DB_PASSWORD",
-        "MY_SECRET",
-        "x_api_key",
-        "TOKEN",
-        "KEY",
-    ],
-)
+CREDENTIAL_NAMES = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_ACCESS_KEY_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CREDENTIALS",
+    "GOOGLE_CLOUD_KEYFILE_JSON",
+    "GOOGLE_API_KEY",
+    "X_SECRET_KEY_BASE",
+    "X_KEY_ID",
+    "X_PASSWORD_FILE",
+    "SERVICE_CREDENTIALS",
+    "DB_PASSWD",
+    "DB_PASS",
+    "SSH_PASSPHRASE",
+    "PROXY_AUTH",
+    "PROXY_AUTHORIZATION",
+    "GATEWAY_BEARER",
+    "GATEWAY_APIKEY",
+    "PRIVATE_KEY",
+    "PRIVATE_KEY_PEM",
+    "SESSION_COOKIE",
+    "MY_CREDS",
+    "AWS_KEYS",
+    "X_TOKENS",
+    "X_SECRETS",
+    "KEY_FILE",
+    "DB_PASSWORD",
+    "MY_SECRET",
+    "TOKEN",
+    "KEY",
+]
+
+
+@pytest.mark.parametrize("name", [*CREDENTIAL_NAMES, *(n.lower() for n in CREDENTIAL_NAMES)])
 def test_credential_names(name: str) -> None:
     assert envbuild.is_credential_name(name)
 
@@ -1197,24 +1229,84 @@ def test_credential_names(name: str) -> None:
     "name",
     [
         "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
         "ANTHROPIC_BASE_URL",
         "AWS_REGION",
+        "AWS_DEFAULT_REGION",
         "AWS_PROFILE",
         "CLOUD_ML_REGION",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "GOOGLE_CLOUD_PROJECT",
         "CLAUDE_CODE_USE_BEDROCK",
-        "GOOGLE_APPLICATION_CREDENTIALS",
+        "CLAUDE_CODE_USE_VERTEX",
         "MONKEY",
-        "AWS_KEYS",
-        "X_TOKENS",
+        "BYPASS",
         "TOKENIZER",
         "SECRETARY",
-        "AWS_ACCESS_KEY_ID_FILE",
-        "KEY_FILE",
+        "COMPASS",
         "",
     ],
 )
 def test_near_miss_names_are_not_credentials(name: str) -> None:
     assert not envbuild.is_credential_name(name)
+    assert not envbuild.is_credential_name(name.lower())
+
+
+@pytest.mark.parametrize(
+    ("value", "secret"),
+    [
+        ("https://gateway.example.com/v1", False),
+        ("https://gateway.example.com:8443", False),
+        ("https://user:pass@gateway.example.com/v1", True),
+        ("https://token@gateway.example.com", True),
+        ("https://gateway.example.com/v1?key=abcdef0123", True),
+        ("https://gateway.example.com/v1#token=abcdef0123", True),
+        ("https://gateway.example.com/team@x", False),
+    ],
+)
+@pytest.mark.parametrize(
+    "name", ["ANTHROPIC_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL"]
+)
+def test_a_url_setting_is_a_secret_only_when_it_carries_credentials(
+    name: str, value: str, secret: bool
+) -> None:
+    assert envbuild.is_secret_auth(name, value, ()) is secret
+    assert envbuild.is_secret_auth(name.lower(), value, ()) is secret
+
+
+def test_a_base_url_with_credentials_is_redacted_and_a_plain_one_is_not(cfg_dir: Path) -> None:
+    with_token = "https://gateway.example.com/v1?key=abcdef0123"
+    for value, expected in ((with_token, {with_token}), ("https://gateway.example.com", set())):
+        environ = {**CALLER, "ANTHROPIC_BASE_URL": value}
+        result = build(load(cfg_dir), "rank", environ)
+        assert result.env["ANTHROPIC_BASE_URL"] == value
+        assert envbuild.secret_values(result, environ) == expected
+
+
+def test_credential_values_cover_builtin_provider_and_configured_names(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "claude_auth_env: [MY_LOGIN]\nsecret_env: [VAULT_TOKEN]\n")
+    environ = {
+        **CALLER,
+        "ANTHROPIC_API_KEY": "anthropic-key-0123",
+        "ANTHROPIC_MODEL": "a-plain-model-name",
+        "ANTHROPIC_BASE_URL": "https://u:p@gateway.example.com",
+        "AWS_SECRET_ACCESS_KEY": "aws-secret-0123",  # no provider flag: still a secret here
+        "AWS_REGION": "eu-central-1",
+        "GOOGLE_CREDENTIALS": "{json-credentials}",
+        "MY_LOGIN": "login-value-0123",
+        "VAULT_TOKEN": "vault-value-0123",
+        "OTHER_TOKEN": "not-an-auth-name-0123",
+        "SHORT_KEY": "short",
+    }
+    assert envbuild.credential_values(environ, cfg, run_secret=RUN_SECRET) == {
+        "anthropic-key-0123",
+        "https://u:p@gateway.example.com",
+        "aws-secret-0123",
+        "{json-credentials}",
+        "login-value-0123",
+        "vault-value-0123",
+        RUN_SECRET,
+    }
 
 
 # 7. Git hardening (third-party-reading runs)

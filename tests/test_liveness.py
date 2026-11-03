@@ -934,6 +934,75 @@ def test_a_tmpdir_a_new_run_made_meanwhile_is_put_back(st: Store, root: str, pro
     assert path.exists() and not any(Path(tmpdir.root_path()).glob(".stale-*"))
 
 
+def private_runtime(tmp_path: Path) -> Path:
+    path = tmp_path / "run"
+    path.mkdir(mode=0o700)
+    return path
+
+
+def test_reconcile_finds_a_fallback_tmpdir_by_its_recorded_path(
+    tmp_path: Path, st: Store, root: str, procs: Procs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = private_runtime(tmp_path)
+    final = session(st, root, wrapper=procs.live())
+    st.finalize_run(final, 1, Final("session", "lost", "lost", 17, "lost", "exit"))
+    other = session(st, root, wrapper=procs.live())
+    st.finalize_run(other, 1, Final("session", "lost", "lost", 17, "lost", "exit"))
+    with monkeypatch.context() as patched:
+        patched.setenv("XDG_RUNTIME_DIR", str(runtime))
+        # The per-uid root was unusable at launch: the run lives in the fallback root.
+        primary = Path(tmpdir.root_path())
+        primary.mkdir(mode=0o755)
+        primary.chmod(0o755)
+        path = Path(tmpdir.create(final))
+        primary.rmdir()
+    assert path.parent == runtime / "csession"
+    st.update_session(final, tmp_dir=str(path))
+    stale = runtime / "csession" / f".stale-{other}-00112233aabbccdd"
+    stale.mkdir()
+    # reconcile from cron or ssh: no XDG_RUNTIME_DIR (conftest unsets it)
+    assert "XDG_RUNTIME_DIR" not in os.environ
+    result = reconcile.run(st, cfg_of(tmp_path), gateway=SystemGateway(), environ=os.environ)
+    assert not path.exists() and not stale.exists()
+    removed = sorted(c["csession_id"] for c in result["changes"] if c["action"] == "tmpdir_removed")
+    assert removed == sorted([final, other])
+
+
+def test_the_liveness_removal_finds_a_fallback_tmpdir_by_its_recorded_path(
+    tmp_path: Path, st: Store, root: str, procs: Procs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = private_runtime(tmp_path)
+    sid = session(st, root, wrapper=procs.live())
+    st.finalize_run(sid, 1, Final("session", "lost", "lost", 17, "lost", "exit"))
+    with monkeypatch.context() as patched:
+        patched.setenv("XDG_RUNTIME_DIR", str(runtime))
+        primary = Path(tmpdir.root_path())
+        primary.mkdir(mode=0o755)
+        primary.chmod(0o755)
+        path = Path(tmpdir.create(sid))
+        primary.rmdir()
+    st.update_session(sid, tmp_dir=str(path))
+    assert reconcile.remove_tmpdir(st, sid) is True
+    assert not path.exists()
+
+
+def test_reconcile_warns_about_an_unsafe_fallback_root_and_leaves_it(
+    tmp_path: Path, st: Store, root: str, procs: Procs
+) -> None:
+    runtime = private_runtime(tmp_path)
+    sid = session(st, root, wrapper=procs.live())
+    st.finalize_run(sid, 1, Final("session", "lost", "lost", 17, "lost", "exit"))
+    fallback = runtime / "csession"
+    (fallback / sid).mkdir(parents=True)
+    fallback.chmod(0o755)
+    st.update_session(sid, tmp_dir=str(fallback / sid))
+    result = reconcile.run(st, cfg_of(tmp_path), gateway=SystemGateway(), environ=os.environ)
+    assert (fallback / sid).is_dir()
+    assert any(str(fallback) in w and "unsafe and was skipped" in w for w in result["warnings"]), (
+        result["warnings"]
+    )
+
+
 @pytest.mark.parametrize(
     "name",
     [

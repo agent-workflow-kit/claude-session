@@ -2404,6 +2404,14 @@ class Store:
         rows = self.conn.execute("SELECT csession_id FROM sessions ORDER BY csession_id")
         return [str(sid) for (sid,) in rows.fetchall()]
 
+    def recorded_tmp_dirs(self) -> list[str]:
+        """The distinct private tmpdir paths recorded on sessions (``tmp_dir``), sorted: the
+        roots ``reconcile`` searches besides the ones the current environment names."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT tmp_dir FROM sessions WHERE tmp_dir IS NOT NULL ORDER BY tmp_dir"
+        )
+        return [str(path) for (path,) in rows.fetchall()]
+
     def tmpdir_owner(self, csession_id: str) -> tuple[int, bool] | None:
         """What decides whether a private tmpdir of ``csession_id`` may be removed: the
         session's current run and whether it is final; ``(0, True)`` for a deleted session

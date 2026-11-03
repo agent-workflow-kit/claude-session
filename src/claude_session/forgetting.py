@@ -49,7 +49,7 @@ from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from . import audit, liveness, logs, outcomefile, store, toolhooks
+from . import audit, envbuild, liveness, outcomefile, store, toolhooks
 from .errors import InternalError, NotFoundError, RefusedError
 
 if TYPE_CHECKING:
@@ -87,9 +87,7 @@ class _Forgetter:
         self.dry_run = dry_run
         self.state_root = os.path.dirname(st.path)
         self.audit_path = os.path.join(self.state_root, AUDIT_NAME)
-        self.secrets = logs.secret_values(
-            environ, secret_env=cfg.secret_env, claude_auth_env=cfg.claude_auth_env
-        )
+        self.secrets = envbuild.credential_values(environ, cfg)
         # A dry run's liveness changes per session (nothing was applied).
         self.dry_changes: dict[str, list[liveness.Change]] = {}
 

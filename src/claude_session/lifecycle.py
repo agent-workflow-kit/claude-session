@@ -550,8 +550,7 @@ def freeze(
         except tmpdir.TmpdirLeftover as exc:
             warnings.append(f"{exc}; {exc.hint}")
         except OSError as exc:
-            path = tmpdir.run_path(sid)
-            warnings.append(f"could not remove the private temporary directory {path}: {exc}")
+            warnings.append(f"could not remove the private temporary directory {v.tmpdir}: {exc}")
     st.add_run_warnings(sid, run, warnings)
     assert alloc.wrapper_start is not None
     expires_at = st.release_pending(
