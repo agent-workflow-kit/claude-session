@@ -1088,8 +1088,17 @@ def test_a_hook_leaving_a_process_in_the_background_finishes_when_sh_exits(
     finally:
         wait_until(lambda: pidfile.exists() and pidfile.read_text().strip() != "", 5)
         pid = int(pidfile.read_text())
-        with open(f"/proc/{pid}/cmdline", "rb") as fh:  # the exact sleep this test started
-            assert fh.read().split(b"\0")[0].endswith(b"sleep")
+
+        def argv0() -> bytes:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    return fh.read().split(b"\0")[0]
+            except OSError:
+                return b""
+
+        # The backgrounded subshell may not have exec'd sleep yet: wait (bounded) until it
+        # has, and signal only the exact sleep this test started.
+        wait_until(lambda: argv0().endswith(b"sleep"), 5)
         os.kill(pid, signal.SIGKILL)
 
 

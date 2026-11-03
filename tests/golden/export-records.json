@@ -1,0 +1,91 @@
+[
+  {
+    "action": "resume_tainted",
+    "actor": "human:tester",
+    "decision_id": [
+      "gate-1"
+    ],
+    "inputs": {
+      "kind": "review",
+      "run": 2,
+      "run_kind": "implement",
+      "tty": true
+    },
+    "result": "ok",
+    "target": "cs-aaaaaaaa",
+    "ts": "2026-10-30T12:00:00.000Z"
+  },
+  {
+    "action": "launch_escalation_override",
+    "actor": "human:tester",
+    "decision_id": [],
+    "inputs": {
+      "overridden_hooks": [
+        "4f2a"
+      ],
+      "run": 3,
+      "tty": false
+    },
+    "result": "ok",
+    "target": "cs-bbbbbbbb",
+    "ts": "2026-10-30T13:00:00.000Z"
+  },
+  {
+    "action": "sandbox_lowered",
+    "actor": "auto:queue",
+    "decision_id": [],
+    "inputs": {
+      "forked_from": "cs-aaaaaaaa",
+      "labels": [
+        "team=core",
+        "prio=high"
+      ],
+      "run": 1,
+      "run_kind": "review",
+      "sandbox_from": "required",
+      "sandbox_to": "off"
+    },
+    "result": "ok",
+    "target": "cs-cccccccc",
+    "ts": "2026-10-30T14:00:00.000Z"
+  },
+  {
+    "action": "stop",
+    "actor": "human:tester",
+    "decision_id": [],
+    "inputs": {
+      "grace": 10,
+      "run": 1
+    },
+    "result": "ok",
+    "target": "cs-dddddddd",
+    "ts": "2026-10-30T15:00:00.000Z"
+  },
+  {
+    "action": "stop",
+    "actor": "human:tester",
+    "decision_id": [],
+    "inputs": null,
+    "result": "error",
+    "target": "cs-dddddddd",
+    "ts": "2026-10-30T16:00:00.000Z"
+  },
+  {
+    "action": "forget",
+    "actor": "human:tester",
+    "decision_id": [],
+    "inputs": null,
+    "result": "ok",
+    "target": "cs-eeeeeeee",
+    "ts": "2026-10-30T17:00:00.000Z"
+  },
+  {
+    "action": "forget",
+    "actor": "human:tester",
+    "decision_id": [],
+    "inputs": null,
+    "result": "refused",
+    "target": "cs-ffffffff",
+    "ts": "2026-10-30T18:00:00.000Z"
+  }
+]
