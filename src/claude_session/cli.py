@@ -1092,6 +1092,7 @@ def build_parser() -> _Parser:
     form = p.add_mutually_exclusive_group()
     form.add_argument("--raw", action="store_true")
     form.add_argument("--paths", action="store_true")
+    p.add_argument("--allow-tty", action="store_true")
     p.add_argument("--subagents", action="store_true")
     p.add_argument("--run", type=int, metavar="N")
 
@@ -1315,6 +1316,13 @@ def _check_list(args: argparse.Namespace) -> None:
 def _check_transcript(args: argparse.Namespace) -> None:
     if args.raw and args.json:
         raise UsageError("--raw cannot be combined with --json")
+    if args.allow_tty and not args.raw:
+        raise UsageError("--allow-tty is only for --raw")
+    if args.raw and not args.allow_tty and _is_terminal(sys.stdout):
+        raise UsageError(
+            "--raw writes transcript bytes unchanged, escape sequences included, and stdout is "
+            "a terminal: redirect or pipe it, or pass --allow-tty to print it anyway"
+        )
 
 
 def _check_forget(args: argparse.Namespace) -> None:

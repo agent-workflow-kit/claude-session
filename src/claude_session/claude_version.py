@@ -3,12 +3,14 @@ Launch order step 5; design.md, Platform notes).
 
 ``kinds`` reports the version and ``claude_version_ok``; the launch (``launch.checks``, right
 after the tools are resolved, so a dry run makes the same check) calls ``require``:
-``claude_too_old`` below ``min_claude_version`` or when the output holds no version, and
-``claude_not_found`` when ``claude --version`` cannot run. One probe per launch, bounded in
-time (``PROBE_TIMEOUT`` plus ``KILL_GRACE``) and in memory (``MAX_OUTPUT``); nothing is
-cached: the version is read again at every launch, so an upgraded or downgraded ``claude``
-is seen at once. The version is read from the first line of the output exactly as printed
-(``Version.line``); messages show it with control characters replaced (``Version.text``).
+``claude_too_old`` below ``min_claude_version``. A version that cannot be determined (the
+output holds none, or ``claude --version`` cannot run) only warns (``claude_version_unknown``)
+and the launch goes on. One probe per launch, bounded in time (``PROBE_TIMEOUT`` plus
+``KILL_GRACE``) and in memory (``MAX_OUTPUT``); a process makes one launch, so there is
+nothing to cache across launches, and nothing is cached on disk: the version is read again at
+every launch, so an upgraded or downgraded ``claude`` is seen at once. The version is read
+from the first line of the output exactly as printed (``Version.line``); messages show it with
+control characters replaced (``Version.text``).
 ``check_interpreter`` keeps a script ``claude``'s ``#!`` interpreter out of the
 session-writable paths (isolated launches, dry runs and ``kinds``).
 
@@ -29,9 +31,13 @@ from .errors import LaunchValidationError
 from .gateway import Gateway, GatewayTimeout
 from .pathrules import ResolvedTool
 
-PROBE_TIMEOUT = 10.0
+# A hung `claude --version` stalls a launch for at most PROBE_TIMEOUT + KILL_GRACE (6 s); it
+# only warns (UNKNOWN_CODE), so it must not hold a launch up for long.
+PROBE_TIMEOUT = 5.0
 # SIGTERM-to-SIGKILL delay for the probe's process group on a timeout.
-KILL_GRACE = 2.0
+KILL_GRACE = 1.0
+# The stable code leading the warning of a version that could not be determined.
+UNKNOWN_CODE = "claude_version_unknown"
 # The only variables the probe gets: nothing secret (auth, secret_env, env.set) reaches it.
 PROBE_NAMES = ("PATH", "HOME", "LANG", "LANGUAGE")
 # The most of claude's first line read for its #! interpreter (the kernel reads as much).
@@ -261,6 +267,19 @@ def at_least(text: str | None, minimum: str) -> bool | None:
     return _key(version, width) >= _key(required, width)
 
 
+class Checked(NamedTuple):
+    """The launch's version check result: ``text`` is the version for display (None when it
+    could not be determined), ``warning`` the ``claude_version_unknown`` warning then."""
+
+    text: str | None
+    warning: str | None
+
+
+def unknown(detail: str, hint: str) -> str:
+    """The ``UNKNOWN_CODE`` warning: ``detail`` says why the version is not known."""
+    return f"{UNKNOWN_CODE}: {detail}; the launch goes on, the minimum was not verified ({hint})"
+
+
 def require(
     claude: ResolvedTool,
     environ: Mapping[str, str],
@@ -268,35 +287,29 @@ def require(
     minimum: str,
     *,
     writable: Callable[[str], bool],
-) -> str:
+) -> Checked:
     """The launch's version check: ``run`` (``writable``: the run's session-writable
     paths, which no ``PATH`` entry of the probe may be under), then ``at_least`` on the raw
-    first line. Returns the version text (for display). Raises ``LaunchValidationError``:
-    ``claude_not_found`` when ``claude --version`` cannot run (``NotRun``: it fails to
-    start, exits non-zero, prints nothing, times out, or no ``PATH`` entry is left to run it
-    with; the message says which, ``NOT_RUN_HINT``), ``claude_too_old`` when the version is
-    older than ``minimum`` (``TOO_OLD_HINT``) or the first line does not start with a version
-    (``NO_VERSION_HINT``; fail closed: it is not known to be new enough)."""
+    first line. A version older than ``minimum`` raises ``LaunchValidationError``
+    (``claude_too_old``, ``TOO_OLD_HINT``). A version that is not known does not block the
+    launch: when ``claude --version`` cannot run (``NotRun``: it fails to start, exits
+    non-zero, prints nothing, times out, or no ``PATH`` entry is left to run it with) or its
+    first line does not start with a version, the result carries a ``claude_version_unknown``
+    warning (``unknown``) and no text."""
     try:
         version = run(claude, environ, gw, writable=writable)
     except NotRun as error:
-        raise LaunchValidationError(
-            f"could not run {claude.path!r} --version: {error.reason}",
-            end_reason="claude_not_found",
-            hint=NOT_RUN_HINT,
-        ) from None
+        detail = f"could not run {claude.path!r} --version: {error.reason}"
+        return Checked(None, unknown(detail, NOT_RUN_HINT))
     text = version.text
     ok = at_least(version.line, minimum)
     if ok is None:
-        raise LaunchValidationError(
-            f"{claude.path!r} --version printed no version: {text!r}",
-            end_reason="claude_too_old",
-            hint=NO_VERSION_HINT,
-        )
+        detail = f"{claude.path!r} --version printed no version: {text!r}"
+        return Checked(None, unknown(detail, NO_VERSION_HINT))
     if not ok:
         raise LaunchValidationError(
             f"Claude Code {text!r} ({claude.path!r}) is older than min_claude_version {minimum}",
             end_reason="claude_too_old",
             hint=TOO_OLD_HINT,
         )
-    return text
+    return Checked(text, None)

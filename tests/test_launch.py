@@ -340,8 +340,8 @@ def test_the_version_probe_path_is_the_tool_lookup_path_without_writable_entries
     gw.on(["claude", "--version"], stdout="2.1.312 (Claude Code)\n")
     claude = pathrules.ResolvedTool("/opt/claude/claude", "claude")
     writable = pathrules.SessionWritable([str(tmp_path / "cwd")])
-    text = launch.check_claude_version(cfg, resolution(cfg), proc, claude, writable)
-    assert text == "2.1.312 (Claude Code)"
+    checked = launch.check_claude_version(cfg, resolution(cfg), proc, claude, writable)
+    assert checked == ("2.1.312 (Claude Code)", None)
     (call,) = gw.calls
     assert call.env is not None
     assert call.env["PATH"] == f"{prepend}:/usr/bin:/bin"
@@ -362,6 +362,33 @@ def test_the_version_check_uses_the_configured_minimum(tmp_path: Path) -> None:
     with pytest.raises(LaunchValidationError) as info:
         launch.check_claude_version(cfg, resolution(cfg), proc, claude, launch.NO_SANDBOX)
     assert info.value.end_reason == "claude_too_old"
+
+
+@pytest.mark.parametrize(
+    "answer", [{"stdout": "no version here\n"}, {"returncode": 1}, {"timeout": True}]
+)
+def test_an_unknown_version_warns_and_the_launch_effects_go_on(
+    tmp_path: Path, answer: dict[str, Any]
+) -> None:
+    claude = executable(tmp_path / "tools" / "claude")
+    cfg = load(tmp_path, f"claude_bin: {claude}\n")
+    proc = process(tmp_path)
+    assert isinstance(proc.gateway, FakeGateway)
+    proc.gateway.on(["claude", "--version"], **answer)
+    tools = launch.Tools(
+        claude=pathrules.ResolvedTool(str(claude), "claude"), git=None, bwrap=None, socat=None
+    )
+    found = launch.Recording.claude_version(
+        launch.Recording.__new__(launch.Recording),
+        cfg,
+        resolution(cfg),
+        proc,
+        tools,
+        launch.NO_SANDBOX,
+        lambda: None,
+    )
+    (warning,) = found
+    assert warning.startswith("claude_version_unknown: ")
 
 
 def dry_run_version(

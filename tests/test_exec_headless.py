@@ -844,11 +844,12 @@ def test_the_configured_minimum_admits_an_older_claude(
 
 
 @pytest.mark.parametrize("isolated", [False, True])
-def test_a_claude_that_cannot_run_fails_the_version_check(
+def test_a_claude_that_cannot_run_only_warns_at_the_version_check(
     tmp_path: Path, state: Path, work: Path, isolated: bool
 ) -> None:
-    """An executable that is not a working program is caught by ``claude --version`` in the
-    launch validations (``claude_not_found``), before anything of step 7 exists."""
+    """A ``claude --version`` that cannot run does not block the launch: it is a
+    ``claude_version_unknown`` warning, and the launch goes on (here to the spawn, which
+    fails the same way: ``launch_interrupted``)."""
     claude = script(tmp_path / "badbin" / "claude", "#!/nonexistent/interp\n")
     run = run_exec(
         tmp_path,
@@ -864,9 +865,9 @@ def test_a_claude_that_cannot_run_fails_the_version_check(
     assert (run.outcome["phase"], run.outcome["outcome"], run.outcome["end_reason"]) == (
         "launch",
         "not-started",
-        "claude_not_found",
+        "launch_interrupted",
     )
-    assert "--version" in run.outcome["message"]
+    assert any(w.startswith("claude_version_unknown: ") for w in run.outcome["warnings"])
     assert run.run_row()["child_pid"] is None
     assert not (run.private_run / "secret-index").exists()
     assert not csession_tmpdir(run.sid).exists()

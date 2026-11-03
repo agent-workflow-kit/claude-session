@@ -756,12 +756,8 @@ def test_an_interactive_claude_that_cannot_be_executed_ends_the_run_not_started(
     """G3: the exec fails only at the gate's release (a bad interpreter): the run goes back
     to the launch phase and ends not-started, launch_interrupted, with no child recorded."""
     claude = script(tmp_path / "badbin" / "claude", "#!/nonexistent/interp\n")
-    # The ``claude --version`` probe (min_claude_version) would already fail to run this
-    # binary (claude_not_found); skip it so that the exec fails at the gate's release.
-    skip_probe = (
-        "import claude_session.claude_version as _cv\n_cv.require = lambda *a, **k: '2.1.400'"
-    )
-    term = start_terminal(tmp_path, state, work, [], claude=claude, patch=skip_probe)
+    # ``claude --version`` cannot run it either; that only warns (claude_version_unknown).
+    term = start_terminal(tmp_path, state, work, [], claude=claude)
     code, outcome, err = term.finish()
     outcome = check_outcome(code, outcome, err)
     assert code == 12

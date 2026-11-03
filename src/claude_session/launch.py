@@ -1283,12 +1283,12 @@ def check_claude_version(
     process: Process,
     claude: pathrules.ResolvedTool,
     writable: Callable[[str], bool],
-) -> str:
-    """``claude --version`` against ``min_claude_version`` (``claude_too_old``;
-    ``claude_not_found`` when it cannot run), with ``claude_version.require``: in ``/``, a
-    minimal environment and its own process group. Its ``PATH`` is the one the tools were
-    looked up on (``env.path_prepend``, then the caller's) without any entry under
-    ``writable``. Returns the version text."""
+) -> claude_version.Checked:
+    """``claude --version`` against ``min_claude_version`` (``claude_too_old``; a version
+    that cannot be determined is only a ``claude_version_unknown`` warning in the result),
+    with ``claude_version.require``: in ``/``, a minimal environment and its own process
+    group. Its ``PATH`` is the one the tools were looked up on (``env.path_prepend``, then
+    the caller's) without any entry under ``writable``."""
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
     environ = {**process.environ, "PATH": ":".join(entries)}
     return claude_version.require(
@@ -1544,15 +1544,15 @@ class Effects:
                 end_reason="claude_not_found",
                 hint=HINTS["claude_not_found"],
             )
-        try:
-            check_claude_version(cfg, resolution, process, claude, guard)
-        except LaunchValidationError as error:
-            dropped = set(_probe_entries(entries, writable)) - set(_probe_entries(entries, guard))
-            if error.end_reason != "claude_not_found" or not dropped:
-                raise
-            why = f"{error.message}; PATH entries under session-writable paths were dropped"
+        checked = check_claude_version(cfg, resolution, process, claude, guard)
+        if checked.warning is None:
+            return []
+        dropped = set(_probe_entries(entries, writable)) - set(_probe_entries(entries, guard))
+        if dropped and checked.text is None and "--version: " in checked.warning:
+            # It could not run, and the dry run's PATH lost entries the launch's probe keeps.
+            why = f"{checked.warning}; PATH entries under session-writable paths were dropped"
             return [VERSION_NOT_PROBED.format(why=why)]
-        return []
+        return [checked.warning]
 
 
 class Recording(Effects):
@@ -1622,8 +1622,8 @@ class Recording(Effects):
     ) -> list[str]:
         """The launch's version check: the ``claude`` ``check_tools`` accepted, its probe's
         ``PATH`` without the run's session-writable paths (``writable``)."""
-        check_claude_version(cfg, resolution, process, tools.claude, writable)
-        return []
+        checked = check_claude_version(cfg, resolution, process, tools.claude, writable)
+        return [] if checked.warning is None else [checked.warning]
 
 
 def _discard_tmpdir(csession_id: str, pin: int | None) -> None:

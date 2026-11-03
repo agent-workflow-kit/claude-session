@@ -1617,13 +1617,14 @@ def test_a_dry_run_claude_failing_only_for_the_dropped_path_entries_is_a_warning
     ), plan["warnings"]
 
 
-def test_a_dry_run_claude_that_cannot_run_anyway_would_fail(
+def test_a_dry_run_claude_that_cannot_run_anyway_warns_claude_version_unknown(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
-    """No entry dropped: the dry run predicts the launch's ``claude_not_found``."""
+    """No entry dropped: the dry run predicts the launch's warning, not a failure."""
     (tools / "claude").write_text(f"#!/bin/sh\nexec {INTERP}\n", encoding="utf-8")
     proc, plan = dry_run("implement", cwd=work, tools=tools, tmp_path=tmp_path)
-    assert proc.returncode == 12 and plan["would_fail"] == "claude_not_found"
+    assert proc.returncode == 0 and plan["would_fail"] is None
+    assert any(w.startswith("claude_version_unknown: ") for w in plan["warnings"]), plan["warnings"]
 
 
 def interp_symlinked_into(work: Path, tmp_path: Path, marker: Path) -> Path:

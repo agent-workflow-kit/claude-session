@@ -16,7 +16,7 @@
       "type": "string",
       "default": "2.1.312",
       "pattern": "^[0-9]+(\\.[0-9]+)*$",
-      "description": "Minimum Claude Code version (claude --version) a launch accepts; older fails the launch with end_reason claude_too_old. Built-in: the version the spike verified."
+      "description": "Minimum Claude Code version (claude --version) a launch accepts; older fails the launch with end_reason claude_too_old; a version that cannot be determined only warns (claude_version_unknown). Built-in: the version the spike verified."
     },
     "default_kind": {
       "type": "string",
