@@ -467,7 +467,7 @@ def _stop(args: argparse.Namespace) -> int:
         line += f"{output['outcome']} ({output['end_reason']}), exit {output['run_exit_code']}"
     else:
         line += f"still {output['state']}"
-    print(sanitize(line))
+    print(display(line))
     return stopped.exit_code
 
 
