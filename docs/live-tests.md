@@ -124,7 +124,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 | Deny-root reads (E1): markers hidden; Bash, interpreters work | `test_sandbox.py::test_deny_root_...`; git: `test_a_denied_git_dir_...`; the network bridge: #42 |
 | Planted project and nested skills (E2) | `test_isolation.py::test_planted_project_...` |
 | A fork with `--cwd` records the transcript path from its SessionStart payload | `test_e2e.py::test_a_respond_like_fork_...`, `test_headless.py::test_resume_keeps_the_id_...` |
-| Manual macOS checklist | [macos-checklist.md](macos-checklist.md) (#43) |
+| Manual macOS checklist | #43 |
 
 ### Not covered, with the owner
 
@@ -141,7 +141,7 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 | Sandbox: TMPDIR socket length; `excludedCommands` matching; `.bash_profile` placeholder | #42 | Unit-tested in `selfcheck`; the live half needs a sandbox host. |
 | Search tools under the review profile (Glob, Grep, LS); symlink planted by sandboxed Bash and the Read tool (F1); `/proc` isolation (F2); MCP elicitation (`elicitation_dialog`) | #42 | Open items. |
 | Managed settings (#56 (b), #59 item 13) | #42 | Needs a root-owned managed settings file (procedure below). |
-| macOS Seatbelt checks, process start time, socket paths | #43 | Manual, macOS only: [macos-checklist.md](macos-checklist.md). |
+| macOS Seatbelt checks | #43 | Manual checklist (macOS only). |
 
 ### Comments on issue #41
 

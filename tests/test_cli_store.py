@@ -64,8 +64,19 @@ def test_list_json_creates_the_store_in_the_state_dir(
 
 
 def test_list_json_with_filters_on_an_empty_store(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(FULL_INVOCATIONS["list"]) == 0
+    argv = FULL_INVOCATIONS["list"]
+    at = argv.index("--forked-from")
+    assert main(argv[:at] + argv[at + 2 :]) == 0
     assert json.loads(capsys.readouterr().out) == {"sessions": []}
+
+
+def test_list_forked_from_an_unknown_session_exits_10(capsys: pytest.CaptureFixture[str]) -> None:
+    # --forked-from takes session id input, which resolves like any id (interface.md,
+    # Identifiers): an unknown id exits 10.
+    assert main(FULL_INVOCATIONS["list"]) == 10
+    envelope = json.loads(capsys.readouterr().out)
+    validate(envelope, ERROR_SCHEMA)
+    assert envelope["error"]["code"] == "not_found"
 
 
 def test_list_human_on_an_empty_store(capsys: pytest.CaptureFixture[str]) -> None:
@@ -263,3 +274,29 @@ def test_hook_event_works_with_a_newer_additive_schema_and_never_migrates(
     assert row == ("working", "working")
     log = Path(state_root, "log.jsonl")
     assert "hook_event_failed" not in (log.read_text() if log.exists() else "")
+
+
+@pytest.mark.parametrize("extra", [[], ["--dry-run"]])
+def test_schema_newer_runs_no_claude_not_even_its_version(
+    extra: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The schema check comes first: a launch or dry run against a newer database never
+    reaches the ``claude --version`` check of step 5 (nothing runs, nothing is allocated)."""
+    make_newer()
+    marker = tmp_path / "ran"
+    claude = tmp_path / "bin" / "claude"
+    claude.parent.mkdir()
+    claude.write_text(f"#!/bin/sh\necho ran >> {marker}\necho '2.1.312 (Claude Code)'\n")
+    claude.chmod(0o755)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"claude_bin: {claude}\n", encoding="utf-8")
+    (tmp_path / "p.md").write_text("Do it.\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    seen = capture_errors(monkeypatch)
+    argv = ["exec", "--mode", "headless", "--json", "--config", str(cfg), "--prompt-file", "p.md"]
+    before = db_bytes()
+    assert main([*argv, *extra]) == 12
+    assert [error.code for error in seen] == ["schema_newer"]
+    assert not marker.exists()
+    assert db_bytes() == before
+    assert not (Path(store.state_dir()) / "sessions").exists()
