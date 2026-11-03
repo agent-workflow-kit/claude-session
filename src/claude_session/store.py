@@ -1002,7 +1002,7 @@ class Store:
         if _SESSION_ID_PREFIX.fullmatch(prefix) is None:
             raise ValueError(f"not a session id prefix: {prefix!r}")
         upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
-        with self._lenient_decoding():
+        with self.lenient_decoding():
             rows = self.conn.execute(
                 "SELECT csession_id, forgotten_at IS NOT NULL FROM sessions "
                 "WHERE csession_id >= ? AND csession_id < ? ORDER BY csession_id",
@@ -1028,7 +1028,7 @@ class Store:
     # is decoded leniently (``_lenient_text``) so stored bytes that are not UTF-8 never fail.
 
     @contextmanager
-    def _lenient_decoding(self) -> Iterator[None]:
+    def lenient_decoding(self) -> Iterator[None]:
         """Lenient text decoding on the shared connection (restored afterwards); usable
         inside a caller's transaction."""
         previous = self.conn.text_factory
@@ -1041,7 +1041,7 @@ class Store:
     @contextmanager
     def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
         """A deferred read transaction with lenient text decoding (restored afterwards)."""
-        with self._lenient_decoding():
+        with self.lenient_decoding():
             self.conn.execute("BEGIN")
             try:
                 yield self.conn
@@ -1160,7 +1160,7 @@ class Store:
             with self._read_snapshot() as conn:
                 return self._label_change(conn, csession_id, unique, add=add)
         # Stored text is only read and compared: decode it leniently, as the dry run does.
-        with self._lenient_decoding(), self.transaction() as conn:
+        with self.lenient_decoding(), self.transaction() as conn:
             change = self._label_change(conn, csession_id, unique, add=add)
             if change is None:
                 return None

@@ -65,8 +65,14 @@ def alive(monkeypatch: pytest.MonkeyPatch) -> set[tuple[int, str]]:
 
 
 @pytest.fixture
-def st(clock: Clock, alive: set[tuple[int, str]]) -> Iterator[Store]:
-    with store.open_state(clock=clock) as s:
+def st(
+    clock: Clock, alive: set[tuple[int, str]], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Store]:
+    # The commands under test read the same clock, so the inline liveness check sees the
+    # seeded deadlines as the seeding store does.
+    open_state = store.open_state
+    monkeypatch.setattr(store, "open_state", lambda **kw: open_state(**{"clock": clock, **kw}))
+    with store.open_state() as s:
         yield s
 
 
@@ -928,6 +934,38 @@ def test_status_and_list_run_the_liveness_hook_and_never_write(
     assert seeded.conn.execute("SELECT COUNT(*) FROM events").fetchone() == events
 
 
+def final_unwritten(st: Store, clock: Clock, out: Path) -> str:
+    """A final run with an outcome file whose write was never claimed (its finalizer died
+    before claiming): the liveness check's backfill writes it."""
+    trusted = {"kind": "implement", "profile": {"sandbox": "off", "reads_third_party": False}}
+    sid = allocate(st, "cs-eeeeeeee", clock, outcome_file=str(out), resolved=trusted)
+    finalize(st, sid, clock, DONE)
+    assert st.run_record(sid, 1)["outcome_file_written_at"] is None
+    return sid
+
+
+def test_status_backfills_an_unwritten_outcome_file(
+    st: Store, clock: Clock, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "out.json"
+    sid = final_unwritten(st, clock, out)
+    code, _ = run_json(["status", sid], capsys)
+    assert code == 0
+    assert json.loads(out.read_text())["outcome"] == "done"
+    assert st.run_record(sid, 1)["outcome_file_written_at"] is not None
+
+
+def test_list_backfills_an_unwritten_outcome_file(
+    st: Store, clock: Clock, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "out.json"
+    sid = final_unwritten(st, clock, out)
+    code, _ = run_json(["list"], capsys)
+    assert code == 0
+    assert json.loads(out.read_text())["outcome"] == "done"
+    assert st.run_record(sid, 1)["outcome_file_written_at"] is not None
+
+
 def test_store_open_failure_exits_12(
     _private_state_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1209,3 +1247,90 @@ def test_list_human_columns_align_with_wide_characters(
         kind, run = line.split()[2:4]
         at = line.index(f" {run} ", line.index(kind) + len(kind)) + 1
         assert terminal.display_width(line[:at]) == column, line
+
+
+# The inline liveness check (interface.md, Liveness): status and list finalize, never deliver
+
+
+def _final_event(s: Store, sid: str) -> tuple[Any, ...]:
+    return s.conn.execute(
+        "SELECT to_state, cause, final, delivered_at FROM events WHERE csession_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (sid,),
+    ).fetchone()
+
+
+def test_status_finalizes_an_expired_pending_run_without_delivering(
+    seeded: Store, clock: Clock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clock.tick(11 * 60)  # past cs-dddddddd's expires_at
+    _, obj = run_json(["status", "cs-dddddddd"], capsys)
+    run = obj["run"]
+    assert (obj["state"], obj["live"], obj["pending"]) == ("not-started", False, False)
+    assert (run["outcome"], run["end_reason"]) == ("not-started", "never_adopted")
+    assert _final_event(seeded, "cs-dddddddd") == ("not-started", "liveness", 1, None)
+
+
+def test_list_finalizes_an_expired_pending_run_and_live_excludes_it(
+    seeded: Store, clock: Clock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clock.tick(11 * 60)
+    _, obj = run_json(["list"], capsys)
+    item = next(i for i in obj["sessions"] if i["csession_id"] == "cs-dddddddd")
+    assert (item["state"], item["pending"], item["last_end_reason"]) == (
+        "not-started",
+        False,
+        "never_adopted",
+    )
+    assert listed(["--live"], capsys) == ["cs-aaaaaaaa"]
+    assert listed(["--pending"], capsys) == []
+    assert _final_event(seeded, "cs-dddddddd") == ("not-started", "liveness", 1, None)
+
+
+def test_status_finalizes_a_run_whose_wrapper_and_child_are_dead_as_lost(
+    seeded: Store, alive: set[tuple[int, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    alive.clear()
+    _, obj = run_json(["status", "cs-aaaaaaaa"], capsys)
+    run = obj["run"]
+    assert (obj["state"], obj["live"]) == ("lost", False)
+    assert (run["outcome"], run["end_reason"], run["exit_code"]) == ("lost", "lost", 17)
+    assert _final_event(seeded, "cs-aaaaaaaa") == ("lost", "liveness", 1, None)
+
+
+def test_list_finalizes_a_run_whose_wrapper_is_dead_and_live_excludes_it(
+    seeded: Store, alive: set[tuple[int, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    alive.clear()
+    assert listed(["--live"], capsys) == ["cs-dddddddd"]
+    _, obj = run_json(["list"], capsys)
+    item = next(i for i in obj["sessions"] if i["csession_id"] == "cs-aaaaaaaa")
+    assert (item["state"], item["last_outcome"], item["last_end_reason"]) == (
+        "lost",
+        "lost",
+        "lost",
+    )
+    assert _final_event(seeded, "cs-aaaaaaaa") == ("lost", "liveness", 1, None)
+
+
+def test_status_and_list_leave_an_orphan_live(
+    seeded: Store, alive: set[tuple[int, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    alive.discard((4242, "boot:1"))  # wrapper dead, child alive
+    _, obj = run_json(["status", "cs-aaaaaaaa"], capsys)
+    assert (obj["state"], obj["live"]) == ("working", True)
+    assert listed(["--live"], capsys) == ["cs-dddddddd", "cs-aaaaaaaa"]
+
+
+def test_status_finalizes_a_dead_run_whose_text_is_not_utf8(
+    seeded: Store, alive: set[tuple[int, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    sql(
+        seeded,
+        "UPDATE runs SET message = CAST(? AS TEXT) WHERE csession_id = 'cs-aaaaaaaa'",
+        b"bad \xff utf8",
+    )
+    alive.clear()
+    code, obj = run_json(["status", "cs-aaaaaaaa"], capsys)
+    assert (code, obj["state"], obj["run"]["end_reason"]) == (0, "lost", "lost")
+    assert seeded.conn.text_factory is str
