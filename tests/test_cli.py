@@ -346,8 +346,10 @@ def test_json_after_double_dash_is_a_positional(
 
 
 def test_unimplemented_command_is_internal_not_implemented(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Every command is implemented eventually: route one through the placeholder handler.
+    monkeypatch.setitem(cli.HANDLERS, "export", cli._not_implemented)
     code, envelope, err = run_json(["export", "--json"], capsys)
     assert code == 1
     assert_golden(envelope, "error-not-implemented")
