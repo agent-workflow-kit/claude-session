@@ -496,7 +496,12 @@ class Host:
 class PathRules:
     """The path rules of one run: ``Host`` facts plus the run's ``session_dir``
     (``$CSESSION_DIR``), resolved ``cwd``, the ``caller_cwd`` (the cwd of the invoking
-    process, resolved) and the private ``tmpdir`` (None: not sandboxed)."""
+    process, resolved) and the private ``tmpdir`` (None: not sandboxed).
+
+    ``planned`` (``--dry-run``, which creates nothing): a run's own ``work/``, ``outbox/`` or
+    ``artifacts/`` that does not exist yet, at any component, gets its exception as the real
+    directory the launch would create there (``planned_dir``); one that exists must still
+    qualify as it is."""
 
     def __init__(
         self,
@@ -506,6 +511,7 @@ class PathRules:
         cwd: str,
         caller_cwd: str,
         tmpdir: str | None = None,
+        planned: bool = False,
     ) -> None:
         self.host = host
         self.cwd = cwd
@@ -518,10 +524,12 @@ class PathRules:
         self._private = _ref(os.path.join(host.state_root, sessiondir.PRIVATE))
         self._tmp_parent = _ref(host.tmp_parent)
         self._session = _ref(session_dir)
+        own = [os.path.join(session_dir, name) for name in OWN_WRITABLE]
+        self._planned = tuple(path for path in own if planned and planned_dir(path) is not None)
         self._own = tuple(
             ref
-            for name in OWN_WRITABLE
-            if (ref := _exception_dir(os.path.join(session_dir, name))) is not None
+            for path in own
+            if (ref := _exception_dir(path) or (planned and planned_dir(path)) or None) is not None
         )
         self._tmpdir = None if tmpdir is None else _exception_dir(tmpdir)
         self._cwd = _ref(cwd)
@@ -540,6 +548,12 @@ class PathRules:
         self._hidden = tuple(
             hidden for home, label in self._homes for hidden in _hidden_dirs(home, label)
         )
+
+    def planned(self, path: str) -> bool:
+        """Whether ``path`` is one of the run's own directories that does not exist yet and
+        is treated as created (``planned``)."""
+        real = os.path.realpath(path)
+        return any(os.path.realpath(own) == real for own in self._planned)
 
     # Host
 
@@ -948,6 +962,19 @@ def _exception_dir(path: str) -> _Ref | None:
     if real != os.path.join(parent, os.path.basename(literal)):
         return None
     return _ref(real)
+
+
+def planned_dir(path: str) -> _Ref | None:
+    """The directory a launch would create at ``path``, for a dry run: None when anything
+    exists there (an existing entry qualifies only through ``_exception_dir``); otherwise
+    the realpath of the nearest existing parent joined with the missing components."""
+    literal = os.path.normpath(path)
+    if os.path.lexists(literal):
+        return None
+    try:
+        return _ref(literal)
+    except ValueError:
+        return None
 
 
 # read_dirs and write_dirs

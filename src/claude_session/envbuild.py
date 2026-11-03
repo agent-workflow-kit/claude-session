@@ -108,7 +108,7 @@ GIT_HARDENING = (
 )
 # Step 7: removed first; each beats the hardening entries (GIT_CONFIG_PARAMETERS is applied
 # after the GIT_CONFIG_COUNT entries) or points git at other commands or another repository.
-# Not kinds._GIT_ENV_DROP: that one also drops the GIT_CONFIG_COUNT set kept here.
+# Not kinds.git_env: claude-session's own git calls get a minimal environment instead.
 GIT_ENV_DROP = (
     "GIT_CONFIG_PARAMETERS",
     "GIT_SSH",
