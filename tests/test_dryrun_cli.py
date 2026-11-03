@@ -490,12 +490,31 @@ def test_secret_values_too_large_to_index_are_an_invalid_config(
         env={
             "ANTHROPIC_API_KEY": "a" + big,
             "ANTHROPIC_AUTH_TOKEN": "b" + big,
-            "ANTHROPIC_MODEL": "c" + big,
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "AWS_SECRET_ACCESS_KEY": "c" + big,
         },
     )
     assert proc.returncode == 2
     assert error_of(proc)["error"]["code"] == "usage"
     assert big not in proc.stdout and big not in proc.stderr
+
+
+def test_a_huge_plain_setting_is_not_indexed(tmp_path: Path, tools: Path, work: Path) -> None:
+    # Only credential values count towards the index size (#95).
+    big = "k" * 100_000
+    proc = cli(
+        ["exec", "--dry-run", "--json", "--mode", "headless", "--prompt-file", "prompt.md"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        env={
+            "ANTHROPIC_MODEL": big,
+            "ANTHROPIC_BASE_URL": big,
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "AWS_REGION": big,
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_a_profile_file_is_shown_by_its_hash(tmp_path: Path, tools: Path, work: Path) -> None:

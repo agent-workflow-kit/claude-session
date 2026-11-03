@@ -353,7 +353,7 @@ def step2_writable(process: Process, probe_cwd: str | None) -> pathrules.Session
     """What git must not be under at step 2, before the run's session-writable paths are
     known (conservative): the probe cwd, every session's directory (``<state>/sessions``)
     and the tmp root of the private temporary directories (``/tmp/csession-<uid>``)."""
-    paths = [os.path.join(process.state_root, sessiondir.SESSIONS), pathrules.tmp_parent()]
+    paths = [os.path.join(process.state_root, sessiondir.SESSIONS), *pathrules.tmp_parents()]
     return pathrules.SessionWritable([*([probe_cwd] if probe_cwd else []), *paths])
 
 
@@ -2244,7 +2244,7 @@ def notes_conf(
         v.notes_tool.name, cfg.notes_context_cmd, repo=resolution.repo, labels=labels
     )
     path = sanitize_path(v.session_env.env.get("PATH", ""))
-    names = frozenset((*cfg.secret_env, *cfg.claude_auth_env, *v.session_env.auth_names))
+    names = frozenset((*cfg.secret_env, *cfg.claude_auth_env, *v.session_env.credential_names))
     conf = notes.NotesConf(
         argv=argv,
         executable=v.notes_tool.path,

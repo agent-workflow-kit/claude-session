@@ -1078,7 +1078,10 @@ RUN_SECRET = "ab" * 32
 
 
 def session_env(env: dict[str, str], auth: tuple[str, ...], secret: tuple[str, ...]) -> Any:
-    return envbuild.SessionEnv(env=env, auth_names=auth, secret_names=secret)
+    credentials = tuple(name for name in auth if envbuild.is_credential_name(name))
+    return envbuild.SessionEnv(
+        env=env, auth_names=auth, credential_names=credentials, secret_names=secret
+    )
 
 
 def test_secret_values_take_auth_from_the_session_env_and_secrets_from_the_caller() -> None:
@@ -1106,6 +1109,112 @@ def test_secret_values_feed_an_index_that_catches_them(tmp_path: Path) -> None:
     for value in (AUTH_PASSED, VAULT, RUN_SECRET):
         assert index.contains(f"x {value} y".encode())
     assert not index.contains(AUTH_CALLER.encode())
+
+
+# Only credential values are secrets (#95; interface.md, report: contains_secret)
+
+BEDROCK_ENV_VARS = {
+    **CALLER,
+    "CLAUDE_CODE_USE_BEDROCK": "1",
+    "AWS_REGION": "eu-central-1",
+    "AWS_PROFILE": "bedrock-profile",
+    "ANTHROPIC_MODEL": "anthropic.claude-model-v1:0",
+    "ANTHROPIC_BASE_URL": "https://gateway.example.com/bedrock",
+    "AWS_ACCESS_KEY_ID": "AKIAEXAMPLE000000",
+    "AWS_SECRET_ACCESS_KEY": "secret-access-key-0123456789",
+    "AWS_SESSION_TOKEN": "session-token-0123456789",
+}
+
+
+def test_bedrock_settings_are_passed_but_not_secrets(cfg_dir: Path) -> None:
+    result = build(load(cfg_dir), "rank", BEDROCK_ENV_VARS)
+    for name in ("AWS_REGION", "AWS_PROFILE", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL"):
+        assert result.env[name] == BEDROCK_ENV_VARS[name]
+        assert name in result.auth_names and name not in result.credential_names
+    values = envbuild.secret_values(result, BEDROCK_ENV_VARS)
+    # The access key id is an identifier, not a credential by name.
+    assert values == {"secret-access-key-0123456789", "session-token-0123456789"}
+
+
+def test_a_summary_naming_the_region_and_model_passes_the_index(cfg_dir: Path) -> None:
+    result = build(load(cfg_dir), "rank", BEDROCK_ENV_VARS)
+    index = secretindex.parse(
+        secretindex.build(envbuild.secret_values(result, BEDROCK_ENV_VARS, run_secret=RUN_SECRET))
+    )
+    text = "ran on eu-central-1 with anthropic.claude-model-v1:0 via https://gateway.example.com/bedrock"
+    assert not index.contains(text.encode())
+    assert index.contains(b"leak session-token-0123456789 leak")
+    assert index.contains(b"leak secret-access-key-0123456789")
+
+
+def test_vertex_region_is_not_a_secret_but_its_credentials_are(cfg_dir: Path) -> None:
+    environ = {
+        **CALLER,
+        "CLAUDE_CODE_USE_VERTEX": "1",
+        "CLOUD_ML_REGION": "europe-west4",
+        "ANTHROPIC_VERTEX_PROJECT_ID": "my-project-12345",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/home/u/creds.json",
+        "GOOGLE_API_KEY": "google-api-key-0123456789",
+    }
+    result = build(load(cfg_dir), "rank", environ)
+    assert envbuild.secret_values(result, environ) == {"google-api-key-0123456789"}
+
+
+def test_configured_extra_names_are_secrets_whatever_their_spelling(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "claude_auth_env: [MY_PROXY_LOGIN, MY_PROXY_TOKEN]\n")
+    environ = {**CALLER, "MY_PROXY_LOGIN": "login-value-0123", "MY_PROXY_TOKEN": "token-value-0123"}
+    result = build(cfg, "rank", environ)
+    assert set(result.credential_names) == {"MY_PROXY_LOGIN", "MY_PROXY_TOKEN"}
+    assert envbuild.secret_values(result, environ) == {"login-value-0123", "token-value-0123"}
+
+
+def test_an_extra_that_is_a_builtin_setting_name_becomes_a_secret(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "claude_auth_env: [ANTHROPIC_MODEL]\n")
+    environ = {**CALLER, "ANTHROPIC_MODEL": "private-model-name"}
+    assert envbuild.secret_values(build(cfg, "rank", environ), environ) == {"private-model-name"}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "DB_PASSWORD",
+        "MY_SECRET",
+        "x_api_key",
+        "TOKEN",
+        "KEY",
+    ],
+)
+def test_credential_names(name: str) -> None:
+    assert envbuild.is_credential_name(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_BASE_URL",
+        "AWS_REGION",
+        "AWS_PROFILE",
+        "CLOUD_ML_REGION",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "MONKEY",
+        "AWS_KEYS",
+        "X_TOKENS",
+        "TOKENIZER",
+        "SECRETARY",
+        "AWS_ACCESS_KEY_ID_FILE",
+        "KEY_FILE",
+        "",
+    ],
+)
+def test_near_miss_names_are_not_credentials(name: str) -> None:
+    assert not envbuild.is_credential_name(name)
 
 
 # 7. Git hardening (third-party-reading runs)

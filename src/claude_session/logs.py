@@ -127,9 +127,10 @@ def secret_values(
     run_secret: str | None = None,
 ) -> frozenset[str]:
     """The values both writers redact: the same set ``contains_secret`` checks (interface.md,
-    report): the values of the ``secret_env`` and passed ``claude_auth_env`` variables present
-    in ``environ``, plus the run secret when the caller has one; only values of
-    ``MIN_SECRET_CHARS`` or more characters."""
+    report): the values of the ``secret_env`` variables and of the credential variables named
+    in ``claude_auth_env`` present in ``environ`` (the caller filters plain settings out:
+    ``envbuild.SessionEnv.credential_names``), plus the run secret when the caller has one;
+    only values of ``MIN_SECRET_CHARS`` or more characters."""
     names = [*secret_env, *claude_auth_env]
     values = [environ.get(name, "") for name in names]
     if run_secret is not None:

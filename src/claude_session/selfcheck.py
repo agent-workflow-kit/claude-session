@@ -100,7 +100,11 @@ _USERNS_HINT = (
 _WSL1_HINT = "WSL1 has no sandbox: use WSL2, or set the kind's sandbox to preferred"
 _MACOS_HINT = f"the macOS Seatbelt sandbox needs {SANDBOX_EXEC}"
 _UNSUPPORTED_HINT = "Claude Code has no sandbox on this platform; set sandbox to preferred or off"
-_SOCKET_HINT = "use a shorter temporary directory path (the private TMPDIR lives under /tmp)"
+_SOCKET_HINT = (
+    "use a shorter temporary directory path (the private TMPDIR lives under /tmp, or under"
+    " $XDG_RUNTIME_DIR/csession when /tmp/csession-<uid> cannot be used: shorten"
+    " $XDG_RUNTIME_DIR)"
+)
 
 _SYSTEM_GATEWAY = SystemGateway()
 

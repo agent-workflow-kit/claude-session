@@ -1286,3 +1286,60 @@ def test_swapped_final_component_through_a_symlinked_ancestor_loses_the_exceptio
     assert rules.write_target_problem(str(world.home / ".ssh")) is not None
     with pytest.raises(LaunchValidationError):
         rules.check_cwd()
+
+
+# The fallback tmp root under $XDG_RUNTIME_DIR (#95)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "run/user/1", "./run", "/run/../tmp", "/run//user", "/run/user/", "/", "/run/\x00x"],
+)
+def test_an_unusable_runtime_dir_gives_no_fallback_root(value: str) -> None:
+    assert pathrules.runtime_tmp_parent({"XDG_RUNTIME_DIR": value}) is None
+    assert pathrules.runtime_tmp_parent({}) is None
+
+
+def test_the_runtime_fallback_root_is_csession_under_it() -> None:
+    environ = {"XDG_RUNTIME_DIR": "/run/user/1000"}
+    assert pathrules.runtime_tmp_parent(environ) == "/run/user/1000/csession"
+    assert (
+        Host.from_environ({"HOME": "/home/u", **environ}, state_root="/s").runtime_tmp_parent
+        == "/run/user/1000/csession"
+    )
+    assert pathrules.tmp_parents(environ) == [
+        pathrules.tmp_parent(),
+        "/run/user/1000/csession",
+    ]
+    assert pathrules.tmp_parents({}) == [pathrules.tmp_parent()]
+
+
+def runtime_world(world: World) -> tuple[World, Path]:
+    parent = world.root / "run" / "csession"
+    (parent / SID).mkdir(parents=True)
+    (parent / OTHER).mkdir()
+    return world, parent
+
+
+def test_other_sessions_in_the_runtime_fallback_root_are_refused(world: World) -> None:
+    _, parent = runtime_world(world)
+    rules = world.rules(host=world.host(runtime_tmp_parent=str(parent)), tmpdir=str(parent / SID))
+    assert "is inside" in (rules.write_target_problem(str(parent / OTHER)) or "")
+    assert "is or contains" in (rules.write_target_problem(str(parent.parent)) or "")
+    assert rules.read_entry_problem(str(parent / OTHER)) is not None
+    assert rules.write_target_problem(str(parent / SID / "x")) is None
+
+
+def test_the_runtime_fallback_root_is_not_refused_when_it_is_not_configured(world: World) -> None:
+    _, parent = runtime_world(world)
+    assert world.rules().write_target_problem(str(parent / OTHER)) is None
+
+
+def test_home_under_the_runtime_fallback_root_is_refused(world: World) -> None:
+    _, parent = runtime_world(world)
+    home = parent / "home"
+    home.mkdir()
+    with pytest.raises(LaunchValidationError) as info:
+        world.rules(host=world.host(home=str(home), runtime_tmp_parent=str(parent))).check_host()
+    assert info.value.end_reason == "unsafe_path"
+    assert str(parent) in str(info.value)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -576,3 +577,91 @@ def test_end_reasons_exist_in_the_interface_and_the_outcome_schema() -> None:
         assert reason in launch
         assert reason in start
         assert f"`{reason}`" in interface
+
+
+# The fallback root under $XDG_RUNTIME_DIR (#95)
+
+
+@pytest.fixture
+def squatted_base(base: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A base whose per-uid root a hostile user created first (it looks owned by uid 4242)."""
+    root = base / f"csession-{os.geteuid()}"
+    root.mkdir(mode=0o700)
+    ident = (root.lstat().st_dev, root.lstat().st_ino)
+    real_stat, real_fstat = os.stat, os.fstat
+
+    def spoof(result: os.stat_result) -> os.stat_result:
+        if (result.st_dev, result.st_ino) != ident:
+            return result
+        fields = list(result)
+        fields[4] = 4242
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "stat", lambda *a, **k: spoof(real_stat(*a, **k)))
+    monkeypatch.setattr(os, "fstat", lambda fd: spoof(real_fstat(fd)))
+    return base
+
+
+@pytest.fixture
+def short_runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    path = Path(tempfile.mkdtemp(prefix="cs-rt-", dir="/tmp"))
+    path.chmod(0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(path))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path)
+
+
+def test_a_squatted_root_gets_its_tmpdir_in_the_runtime_dir(
+    squatted_base: Path, short_runtime: Path, tools: tuple[str, str]
+) -> None:
+    result = run_check("required", squatted_base, tools, FakeRunner(0))
+    assert result.tmpdir == str(short_runtime / "csession" / SID)
+    assert (short_runtime / "csession" / SID).is_dir()
+    assert result.sandbox_active
+    assert os.listdir(squatted_base / f"csession-{os.geteuid()}") == []
+
+
+def test_a_dry_run_names_the_fallback_tmpdir_and_creates_nothing(
+    squatted_base: Path, short_runtime: Path, tools: tuple[str, str]
+) -> None:
+    result = run_check("required", squatted_base, tools, FakeRunner(0), create=False)
+    assert result.tmpdir == str(short_runtime / "csession" / SID)
+    assert not (short_runtime / "csession").exists()
+
+
+@pytest.mark.parametrize("mode", ["required", "preferred"])
+def test_a_runtime_dir_too_long_for_sockets_fails_with_socket_path_too_long(
+    mode: str,
+    squatted_base: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tools: tuple[str, str],
+) -> None:
+    deep = tmp_path / ("d" * 80)
+    deep.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(deep))
+    with pytest.raises(LaunchValidationError) as info:
+        run_check(mode, squatted_base, tools, FakeRunner(0))
+    assert info.value.end_reason == "socket_path_too_long"
+    assert str(deep / "csession") in str(info.value)
+    assert info.value.hint is not None and "XDG_RUNTIME_DIR" in info.value.hint
+    assert list(deep.iterdir()) == []
+
+
+def test_a_squatted_root_without_a_runtime_dir_is_tmpdir_unsafe(
+    squatted_base: Path, tools: tuple[str, str]
+) -> None:
+    with pytest.raises(LaunchValidationError) as info:
+        run_check("required", squatted_base, tools, FakeRunner(0))
+    assert info.value.end_reason == "tmpdir_unsafe"
+
+
+def test_sandbox_unavailable_still_precedes_the_tmpdir(
+    squatted_base: Path, short_runtime: Path
+) -> None:
+    with pytest.raises(LaunchValidationError) as info:
+        run_check("required", squatted_base, (None, None), FakeRunner(0))
+    assert info.value.end_reason == "sandbox_unavailable"
+    assert not (short_runtime / "csession").exists()

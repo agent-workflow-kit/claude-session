@@ -107,11 +107,14 @@ class Created(NamedTuple):
 class _Refusal(fsutil.UnsafePathError):
     """An unsafe entry: ``path`` (full path), what is wrong with it and the hint for it."""
 
-    def __init__(self, path: str, reason: str, hint: str) -> None:
+    def __init__(self, path: str, reason: str, hint: str, *, external: bool = False) -> None:
         super().__init__(f"{path}: {reason}")
         self.path = path
         self.reason = reason
         self.hint = hint
+        # Caused by something outside our own entries (another user's squat, a misconfigured
+        # base): the fallback root is a remedy. A root of ours with a bad mode is not.
+        self.external = external
 
 
 def root_name(uid: int) -> str:
@@ -131,29 +134,113 @@ def root_path(base: str | None = None) -> str:
     return os.path.join(os.path.realpath(base), root_name(os.geteuid()))
 
 
+def runtime_root_path() -> str | None:
+    """``<realpath($XDG_RUNTIME_DIR)>/csession``, the fallback root, or None when the variable
+    is unset or unusable (``pathrules.runtime_tmp_parent``). Read at call time."""
+    given = pathrules.runtime_tmp_parent()
+    if given is None:
+        return None
+    return os.path.join(os.path.realpath(os.path.dirname(given)), os.path.basename(given))
+
+
 def run_path(csession_id: str, base: str | None = None) -> str:
-    """The private temporary directory of session ``csession_id`` (not checked or created)."""
+    """The private temporary directory of session ``csession_id`` in the root a launch uses
+    now: ``select_root`` (nothing is created; an unsafe root is not reported here: ``check``
+    and ``create`` do)."""
     _check_id(csession_id)
-    return os.path.join(root_path(base), csession_id)
+    return os.path.join(select_root(base), csession_id)
+
+
+class _Candidate(NamedTuple):
+    root: str  # full path of the root
+    private_parent: bool  # the parent must be ours alone (the runtime directory)
+
+
+def _candidates(base: str | None) -> list[_Candidate]:
+    """The roots in precedence order: the per-uid root in the base, then the runtime-dir
+    root when ``$XDG_RUNTIME_DIR`` is usable."""
+    found = [_Candidate(root_path(base), False)]
+    runtime = runtime_root_path()
+    if runtime is not None:
+        found.append(_Candidate(runtime, True))
+    return found
+
+
+def select_root(base: str | None = None) -> str:
+    """The root a launch uses: the first candidate that can be established (it exists and is
+    safe, or is missing and could be created), else the per-uid root (the failure is
+    reported by ``check``/``create``). Creates and changes nothing."""
+    try:
+        root, fd = _open_first(base, create=False)
+    except _Refusal:
+        return root_path(base)
+    if fd is not None:
+        os.close(fd)
+    return root
+
+
+def _open_first(base: str | None, *, create: bool) -> tuple[str, int | None]:
+    """Open the first candidate root that is safe: ``(root, descriptor)``; the descriptor is
+    None for a missing root that is not created (``create`` false) whose parent is safe.
+    Raises ``_Refusal`` (``refusals``: every candidate's) when none is."""
+    failures: list[_Refusal] = []
+    for candidate in _candidates(base):
+        try:
+            return candidate.root, _open_candidate(candidate, create=create)
+        except _Refusal as exc:
+            failures.append(exc)
+    raise _combine(failures, runtime_unusable=runtime_root_path() is None)
+
+
+def _open_candidate(candidate: _Candidate, *, create: bool) -> int | None:
+    parent = os.path.dirname(candidate.root)
+    parent_fd = _open_runtime_dir(parent) if candidate.private_parent else _open_base(parent)
+    try:
+        return _open_root(parent_fd, candidate.root, create=create)
+    finally:
+        os.close(parent_fd)
+
+
+def _open_existing(base: str | None) -> list[tuple[str, int]]:
+    """Every candidate root that exists and is safe, opened (the caller closes them), for
+    the operations that look a run up (removal, listing): a run can live in the fallback root
+    after the per-uid root became usable again, or the reverse. Raises ``_Refusal`` only
+    when no root could be opened and the per-uid root is unsafe (as it did before the
+    fallback existed): an unsafe fallback root is skipped."""
+    opened: list[tuple[str, int]] = []
+    primary_failure: _Refusal | None = None
+    for position, candidate in enumerate(_candidates(base)):
+        try:
+            fd = _open_candidate(candidate, create=False)
+        except _Refusal as exc:
+            if position == 0:
+                primary_failure = exc
+            continue
+        if fd is not None:
+            opened.append((candidate.root, fd))
+    if not opened and primary_failure is not None:
+        raise primary_failure
+    return opened
+
+
+def _close_all(opened: list[tuple[str, int]]) -> None:
+    for _, fd in opened:
+        os.close(fd)
 
 
 def check(csession_id: str | None, *, base: str | None = None) -> str | None:
     """Validate the base and, when it exists, the per-uid root, creating and changing nothing
     (``--dry-run``, and the temporary-directory slot of launch step 5); returns the tmpdir
     path (None without a session id). Raises ``TmpdirUnsafe``."""
-    path = None if csession_id is None else run_path(csession_id, base)
-    root = root_path(base)
+    if csession_id is not None:
+        _check_id(csession_id)
     try:
-        base_fd = _open_base(os.path.dirname(root))
-        try:
-            root_fd = _open_root(base_fd, root, create=False)
-            if root_fd is not None:
-                os.close(root_fd)
-        finally:
-            os.close(base_fd)
+        root, fd = _open_first(base, create=False)
     except _Refusal as exc:
         raise _unsafe(exc) from exc
-    return path
+    if fd is not None:
+        os.close(fd)
+    return None if csession_id is None else os.path.join(root, csession_id)
 
 
 def create(csession_id: str, *, base: str | None = None) -> str:
@@ -177,15 +264,11 @@ def create_pinned(csession_id: str, *, base: str | None = None) -> Created:
     directory, which the run's ``remove`` passes so that it never removes a directory
     another run created. The caller closes it."""
     stale_path: str | None = None
-    path = run_path(csession_id, base)
-    root = os.path.dirname(path)
+    _check_id(csession_id)
     try:
-        base_fd = _open_base(os.path.dirname(root))
-        try:
-            root_fd = _open_root(base_fd, root, create=True)
-        finally:
-            os.close(base_fd)
+        root, root_fd = _open_first(base, create=True)
         assert root_fd is not None
+        path = os.path.join(root, csession_id)
         try:
             if _exists_at(root_fd, csession_id):
                 stale_path = _clear_leftover(root_fd, root, csession_id)
@@ -211,55 +294,57 @@ def remove(csession_id: str, *, base: str | None = None, pin: int | None = None)
     ``fsutil.UnsafePathError`` for an unsafe base or root, which is left untouched;
     ``TmpdirLeftover`` when the directory could not be removed (it is renamed aside first,
     so the session's path is free)."""
-    path = run_path(csession_id, base)
-    root = os.path.dirname(path)
-    base_fd = _open_base(os.path.dirname(root))
+    _check_id(csession_id)
+    opened = _open_existing(base)
     try:
-        root_fd = _open_root(base_fd, root, create=False)
+        for root, root_fd in opened:
+            if _remove_in(root, root_fd, csession_id, pin):
+                return True
     finally:
-        os.close(base_fd)
-    if root_fd is None:
+        _close_all(opened)
+    return False
+
+
+def _remove_in(root: str, root_fd: int, csession_id: str, pin: int | None) -> bool:
+    """``remove`` in one root (``root_fd`` stays open for the caller)."""
+    path = os.path.join(root, csession_id)
+    name = csession_id
+    if pin is not None:
+        # Move the entry aside first and check what was moved: run n + 1 may create its
+        # own directory under the session's name at any moment, so the removal below
+        # must never go by that name once the identity is checked.
+        try:
+            name = _rename_aside(root_fd, csession_id)
+        except FileNotFoundError:
+            return False
+        pinned = os.fstat(pin)
+        if _identity_at(root_fd, name) != (pinned.st_dev, pinned.st_ino):
+            _put_back(root_fd, name, csession_id)
+            return False
+    elif _identity_at(root_fd, csession_id) is None:
         return False
     try:
-        name = csession_id
-        if pin is not None:
-            # Move the entry aside first and check what was moved: run n + 1 may create its
-            # own directory under the session's name at any moment, so the removal below
-            # must never go by that name once the identity is checked.
+        fsutil.remove_tree_at(root_fd, name)
+    except OSError as exc:
+        reason = _reason(exc)
+        if name == csession_id:
             try:
                 name = _rename_aside(root_fd, csession_id)
-            except FileNotFoundError:
-                return False
-            pinned = os.fstat(pin)
-            if _identity_at(root_fd, name) != (pinned.st_dev, pinned.st_ino):
-                _put_back(root_fd, name, csession_id)
-                return False
-        elif _identity_at(root_fd, csession_id) is None:
-            return False
-        try:
-            fsutil.remove_tree_at(root_fd, name)
-        except OSError as exc:
-            reason = _reason(exc)
-            if name == csession_id:
-                try:
-                    name = _rename_aside(root_fd, csession_id)
-                except OSError:
-                    raise TmpdirLeftover(
-                        f"private temporary directory {path} could not be removed: {reason}",
-                        path=path,
-                        stale_path=None,
-                        hint=_leftover_hint(path),
-                    ) from exc
-            stale_path = os.path.join(root, name)
-            raise TmpdirLeftover(
-                f"private temporary directory {path} could not be removed ({reason});"
-                f" it was moved aside to {stale_path}",
-                path=path,
-                stale_path=stale_path,
-                hint=_leftover_hint(stale_path),
-            ) from exc
-    finally:
-        os.close(root_fd)
+            except OSError:
+                raise TmpdirLeftover(
+                    f"private temporary directory {path} could not be removed: {reason}",
+                    path=path,
+                    stale_path=None,
+                    hint=_leftover_hint(path),
+                ) from exc
+        stale_path = os.path.join(root, name)
+        raise TmpdirLeftover(
+            f"private temporary directory {path} could not be removed ({reason});"
+            f" it was moved aside to {stale_path}",
+            path=path,
+            stale_path=stale_path,
+            hint=_leftover_hint(stale_path),
+        ) from exc
     return True
 
 
@@ -275,36 +360,39 @@ def remove_checked(
     read that still sees no new run cannot be that run's. Returns whether it was removed.
     Raises ``OSError`` as ``remove`` does (``TmpdirLeftover`` when it could not be removed:
     it stays aside for ``remove_stale``)."""
-    path = run_path(csession_id, base)
-    root = os.path.dirname(path)
-    base_fd = _open_base(os.path.dirname(root))
+    _check_id(csession_id)
+    opened = _open_existing(base)
     try:
-        root_fd = _open_root(base_fd, root, create=False)
+        for root, root_fd in opened:
+            if _remove_checked_in(root, root_fd, csession_id, still_removable):
+                return True
     finally:
-        os.close(base_fd)
-    if root_fd is None:
+        _close_all(opened)
+    return False
+
+
+def _remove_checked_in(
+    root: str, root_fd: int, csession_id: str, still_removable: Callable[[], bool]
+) -> bool:
+    path = os.path.join(root, csession_id)
+    try:
+        name = _rename_aside(root_fd, csession_id)
+    except FileNotFoundError:
+        return False
+    if not still_removable():
+        _put_back(root_fd, name, csession_id)
         return False
     try:
-        try:
-            name = _rename_aside(root_fd, csession_id)
-        except FileNotFoundError:
-            return False
-        if not still_removable():
-            _put_back(root_fd, name, csession_id)
-            return False
-        try:
-            fsutil.remove_tree_at(root_fd, name)
-        except OSError as exc:
-            stale_path = os.path.join(root, name)
-            raise TmpdirLeftover(
-                f"private temporary directory {path} could not be removed ({_reason(exc)});"
-                f" it was moved aside to {stale_path}",
-                path=path,
-                stale_path=stale_path,
-                hint=_leftover_hint(stale_path),
-            ) from exc
-    finally:
-        os.close(root_fd)
+        fsutil.remove_tree_at(root_fd, name)
+    except OSError as exc:
+        stale_path = os.path.join(root, name)
+        raise TmpdirLeftover(
+            f"private temporary directory {path} could not be removed ({_reason(exc)});"
+            f" it was moved aside to {stale_path}",
+            path=path,
+            stale_path=stale_path,
+            hint=_leftover_hint(stale_path),
+        ) from exc
     return True
 
 
@@ -312,18 +400,11 @@ def session_entries(*, base: str | None = None) -> tuple[list[str], list[str]]:
     """The names in the per-uid root (none when it is missing): the entries named like a
     session id, and the ``.stale-*`` entries. Read only. Raises ``OSError`` for an unsafe
     base or root."""
-    root = root_path(base)
-    base_fd = _open_base(os.path.dirname(root))
+    opened = _open_existing(base)
     try:
-        root_fd = _open_root(base_fd, root, create=False)
+        names = sorted({name for _, fd in opened for name in os.listdir(fd)})
     finally:
-        os.close(base_fd)
-    if root_fd is None:
-        return [], []
-    try:
-        names = sorted(os.listdir(root_fd))
-    finally:
-        os.close(root_fd)
+        _close_all(opened)
     sessions = [name for name in names if ids.is_session_id(name)]
     stale = [name for name in names if stale_session(name) is not None]
     return sessions, stale
@@ -351,21 +432,15 @@ def remove_stale(name: str, *, base: str | None = None) -> bool:
     Raises ``OSError`` when it cannot be removed."""
     if stale_session(name) is None:
         raise ValueError(f"not a stale entry: {name!r}")
-    root = root_path(base)
-    base_fd = _open_base(os.path.dirname(root))
+    opened = _open_existing(base)
     try:
-        root_fd = _open_root(base_fd, root, create=False)
+        for _, root_fd in opened:
+            if _identity_at(root_fd, name) is not None:
+                fsutil.remove_tree_at(root_fd, name)
+                return True
     finally:
-        os.close(base_fd)
-    if root_fd is None:
-        return False
-    try:
-        if _identity_at(root_fd, name) is None:
-            return False
-        fsutil.remove_tree_at(root_fd, name)
-    finally:
-        os.close(root_fd)
-    return True
+        _close_all(opened)
+    return False
 
 
 def _check_id(csession_id: str) -> None:
@@ -380,7 +455,7 @@ def _open_base(base: str) -> int:
     try:
         fd = fsutil.open_dir_nofollow(base)
     except OSError as exc:
-        raise _refusal(base, exc, _base_hint(base)) from exc
+        raise _external(_refusal(base, exc, _base_hint(base))) from exc
     try:
         info = os.fstat(fd)
         euid = os.geteuid()
@@ -390,14 +465,60 @@ def _open_base(base: str) -> int:
                 base,
                 f"owned by uid {info.st_uid}, neither root nor you",
                 _base_owner_hint(base, info.st_uid),
+                external=True,
             )
         writable = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         if writable and not info.st_mode & stat.S_ISVTX:
-            raise _Refusal(base, "writable by others and without the sticky bit", _base_hint(base))
+            raise _Refusal(
+                base,
+                "writable by others and without the sticky bit",
+                _base_hint(base),
+                external=True,
+            )
     except BaseException:
         os.close(fd)
         raise
     return fd
+
+
+def _open_runtime_dir(parent: str) -> int:
+    """Open the resolved ``$XDG_RUNTIME_DIR`` without following a symlink and check it: a
+    directory owned by us that neither group nor others can write (a sticky bit is not
+    enough here: the fallback exists because the shared base cannot be trusted)."""
+    try:
+        fd = fsutil.open_dir_nofollow(parent)
+    except OSError as exc:
+        raise _refusal(parent, exc, _runtime_hint(parent)) from exc
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.geteuid():
+            raise _Refusal(parent, f"owned by uid {info.st_uid}, not you", _runtime_hint(parent))
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise _Refusal(
+                parent,
+                f"mode {stat.S_IMODE(info.st_mode):04o} is writable by others",
+                _runtime_hint(parent),
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _combine(failures: list[_Refusal], *, runtime_unusable: bool) -> _Refusal:
+    """The refusal when no candidate root is safe: the per-uid root's (the first), with the
+    fallback's appended when there was one, or why there was none."""
+    primary = failures[0]
+    reason, hint = primary.reason, primary.hint
+    if len(failures) > 1:
+        fallback = failures[1]
+        reason = f"{reason}; fallback {fallback.path}: {fallback.reason}"
+        hint = f"{hint}; fallback: {fallback.hint}"
+    elif os.environ.get("XDG_RUNTIME_DIR"):
+        reason = f"{reason}; $XDG_RUNTIME_DIR is not an absolute normalized path, so no fallback"
+    if runtime_unusable and primary.external:
+        hint = f"{hint}; or set $XDG_RUNTIME_DIR to a directory you own (mode 0700), the fallback"
+    return _Refusal(primary.path, reason, hint)
 
 
 def _open_root(base_fd: int, root: str, *, create: bool) -> int | None:
@@ -448,7 +569,7 @@ def _diagnose_root(base_fd: int, root: str) -> None:
         return  # the open below reports it
     if info.st_uid != os.geteuid():
         kind = "" if stat.S_ISDIR(info.st_mode) else " (not a directory)"
-        raise _Refusal(root, f"owned by uid {info.st_uid}{kind}", _squat_hint(root))
+        raise _Refusal(root, f"owned by uid {info.st_uid}{kind}", _squat_hint(root), external=True)
 
 
 def _check_root(fd: int, root: str) -> None:
@@ -456,7 +577,7 @@ def _check_root(fd: int, root: str) -> None:
     if not stat.S_ISDIR(info.st_mode):
         raise _Refusal(root, "not a directory", _root_hint(root))
     if info.st_uid != os.geteuid():
-        raise _Refusal(root, f"owned by uid {info.st_uid}", _squat_hint(root))
+        raise _Refusal(root, f"owned by uid {info.st_uid}", _squat_hint(root), external=True)
     if stat.S_IMODE(info.st_mode) != 0o700:
         raise _Refusal(root, f"mode {stat.S_IMODE(info.st_mode):04o}, not 0700", _root_hint(root))
 
@@ -541,6 +662,11 @@ def _refusal(path: str, exc: OSError, hint: str) -> _Refusal:
     return _Refusal(path, _reason(exc), hint)
 
 
+def _external(refusal: _Refusal) -> _Refusal:
+    refusal.external = True
+    return refusal
+
+
 def _unsafe(refusal: _Refusal) -> TmpdirUnsafe:
     return TmpdirUnsafe(
         f"private temporary directory unsafe: {refusal.path}: {refusal.reason}",
@@ -565,6 +691,13 @@ def _base_owner_hint(base: str, uid: int) -> str:
         " container this usually means its owner is unmapped there (shown as the overflow"
         f" uid, often 65534): {_SANDBOX_OFF}, or give the run a {base} owned by root or you"
         " (with the sticky bit when others can write it)"
+    )
+
+
+def _runtime_hint(parent: str) -> str:
+    return (
+        f"$XDG_RUNTIME_DIR ({parent}) must be a directory you own that others cannot write"
+        f" (mode 0700): fix it, unset it, or {_SANDBOX_OFF}"
     )
 
 

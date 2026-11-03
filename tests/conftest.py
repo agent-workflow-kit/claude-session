@@ -51,7 +51,8 @@ The other autouse fixtures keep every test off the user's real directories: its 
 (``_private_home``; ``live`` tests too: they build their own private environment for the real
 ``claude`` and copy a login in only when asked, see ``tests/live/harness.py``) and
 temporary-directory root (``private_tmp_root``: ``pathrules.TMP_ROOT``, so no run creates
-anything under the real ``/tmp/csession-<uid>``).
+anything under the real ``/tmp/csession-<uid>``, and no ``XDG_RUNTIME_DIR``, so none falls back
+to the real runtime directory).
 """
 
 from __future__ import annotations
@@ -421,6 +422,8 @@ def private_tmp_root(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     base = tempfile.mkdtemp(prefix="cs-t-", dir="/tmp")
     os.chmod(base, 0o700)
     monkeypatch.setattr(pathrules, "TMP_ROOT", base)
+    # No test may fall back to the real runtime directory (tmpdir's fallback root).
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     try:
         yield Path(base)
     finally:
