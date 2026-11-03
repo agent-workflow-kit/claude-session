@@ -268,20 +268,36 @@ def _end_interrupted_launch(
 
 def _adopt(args: argparse.Namespace) -> int:
     """``exec --session-id <id>``: adopt the pending run ``start`` created and launch it
-    (interface.md, Launch order); with ``--dry-run``, inspect it without adopting."""
+    (interface.md, Launch order); with ``--dry-run``, inspect it without adopting. The signal
+    handlers are installed first and restored once the outcome is printed, as for plain exec."""
     from . import launch, lifecycle, supervisor
     from .gateway import SystemGateway
+    from .signals import ExecSignals, LaunchInterrupted
 
-    try:
-        with store.open_state() as st:
-            process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
-            if args.dry_run:
-                return _print_dry_run(args, *lifecycle.adoption_plan(st, args, process))
-            outcome, code = lifecycle.adopt(st, args, process, supervise=supervisor.run_headless)
-    except KeyboardInterrupt:
-        # TODO(#17): as for plain exec (signal handling of the launch and session phases).
-        _die_of_sigint()
-    _print_outcome(outcome, args.json)
+    signals = ExecSignals()
+    try:  # entered first: a signal during the install is handled and the handlers restored
+        try:
+            signals.install()
+            with store.open_state() as st:
+                process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
+                if args.dry_run:
+                    return _print_dry_run(args, *lifecycle.adoption_plan(st, args, process))
+                signals.defer()  # a signal during the adoption's checks acts once the run is ours
+                outcome, code = lifecycle.adopt(
+                    st, args, process, supervise=supervisor.run_session, signals=signals
+                )
+        except LaunchInterrupted as exc:  # before the adoption: nothing to record
+            _die_of(exc.signum)
+        except KeyboardInterrupt:  # handlers not installed (not the main thread)
+            _die_of(signal.SIGINT)
+        signals.defer()  # until the outcome is printed, a signal is only recorded
+        try:
+            _print_outcome(outcome, args.json)
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+    finally:
+        signals.restore()
     return code
 
 
