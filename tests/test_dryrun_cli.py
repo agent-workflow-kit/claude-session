@@ -490,12 +490,31 @@ def test_secret_values_too_large_to_index_are_an_invalid_config(
         env={
             "ANTHROPIC_API_KEY": "a" + big,
             "ANTHROPIC_AUTH_TOKEN": "b" + big,
-            "ANTHROPIC_MODEL": "c" + big,
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "AWS_SECRET_ACCESS_KEY": "c" + big,
         },
     )
     assert proc.returncode == 2
     assert error_of(proc)["error"]["code"] == "usage"
     assert big not in proc.stdout and big not in proc.stderr
+
+
+def test_a_huge_plain_setting_is_not_indexed(tmp_path: Path, tools: Path, work: Path) -> None:
+    # Only credential values count towards the index size (#95).
+    big = "k" * 100_000
+    proc = cli(
+        ["exec", "--dry-run", "--json", "--mode", "headless", "--prompt-file", "prompt.md"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        env={
+            "ANTHROPIC_MODEL": big,
+            "ANTHROPIC_BASE_URL": big,
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "AWS_REGION": big,
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_a_profile_file_is_shown_by_its_hash(tmp_path: Path, tools: Path, work: Path) -> None:
@@ -1633,16 +1652,47 @@ def test_a_dry_run_claude_failing_only_for_the_dropped_path_entries_is_a_warning
         env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
     )
     assert not marker.exists()
-    assert proc.returncode == 12 and plan["would_fail"] == "claude_not_found"
+    assert proc.returncode == 0 and plan["would_fail"] is None
+    assert any(
+        w.startswith("claude --version not run (not probed by a dry run")
+        and "PATH entries under session-writable paths were dropped" in w
+        and "claude_version_unknown" not in w
+        for w in plan["warnings"]
+    ), plan["warnings"]
 
 
-def test_a_dry_run_claude_that_cannot_run_anyway_would_fail(
+def test_a_dry_run_claude_printing_no_version_with_dropped_path_entries_warns_unknown(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
-    """No entry dropped: the dry run predicts the launch's ``claude_not_found``."""
+    """The probe ran (PATH entries dropped all the same) and printed no version: the
+    launch's ``claude_version_unknown`` warning, whatever the output says, never the
+    not-probed text (output holding ``--version: `` included)."""
+    marker = tmp_path / "ran"
+    planted = plant_interp(home() / "wd" / "bin", marker).parent
+    (tools / "claude").write_text(
+        "#!/bin/sh\necho 'usage: claude --version: unknown option'\n", encoding="utf-8"
+    )
+    proc, plan = dry_run(
+        "implement",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config="kinds:\n  implement:\n    write_dirs: ['~/wd']\n",
+        env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0 and plan["would_fail"] is None
+    version = [w for w in plan["warnings"] if "--version" in w]
+    assert version and all(w.startswith("claude_version_unknown: ") for w in version), version
+
+
+def test_a_dry_run_claude_that_cannot_run_anyway_warns_claude_version_unknown(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """No entry dropped: the dry run predicts the launch's warning, not a failure."""
     (tools / "claude").write_text(f"#!/bin/sh\nexec {INTERP}\n", encoding="utf-8")
     proc, plan = dry_run("implement", cwd=work, tools=tools, tmp_path=tmp_path)
-    assert proc.returncode == 12 and plan["would_fail"] == "claude_not_found"
+    assert proc.returncode == 0 and plan["would_fail"] is None
+    assert any(w.startswith("claude_version_unknown: ") for w in plan["warnings"]), plan["warnings"]
 
 
 def interp_symlinked_into(work: Path, tmp_path: Path, marker: Path) -> Path:

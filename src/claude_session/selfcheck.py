@@ -44,6 +44,7 @@ The adopting ``exec`` (``lifecycle``) makes both calls again through ``launch.ch
 from __future__ import annotations
 
 import os
+import shlex
 import stat
 import sys
 from dataclasses import dataclass
@@ -100,7 +101,11 @@ _USERNS_HINT = (
 _WSL1_HINT = "WSL1 has no sandbox: use WSL2, or set the kind's sandbox to preferred"
 _MACOS_HINT = f"the macOS Seatbelt sandbox needs {SANDBOX_EXEC}"
 _UNSUPPORTED_HINT = "Claude Code has no sandbox on this platform; set sandbox to preferred or off"
-_SOCKET_HINT = "use a shorter temporary directory path (the private TMPDIR lives under /tmp)"
+_SOCKET_HINT = (
+    "use a shorter temporary directory path (the private TMPDIR lives under /tmp, or under"
+    " $XDG_RUNTIME_DIR/csession when /tmp/csession-<uid> cannot be used: shorten"
+    " $XDG_RUNTIME_DIR)"
+)
 
 _SYSTEM_GATEWAY = SystemGateway()
 
@@ -187,13 +192,17 @@ def self_check(
     platform: str | None = None,
     gw: Gateway = _SYSTEM_GATEWAY,
     tmp_base: str | None = None,  # None: pathrules.TMP_ROOT
+    tmp_root: str | None = None,  # None: tmpdir.select_root(tmp_base), chosen here
     create: bool = True,
     sandbox_exec: str = SANDBOX_EXEC,
 ) -> SelfCheck:
     """Run the sandbox self-check for a run with sandbox ``mode``: sandbox prerequisites,
     socket path length, then the private tmpdir is created (a leftover moved aside and left
     there is reported in ``warnings``). The caller has run
-    ``tmpdir.check`` earlier in launch step 5. ``create=False`` (dry run) checks the same and
+    ``tmpdir.check`` earlier in launch step 5 for the root it chose (``tmp_root``, the
+    parent of its ``tmpdir.run_path``): the socket path is measured in that root and the
+    tmpdir is created only there (``tmpdir_unsafe`` when that root can no longer be
+    established; never another root). ``create=False`` (dry run) checks the same and
     does not touch the tmpdir at all; ``csession_id`` may then be None (a new session), and
     the socket path is checked for an id of the fixed length. Raises
     ``LaunchValidationError`` (``sandbox_unavailable``, ``socket_path_too_long``,
@@ -223,16 +232,17 @@ def self_check(
             f"sandbox 'preferred' but unavailable ({prerequisites.problem}): the run is not"
             f" sandboxed; {prerequisites.hint}"
         )
-    check_socket_path(tmpdir.run_path(csession_id or _PLACEHOLDER_ID, tmp_base), platform)
-    path = None if csession_id is None else tmpdir.run_path(csession_id, tmp_base)
+    root = tmpdir.select_root(tmp_base) if tmp_root is None else tmp_root
+    check_socket_path(os.path.join(root, csession_id or _PLACEHOLDER_ID), platform)
+    path = None if csession_id is None else os.path.join(root, csession_id)
     pin = None
     if create:
         assert csession_id is not None
-        path, stale, pin = tmpdir.create_pinned(csession_id, base=tmp_base)
+        path, stale, pin = tmpdir.create_pinned(csession_id, base=tmp_base, root=root)
         if stale is not None:
             warnings.append(
                 f"leftover private temporary directory moved aside: {stale};"
-                f" remove it: rm -rf {stale}"
+                f" remove it: rm -rf {shlex.quote(stale)}"
             )
     return SelfCheck(
         sandbox_active=prerequisites.available,

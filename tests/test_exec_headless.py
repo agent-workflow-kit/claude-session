@@ -845,11 +845,12 @@ def test_the_configured_minimum_admits_an_older_claude(
 
 
 @pytest.mark.parametrize("isolated", [False, True])
-def test_a_claude_that_cannot_run_fails_the_version_check(
+def test_a_claude_that_cannot_run_only_warns_at_the_version_check(
     tmp_path: Path, state: Path, work: Path, isolated: bool
 ) -> None:
-    """An executable that is not a working program is caught by ``claude --version`` in the
-    launch validations (``claude_not_found``), before anything of step 7 exists."""
+    """A ``claude --version`` that cannot run does not block the launch: it is a
+    ``claude_version_unknown`` warning, and the launch goes on (here to the spawn, which
+    fails the same way: ``launch_interrupted``)."""
     claude = script(tmp_path / "badbin" / "claude", "#!/nonexistent/interp\n")
     run = run_exec(
         tmp_path,
@@ -865,12 +866,55 @@ def test_a_claude_that_cannot_run_fails_the_version_check(
     assert (run.outcome["phase"], run.outcome["outcome"], run.outcome["end_reason"]) == (
         "launch",
         "not-started",
-        "claude_not_found",
+        "launch_interrupted",
     )
-    assert "--version" in run.outcome["message"]
+    assert any(w.startswith("claude_version_unknown: ") for w in run.outcome["warnings"])
     assert run.run_row()["child_pid"] is None
     assert not (run.private_run / "secret-index").exists()
     assert not csession_tmpdir(run.sid).exists()
+
+
+def test_json_output_escapes_c1_and_format_characters(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """interface.md, Global flags: ``--json`` output carries C1 (an 8-bit CSI) and format
+    characters (a bidi override) of untrusted fields JSON-escaped, never raw."""
+    summary = "a\x9b31mb\u202ec"
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, {"do": "report", "args": ["done", "--summary", summary]}, STOP, result_step()],
+    )
+    assert run.code == 0, run.proc.stderr
+    assert run.outcome["report"]["summary"] == summary
+    out = run.proc.stdout
+    assert "\\u009b" in out and "\\u202e" in out
+    assert "\x9b" not in out and "\u202e" not in out
+
+
+def test_a_version_warning_is_kept_when_a_later_check_fails(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """The ``claude_version_unknown`` warning is recorded on the run even when a later
+    step-5 check (the session ``PATH``: ``unsafe_path``) ends it ``not-started``."""
+    claude = script(tmp_path / "badbin" / "claude", "#!/bin/sh\necho garbage\n")
+    (work / "bin").mkdir()
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [],
+        args=ISOLATED,
+        config=FAST,
+        env={"PATH": f"{work / 'bin'}:/usr/bin:/bin"},
+        claude=claude,
+    )
+    assert run.code == 12, run.proc.stderr
+    assert (run.outcome["outcome"], run.outcome["end_reason"]) == ("not-started", "unsafe_path")
+    assert any(w.startswith("claude_version_unknown: ") for w in run.outcome["warnings"]), (
+        run.outcome["warnings"]
+    )
 
 
 @pytest.mark.parametrize("isolated", [False, True])
@@ -1542,3 +1586,100 @@ def test_a_headless_run_with_a_done_report_auto_exits(
     assert row["pending_cause"] == "auto_exit"
     assert [r["signal"] for r in run.fake_log() if r["event"] == "signal"] == ["TERM"]
     assert gone(row["child_pid"])
+
+
+# The tmp root is chosen once at step 5 (#95 review R1-1)
+
+
+@pytest.fixture
+def short_runtime_dir() -> Any:
+    """A private ``$XDG_RUNTIME_DIR`` stand-in short enough for the socket path limit."""
+    import shutil
+    import tempfile
+
+    path = Path(tempfile.mkdtemp(prefix="cs-rt-", dir="/tmp"))
+    path.chmod(0o700)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path)
+
+
+def sessions_tmp_dir(state: Path) -> str | None:
+    db = sqlite3.connect(f"file:{state / 'state.db'}?mode=ro", uri=True)
+    try:
+        return db.execute("SELECT tmp_dir FROM sessions").fetchone()[0]
+    finally:
+        db.close()
+
+
+def test_the_planned_tmpdir_is_the_env_the_settings_and_the_recorded_one(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    state: Path,
+    work: Path,
+    private_tmp_root: Path,
+    short_runtime_dir: Path,
+) -> None:
+    primary = private_tmp_root.resolve() / pathrules.tmp_root_name(os.geteuid())
+    primary.mkdir(mode=0o755)
+    primary.chmod(0o755)  # unusable: the fallback is chosen
+    code, outcome = exec_in_process(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        work,
+        [
+            START,
+            {
+                "do": "bash",
+                "command": 'printf "%s\\n%s" "$TMPDIR" "$CLAUDE_CODE_TMPDIR" > tmpdir.txt',
+            },
+            STOP,
+            result_step(),
+        ],
+        args=["--reads-third-party", "--sandbox", "preferred"],
+        env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": str(short_runtime_dir)},
+    )
+    assert code == 0, outcome
+    sid = outcome["csession_id"]
+    expected = str(short_runtime_dir.resolve() / "csession" / sid)
+    assert (work / "tmpdir.txt").read_text().splitlines() == [expected, expected]
+    assert sessions_tmp_dir(state) == expected
+    settings = json.loads((state / "private" / sid / "runs" / "1" / "settings.json").read_text())
+    assert expected in settings["sandbox"]["filesystem"]["allowWrite"]
+
+
+def test_a_root_change_between_check_and_creation_ends_tmpdir_unsafe(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    state: Path,
+    work: Path,
+    private_tmp_root: Path,
+    short_runtime_dir: Path,
+) -> None:
+    from claude_session import tmpdir
+
+    primary = private_tmp_root.resolve() / pathrules.tmp_root_name(os.geteuid())
+    real_create = tmpdir.create_pinned
+
+    def changed_first(*args: Any, **kwargs: Any) -> tmpdir.Created:
+        primary.mkdir(mode=0o700)
+        primary.chmod(0o755)  # the chosen per-uid root became unusable meanwhile
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(tmpdir, "create_pinned", changed_first)
+    code, outcome = exec_in_process(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        work,
+        [START, result_step()],
+        args=["--reads-third-party", "--sandbox", "preferred"],
+        env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": str(short_runtime_dir)},
+    )
+    assert code == 12 and outcome["end_reason"] == "tmpdir_unsafe", outcome
+    assert not (short_runtime_dir / "csession").exists()  # never moved to the fallback
+    assert list(primary.iterdir()) == []

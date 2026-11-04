@@ -16,7 +16,7 @@
       "type": "string",
       "default": "2.1.312",
       "pattern": "^[0-9]+(\\.[0-9]+)*$",
-      "description": "Minimum Claude Code version (claude --version) a launch accepts; older fails the launch with end_reason claude_too_old. Built-in: the version the spike verified."
+      "description": "Minimum Claude Code version (claude --version) a launch accepts; older fails the launch with end_reason claude_too_old; a version that cannot be determined only warns (claude_version_unknown). Built-in: the version the spike verified."
     },
     "default_kind": {
       "type": "string",
@@ -279,7 +279,7 @@
       "minimum": 0,
       "maximum": 9007199254740991,
       "default": 16384,
-      "description": "Cap on the notes command's output (bytes). At most 1 MiB (1048576) is used."
+      "description": "Cap on the notes command's output (bytes). At most 1 MiB (1048576) is used. Output over the cap is truncated (a final [truncated] line), not omitted."
     },
     "notes_context_sources": {
       "type": "array",

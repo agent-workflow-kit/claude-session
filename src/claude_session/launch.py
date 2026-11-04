@@ -354,8 +354,9 @@ def resolve_caller_cwd(given: str | None, process: Process) -> str:
 def step2_writable(process: Process, probe_cwd: str | None) -> pathrules.SessionWritable:
     """What git must not be under at step 2, before the run's session-writable paths are
     known (conservative): the probe cwd, every session's directory (``<state>/sessions``)
-    and the tmp root of the private temporary directories (``/tmp/csession-<uid>``)."""
-    paths = [os.path.join(process.state_root, sessiondir.SESSIONS), pathrules.tmp_parent()]
+    and the roots of the private temporary directories (``/tmp/csession-<uid>`` and, when
+    usable, ``$XDG_RUNTIME_DIR/csession``: ``pathrules.tmp_parents``)."""
+    paths = [os.path.join(process.state_root, sessiondir.SESSIONS), *pathrules.tmp_parents()]
     return pathrules.SessionWritable([*([probe_cwd] if probe_cwd else []), *paths])
 
 
@@ -1424,12 +1425,12 @@ def check_claude_version(
     process: Process,
     claude: pathrules.ResolvedTool,
     writable: Callable[[str], bool],
-) -> str:
-    """``claude --version`` against ``min_claude_version`` (``claude_too_old``;
-    ``claude_not_found`` when it cannot run), with ``claude_version.require``: in ``/``, a
-    minimal environment and its own process group. Its ``PATH`` is the one the tools were
-    looked up on (``env.path_prepend``, then the caller's) without any entry under
-    ``writable``. Returns the version text."""
+) -> claude_version.Checked:
+    """``claude --version`` against ``min_claude_version`` (``claude_too_old``; a version
+    that cannot be determined is only a ``claude_version_unknown`` warning in the result),
+    with ``claude_version.require``: in ``/``, a minimal environment and its own process
+    group. Its ``PATH`` is the one the tools were looked up on (``env.path_prepend``, then
+    the caller's) without any entry under ``writable``."""
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
     environ = {**process.environ, "PATH": ":".join(entries)}
     return claude_version.require(
@@ -1544,11 +1545,12 @@ def generated_entries(
     }
 
 
-def check_tmpdir(resolution: kinds.Resolution, alloc: Allocated) -> None:
-    """The temporary-directory check of a sandboxed run (``tmpdir_unsafe``); nothing is
+def check_tmpdir(resolution: kinds.Resolution, alloc: Allocated, tmp: str | None) -> None:
+    """The temporary-directory check of a sandboxed run (``tmpdir_unsafe``) for the root
+    chosen once at step 5 (the parent of ``tmp``, from ``tmpdir.run_path``); nothing is
     created."""
     if resolution.profile.sandbox != "off":
-        tmpdir.check(alloc.csession_id)
+        tmpdir.check(alloc.csession_id, root=None if tmp is None else os.path.dirname(tmp))
 
 
 def check_sandbox(
@@ -1556,11 +1558,13 @@ def check_sandbox(
     alloc: Allocated,
     tools: Tools,
     process: Process,
+    tmp: str | None,
     *,
     create: bool = True,
 ) -> selfcheck.SelfCheck:
     """``claude_args`` and setting sources, then the sandbox self-check, which creates the
-    private tmpdir: the last action of step 5 (``unsafe_claude_args``,
+    private tmpdir ``tmp`` (in the root chosen once at step 5; ``tmpdir_unsafe`` when that
+    root can no longer be established): the last action of step 5 (``unsafe_claude_args``,
     ``unsafe_setting_sources``, ``sandbox_unavailable``, ``socket_path_too_long``). A dry run
     passes ``create=False``: the same checks, nothing created."""
     profile = resolution.profile
@@ -1572,6 +1576,7 @@ def check_sandbox(
         bwrap=None if tools.bwrap is None else tools.bwrap.path,
         socat=None if tools.socat is None else tools.socat.path,
         gw=process.gateway,
+        tmp_root=None if tmp is None else os.path.dirname(tmp),
         create=create,
     )
 
@@ -1698,9 +1703,14 @@ class Effects:
         pass
 
     def sandbox(
-        self, resolution: kinds.Resolution, alloc: Allocated, tools: Tools, process: Process
+        self,
+        resolution: kinds.Resolution,
+        alloc: Allocated,
+        tools: Tools,
+        process: Process,
+        tmp: str | None,
     ) -> selfcheck.SelfCheck:
-        return check_sandbox(resolution, alloc, tools, process, create=False)
+        return check_sandbox(resolution, alloc, tools, process, tmp, create=False)
 
     def claude_version(
         self,
@@ -1718,8 +1728,9 @@ class Effects:
         whose ``#!`` interpreter, as the launch's probe would find it, is under one of them
         or cannot be checked (``claude_version.check_interpreter``). Otherwise
         ``check_claude_version`` as a launch makes it, the probe's ``PATH`` without those
-        paths either; a ``claude_not_found`` is then only a warning when that ``PATH`` lost
-        entries the launch's probe keeps (the launch may well run it)."""
+        paths either; when that probe could not run (``Checked.not_run``) and its ``PATH``
+        lost entries the launch's probe keeps, the ``claude_version_unknown`` warning becomes
+        the not-probed one (the launch may well run it)."""
         known = dry_run()
         if known is None:
             why = "the permission profile or write_dirs are not known"
@@ -1742,15 +1753,15 @@ class Effects:
                 end_reason="claude_not_found",
                 hint=HINTS["claude_not_found"],
             )
-        try:
-            check_claude_version(cfg, resolution, process, claude, guard)
-        except LaunchValidationError as error:
-            dropped = set(_probe_entries(entries, writable)) - set(_probe_entries(entries, guard))
-            if error.end_reason != "claude_not_found" or not dropped:
-                raise
-            why = f"{error.message}; PATH entries under session-writable paths were dropped"
+        checked = check_claude_version(cfg, resolution, process, claude, guard)
+        if checked.warning is None:
+            return []
+        dropped = set(_probe_entries(entries, writable)) - set(_probe_entries(entries, guard))
+        if dropped and checked.not_run:
+            # It could not run, and the dry run's PATH lost entries the launch's probe keeps.
+            why = f"{checked.detail}; PATH entries under session-writable paths were dropped"
             return [VERSION_NOT_PROBED.format(why=why)]
-        return []
+        return [checked.warning]
 
 
 class Recording(Effects):
@@ -1795,12 +1806,25 @@ class Recording(Effects):
         create_write_dirs(self.dirs, write)
 
     def sandbox(
-        self, resolution: kinds.Resolution, alloc: Allocated, tools: Tools, process: Process
+        self,
+        resolution: kinds.Resolution,
+        alloc: Allocated,
+        tools: Tools,
+        process: Process,
+        tmp: str | None,
     ) -> selfcheck.SelfCheck:
-        """The self-check, then the created tmpdir recorded on the session. When recording
-        fails, the tmpdir is removed (with its pin) and the pin closed before the error is
-        re-raised: the run's ``Validated`` never exists, so ``_cleanup`` cannot."""
-        check = check_sandbox(resolution, alloc, tools, process)
+        """The self-check, then the created tmpdir recorded on the session. The created path
+        must be ``tmp``, the one planned at step 5 (path rules, ``TMPDIR``): otherwise it is
+        removed and the launch refused (``tmpdir_unsafe``). When recording fails, the tmpdir
+        is removed (with its pin) and the pin closed before the error is re-raised: the run's
+        ``Validated`` never exists, so ``_cleanup`` cannot."""
+        check = check_sandbox(resolution, alloc, tools, process, tmp)
+        if check.tmpdir is not None and check.tmpdir != tmp:
+            _discard_tmpdir(alloc.csession_id, check.tmpdir_pin)
+            raise tmpdir.TmpdirUnsafe(
+                f"private temporary directory unsafe: {check.tmpdir} is not the planned {tmp}",
+                hint="run again: the root is chosen anew at the next launch",
+            )
         if check.tmpdir is not None:
             try:
                 self.st.update_session(alloc.csession_id, tmp_dir=check.tmpdir)
@@ -1808,6 +1832,11 @@ class Recording(Effects):
                 _discard_tmpdir(alloc.csession_id, check.tmpdir_pin)
                 raise
         return check
+
+    def warn(self, warnings: Sequence[str]) -> None:
+        """Step-5 warnings are recorded on the run as they are found, so a run that a later
+        check ends ``not-started`` keeps them (``add_run_warnings`` keeps each once)."""
+        self.st.add_run_warnings(self.alloc.csession_id, self.alloc.run, warnings)
 
     def claude_version(
         self,
@@ -1820,8 +1849,8 @@ class Recording(Effects):
     ) -> list[str]:
         """The launch's version check: the ``claude`` ``check_tools`` accepted, its probe's
         ``PATH`` without the run's session-writable paths (``writable``)."""
-        check_claude_version(cfg, resolution, process, tools.claude, writable)
-        return []
+        checked = check_claude_version(cfg, resolution, process, tools.claude, writable)
+        return [] if checked.warning is None else [checked.warning]
 
 
 def _discard_tmpdir(csession_id: str, pin: int | None) -> None:
@@ -1901,7 +1930,7 @@ def checks(
     effects.record_plugin_dirs(plugins)
     guard = others if writable is None else with_own(others, writable)
     check_hook_interpreter(process, writable, guard)
-    check_tmpdir(resolution, alloc)
+    check_tmpdir(resolution, alloc, tmp)
     with named(guard):
         tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool, guard=guard)
     notes_tool, notes_problem = resolve_notes(cfg, resolution, process, guard)
@@ -1924,7 +1953,7 @@ def checks(
     generated = generated_entries(resolution, tools, git_dirs, process)
     if isolated:
         rules.check_generated(generated)
-    check = effects.sandbox(resolution, alloc, tools, process)
+    check = effects.sandbox(resolution, alloc, tools, process, tmp)
     warnings += check.warnings
     effects.warn(check.warnings)
     isolation = None
@@ -2410,14 +2439,15 @@ class Prepared:
 def secret_index(values: frozenset[str]) -> bytes:
     """The run's ``contains_secret`` index. Values over ``secretindex.VALUES_MAX_BYTES`` in
     total fail the launch: no end reason names this, and the values come from the
-    environment variables the configured ``claude_auth_env`` and ``secret_env`` names select,
-    so it is ``config_invalid``."""
+    ``claude_auth_env`` credential variables and the configured ``secret_env`` names, so it
+    is ``config_invalid``."""
     try:
         return secretindex.build(values)
     except ValueError as exc:
         raise LaunchValidationError(
             f"secret values exceed {secretindex.VALUES_MAX_BYTES // 1024} KiB: the values of"
-            " the claude_auth_env and secret_env variables and the run secret are too large"
+            " the claude_auth_env credential and secret_env variables and the run secret are"
+            " too large"
             " to index for contains_secret",
             end_reason="config_invalid",
         ) from exc
@@ -2440,11 +2470,9 @@ def notes_conf(
     by the hook's budget (``notes.TIMEOUT_MAX``), the size cap bounded by
     ``notes.MAX_BYTES_MAX`` and the sources (duplicates dropped).
 
-    TODO(#28): ``start`` freezes ``notes_context_cmd``, ``notes_context_max_bytes`` and
-    ``notes_context_sources`` with the launch spec (``lifecycle.FROZEN_CONFIG``), and
-    adoption takes them from there: interface.md (start) lists only the notes timeout among
-    the values adoption reads from the current config. The kind's ``notes_context`` is
-    already part of the resolved profile."""
+    ``cfg`` is the launch's config: at adoption the notes settings in it are those ``start``
+    froze (``lifecycle.FROZEN_CONFIG``), never the current config's. The kind's
+    ``notes_context`` is part of the resolved profile."""
     if v.notes_tool is None:
         return None, []
     labels, problems = [], []
@@ -2457,7 +2485,7 @@ def notes_conf(
         v.notes_tool.name, cfg.notes_context_cmd, repo=resolution.repo, labels=labels
     )
     path = sanitize_path(v.session_env.env.get("PATH", ""))
-    names = frozenset((*cfg.secret_env, *cfg.claude_auth_env, *v.session_env.auth_names))
+    names = frozenset((*cfg.secret_env, *cfg.claude_auth_env, *v.session_env.credential_names))
     conf = notes.NotesConf(
         argv=argv,
         executable=v.notes_tool.path,

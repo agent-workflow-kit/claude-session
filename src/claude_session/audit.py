@@ -169,8 +169,9 @@ def append(
     written. Never swallow either: the audited action must not be taken without its
     record.
     """
-    # Callers pass the values of the configured secret_env and claude_auth_env variables
-    # (envbuild.secret_values; exec's launch does) and the run secret where they have one.
+    # Callers pass the secret_env values and the claude_auth_env credential values
+    # (envbuild.secret_values at launch; envbuild.credential_values in stop and forget) and
+    # the run secret where they have one.
     if action not in ACTIONS:
         raise ValueError("unknown audit action")
     if result not in RESULTS:

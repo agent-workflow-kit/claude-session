@@ -127,9 +127,10 @@ def secret_values(
     run_secret: str | None = None,
 ) -> frozenset[str]:
     """The values both writers redact: the same set ``contains_secret`` checks (interface.md,
-    report): the values of the ``secret_env`` and passed ``claude_auth_env`` variables present
-    in ``environ``, plus the run secret when the caller has one; only values of
-    ``MIN_SECRET_CHARS`` or more characters."""
+    report): the values of the ``secret_env`` variables and of the credential variables named
+    in ``claude_auth_env`` present in ``environ`` (the caller filters plain settings out:
+    ``envbuild.SessionEnv.credential_names``), plus the run secret when the caller has one;
+    only values of ``MIN_SECRET_CHARS`` or more characters."""
     names = [*secret_env, *claude_auth_env]
     values = [environ.get(name, "") for name in names]
     if run_secret is not None:
@@ -360,9 +361,9 @@ class EventLog:
     ``MIN_SECRET_CHARS`` are ignored.
     """
 
-    # Callers pass the values of the configured secret_env and claude_auth_env variables
-    # (envbuild.secret_values; exec's launch and supervisor do) and the run secret where they
-    # have one.
+    # Callers pass the secret_env values and the claude_auth_env credential values
+    # (envbuild.secret_values at launch and in the supervisor; envbuild.credential_values in
+    # stop and forget) and the run secret where they have one.
     def __init__(self, path: str, *, secrets: Iterable[str] = ()) -> None:
         self.path = path
         self.secrets = usable_secrets(secrets)

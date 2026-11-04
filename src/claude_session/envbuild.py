@@ -48,6 +48,7 @@ itself be a valid variable-name start. Any other entry matches only the identica
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 
@@ -76,6 +77,44 @@ AUTH_ENV = (
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
 )
+# Which passed claude_auth_env values are secrets (scanned by contains_secret, redacted in the
+# log and audit): the values of credential variables only. A name is a credential when, upper-
+# cased, any of its "_"-separated components is one of these words (ANTHROPIC_API_KEY,
+# AWS_SESSION_TOKEN, AWS_BEARER_TOKEN_BEDROCK, GOOGLE_APPLICATION_CREDENTIALS,
+# ANTHROPIC_CUSTOM_HEADERS, which may carry an Authorization header); whole components only,
+# so BYPASS or MONKEY do not count. Every name the user configures in claude_auth_env is one,
+# whatever its spelling. The list errs towards redacting more (AWS_ACCESS_KEY_ID is one).
+# A *_URL value is one when it carries userinfo, a query or a fragment (URL_CREDENTIALS).
+# Plain settings (ANTHROPIC_MODEL, AWS_REGION, AWS_PROFILE, CLOUD_ML_REGION, project ids, the
+# provider flags, a plain base URL) are not secrets.
+CREDENTIAL_COMPONENTS = frozenset(
+    {
+        "KEY",
+        "KEYS",
+        "APIKEY",
+        "TOKEN",
+        "TOKENS",
+        "SECRET",
+        "SECRETS",
+        "PASSWORD",
+        "PASSWD",
+        "PASS",
+        "PASSPHRASE",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "CREDS",
+        "AUTH",
+        "AUTHORIZATION",
+        "BEARER",
+        "KEYFILE",
+        "PRIVATE",
+        "COOKIE",
+        "HEADERS",
+    }
+)
+URL_COMPONENT = "URL"
+# A URL whose authority has userinfo (scheme://user:pass@host), or any query or fragment.
+URL_CREDENTIALS = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*@|[?#]")
 BEDROCK_FLAG = "CLAUDE_CODE_USE_BEDROCK"
 BEDROCK_ENV = ("AWS_*",)
 VERTEX_FLAG = "CLAUDE_CODE_USE_VERTEX"
@@ -147,6 +186,10 @@ class SessionEnv:
       the exact names (built-in and config) and, for a selected provider, its globbed names,
       wherever the value came from (the caller or ``env.set``). Consumers (#15, #26) take the
       values from ``env``.
+    - ``credential_names``: the ``auth_names`` whose values are secrets (``is_secret_auth``):
+      the names configured in ``claude_auth_env``, the built-in or provider names that
+      ``is_credential_name`` accepts, and ``*_URL`` names whose value carries credentials.
+      Plain settings such as the model, a plain base URL or the region are not among them.
     - ``secret_names``: the ``secret_env`` names present in the input environment, whether or
       not they were passed (interface.md, report: "a ``secret_env`` variable present in
       ``exec``'s environment").
@@ -154,9 +197,48 @@ class SessionEnv:
 
     env: dict[str, str] = field(repr=False)
     auth_names: tuple[str, ...]
+    credential_names: tuple[str, ...]
     secret_names: tuple[str, ...]
     # A trusted run's PATH entries dropped because they lie under ``guard`` (one per entry).
     warnings: tuple[str, ...] = ()
+
+
+def is_credential_name(name: str) -> bool:
+    """Whether the variable name is a credential by its spelling: any ``_``-separated
+    component, case-insensitively, is in ``CREDENTIAL_COMPONENTS``. A word glued to another
+    (``MONKEY``, ``BYPASS``, ``TOKENIZER``) does not count."""
+    return any(part in CREDENTIAL_COMPONENTS for part in name.upper().split("_"))
+
+
+def is_secret_auth(name: str, value: str, extras: Iterable[str]) -> bool:
+    """Whether a passed ``claude_auth_env`` variable's value is a secret: a configured extra
+    name (``extras``), a credential name (``is_credential_name``), or a name whose last
+    component is ``URL`` with a value that carries userinfo, a query or a fragment."""
+    if name in extras or is_credential_name(name):
+        return True
+    return name.upper().split("_")[-1] == URL_COMPONENT and bool(URL_CREDENTIALS.search(value))
+
+
+def credential_values(
+    environ: Mapping[str, str], cfg: config.Config, *, run_secret: str | None = None
+) -> frozenset[str]:
+    """The secret values of ``environ`` for commands that build no session environment
+    (``stop``, ``forget``): the ``claude_auth_env`` variables present (the built-in names,
+    every provider's names whatever its flag, and ``cfg.claude_auth_env``) whose values are
+    secrets (``is_secret_auth``), the ``cfg.secret_env`` values and the run secret; only
+    values of ``logs.MIN_SECRET_CHARS`` or more characters. The same rule as ``build`` and
+    ``secret_values`` at launch."""
+    exact = [*AUTH_ENV, *cfg.claude_auth_env]
+    globs = [*BEDROCK_ENV, *VERTEX_ENV]
+    names = [
+        name
+        for name, value in environ.items()
+        if (name in exact or _matches(name, globs))
+        and is_secret_auth(name, value, cfg.claude_auth_env)
+    ]
+    return logs.secret_values(
+        environ, secret_env=cfg.secret_env, claude_auth_env=names, run_secret=run_secret
+    )
 
 
 def build(
@@ -289,8 +371,15 @@ def build(
             env[name] = tmpdir
 
     auth_names = tuple(name for name in env if name in auth or _matches(name, auth_globs))
+    credential_names = tuple(
+        name for name in auth_names if is_secret_auth(name, env[name], cfg.claude_auth_env)
+    )
     return SessionEnv(
-        env=env, auth_names=auth_names, secret_names=secret_names, warnings=tuple(warnings)
+        env=env,
+        auth_names=auth_names,
+        credential_names=credential_names,
+        secret_names=secret_names,
+        warnings=tuple(warnings),
     )
 
 
@@ -332,13 +421,16 @@ def secret_values(
     session_env: SessionEnv, environ: Mapping[str, str], *, run_secret: str | None = None
 ) -> frozenset[str]:
     """The run's secret values (interface.md, report: ``contains_secret``), which the log and
-    audit writers also redact: the ``claude_auth_env`` values as passed (from
-    ``session_env.env``, so a value ``env.set`` supplies or overrides is the one indexed),
+    audit writers also redact: the values of the passed credential variables
+    (``session_env.credential_names``, ``is_secret_auth``: credential names, the configured
+    ``claude_auth_env`` names and URLs carrying credentials, not plain settings such as the
+    model, a plain base URL or the region; read
+    from ``session_env.env``, so a value ``env.set`` supplies or overrides is the one indexed),
     the ``secret_env`` values of ``environ`` (passed or stripped) and the run secret; only
     values of ``logs.MIN_SECRET_CHARS`` or more characters. Other ``env.set`` values are
     literal configuration, not secrets."""
     passed = logs.secret_values(
-        session_env.env, claude_auth_env=session_env.auth_names, run_secret=run_secret
+        session_env.env, claude_auth_env=session_env.credential_names, run_secret=run_secret
     )
     return passed | logs.secret_values(environ, secret_env=session_env.secret_names)
 

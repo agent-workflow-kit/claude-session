@@ -20,7 +20,8 @@
 claude_bin: claude
 
 # Minimum Claude Code version (claude --version) a launch accepts; an older claude fails the launch
-# (exit 12, end_reason claude_too_old). Built-in: the version the spike verified.
+# (exit 12, end_reason claude_too_old); a version that cannot be determined only warns
+# (claude_version_unknown). Built-in: the version the spike verified.
 min_claude_version: "2.1.312"
 
 # Kind used when --kind is omitted. Kind names: ^[a-z0-9][a-z0-9_-]{0,63}$.
