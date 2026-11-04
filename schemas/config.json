@@ -279,7 +279,7 @@
       "minimum": 0,
       "maximum": 9007199254740991,
       "default": 16384,
-      "description": "Cap on the notes command's output (bytes). At most 1 MiB (1048576) is used."
+      "description": "Cap on the notes command's output (bytes). At most 1 MiB (1048576) is used. Output over the cap is truncated (a final [truncated] line), not omitted."
     },
     "notes_context_sources": {
       "type": "array",

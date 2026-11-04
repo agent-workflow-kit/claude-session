@@ -2227,11 +2227,9 @@ def notes_conf(
     by the hook's budget (``notes.TIMEOUT_MAX``), the size cap bounded by
     ``notes.MAX_BYTES_MAX`` and the sources (duplicates dropped).
 
-    TODO(#28): ``start`` freezes ``notes_context_cmd``, ``notes_context_max_bytes`` and
-    ``notes_context_sources`` with the launch spec (``lifecycle.FROZEN_CONFIG``), and
-    adoption takes them from there: interface.md (start) lists only the notes timeout among
-    the values adoption reads from the current config. The kind's ``notes_context`` is
-    already part of the resolved profile."""
+    ``cfg`` is the launch's config: at adoption the notes settings in it are those ``start``
+    froze (``lifecycle.FROZEN_CONFIG``), never the current config's. The kind's
+    ``notes_context`` is part of the resolved profile."""
     if v.notes_tool is None:
         return None, []
     labels, problems = [], []

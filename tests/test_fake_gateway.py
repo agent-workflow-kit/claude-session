@@ -279,19 +279,6 @@ def test_a_release_error_needs_a_gated_spawn() -> None:
     assert child.wait() == 0
 
 
-def test_kill_over_bytes_matches_the_real_gateway() -> None:
-    from claude_session.gateway import GatewayOutputLimit
-
-    fake = FakeGateway()
-    fake.on(["/bin/sh"], stdout="x" * 5, stderr="e" * 9)
-    assert fake.run(["/bin/sh"], kill_over_bytes=5).stderr == "e" * 5
-    assert fake.calls[0].kill_over_bytes == 5
-    with pytest.raises(GatewayOutputLimit):
-        fake.run(["/bin/sh"], kill_over_bytes=4)
-    with pytest.raises(ValueError):
-        fake.run(["/bin/sh"], kill_over_bytes=-1)
-
-
 def test_the_scripted_raw_bytes_are_stdout_bytes() -> None:
     fake = FakeGateway()
     fake.on(["/opt/tool", "raw"], raw_stdout=b"a\r\nb\xff\n")

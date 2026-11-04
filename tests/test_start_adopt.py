@@ -29,7 +29,13 @@ from jsonschema import Draft202012Validator, FormatChecker
 from claude_session import lifecycle, store
 
 from .fakeclaude import claude_bin, read_jsonl, write_json
-from .test_exec_headless import SECRET_VALUE, claude_session_cmd, private_home, validate_exec
+from .test_exec_headless import (
+    SECRET_VALUE,
+    claude_session_cmd,
+    private_home,
+    script,
+    validate_exec,
+)
 from .test_schemas import registry
 
 FAST = "poll_interval: 0.05s\n"
@@ -1171,3 +1177,110 @@ def test_a_failed_start_writes_its_outcome_file_and_delivers_the_final_event(
     assert json.loads(target.read_text())["end_reason"] == "claude_not_found"
     payloads = [json.loads(line) for line in hooked.read_text().splitlines() if line]
     assert payloads[-1]["final"] is True
+
+
+# The notes-context config is frozen at start (the current config is not re-read)
+
+
+def notes_cmd(tmp_path: Path, name: str) -> Path:
+    return script(tmp_path / f"notes-{name}" / f"memo-{name}", "#!/bin/sh\necho notes\n")
+
+
+def hookconf_notes(env: Env, sid: str) -> dict[str, Any]:
+    return json.loads((env.private_run(sid) / "hookconf.json").read_text())["notes"]
+
+
+def test_a_changed_notes_config_keeps_the_values_frozen_at_start(env: Env) -> None:
+    frozen_cmd, other_cmd = notes_cmd(env.tmp_path, "a"), notes_cmd(env.tmp_path, "b")
+    env.write_config(
+        f"notes_context_cmd: [{frozen_cmd}, context]\nnotes_context_timeout: 7s\n"
+        "notes_context_max_bytes: 1000\nnotes_context_sources: [startup, resume]\n"
+    )
+    sid = env.started()["csession_id"]
+    env.write_config(
+        f"notes_context_cmd: [{other_cmd}, other]\nnotes_context_timeout: 9s\n"
+        "notes_context_max_bytes: 2000\nnotes_context_sources: [clear]\n"
+    )
+    proc, out = env.adopt(sid)
+    assert proc.returncode == 0, proc.stderr
+    assert any("config changed since start" in w for w in out["warnings"])
+    conf = hookconf_notes(env, sid)
+    assert conf["executable"] == str(frozen_cmd)
+    assert conf["argv"][:2] == ["memo-a", "context"]
+    assert (conf["timeout"], conf["max_bytes"], conf["sources"]) == (
+        7.0,
+        1000,
+        ["startup", "resume"],
+    )
+
+
+def test_a_notes_command_removed_from_the_config_after_start_still_runs(env: Env) -> None:
+    cmd = notes_cmd(env.tmp_path, "a")
+    env.write_config(f"notes_context_cmd: [{cmd}]\n")
+    sid = env.started()["csession_id"]
+    env.write_config("notes_context_cmd: [/no/such/notes-command]\n")
+    proc, _ = env.adopt(sid)
+    assert proc.returncode == 0, proc.stderr
+    assert hookconf_notes(env, sid)["executable"] == str(cmd)
+
+
+def test_a_notes_command_missing_at_start_stays_missing_at_adoption(env: Env) -> None:
+    """The frozen command, not the current config's, is resolved at adoption: a command
+    added to the config after start is not used."""
+    env.write_config("notes_context_cmd: [/no/such/notes-command]\n")
+    sid = env.started()["csession_id"]
+    env.write_config(f"notes_context_cmd: [{notes_cmd(env.tmp_path, 'b')}]\n")
+    proc, _ = env.adopt(sid)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads((env.private_run(sid) / "hookconf.json").read_text())["notes"] is None
+
+
+def test_the_launch_spec_freezes_the_notes_context_config(env: Env) -> None:
+    sid = env.started()["csession_id"]
+    data = json.loads((env.private_run(sid) / lifecycle.SPEC_NAME).read_text())
+    assert data["config"]["notes_context_cmd"] == ["memoctl", "context"]
+    assert data["config"]["notes_context_timeout"] == 5.0
+    assert data["config"]["notes_context_max_bytes"] == 16384
+    assert data["config"]["notes_context_sources"] == ["startup"]
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("notes_context_cmd", []),
+        ("notes_context_cmd", "memoctl"),
+        ("notes_context_cmd", ["memoctl", 5]),
+        ("notes_context_cmd", ["memo\x00ctl"]),
+        ("notes_context_timeout", 0),
+        ("notes_context_timeout", -1),
+        ("notes_context_timeout", "5s"),
+        ("notes_context_timeout", True),
+        ("notes_context_timeout", 36500 * 86400.0 + 1),  # just over durations.MAX_SECONDS
+        ("notes_context_timeout", 1e308),
+        ("notes_context_max_bytes", -1),
+        ("notes_context_max_bytes", 1.5),
+        ("notes_context_max_bytes", True),
+        ("notes_context_max_bytes", 2**53),
+        ("notes_context_sources", "startup"),
+        ("notes_context_sources", ["boot"]),
+        ("notes_context_sources", [1]),
+    ],
+)
+def test_an_unusable_frozen_notes_value_fails_the_adoption(env: Env, key: str, value: Any) -> None:
+    sid = env.started()["csession_id"]
+    spec = env.private_run(sid) / lifecycle.SPEC_NAME
+    data = json.loads(spec.read_text())
+    data["config"][key] = value
+    spec.write_text(json.dumps(data))
+    proc, out = env.adopt(sid)
+    assert_not_started(proc, out, "session_dir_unsafe")
+
+
+def test_a_launch_spec_missing_a_notes_value_fails_the_adoption(env: Env) -> None:
+    sid = env.started()["csession_id"]
+    spec = env.private_run(sid) / lifecycle.SPEC_NAME
+    data = json.loads(spec.read_text())
+    del data["config"]["notes_context_cmd"]
+    spec.write_text(json.dumps(data))
+    proc, out = env.adopt(sid)
+    assert_not_started(proc, out, "session_dir_unsafe")
