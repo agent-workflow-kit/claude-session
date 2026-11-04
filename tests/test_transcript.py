@@ -1344,3 +1344,109 @@ def test_the_clip_never_cuts_an_escape(
     lines = render(["transcript", SID], capsys)
     assert lines[2] == f"[user] {'a' * (limit - 2)}\\x1b[ ... (3 more characters)"
     assert lines[3] == f"[user] {'b' * (limit - 1)} ... (4 more characters)"
+
+
+# --raw to a terminal (simulated with a pty): refused unless --allow-tty
+
+
+class Terminal:
+    """A pty: ``attach()`` makes ``sys.stdout`` its slave side (inside the test body, after
+    pytest's capture has installed its own ``sys.stdout``); ``read()`` drains the master."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import pty
+
+        self.monkeypatch = monkeypatch
+        self.master, slave = pty.openpty()
+        os.set_blocking(self.master, False)
+        self.stream = os.fdopen(slave, "w", closefd=True)
+
+    def attach(self) -> None:
+        self.monkeypatch.setattr("sys.stdout", self.stream)
+
+    def read(self) -> bytes:
+        self.stream.flush()
+        return drain(self.master)
+
+
+@pytest.fixture
+def tty(monkeypatch: pytest.MonkeyPatch) -> Iterator[Terminal]:
+    term = Terminal(monkeypatch)
+    try:
+        yield term
+    finally:
+        monkeypatch.undo()
+        term.stream.close()
+        os.close(term.master)
+
+
+def drain(master: int) -> bytes:
+    data = b""
+    while True:
+        try:
+            chunk = os.read(master, 65536)
+        except (BlockingIOError, OSError):
+            return data
+        if not chunk:
+            return data
+        data += chunk
+
+
+def hostile_session(st: Store, clock: Clock, projects: Path) -> None:
+    session(st, clock)
+    data = jsonl(user(HOSTILE)) + b"\x1b]0;pwned\x07\x1b[2J\n"
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, data)))
+
+
+def test_raw_to_a_terminal_is_a_usage_error_and_writes_nothing(
+    st: Store,
+    clock: Clock,
+    projects: Path,
+    tty: Terminal,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    hostile_session(st, clock, projects)
+    tty.attach()
+    code = main(["transcript", SID, "--raw"])
+    assert code == 2
+    assert tty.read() == b""
+    err = capfd.readouterr().err
+    assert "--raw" in err and "terminal" in err and "--allow-tty" in err
+
+
+def test_raw_to_a_terminal_with_allow_tty_writes_the_bytes_unchanged(
+    st: Store, clock: Clock, projects: Path, tty: Terminal
+) -> None:
+    hostile_session(st, clock, projects)
+    tty.attach()
+    assert main(["transcript", SID, "--raw", "--allow-tty"]) == 0
+    assert b"\x1b]0;pwned\x07\x1b[2J" in tty.read()
+
+
+def test_allow_tty_changes_nothing_when_output_is_not_a_terminal(
+    st: Store, clock: Clock, projects: Path, capfdbinary: pytest.CaptureFixture[bytes]
+) -> None:
+    session(st, clock)
+    data = jsonl(user(HOSTILE)) + b"\x1b[2J\n"
+    claude_id(st, CID1, 1, "startup", str(write_main(projects, CID1, data)))
+    assert run_raw(["transcript", SID, "--raw", "--allow-tty"], capfdbinary) == (0, data)
+
+
+@pytest.mark.parametrize("form", [[], ["--paths"], ["--json"]])
+def test_other_forms_to_a_terminal_are_unaffected(
+    st: Store, clock: Clock, projects: Path, tty: Terminal, form: list[str]
+) -> None:
+    """Rendered text strips control characters; ``--paths`` prints only validated, printable
+    paths; ``--json`` escapes them."""
+    hostile_session(st, clock, projects)
+    tty.attach()
+    assert main(["transcript", SID, *form]) == 0
+    assert b"\x1b" not in tty.read()
+
+
+def test_allow_tty_without_raw_is_a_usage_error(
+    st: Store, clock: Clock, projects: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    hostile_session(st, clock, projects)
+    assert main(["transcript", SID, "--allow-tty"]) == 2
+    assert "--allow-tty" in capfd.readouterr().err

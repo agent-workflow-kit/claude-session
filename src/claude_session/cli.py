@@ -44,6 +44,14 @@ DESCRIPTION = "Runs and supervises Claude Code sessions (terminal-agnostic)."
 
 Handler = Callable[[argparse.Namespace], int]
 
+
+def print_json(value: Any) -> None:
+    """A ``--json`` result on stdout: ASCII only, so C0 and C1 control characters and
+    format characters (a bidi override) of untrusted fields are JSON-escaped, never printed
+    raw (interface.md, Global flags); no NaN or infinity."""
+    print(json.dumps(value, ensure_ascii=True, allow_nan=False))
+
+
 STATES = (
     "starting",
     "working",
@@ -154,7 +162,7 @@ def _status(args: argparse.Namespace) -> int:
     with store.open_state() as state:
         obj = views.status_object(state, args.id, args.run)
     if args.json:
-        print(json.dumps(obj, allow_nan=False))
+        print_json(obj)
     else:
         print("\n".join(views.status_lines(obj)))
     return 0
@@ -189,7 +197,7 @@ def _list(args: argparse.Namespace) -> int:
         )
         items = views.list_items(state, flt)
     if args.json:
-        print(json.dumps({"sessions": items}, allow_nan=False))
+        print_json({"sessions": items})
     else:
         print("\n".join(views.list_lines(items)))
     return 0
@@ -212,7 +220,7 @@ def _label(args: argparse.Namespace) -> int:
         "dry_run": bool(args.dry_run),
     }
     if args.json:
-        print(json.dumps(obj))
+        print_json(obj)
         return 0
     action, done_key = ("add", "added") if add else ("remove", "removed")
     changed = obj[done_key]
@@ -235,7 +243,7 @@ def _verify_secret(args: argparse.Namespace) -> int:
     with store.open_state() as st:
         match = secretcheck.matches(st, args.id, presented)
     if args.json:
-        print(json.dumps({"match": match}))
+        print_json({"match": match})
     return 0 if match else VERIFY_SECRET_MISMATCH
 
 
@@ -261,7 +269,7 @@ def _export(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if args.json:
-        print(json.dumps([exporter.json_record(r) for r in records], allow_nan=False))
+        print_json([exporter.json_record(r) for r in records])
     else:
         for record in records:
             print(exporter.encodable(exporter.record_line(record), sys.stdout.encoding))
@@ -280,7 +288,7 @@ def _report(args: argparse.Namespace) -> int:
         stdin=sys.stdin.buffer,
     )
     if args.json:
-        print(json.dumps(queued.as_json()))
+        print_json(queued.as_json())
     else:
         print("report queued")
     return 0
@@ -394,7 +402,7 @@ def _exec(args: argparse.Namespace) -> int:
 
 def _cron_report(args: argparse.Namespace, result: dict[str, Any]) -> int:
     if args.json:
-        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+        print_json(result)
         return 0
     print(f"crontab block {result['action']}" + (" (dry run)" if result["dry_run"] else ""))
     if result["block"] is not None:
@@ -438,7 +446,7 @@ def _reconcile(args: argparse.Namespace) -> int:
             st, cfg, gateway=SystemGateway(), environ=os.environ, dry_run=args.dry_run
         )
     if args.json:
-        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+        print_json(result)
         return 0
     if result["already_running"]:
         print("reconcile is already running")
@@ -486,7 +494,7 @@ def _stop(args: argparse.Namespace) -> int:
         ).run(args.id, dry_run=args.dry_run)
     output = stopped.as_json()
     if args.json:
-        print(json.dumps(output, ensure_ascii=False, allow_nan=False))
+        print_json(output)
         return stopped.exit_code
     line = f"{output['csession_id']} run {output['run']}: "
     if output["dry_run"]:
@@ -535,7 +543,7 @@ def _forget(args: argparse.Namespace) -> int:
                 **common,
             )
     if args.json:
-        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+        print_json(result)
         return 0
     verb = "would forget" if result["dry_run"] else "forgot"
     for item in result["forgotten"]:
@@ -599,7 +607,7 @@ def _wait(args: argparse.Namespace) -> int:
         writable = outcomefile.run_writable(waited.row, state_root)
         _write_wait_outcome_file(args.outcome_file, output, state_root, writable)
     if args.json:
-        print(json.dumps(output, ensure_ascii=False, allow_nan=False))
+        print_json(output)
     elif output["timed_out"]:
         line = (
             f"{output['csession_id']} run {output['run']}: timed out, still {output['state']}"
@@ -652,7 +660,7 @@ def _start(args: argparse.Namespace) -> int:
     with store.open_state() as st:
         process = launch.Process.current(SystemGateway(), os.path.dirname(st.path))
         result = lifecycle.start(st, args, cfg, source, process)
-    print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+    print_json(result)
     return 0
 
 
@@ -726,7 +734,7 @@ def _print_dry_run(args: argparse.Namespace, plan: dict[str, Any], message: str 
 
     plan = dryrun.printable(plan)  # valid UTF-8 output, also for a non-UTF-8 path
     if args.json:
-        print(json.dumps(plan, ensure_ascii=False, allow_nan=False))
+        print_json(plan)
     else:
         _print_plan(plan, dryrun.printable(message))
     return dryrun.exit_code(plan)
@@ -766,7 +774,7 @@ def _kinds(args: argparse.Namespace) -> int:
     process = dryrun.current_process(SystemGateway())
     report = dryrun.printable(dryrun.kinds_report(cfg, process, kind=args.kind, repo=args.repo))
     if args.json:
-        print(json.dumps(report, ensure_ascii=False, allow_nan=False))
+        print_json(report)
         return 0
     claude = report["claude_bin_resolved"] or "not found"
     version = report["claude_version"] or "unknown"
@@ -861,7 +869,7 @@ def _die_of(signum: int) -> NoReturn:
 def _print_outcome(outcome: dict[str, Any], json_mode: bool) -> None:
     """``--json``: the outcome object on stdout; otherwise a one-line summary on stderr."""
     if json_mode:
-        print(json.dumps(outcome, ensure_ascii=False, allow_nan=False))
+        print_json(outcome)
         return
     line = (
         f"{outcome['csession_id']} run {outcome['run']}: {outcome['outcome']}"
@@ -892,7 +900,7 @@ def _transcript(args: argparse.Namespace) -> int:
     listing = transcripts.discover(sid, record.claude_ids, roots, reader, run_no=args.run)
     warnings += listing.warnings
     if args.json:
-        print(json.dumps(listing.as_json(), allow_nan=False))
+        print_json(listing.as_json())
     elif args.paths:
         warnings += transcripts.missing_warnings(listing, subagents=True)
         for line in transcripts.path_lines(listing):
@@ -1092,6 +1100,7 @@ def build_parser() -> _Parser:
     form = p.add_mutually_exclusive_group()
     form.add_argument("--raw", action="store_true")
     form.add_argument("--paths", action="store_true")
+    p.add_argument("--allow-tty", action="store_true")
     p.add_argument("--subagents", action="store_true")
     p.add_argument("--run", type=int, metavar="N")
 
@@ -1315,6 +1324,13 @@ def _check_list(args: argparse.Namespace) -> None:
 def _check_transcript(args: argparse.Namespace) -> None:
     if args.raw and args.json:
         raise UsageError("--raw cannot be combined with --json")
+    if args.allow_tty and not args.raw:
+        raise UsageError("--allow-tty is only for --raw")
+    if args.raw and not args.allow_tty and _is_terminal(sys.stdout):
+        raise UsageError(
+            "--raw writes transcript bytes unchanged, escape sequences included, and stdout is "
+            "a terminal: redirect or pipe it, or pass --allow-tty to print it anyway"
+        )
 
 
 def _check_forget(args: argparse.Namespace) -> None:
@@ -1484,7 +1500,7 @@ def _print_error(error: CliError, json_mode: bool) -> None:
         message = f"{message} ({display(error.detail)})"
     print(f"{PROG}: error: {message}", file=sys.stderr)
     if json_mode:
-        print(json.dumps(error.envelope()))
+        print_json(error.envelope())
 
 
 # Schema check (interface.md, Launch order step 1).

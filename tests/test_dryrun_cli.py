@@ -1613,17 +1613,43 @@ def test_a_dry_run_claude_failing_only_for_the_dropped_path_entries_is_a_warning
     assert any(
         w.startswith("claude --version not run (not probed by a dry run")
         and "PATH entries under session-writable paths were dropped" in w
+        and "claude_version_unknown" not in w
         for w in plan["warnings"]
     ), plan["warnings"]
 
 
-def test_a_dry_run_claude_that_cannot_run_anyway_would_fail(
+def test_a_dry_run_claude_printing_no_version_with_dropped_path_entries_warns_unknown(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
-    """No entry dropped: the dry run predicts the launch's ``claude_not_found``."""
+    """The probe ran (PATH entries dropped all the same) and printed no version: the
+    launch's ``claude_version_unknown`` warning, whatever the output says, never the
+    not-probed text (output holding ``--version: `` included)."""
+    marker = tmp_path / "ran"
+    planted = plant_interp(home() / "wd" / "bin", marker).parent
+    (tools / "claude").write_text(
+        "#!/bin/sh\necho 'usage: claude --version: unknown option'\n", encoding="utf-8"
+    )
+    proc, plan = dry_run(
+        "implement",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config="kinds:\n  implement:\n    write_dirs: ['~/wd']\n",
+        env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0 and plan["would_fail"] is None
+    version = [w for w in plan["warnings"] if "--version" in w]
+    assert version and all(w.startswith("claude_version_unknown: ") for w in version), version
+
+
+def test_a_dry_run_claude_that_cannot_run_anyway_warns_claude_version_unknown(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """No entry dropped: the dry run predicts the launch's warning, not a failure."""
     (tools / "claude").write_text(f"#!/bin/sh\nexec {INTERP}\n", encoding="utf-8")
     proc, plan = dry_run("implement", cwd=work, tools=tools, tmp_path=tmp_path)
-    assert proc.returncode == 12 and plan["would_fail"] == "claude_not_found"
+    assert proc.returncode == 0 and plan["would_fail"] is None
+    assert any(w.startswith("claude_version_unknown: ") for w in plan["warnings"]), plan["warnings"]
 
 
 def interp_symlinked_into(work: Path, tmp_path: Path, marker: Path) -> Path:
