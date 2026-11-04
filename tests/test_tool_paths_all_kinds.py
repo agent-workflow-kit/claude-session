@@ -333,7 +333,10 @@ def test_a_session_path_interpreter_under_the_guard_is_refused(tmp_path: Path) -
     guard = launch.tool_guard(cfg, proc, git_cwd=None)
     claude = pathrules.ResolvedTool(path=str(tmp_path / "safe" / "claude"), name="claude")
     unfiltered = envbuild.SessionEnv(
-        env={"PATH": f"{other}:{tmp_path / 'safe'}"}, auth_names=(), secret_names=()
+        env={"PATH": f"{other}:{tmp_path / 'safe'}"},
+        auth_names=(),
+        credential_names=(),
+        secret_names=(),
     )
     with pytest.raises(LaunchValidationError) as info:
         launch.check_session_interpreter(claude, unfiltered, str(tmp_path), guard)
@@ -347,7 +350,9 @@ def test_a_notes_command_interpreter_under_the_guard_gives_no_notes(tmp_path: Pa
     notes = executable(tmp_path / "safe" / "notes-cmd")
     notes.write_text("#!/usr/bin/env cs-test-node\n")
     guard = launch.tool_guard(cfg, process(tmp_path), git_cwd=None)
-    session = envbuild.SessionEnv(env={"PATH": f"{other}:/usr/bin"}, auth_names=(), secret_names=())
+    session = envbuild.SessionEnv(
+        env={"PATH": f"{other}:/usr/bin"}, auth_names=(), credential_names=(), secret_names=()
+    )
     tool = pathrules.ResolvedTool(path=str(notes), name="notes-cmd")
     found, problem = launch.check_notes_interpreter(tool, session, guard)
     assert found is None
