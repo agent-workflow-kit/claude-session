@@ -1616,8 +1616,8 @@ def test_a_dry_run_version_probe_never_runs_an_interpreter_from_a_write_dir(
 ) -> None:
     """S5 for the launch check: a ``#!/usr/bin/env`` claude whose interpreter would be found
     in a kind's ``write_dirs`` is never run: the version probe's ``PATH`` drops the entry (a
-    launch checks every kind's write paths, also for a trusted kind), so the launch fails
-    ``claude_not_found`` and a dry run says so."""
+    launch checks every kind's write paths, also for a trusted kind), so the version cannot
+    be read: the launch's ``claude_version_unknown`` warning, which a dry run predicts."""
     marker = tmp_path / "ran"
     planted = plant_interp(home() / "wd" / "bin", marker).parent
     (tools / "claude").write_text(f"#!/usr/bin/env {INTERP}\n", encoding="utf-8")
@@ -1630,16 +1630,19 @@ def test_a_dry_run_version_probe_never_runs_an_interpreter_from_a_write_dir(
         env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
     )
     assert not marker.exists()
-    assert proc.returncode == 12 and plan["would_fail"] == "claude_not_found"
-    assert any(INTERP in w for w in plan["warnings"]), plan["warnings"]
+    assert proc.returncode == 0 and plan["would_fail"] is None
+    assert any(
+        w.startswith("claude_version_unknown: ") and INTERP in w for w in plan["warnings"]
+    ), plan["warnings"]
 
 
 def test_a_dry_run_claude_failing_only_for_the_dropped_path_entries_is_a_warning(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
     """The ``claude --version`` probe drops the ``PATH`` entries under any kind's
-    ``write_dirs``, also those of a trusted kind, so a ``claude`` that then cannot run fails
-    the launch (``claude_not_found``) without the planted interpreter ever running."""
+    ``write_dirs``, also those of a trusted kind, so a ``claude`` that then cannot run is
+    the launch's ``claude_version_unknown`` warning, without the planted interpreter ever
+    running."""
     marker = tmp_path / "ran"
     planted = plant_interp(home() / "wd" / "bin", marker).parent
     (tools / "claude").write_text(f"#!/bin/sh\nexec {INTERP}\n", encoding="utf-8")
@@ -1654,9 +1657,7 @@ def test_a_dry_run_claude_failing_only_for_the_dropped_path_entries_is_a_warning
     assert not marker.exists()
     assert proc.returncode == 0 and plan["would_fail"] is None
     assert any(
-        w.startswith("claude --version not run (not probed by a dry run")
-        and "PATH entries under session-writable paths were dropped" in w
-        and "claude_version_unknown" not in w
+        w.startswith("claude_version_unknown: ") and "session-writable path" in w
         for w in plan["warnings"]
     ), plan["warnings"]
 
