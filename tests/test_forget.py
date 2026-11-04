@@ -756,3 +756,20 @@ def test_sessions_with_events_to_deliver_take_no_deletion_slot(
     assert [c["csession_id"] for c in out["changes"] if c["action"] == "deleted"] == [clean]
     assert any("left to deliver" in w for w in out["warnings"])
     assert forgotten_at(st, held) is not None
+
+
+def test_a_builtin_credential_is_redacted_from_the_forget_audit(
+    st: Store,
+    root: str,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #95 review R1-12: ANTHROPIC_API_KEY is redacted without being configured anywhere.
+    key = "sk-ant-builtin-credential-0123"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", key)
+    sid = make(st, root)
+    code = main(["forget", sid, "--json", "--actor", f"auto:{key}", "--decision-id", key])
+    capsys.readouterr()
+    assert code == 0
+    text = (Path(root) / "audit.jsonl").read_text()
+    assert key not in text and "[redacted]" in text

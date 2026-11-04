@@ -361,7 +361,12 @@ def test_required_env_names_are_auth_allow_and_set_names(tmp_path: Path) -> None
     resolution = kinds.resolve(
         cfg, "implement", mode="headless", flags={"env_allow": ["EXTRA"]}, origin_url=lambda _: None
     )
-    session_env = envbuild.SessionEnv(env={}, auth_names=("ANTHROPIC_API_KEY",), secret_names=())
+    session_env = envbuild.SessionEnv(
+        env={},
+        auth_names=("ANTHROPIC_API_KEY",),
+        credential_names=("ANTHROPIC_API_KEY",),
+        secret_names=(),
+    )
     assert dryrun.required_env_names(resolution, session_env) == (
         "ANTHROPIC_API_KEY",
         "LC_*",

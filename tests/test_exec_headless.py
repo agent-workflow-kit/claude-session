@@ -1561,3 +1561,100 @@ def test_a_headless_run_with_a_done_report_auto_exits(
     assert row["pending_cause"] == "auto_exit"
     assert [r["signal"] for r in run.fake_log() if r["event"] == "signal"] == ["TERM"]
     assert gone(row["child_pid"])
+
+
+# The tmp root is chosen once at step 5 (#95 review R1-1)
+
+
+@pytest.fixture
+def short_runtime_dir() -> Any:
+    """A private ``$XDG_RUNTIME_DIR`` stand-in short enough for the socket path limit."""
+    import shutil
+    import tempfile
+
+    path = Path(tempfile.mkdtemp(prefix="cs-rt-", dir="/tmp"))
+    path.chmod(0o700)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path)
+
+
+def sessions_tmp_dir(state: Path) -> str | None:
+    db = sqlite3.connect(f"file:{state / 'state.db'}?mode=ro", uri=True)
+    try:
+        return db.execute("SELECT tmp_dir FROM sessions").fetchone()[0]
+    finally:
+        db.close()
+
+
+def test_the_planned_tmpdir_is_the_env_the_settings_and_the_recorded_one(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    state: Path,
+    work: Path,
+    private_tmp_root: Path,
+    short_runtime_dir: Path,
+) -> None:
+    primary = private_tmp_root.resolve() / pathrules.tmp_root_name(os.geteuid())
+    primary.mkdir(mode=0o755)
+    primary.chmod(0o755)  # unusable: the fallback is chosen
+    code, outcome = exec_in_process(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        work,
+        [
+            START,
+            {
+                "do": "bash",
+                "command": 'printf "%s\\n%s" "$TMPDIR" "$CLAUDE_CODE_TMPDIR" > tmpdir.txt',
+            },
+            STOP,
+            result_step(),
+        ],
+        args=["--reads-third-party", "--sandbox", "preferred"],
+        env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": str(short_runtime_dir)},
+    )
+    assert code == 0, outcome
+    sid = outcome["csession_id"]
+    expected = str(short_runtime_dir.resolve() / "csession" / sid)
+    assert (work / "tmpdir.txt").read_text().splitlines() == [expected, expected]
+    assert sessions_tmp_dir(state) == expected
+    settings = json.loads((state / "private" / sid / "runs" / "1" / "settings.json").read_text())
+    assert expected in settings["sandbox"]["filesystem"]["allowWrite"]
+
+
+def test_a_root_change_between_check_and_creation_ends_tmpdir_unsafe(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    state: Path,
+    work: Path,
+    private_tmp_root: Path,
+    short_runtime_dir: Path,
+) -> None:
+    from claude_session import tmpdir
+
+    primary = private_tmp_root.resolve() / pathrules.tmp_root_name(os.geteuid())
+    real_create = tmpdir.create_pinned
+
+    def changed_first(*args: Any, **kwargs: Any) -> tmpdir.Created:
+        primary.mkdir(mode=0o700)
+        primary.chmod(0o755)  # the chosen per-uid root became unusable meanwhile
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(tmpdir, "create_pinned", changed_first)
+    code, outcome = exec_in_process(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        work,
+        [START, result_step()],
+        args=["--reads-third-party", "--sandbox", "preferred"],
+        env={"PATH": "/usr/bin:/bin", "XDG_RUNTIME_DIR": str(short_runtime_dir)},
+    )
+    assert code == 12 and outcome["end_reason"] == "tmpdir_unsafe", outcome
+    assert not (short_runtime_dir / "csession").exists()  # never moved to the fallback
+    assert list(primary.iterdir()) == []

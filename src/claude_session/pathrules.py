@@ -111,6 +111,42 @@ def tmp_parent(uid: int | None = None) -> str:
     return os.path.join(TMP_ROOT, tmp_root_name(os.geteuid() if uid is None else uid))
 
 
+# The fallback root of private temporary directories, used when the primary one cannot be
+# established (``tmpdir``): ``$XDG_RUNTIME_DIR/csession``.
+RUNTIME_ROOT_NAME = "csession"
+
+
+def usable_runtime_dir(value: str) -> bool:
+    """Whether ``value`` can be the parent of the fallback root: non-empty, absolute,
+    normalized (no ``..`` or ``.`` component, no doubled, leading double or trailing slash),
+    not ``/``, and without control characters (below 0x20, or 0x7f; NUL included), which
+    would make the path unsafe to print in a command."""
+    return (
+        bool(value)
+        and not any(ord(c) < 0x20 or c == "\x7f" for c in value)
+        and os.path.isabs(value)
+        and value != "/"
+        and not value.startswith("//")
+        and os.path.normpath(value) == value
+    )
+
+
+def runtime_tmp_parent(environ: Mapping[str, str] | None = None) -> str | None:
+    """``$XDG_RUNTIME_DIR/csession`` as given (not resolved), or None when the variable is
+    unset or unusable (``usable_runtime_dir``). ``environ`` defaults to ``os.environ``."""
+    value = (os.environ if environ is None else environ).get("XDG_RUNTIME_DIR", "")
+    if not usable_runtime_dir(value):
+        return None
+    return os.path.join(value, RUNTIME_ROOT_NAME)
+
+
+def tmp_parents(environ: Mapping[str, str] | None = None) -> list[str]:
+    """Every root a private temporary directory can live in: ``tmp_parent()``, then
+    ``runtime_tmp_parent()`` when usable."""
+    runtime = runtime_tmp_parent(environ)
+    return [tmp_parent(), *([runtime] if runtime is not None else [])]
+
+
 # Resolved paths
 
 
@@ -437,6 +473,8 @@ class Host:
     - ``home``: ``$HOME``.
     - ``state_root``: the state directory (``private/`` is under it).
     - ``tmp_parent``: ``/tmp/csession-<uid>``, the parent of every private tmpdir.
+    - ``runtime_tmp_parent``: ``$XDG_RUNTIME_DIR/csession``, the fallback parent of private
+      tmpdirs (None: the variable is unset or unusable); refused like ``tmp_parent``.
     - ``path_dirs``: the absolute entries of the caller's ``PATH`` plus
       ``env.path_prepend`` (unsafe write targets: a directory on ``PATH``).
     - ``xdg_dirs``: ``$XDG_CONFIG_HOME``, ``$XDG_DATA_HOME``, ``$XDG_STATE_HOME`` when set
@@ -452,6 +490,7 @@ class Host:
     tmp_parent: str
     path_dirs: tuple[str, ...] = ()
     xdg_dirs: tuple[str, ...] = ()
+    runtime_tmp_parent: str | None = None
     xdg_credentials: tuple[tuple[str, str], ...] = ()
     account_home: str | None = None
 
@@ -502,6 +541,7 @@ class Host:
             home=home,
             state_root=state_root,
             tmp_parent=tmp_parent(uid),
+            runtime_tmp_parent=runtime_tmp_parent(environ),
             path_dirs=tuple(dict.fromkeys([*path_prepend, *path_dirs])),
             xdg_dirs=tuple(xdg),
             xdg_credentials=tuple(xdg_credentials),
@@ -539,6 +579,10 @@ class PathRules:
         self._state = _ref(host.state_root)
         self._private = _ref(os.path.join(host.state_root, sessiondir.PRIVATE))
         self._tmp_parent = _ref(host.tmp_parent)
+        # Every tmp root as (ref, shown path): the per-uid one, then the runtime-dir fallback.
+        self._tmp_roots = [(self._tmp_parent, host.tmp_parent)]
+        if host.runtime_tmp_parent is not None:
+            self._tmp_roots.append((_ref(host.runtime_tmp_parent), host.runtime_tmp_parent))
         self._session = _ref(session_dir)
         own = [os.path.join(session_dir, name) for name in OWN_WRITABLE]
         self._planned = tuple(path for path in own if planned and planned_dir(path) is not None)
@@ -580,10 +624,11 @@ class PathRules:
         (``unsafe_path``). The launch path must call it before the write checks
         (``check_cwd``, ``check_write_dirs``, ``check_profile``): they assume a valid
         ``$HOME``."""
-        if _contains(self._state, self._home) or _contains(self._tmp_parent, self._home):
+        if _contains(self._state, self._home) or any(
+            _contains(root, self._home) for root, _ in self._tmp_roots
+        ):
             raise LaunchValidationError(
-                f"HOME is inside the state root or {self.host.tmp_parent}:"
-                f" {_shown(self.host.home)!r}",
+                f"HOME is inside the state root or {self._tmp_names()}: {_shown(self.host.home)!r}",
                 end_reason="unsafe_path",
             )
 
@@ -626,7 +671,7 @@ class PathRules:
         for root, label in (
             (self._state, "the state root"),
             (self._private, "the private directory"),
-            (self._tmp_parent, self.host.tmp_parent),
+            *self._tmp_roots,
         ):
             if _contains(ref, root):
                 return f"is or contains {label}"
@@ -635,9 +680,13 @@ class PathRules:
         own = own_session and _exactly_under(ref, self._session)
         if _contains(self._state, ref) and not own:
             return "is inside the state root (outside the session's own directory)"
-        if _contains(self._tmp_parent, ref) and not self._in_tmpdir(ref):
-            return f"is inside {self.host.tmp_parent} (outside the run's private tmpdir)"
+        for root, shown in self._tmp_roots:
+            if _contains(root, ref) and not self._in_tmpdir(ref):
+                return f"is inside {shown} (outside the run's private tmpdir)"
         return None
+
+    def _tmp_names(self) -> str:
+        return " or ".join(shown for _, shown in self._tmp_roots)
 
     def _in_tmpdir(self, ref: _Ref) -> bool:
         return self._tmpdir is not None and _exactly_under(ref, self._tmpdir)
@@ -923,8 +972,9 @@ class PathRules:
             return "cannot be resolved"
         if _contains(self._state, ref) and not _exactly_under(ref, self._session):
             return "is under the state root (outside the session's own directory)"
-        if _contains(self._tmp_parent, ref) and not self._in_tmpdir(ref):
-            return f"is under {self.host.tmp_parent} (outside the run's private tmpdir)"
+        for root, shown in self._tmp_roots:
+            if _contains(root, ref) and not self._in_tmpdir(ref):
+                return f"is under {shown} (outside the run's private tmpdir)"
         return None
 
 

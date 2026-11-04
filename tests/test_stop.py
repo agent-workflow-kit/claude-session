@@ -1236,3 +1236,20 @@ def test_the_human_output_is_one_sanitized_line(
     assert cli.main(["stop", sid, "--config", str(config)]) == 0
     out = capsys.readouterr().out
     assert out == f"{sid} run 1: canceled, not-started (canceled), exit 12\n"
+
+
+def test_a_builtin_credential_is_redacted_from_the_stop_audit(
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    st: Store,
+    root: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #95 review R1-12: ANTHROPIC_API_KEY is redacted without being configured anywhere.
+    key = "sk-ant-builtin-credential-0123"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", key)
+    sid = pending(st, root)
+    code, _ = run_stop(capsys, config, sid, "--actor", f"auto:{key}", "--decision-id", key)
+    assert code == 0
+    text = (Path(root) / "audit.jsonl").read_text()
+    assert key not in text and "[redacted]" in text

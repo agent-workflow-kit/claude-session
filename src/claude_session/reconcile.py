@@ -463,17 +463,31 @@ def remove_tmpdir(st: store.Store, sid: str, *, expected_run: int | None = None)
     if expected_run is not None and owner[0] not in (expected_run, 0):
         return False
     try:
-        return tmpdir.remove_checked(sid, lambda: st.tmpdir_owner(sid) == owner)
+        return tmpdir.remove_checked(
+            sid, lambda: st.tmpdir_owner(sid) == owner, extra_roots=recorded_roots(st)
+        )
     except (OSError, ValueError):
         return False
 
 
+def recorded_roots(st: store.Store) -> list[str]:
+    """The fallback roots named by the sessions' recorded tmpdir paths
+    (``tmpdir.recorded_root``), so a run created under ``$XDG_RUNTIME_DIR`` is found when
+    the variable is not set now (cron, ssh)."""
+    roots = (tmpdir.recorded_root(path) for path in st.recorded_tmp_dirs())
+    return sorted({root for root in roots if root is not None})
+
+
 def _tmpdirs(st: store.Store, checked: Checked, *, dry_run: bool, lease: _Lease) -> None:
+    extra_roots = recorded_roots(st)
+    problems: list[str] = []
     try:
-        sessions, stale = tmpdir.session_entries()
+        sessions, stale = tmpdir.session_entries(extra_roots=extra_roots, problems=problems)
     except OSError as exc:
         checked.warnings.append(f"the private temporary directories could not be listed: {exc}")
+        checked.warnings.extend(problems)
         return
+    checked.warnings.extend(problems)
     for sid in sessions:
         lease.heartbeat()
         owner = st.tmpdir_owner(sid)
@@ -495,7 +509,7 @@ def _tmpdirs(st: store.Store, checked: Checked, *, dry_run: bool, lease: _Lease)
             checked.changes.append(Change(sid, owner[0] or None, "tmpdir_removed", detail=DRY))
             continue
         try:
-            removed = tmpdir.remove_stale(name)
+            removed = tmpdir.remove_stale(name, extra_roots=extra_roots)
         except (OSError, ValueError) as exc:
             checked.warnings.append(f"{name} could not be removed: {exc}")
             continue

@@ -64,7 +64,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from . import audit, endmap, lifecycle, liveness, logs, outcomefile, store, toolhooks
+from . import audit, endmap, envbuild, lifecycle, liveness, logs, outcomefile, store, toolhooks
 from . import gateway as gw
 from .errors import InternalError
 
@@ -488,11 +488,7 @@ class Stop:
     def _audit(self, sid: str, run: int, result: str) -> None:
         """The ``stop`` audit record; raises when it cannot be written (fail closed:
         interface.md, Audit and log)."""
-        secrets = logs.secret_values(
-            self.environ,
-            secret_env=self.cfg.secret_env,
-            claude_auth_env=self.cfg.claude_auth_env,
-        )
+        secrets = envbuild.credential_values(self.environ, self.cfg)
         try:
             audit.append(
                 os.path.join(self.state_root, AUDIT_NAME),

@@ -903,7 +903,10 @@ def test_a_relative_profile_file_is_resolved_against_starts_cwd(env: Env, tmp_pa
 
 
 def in_process_start(
-    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *args: str,
 ) -> tuple[int, dict[str, Any]]:
     """``start`` run by ``cli.main`` in this process (so a test can patch ``freeze``), with
     the environment ``Env.cs`` gives a subprocess."""
@@ -915,7 +918,7 @@ def in_process_start(
     prompt = env.tmp_path / "prompt.md"
     prompt.write_text("Do the task.\n", encoding="utf-8")
     argv = ["start", "--json", "--config", str(env.config), "--mode", "headless"]
-    code = main([*argv, "--prompt-file", str(prompt)])
+    code = main([*argv, "--prompt-file", str(prompt), *args])
     return code, json.loads(capsys.readouterr().out)
 
 
@@ -1177,6 +1180,45 @@ def test_a_failed_start_writes_its_outcome_file_and_delivers_the_final_event(
     assert json.loads(target.read_text())["end_reason"] == "claude_not_found"
     payloads = [json.loads(line) for line in hooked.read_text().splitlines() if line]
     assert payloads[-1]["final"] is True
+
+
+def test_a_failed_tmpdir_removal_at_start_names_the_created_path(
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    # #95 review R1-9: the warning names the directory the run created, not the root a
+    # later selection would pick.
+    from claude_session import tmpdir
+
+    runtime = tmp_path / "run"
+    runtime.mkdir(mode=0o700)
+    created: list[str] = []
+    real_create = tmpdir.create_pinned
+
+    def recording(*args: Any, **kwargs: Any) -> tmpdir.Created:
+        made = real_create(*args, **kwargs)
+        created.append(made.path)
+        return made
+
+    def failing(csession_id: str, **_kwargs: Any) -> bool:
+        # The per-uid root turns unusable and a fallback appears: run_path would move.
+        root = Path(tmpdir.root_path())
+        root.chmod(0o755)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+        raise OSError("removal failed")
+
+    monkeypatch.setattr(tmpdir, "create_pinned", recording)
+    monkeypatch.setattr(tmpdir, "remove", failing)
+    code, out = in_process_start(env, monkeypatch, capsys, "--sandbox", "preferred")
+    Path(tmpdir.root_path()).chmod(0o700)
+    assert code == 0, out
+    (path,) = created
+    assert (
+        f"could not remove the private temporary directory {path}: removal failed"
+        in (out["warnings"])
+    )
 
 
 # The notes-context config is frozen at start (the current config is not re-read)

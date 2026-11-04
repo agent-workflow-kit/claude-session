@@ -491,7 +491,7 @@ def test_secret_values_include_claude_auth_env_and_the_run_secret() -> None:
     values = logs.secret_values(
         environ,
         secret_env=["API_TOKEN"],
-        claude_auth_env=["ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"],
+        claude_auth_env=["ANTHROPIC_API_KEY"],
         run_secret=run_secret,
     )
     assert values == frozenset({SECRET, "sk-auth-value-123", run_secret})

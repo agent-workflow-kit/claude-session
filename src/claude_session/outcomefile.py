@@ -51,7 +51,7 @@ Writable = Callable[[str], bool]
 def baseline_writable(state_root: str, *extra: str) -> pathrules.SessionWritable:
     """What every outcome-file write refuses: ``<state>/sessions`` and the tmp root, plus
     ``extra`` (a run's cwd)."""
-    paths = [os.path.join(state_root, sessiondir.SESSIONS), pathrules.tmp_parent(), *extra]
+    paths = [os.path.join(state_root, sessiondir.SESSIONS), *pathrules.tmp_parents(), *extra]
     return pathrules.SessionWritable(paths)
 
 

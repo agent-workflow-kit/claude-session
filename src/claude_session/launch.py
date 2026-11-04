@@ -352,8 +352,9 @@ def resolve_caller_cwd(given: str | None, process: Process) -> str:
 def step2_writable(process: Process, probe_cwd: str | None) -> pathrules.SessionWritable:
     """What git must not be under at step 2, before the run's session-writable paths are
     known (conservative): the probe cwd, every session's directory (``<state>/sessions``)
-    and the tmp root of the private temporary directories (``/tmp/csession-<uid>``)."""
-    paths = [os.path.join(process.state_root, sessiondir.SESSIONS), pathrules.tmp_parent()]
+    and the roots of the private temporary directories (``/tmp/csession-<uid>`` and, when
+    usable, ``$XDG_RUNTIME_DIR/csession``: ``pathrules.tmp_parents``)."""
+    paths = [os.path.join(process.state_root, sessiondir.SESSIONS), *pathrules.tmp_parents()]
     return pathrules.SessionWritable([*([probe_cwd] if probe_cwd else []), *paths])
 
 
@@ -1394,11 +1395,12 @@ def generated_entries(
     }
 
 
-def check_tmpdir(resolution: kinds.Resolution, alloc: Allocated) -> None:
-    """The temporary-directory check of a sandboxed run (``tmpdir_unsafe``); nothing is
+def check_tmpdir(resolution: kinds.Resolution, alloc: Allocated, tmp: str | None) -> None:
+    """The temporary-directory check of a sandboxed run (``tmpdir_unsafe``) for the root
+    chosen once at step 5 (the parent of ``tmp``, from ``tmpdir.run_path``); nothing is
     created."""
     if resolution.profile.sandbox != "off":
-        tmpdir.check(alloc.csession_id)
+        tmpdir.check(alloc.csession_id, root=None if tmp is None else os.path.dirname(tmp))
 
 
 def check_sandbox(
@@ -1406,11 +1408,13 @@ def check_sandbox(
     alloc: Allocated,
     tools: Tools,
     process: Process,
+    tmp: str | None,
     *,
     create: bool = True,
 ) -> selfcheck.SelfCheck:
     """``claude_args`` and setting sources, then the sandbox self-check, which creates the
-    private tmpdir: the last action of step 5 (``unsafe_claude_args``,
+    private tmpdir ``tmp`` (in the root chosen once at step 5; ``tmpdir_unsafe`` when that
+    root can no longer be established): the last action of step 5 (``unsafe_claude_args``,
     ``unsafe_setting_sources``, ``sandbox_unavailable``, ``socket_path_too_long``). A dry run
     passes ``create=False``: the same checks, nothing created."""
     profile = resolution.profile
@@ -1422,6 +1426,7 @@ def check_sandbox(
         bwrap=None if tools.bwrap is None else tools.bwrap.path,
         socat=None if tools.socat is None else tools.socat.path,
         gw=process.gateway,
+        tmp_root=None if tmp is None else os.path.dirname(tmp),
         create=create,
     )
 
@@ -1500,9 +1505,14 @@ class Effects:
         pass
 
     def sandbox(
-        self, resolution: kinds.Resolution, alloc: Allocated, tools: Tools, process: Process
+        self,
+        resolution: kinds.Resolution,
+        alloc: Allocated,
+        tools: Tools,
+        process: Process,
+        tmp: str | None,
     ) -> selfcheck.SelfCheck:
-        return check_sandbox(resolution, alloc, tools, process, create=False)
+        return check_sandbox(resolution, alloc, tools, process, tmp, create=False)
 
     def claude_version(
         self,
@@ -1598,12 +1608,25 @@ class Recording(Effects):
         create_write_dirs(self.dirs, write)
 
     def sandbox(
-        self, resolution: kinds.Resolution, alloc: Allocated, tools: Tools, process: Process
+        self,
+        resolution: kinds.Resolution,
+        alloc: Allocated,
+        tools: Tools,
+        process: Process,
+        tmp: str | None,
     ) -> selfcheck.SelfCheck:
-        """The self-check, then the created tmpdir recorded on the session. When recording
-        fails, the tmpdir is removed (with its pin) and the pin closed before the error is
-        re-raised: the run's ``Validated`` never exists, so ``_cleanup`` cannot."""
-        check = check_sandbox(resolution, alloc, tools, process)
+        """The self-check, then the created tmpdir recorded on the session. The created path
+        must be ``tmp``, the one planned at step 5 (path rules, ``TMPDIR``): otherwise it is
+        removed and the launch refused (``tmpdir_unsafe``). When recording fails, the tmpdir
+        is removed (with its pin) and the pin closed before the error is re-raised: the run's
+        ``Validated`` never exists, so ``_cleanup`` cannot."""
+        check = check_sandbox(resolution, alloc, tools, process, tmp)
+        if check.tmpdir is not None and check.tmpdir != tmp:
+            _discard_tmpdir(alloc.csession_id, check.tmpdir_pin)
+            raise tmpdir.TmpdirUnsafe(
+                f"private temporary directory unsafe: {check.tmpdir} is not the planned {tmp}",
+                hint="run again: the root is chosen anew at the next launch",
+            )
         if check.tmpdir is not None:
             try:
                 self.st.update_session(alloc.csession_id, tmp_dir=check.tmpdir)
@@ -1706,7 +1729,7 @@ def checks(
     plugins = check_plugins(rules, req.plugin_dirs, writable, process.caller_cwd)
     effects.record_plugin_dirs(plugins)
     check_hook_interpreter(process, writable)
-    check_tmpdir(resolution, alloc)
+    check_tmpdir(resolution, alloc, tmp)
     tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool)
     notes_tool, notes_problem = resolve_notes(cfg, resolution, process, writable or NO_SANDBOX)
     version_warnings = effects.claude_version(
@@ -1723,7 +1746,7 @@ def checks(
     generated = generated_entries(resolution, tools, git_dirs, process)
     if isolated:
         rules.check_generated(generated)
-    check = effects.sandbox(resolution, alloc, tools, process)
+    check = effects.sandbox(resolution, alloc, tools, process, tmp)
     warnings += check.warnings
     effects.warn(check.warnings)
     isolation = None
@@ -2203,14 +2226,15 @@ class Prepared:
 def secret_index(values: frozenset[str]) -> bytes:
     """The run's ``contains_secret`` index. Values over ``secretindex.VALUES_MAX_BYTES`` in
     total fail the launch: no end reason names this, and the values come from the
-    environment variables the configured ``claude_auth_env`` and ``secret_env`` names select,
-    so it is ``config_invalid``."""
+    ``claude_auth_env`` credential variables and the configured ``secret_env`` names, so it
+    is ``config_invalid``."""
     try:
         return secretindex.build(values)
     except ValueError as exc:
         raise LaunchValidationError(
             f"secret values exceed {secretindex.VALUES_MAX_BYTES // 1024} KiB: the values of"
-            " the claude_auth_env and secret_env variables and the run secret are too large"
+            " the claude_auth_env credential and secret_env variables and the run secret are"
+            " too large"
             " to index for contains_secret",
             end_reason="config_invalid",
         ) from exc
@@ -2248,7 +2272,7 @@ def notes_conf(
         v.notes_tool.name, cfg.notes_context_cmd, repo=resolution.repo, labels=labels
     )
     path = sanitize_path(v.session_env.env.get("PATH", ""))
-    names = frozenset((*cfg.secret_env, *cfg.claude_auth_env, *v.session_env.auth_names))
+    names = frozenset((*cfg.secret_env, *cfg.claude_auth_env, *v.session_env.credential_names))
     conf = notes.NotesConf(
         argv=argv,
         executable=v.notes_tool.path,
