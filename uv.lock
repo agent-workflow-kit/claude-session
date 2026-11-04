@@ -50,7 +50,7 @@ wheels = [
 
 [[package]]
 name = "claude-session"
-version = "0.38.3"
+version = "0.38.4"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
