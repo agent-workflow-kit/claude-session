@@ -248,3 +248,20 @@ def test_the_size_cap_is_bounded_to_one_mib(tmp_path: Path, state: Path, work: P
     assert run.code == 0, run.proc.stderr
     conf = json.loads((run.private_run / "hookconf.json").read_text())["notes"]
     assert conf["max_bytes"] == notes.MAX_BYTES_MAX == 1 << 20
+
+
+def test_notes_output_over_the_cap_is_truncated_and_not_a_failure(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    cmd = notes_script(tmp_path, "printf 'n%.0s' $(seq 1 300); echo\n")
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, STOP, result_step()],
+        config=FAST + f"notes_context_cmd: [{cmd}]\nnotes_context_max_bytes: 100\n",
+    )
+    assert run.code == 0, run.proc.stderr
+    (context,) = contexts(run.fake_log())
+    assert f"\n{'n' * 100}\n[truncated]\n</untrusted id=" in context
+    assert notes_records(state) == []

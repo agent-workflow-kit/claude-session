@@ -25,8 +25,15 @@ def gateway(**answer: Any) -> FakeGateway:
     return gw
 
 
-def require(gw: FakeGateway, minimum: str = "2.1.312") -> str:
+def probe(gw: FakeGateway, minimum: str = "2.1.312") -> claude_version.Checked:
     return claude_version.require(CLAUDE, ENVIRON, gw, minimum, writable=NOTHING)
+
+
+def require(gw: FakeGateway, minimum: str = "2.1.312") -> str | None:
+    """The version text of a check that passed with no warning."""
+    result = probe(gw, minimum)
+    assert result.warning is None
+    return result.text
 
 
 # Parsing and comparing, hostile output included
@@ -125,12 +132,20 @@ def test_the_minimum_comes_from_the_argument() -> None:
     "stdout",
     ["Claude Code\n", "v2.1.312\n", "2.1.312-beta\n", "\x1b[31m\n", "٢.١.٣١٢\n"],
 )
-def test_a_version_that_cannot_be_read_fails_closed(stdout: str) -> None:
-    """Conservative: a version that cannot be compared is not known to be new enough."""
-    with pytest.raises(LaunchValidationError) as info:
-        require(gateway(stdout=stdout))
-    assert info.value.end_reason == "claude_too_old"
-    assert "no version" in info.value.message
+def test_a_version_that_cannot_be_read_warns_and_does_not_block(stdout: str) -> None:
+    """A version that cannot be compared is unknown, not too old: the launch goes on."""
+    result = probe(gateway(stdout=stdout))
+    assert result.text is None
+    assert result.warning is not None
+    assert result.warning.startswith("claude_version_unknown: ")
+    assert "no version" in result.warning
+    assert not result.not_run and result.detail is not None and result.detail in result.warning
+
+
+def test_output_naming_version_is_not_mistaken_for_a_probe_that_could_not_run() -> None:
+    """Whether the probe ran is a field, never read from the (untrusted) output."""
+    result = probe(gateway(stdout="usage: claude --version: unknown option\n"))
+    assert result.warning is not None and not result.not_run
 
 
 @pytest.mark.parametrize(
@@ -145,30 +160,37 @@ def test_a_version_that_cannot_be_read_fails_closed(stdout: str) -> None:
         ({"stdout": " \n", "stderr": "boom\n"}, "printed nothing; stderr: 'boom'"),
         ({"error": PermissionError(13, "Permission denied")}, "could not start: Permission denied"),
         ({"error": OSError(8, "Exec format error")}, "could not start: Exec format error"),
-        ({"timeout": True}, "did not finish within 10 s"),
+        ({"timeout": True}, "did not finish within 5 s"),
     ],
 )
-def test_a_claude_that_cannot_run_its_version_fails_claude_not_found_naming_why(
+def test_a_claude_that_cannot_run_its_version_warns_naming_why_and_does_not_block(
     answer: dict[str, Any], reason: str
 ) -> None:
-    """A ``claude_bin`` that is not a working program (not a valid binary, a missing
-    interpreter, a hang) fails here rather than at spawn (``launch_interrupted``), saying
-    which failure it was, with its own hint (not "install Claude Code")."""
-    with pytest.raises(LaunchValidationError) as info:
-        require(gateway(**answer))
-    error = info.value
-    assert error.end_reason == "claude_not_found"
-    assert CLAUDE.path in error.message and "--version" in error.message
-    assert reason in error.message
-    assert error.hint == claude_version.NOT_RUN_HINT
-    assert "install Claude Code" not in launch.failure_message(error)
+    """A transient or odd ``--version`` failure (a hang, a missing interpreter, a non-zero
+    exit) must not block launches: a ``claude_version_unknown`` warning says which failure
+    it was. A ``claude`` that truly cannot be found is refused earlier (``check_tools``)."""
+    result = probe(gateway(**answer))
+    assert result.text is None
+    warning = result.warning
+    assert warning is not None and warning.startswith("claude_version_unknown: ")
+    assert CLAUDE.path in warning and "--version" in warning
+    assert reason in warning
+    assert claude_version.NOT_RUN_HINT in warning
+    assert "not verified" in warning
+    assert result.not_run and result.detail is not None
+    assert result.detail in warning and claude_version.UNKNOWN_CODE not in result.detail
+
+
+def test_the_probe_is_short_so_an_unknown_version_never_stalls_a_launch_long() -> None:
+    assert claude_version.PROBE_TIMEOUT + claude_version.KILL_GRACE <= 6.0
+    gw = gateway(timeout=True)
+    probe(gw)
+    assert gw.calls[0].timeout == claude_version.PROBE_TIMEOUT
 
 
 def test_the_stderr_line_shown_is_stripped_of_control_characters_and_capped() -> None:
     stderr = "\x1b]0;pwned\x07" + "z" * 5000 + "\n"
-    with pytest.raises(LaunchValidationError) as info:
-        require(gateway(returncode=2, stderr=stderr))
-    message = info.value.message
+    message = probe(gateway(returncode=2, stderr=stderr)).warning or ""
     assert "\x1b" not in message and "\x07" not in message
     assert "z" * claude_version.MAX_TEXT not in message
     assert "z" * (claude_version.MAX_TEXT - 20) in message
@@ -176,11 +198,9 @@ def test_the_stderr_line_shown_is_stripped_of_control_characters_and_capped() ->
 
 def test_output_without_a_version_has_its_own_hint() -> None:
     """``min_claude_version`` cannot help a program whose output holds no version."""
-    with pytest.raises(LaunchValidationError) as info:
-        require(gateway(stdout="Claude Code\n"))
-    assert info.value.end_reason == "claude_too_old"
-    assert info.value.hint == claude_version.NO_VERSION_HINT
-    assert "min_claude_version" not in launch.failure_message(info.value)
+    warning = probe(gateway(stdout="Claude Code\n")).warning or ""
+    assert claude_version.NO_VERSION_HINT in warning
+    assert "min_claude_version" not in warning
     with pytest.raises(LaunchValidationError) as older:
         require(gateway(stdout="2.1.311 (Claude Code)\n"))
     assert older.value.hint == claude_version.TOO_OLD_HINT
@@ -196,10 +216,9 @@ def test_output_without_a_version_has_its_own_hint() -> None:
     ],
 )
 def test_the_version_is_read_from_the_raw_first_line(stdout: str) -> None:
-    with pytest.raises(LaunchValidationError) as info:
-        require(gateway(stdout=stdout))
-    assert info.value.end_reason == "claude_too_old"
-    assert "no version" in info.value.message
+    result = probe(gateway(stdout=stdout))
+    assert result.text is None
+    assert "no version" in (result.warning or "")
 
 
 def test_a_tab_ends_the_version_rather_than_vanishing() -> None:
@@ -230,16 +249,20 @@ def test_the_message_never_carries_control_characters_or_unbounded_text() -> Non
     message = launch.failure_message(info.value)
     assert "\x1b" not in message and "\x07" not in message
     assert len(info.value.message) < 2 * claude_version.MAX_TEXT + len(CLAUDE.path) + 200
+    unreadable = probe(gateway(stdout="\x1b]0;pwned\x07" + "y" * 5000)).warning or ""
+    assert "\x1b" not in unreadable and "\x07" not in unreadable
+    assert len(unreadable) < 3 * claude_version.MAX_TEXT + len(CLAUDE.path) + 400
 
 
-def test_with_no_path_entry_left_nothing_runs_and_it_fails_closed(tmp_path: Any) -> None:
+def test_with_no_path_entry_left_nothing_runs_and_it_warns(tmp_path: Any) -> None:
     gw = FakeGateway()
     writable = pathrules.SessionWritable([str(tmp_path)])
-    with pytest.raises(LaunchValidationError) as info:
-        claude_version.require(CLAUDE, {"PATH": str(tmp_path)}, gw, "2.1.312", writable=writable)
+    result = claude_version.require(
+        CLAUDE, {"PATH": str(tmp_path)}, gw, "2.1.312", writable=writable
+    )
     assert gw.calls == []
-    assert info.value.end_reason == "claude_not_found"
-    assert "PATH" in info.value.message
+    assert result.text is None
+    assert "PATH" in (result.warning or "")
 
 
 # The interpreter of a script claude (one level: its #! line)

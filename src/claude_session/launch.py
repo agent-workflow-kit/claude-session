@@ -1284,12 +1284,12 @@ def check_claude_version(
     process: Process,
     claude: pathrules.ResolvedTool,
     writable: Callable[[str], bool],
-) -> str:
-    """``claude --version`` against ``min_claude_version`` (``claude_too_old``;
-    ``claude_not_found`` when it cannot run), with ``claude_version.require``: in ``/``, a
-    minimal environment and its own process group. Its ``PATH`` is the one the tools were
-    looked up on (``env.path_prepend``, then the caller's) without any entry under
-    ``writable``. Returns the version text."""
+) -> claude_version.Checked:
+    """``claude --version`` against ``min_claude_version`` (``claude_too_old``; a version
+    that cannot be determined is only a ``claude_version_unknown`` warning in the result),
+    with ``claude_version.require``: in ``/``, a minimal environment and its own process
+    group. Its ``PATH`` is the one the tools were looked up on (``env.path_prepend``, then
+    the caller's) without any entry under ``writable``."""
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
     environ = {**process.environ, "PATH": ":".join(entries)}
     return claude_version.require(
@@ -1530,8 +1530,9 @@ class Effects:
         whose ``#!`` interpreter, as the launch's probe would find it, is under one of them
         or cannot be checked (``claude_version.check_interpreter``). Otherwise
         ``check_claude_version`` as a launch makes it, the probe's ``PATH`` without those
-        paths either; a ``claude_not_found`` is then only a warning when that ``PATH`` lost
-        entries the launch's probe keeps (the launch may well run it)."""
+        paths either; when that probe could not run (``Checked.not_run``) and its ``PATH``
+        lost entries the launch's probe keeps, the ``claude_version_unknown`` warning becomes
+        the not-probed one (the launch may well run it)."""
         known = dry_run()
         if known is None:
             why = "the permission profile or write_dirs are not known"
@@ -1554,15 +1555,15 @@ class Effects:
                 end_reason="claude_not_found",
                 hint=HINTS["claude_not_found"],
             )
-        try:
-            check_claude_version(cfg, resolution, process, claude, guard)
-        except LaunchValidationError as error:
-            dropped = set(_probe_entries(entries, writable)) - set(_probe_entries(entries, guard))
-            if error.end_reason != "claude_not_found" or not dropped:
-                raise
-            why = f"{error.message}; PATH entries under session-writable paths were dropped"
+        checked = check_claude_version(cfg, resolution, process, claude, guard)
+        if checked.warning is None:
+            return []
+        dropped = set(_probe_entries(entries, writable)) - set(_probe_entries(entries, guard))
+        if dropped and checked.not_run:
+            # It could not run, and the dry run's PATH lost entries the launch's probe keeps.
+            why = f"{checked.detail}; PATH entries under session-writable paths were dropped"
             return [VERSION_NOT_PROBED.format(why=why)]
-        return []
+        return [checked.warning]
 
 
 class Recording(Effects):
@@ -1634,6 +1635,11 @@ class Recording(Effects):
                 raise
         return check
 
+    def warn(self, warnings: Sequence[str]) -> None:
+        """Step-5 warnings are recorded on the run as they are found, so a run that a later
+        check ends ``not-started`` keeps them (``add_run_warnings`` keeps each once)."""
+        self.st.add_run_warnings(self.alloc.csession_id, self.alloc.run, warnings)
+
     def claude_version(
         self,
         cfg: Config,
@@ -1645,8 +1651,8 @@ class Recording(Effects):
     ) -> list[str]:
         """The launch's version check: the ``claude`` ``check_tools`` accepted, its probe's
         ``PATH`` without the run's session-writable paths (``writable``)."""
-        check_claude_version(cfg, resolution, process, tools.claude, writable)
-        return []
+        checked = check_claude_version(cfg, resolution, process, tools.claude, writable)
+        return [] if checked.warning is None else [checked.warning]
 
 
 def _discard_tmpdir(csession_id: str, pin: int | None) -> None:
@@ -2251,11 +2257,9 @@ def notes_conf(
     by the hook's budget (``notes.TIMEOUT_MAX``), the size cap bounded by
     ``notes.MAX_BYTES_MAX`` and the sources (duplicates dropped).
 
-    TODO(#28): ``start`` freezes ``notes_context_cmd``, ``notes_context_max_bytes`` and
-    ``notes_context_sources`` with the launch spec (``lifecycle.FROZEN_CONFIG``), and
-    adoption takes them from there: interface.md (start) lists only the notes timeout among
-    the values adoption reads from the current config. The kind's ``notes_context`` is
-    already part of the resolved profile."""
+    ``cfg`` is the launch's config: at adoption the notes settings in it are those ``start``
+    froze (``lifecycle.FROZEN_CONFIG``), never the current config's. The kind's
+    ``notes_context`` is part of the resolved profile."""
     if v.notes_tool is None:
         return None, []
     labels, problems = [], []

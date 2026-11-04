@@ -53,7 +53,6 @@ class FakeRunner(FakeGateway):
         new_process_group: bool = False,
         kill_grace: float | None = None,
         executable: str | None = None,
-        kill_over_bytes: int | None = None,
         kill_group_on_exit: bool = False,
         output_limit: int | None = None,
         discard_output: bool = False,

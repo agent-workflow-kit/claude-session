@@ -18,11 +18,11 @@ fully resolved kind profile with its origins (``env.set`` values included, which
 ``resolved_json`` leaves out), the resolved cwd and plugin directories, the permission
 profile (content, or a file profile's snapshot), the config values a session uses beyond
 those the adopting ``exec`` reads from the config again (``claude_auth_env``,
-``secret_env`` and the caps), the resolved ``read_dirs``, ``write_dirs`` and profile write
-paths, and the per-invocation flags. It is private (never in the session directory) and
-0600, and it may hold credentials (``env.set`` values): it is deleted once the adopting
-``exec`` has read it, when ``start`` fails after writing it, and when the run expires
-unadopted (``discard_spec``).
+``secret_env``, the caps and the four ``notes_context_*`` settings), the resolved
+``read_dirs``, ``write_dirs`` and profile write paths, and the per-invocation flags. It is
+private (never in the session directory) and 0600, and it may hold credentials (``env.set``
+values): it is deleted once the adopting ``exec`` has read it, when ``start`` fails after
+writing it, and when the run expires unadopted (``discard_spec``).
 
 The adopting ``exec`` (``adopt``) runs the compare-and-set (``Store.adopt``; refusals exit 20
 ``already_adopted`` or ``expired``, an expired pending run is finalized ``never_adopted``
@@ -70,10 +70,12 @@ from typing import Any
 from . import (
     config,
     dryrun,
+    durations,
     gitinfo,
     ids,
     kinds,
     launch,
+    notes,
     outcomefile,
     pathrules,
     permission_profiles,
@@ -103,15 +105,19 @@ SPEC_NAME = "launch-spec.json"
 SPEC_VERSION = 1
 SPEC_MAX_BYTES = 8 << 20
 # Config values frozen in the spec (the adopting exec reads the rest from the config again).
-# TODO(#38): decide whether notes_context_cmd, notes_context_max_bytes and
-# notes_context_sources are frozen at start (interface.md lists only the notes timeouts as
-# read again at adoption).
+# The notes-context settings are frozen with the rest of the launch: the command, its timeout,
+# its size cap and its sources are what ``start`` validated (interface.md, Flags at start and
+# adoption).
 FROZEN_CONFIG = (
     "claude_auth_env",
     "secret_env",
     "summary_max_bytes",
     "artifact_max_bytes",
     "input_max_bytes",
+    "notes_context_cmd",
+    "notes_context_timeout",
+    "notes_context_max_bytes",
+    "notes_context_sources",
 )
 NO_TTY_HINT = "place the start argv in a terminal (stdin and stdout must be TTYs)"
 SPEC_KEYS = frozenset(
@@ -845,6 +851,25 @@ def _invocation(record: Mapping[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _notes_values_ok(values: Mapping[str, Any]) -> bool:
+    """The frozen ``notes_context_*`` values, checked as the config checks them: a non-empty
+    argv of strings without control characters, a positive timeout of at most
+    ``durations.MAX_SECONDS``, a size cap that is a count and sources the notes code knows."""
+    cmd, timeout = values["notes_context_cmd"], values["notes_context_timeout"]
+    cap, sources = values["notes_context_max_bytes"], values["notes_context_sources"]
+    return (
+        isinstance(cmd, list)
+        and bool(cmd)
+        and all(isinstance(item, str) and not config.has_controls(item) for item in cmd)
+        and type(timeout) in (int, float)
+        and 0 < timeout <= durations.MAX_SECONDS
+        and type(cap) is int
+        and 0 <= cap <= MAX_INTEGER
+        and isinstance(sources, list)
+        and all(isinstance(source, str) and source in notes.SOURCES for source in sources)
+    )
+
+
 def _frozen_config(frozen: Frozen) -> dict[str, Any]:
     """The config values ``start`` froze, checked as the config checks them."""
     values = frozen.config_values
@@ -857,7 +882,12 @@ def _frozen_config(frozen: Frozen) -> dict[str, Any]:
         type(values.get(key)) is int and 1 <= values[key] <= MAX_INTEGER
         for key in ("summary_max_bytes", "artifact_max_bytes", "input_max_bytes")
     )
-    if set(values) != set(FROZEN_CONFIG) or not names_ok or not caps_ok:
+    if (
+        set(values) != set(FROZEN_CONFIG)
+        or not names_ok
+        or not caps_ok
+        or not _notes_values_ok(values)
+    ):
         raise sessiondir.SessionDirUnsafe("the launch spec's config values are unusable")
     return {key: values[key] for key in FROZEN_CONFIG}
 
