@@ -217,7 +217,12 @@ def test_step_2_runs_no_git_when_another_kinds_paths_are_not_known(
 
 
 def build(
-    tmp_path: Path, cfg: config.Config, kind: str, path: str, guard: pathrules.Guard
+    tmp_path: Path,
+    cfg: config.Config,
+    kind: str,
+    path: str,
+    guard: pathrules.Guard,
+    exe_dir: str = "/opt/cs/bin",
 ) -> envbuild.SessionEnv:
     session = tmp_path / "state" / "sessions" / "cs-x"
     res = resolution(cfg, kind)
@@ -229,7 +234,7 @@ def build(
         csession_id="cs-x",
         csession_dir=str(session),
         cwd=str(tmp_path / "cwd"),
-        exe_dir="/opt/cs/bin",
+        exe_dir=exe_dir,
         session_writable=own,
         guard=guard,
     )
@@ -252,6 +257,18 @@ def test_a_trusted_session_path_drops_entries_under_the_guard(tmp_path: Path) ->
     assert built.env["PATH"] == "/opt/cs/bin:/usr/bin::rel:/bin"  # the rest kept as it was
     (warning,) = built.warnings
     assert str(other) in warning and "kind 'scribe'" in warning
+
+
+@pytest.mark.parametrize("kind", ["implement", "review"])
+def test_an_exe_dir_under_the_guard_is_refused_for_every_run(tmp_path: Path, kind: str) -> None:
+    # Not dropped: the injected hooks run the claude-session executable from it.
+    cfg = load(tmp_path, CONFIG)
+    exe_dir = planted(tmp_path, "claude-session")
+    guard = launch.tool_guard(cfg, process(tmp_path), git_cwd=None)
+    with pytest.raises(LaunchValidationError) as info:
+        build(tmp_path, cfg, kind, "/usr/bin:/bin", guard, exe_dir=str(exe_dir))
+    assert info.value.end_reason == "unsafe_path"
+    assert "kind 'scribe'" in info.value.message
 
 
 def test_a_path_set_by_env_set_is_filtered_too(tmp_path: Path) -> None:
