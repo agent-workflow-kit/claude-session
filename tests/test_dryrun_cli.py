@@ -695,12 +695,11 @@ def test_kinds_never_runs_a_tool_under_a_configured_profile_write_path(
     assert any("a launch refuses it" in p for p in review["sandbox_problems"])
 
 
-def test_kinds_words_a_trusted_kinds_unrun_claude_as_not_probed(
+def test_kinds_words_a_trusted_kinds_claude_as_refused_by_the_launch(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
-    """A launch of a trusted kind checks no session-writable path, so it would not refuse a
-    ``claude`` under a trusted kind's ``write_dirs``; ``kinds`` still never runs it, and says
-    so."""
+    """Every launch, trusted kinds' too, refuses a ``claude`` under any kind's ``write_dirs``
+    (a trusted kind's included); ``kinds`` never runs it and says the launch refuses it."""
     marker = tmp_path / "ran"
     planted = home() / "td" / "bin"
     plant(planted, marker)
@@ -717,8 +716,7 @@ def test_kinds_words_a_trusted_kinds_unrun_claude_as_not_probed(
     report = json.loads(proc.stdout)
     validate(report, KINDS)
     claude = [w for w in report["warnings"] if w.startswith("claude:")]
-    assert claude and all("not probed by a dry run" in w for w in claude), claude
-    assert not any("a launch refuses it" in w for w in claude)
+    assert claude and all("a launch refuses it" in w for w in claude), claude
 
 
 def test_kinds_refuses_a_claude_under_any_isolated_kinds_cwd(
@@ -810,6 +808,33 @@ def test_a_failing_dry_run_never_runs_a_tool_under_a_git_dir_write_path(
     assert plan["would_fail"] == "unsafe_path", plan["warnings"]
     assert not marker.exists()
     assert plan["sandbox"]["available"] is False
+    assert any("a launch refuses it" in p for p in plan["sandbox"]["problems"])
+
+
+def test_a_dry_run_never_probes_a_tool_under_a_non_nearest_candidate_git_dir(
+    tmp_path: Path, tools: Path
+) -> None:
+    """Another kind's ``${GIT_DIR}`` entry stands for every directory git could take for the
+    git directory of the cwd (``gitinfo.candidate_dirs``), as in the launch, not only the
+    one the checks found: a tool under an enclosing repository's ``.git`` is not probed."""
+    outer = tmp_path / "outer"
+    work = outer / "sub" / "work"
+    git_repo(outer)
+    git_repo(work)
+    (work / "prompt.md").write_text("Do it.\n", encoding="utf-8")
+    marker = tmp_path / "ran"
+    planted = outer / ".git" / "tools" / "bin"
+    plant(planted, marker)
+    proc, plan = dry_run(
+        "respond",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config="kinds:\n  scribe:\n    write_dirs: ['${GIT_DIR}/tools']\n",
+        env={"PATH": f"{planted}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 12 and plan["would_fail"] == "unsafe_path", plan["warnings"]
+    assert not marker.exists(), marker.read_text()
     assert any("a launch refuses it" in p for p in plan["sandbox"]["problems"])
 
 
@@ -1589,9 +1614,10 @@ def plant_interp(directory: Path, marker: Path) -> Path:
 def test_a_dry_run_version_probe_never_runs_an_interpreter_from_a_write_dir(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
-    """S5 for the launch check: a ``#!/usr/bin/env`` claude whose interpreter a trusted
-    launch would find in the kind's ``write_dirs`` is not run by a dry run: a warning, and
-    no ``would_fail`` the launch would not have."""
+    """S5 for the launch check: a ``#!/usr/bin/env`` claude whose interpreter would be found
+    in a kind's ``write_dirs`` is never run: the version probe's ``PATH`` drops the entry (a
+    launch checks every kind's write paths, also for a trusted kind), so the version cannot
+    be read: the launch's ``claude_version_unknown`` warning, which a dry run predicts."""
     marker = tmp_path / "ran"
     planted = plant_interp(home() / "wd" / "bin", marker).parent
     (tools / "claude").write_text(f"#!/usr/bin/env {INTERP}\n", encoding="utf-8")
@@ -1606,16 +1632,17 @@ def test_a_dry_run_version_probe_never_runs_an_interpreter_from_a_write_dir(
     assert not marker.exists()
     assert proc.returncode == 0 and plan["would_fail"] is None
     assert any(
-        w.startswith("claude --version not run (not probed by a dry run") and INTERP in w
-        for w in plan["warnings"]
+        w.startswith("claude_version_unknown: ") and INTERP in w for w in plan["warnings"]
     ), plan["warnings"]
 
 
 def test_a_dry_run_claude_failing_only_for_the_dropped_path_entries_is_a_warning(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
-    """A trusted launch keeps the ``PATH`` entries under the kind's ``write_dirs``; the dry
-    run's probe drops them, so a ``claude`` that then cannot run is not predicted to fail."""
+    """The ``claude --version`` probe drops the ``PATH`` entries under any kind's
+    ``write_dirs``, also those of a trusted kind, so a ``claude`` that then cannot run is
+    the launch's ``claude_version_unknown`` warning, without the planted interpreter ever
+    running."""
     marker = tmp_path / "ran"
     planted = plant_interp(home() / "wd" / "bin", marker).parent
     (tools / "claude").write_text(f"#!/bin/sh\nexec {INTERP}\n", encoding="utf-8")
@@ -1630,9 +1657,7 @@ def test_a_dry_run_claude_failing_only_for_the_dropped_path_entries_is_a_warning
     assert not marker.exists()
     assert proc.returncode == 0 and plan["would_fail"] is None
     assert any(
-        w.startswith("claude --version not run (not probed by a dry run")
-        and "PATH entries under session-writable paths were dropped" in w
-        and "claude_version_unknown" not in w
+        w.startswith("claude_version_unknown: ") and "session-writable path" in w
         for w in plan["warnings"]
     ), plan["warnings"]
 
@@ -1703,3 +1728,80 @@ def test_a_planted_interpreter_is_never_run_by_a_dry_run_or_kinds(
     assert report["claude_version"] is None
     assert any("interpreter" in w for w in report["warnings"]), report["warnings"]
     assert not marker.exists(), marker.read_text()
+
+
+# Tools under another kind's write dir (the union of every kind's paths)
+
+CONFIG_OTHER_KIND = "kinds:\n  scribe:\n    write_dirs: ['~/td']\n"
+
+
+def test_a_dry_run_never_runs_a_sandbox_tool_planted_in_another_kinds_write_dir(
+    tmp_path: Path,
+    tools: Path,
+    work: Path,
+) -> None:
+    marker = tmp_path / "ran"
+    home = Path(os.environ["HOME"])
+    plant(home / "td" / "bin", marker)
+    proc, plan = dry_run(
+        "review",
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=CONFIG_OTHER_KIND,
+        env={"PATH": f"{home / 'td' / 'bin'}:{tools}:/usr/bin:/bin"},
+    )
+    assert not marker.exists()
+    assert proc.returncode == 12 and plan["would_fail"] == "unsafe_path"
+
+
+def test_kinds_never_runs_or_accepts_a_tool_planted_in_another_kinds_write_dir(
+    tmp_path: Path,
+    tools: Path,
+    work: Path,
+) -> None:
+    marker = tmp_path / "ran"
+    home = Path(os.environ["HOME"])
+    plant(home / "td" / "bin", marker)
+    proc = cli(
+        ["kinds", "--json", "--kind", "review"],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=CONFIG_OTHER_KIND,
+        env={"PATH": f"{home / 'td' / 'bin'}:{tools}:/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not marker.exists()
+    report = json.loads(proc.stdout)
+    validate(report, KINDS)
+    (review,) = report["kinds"]
+    assert review["sandbox_available"] is False
+    assert any("not run" in p or "refuses" in p for p in review["sandbox_problems"])
+
+
+@pytest.mark.parametrize("kind", ["implement", "review"])
+def test_claudes_interpreter_shadowed_from_another_kinds_write_dir_never_runs(
+    kind: str, tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """``#!/usr/bin/env cs-test-interp`` with a planted interpreter in another kind's write
+    dir EARLIER on ``PATH`` and the real one later: the session never gets that entry (a
+    trusted run drops it, an isolated run is refused ``unsafe_path``) and nothing runs it."""
+    marker = tmp_path / "planted-ran"
+    planted = plant_interp(home() / "td" / "bin", marker).parent
+    real = plant_interp(tmp_path / "real", tmp_path / "real-ran").parent
+    (tools / "claude").write_text(f"#!/usr/bin/env {INTERP}\n", encoding="utf-8")
+    proc, plan = dry_run(
+        kind,
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        config=CONFIG_OTHER_KIND,
+        env={"PATH": f"{planted}:{real}:{tools}:/usr/bin:/bin"},
+    )
+    assert not marker.exists(), marker.read_text()
+    if plan["would_fail"] is None:
+        assert str(planted) not in plan["profile"]["path"].split(":")
+        assert any(str(planted) in w and "dropped" in w for w in plan["warnings"])
+    else:
+        assert plan["would_fail"] == "unsafe_path", plan["warnings"]

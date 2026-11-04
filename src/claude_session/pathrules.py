@@ -329,6 +329,38 @@ class SessionWritable:
         return contains_any(path, self.paths)
 
 
+class Guard(SessionWritable):
+    """What no tool claude-session runs or hands a session may lie under (interface.md, PATH
+    rules): session-writable paths, each kept with who may write it (``sources``: a label
+    such as ``kind 'implement'`` and its paths), so a refusal can name the kind or recorded
+    run whose write path covers the tool (``owner``). ``last`` is the last path it found
+    session-writable (the hop ``writable_hop`` stopped at)."""
+
+    def __init__(self, sources: Iterable[tuple[str, Iterable[str]]]) -> None:
+        self._sources = [(label, SessionWritable(paths)) for label, paths in sources]
+        super().__init__(path for _, paths in self._sources for path in paths.paths)
+        self.last: str | None = None
+
+    @property
+    def sources(self) -> list[tuple[str, tuple[str, ...]]]:
+        return [(label, paths.paths) for label, paths in self._sources]
+
+    def __call__(self, path: str) -> bool:
+        if super().__call__(path):
+            self.last = path
+            return True
+        return False
+
+    def owner(self, path: str) -> str | None:
+        """Who may write ``path``: ``'<write path>' (<label>)`` for the first source holding
+        it, or None."""
+        for label, paths in self._sources:
+            for root in paths.paths:
+                if SessionWritable([root])(path):
+                    return f"{_shown(root)!r} ({label})"
+        return None
+
+
 def session_writable(
     *,
     session_dir: str,

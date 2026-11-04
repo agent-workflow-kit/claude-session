@@ -199,6 +199,8 @@ class SessionEnv:
     auth_names: tuple[str, ...]
     credential_names: tuple[str, ...]
     secret_names: tuple[str, ...]
+    # A trusted run's PATH entries dropped because they lie under ``guard`` (one per entry).
+    warnings: tuple[str, ...] = ()
 
 
 def is_credential_name(name: str) -> bool:
@@ -251,8 +253,15 @@ def build(
     git_dir: str | None = None,
     tmpdir: str | None = None,
     session_writable: Callable[[str], bool] | None = None,
+    guard: pathrules.Guard | None = None,
 ) -> SessionEnv:
     """Build the session environment from ``environ`` (never modified).
+
+    ``guard`` (the launch's ``launch.tool_guard``: the run's own, every kind's and every
+    recorded isolated run's session-writable paths) replaces ``session_writable`` for the
+    ``PATH`` checks: an isolated run's ``PATH`` entry or any run's ``exe_dir`` under it is
+    ``unsafe_path``; a trusted run's absolute ``PATH`` entry under it is dropped, with a
+    warning (``SessionEnv.warnings``), and its other entries are kept as they are.
 
     ``exe_dir`` is the directory of the running ``claude-session`` executable, ``git_dir`` the
     cwd's git common directory (None: none), ``tmpdir`` the private temporary directory of a
@@ -260,9 +269,9 @@ def build(
     path check (``pathrules.session_writable``); required for isolated runs (None raises
     ``ValueError``). Raises ``UsageError`` for an invalid ``env.set`` or ``env.path_prepend``
     entry (the message names the key, never a value), ``LaunchValidationError``
-    (``unsafe_path``) for an isolated run's ``PATH`` entry or ``exe_dir`` inside a
-    session-writable path, and ``ValueError`` for an ``exe_dir`` that is not one absolute
-    path.
+    (``unsafe_path``) for an isolated run's ``PATH`` entry, or any run's ``exe_dir``, inside a
+    session-writable path (for a trusted run: under ``guard``), and ``ValueError`` for an
+    ``exe_dir`` that is not one absolute path.
     """
     # exec (launch.build_env) passes exe_dir (from the absolute argv[0]), git_dir (from
     # gitinfo) and the private tmpdir, and builds the log and audit redaction set and the
@@ -330,18 +339,20 @@ def build(
 
     # 6. Isolated runs: PATH sanitized and checked, loader variables removed. The executable
     #    directory is prepended after sanitizing (interface.md, Environment at adoption).
+    warnings: list[str] = []
     if isolated:
         assert session_writable is not None
+        checked = guard if guard is not None else session_writable
         entries = pathrules.sanitize_path(":".join(path))
-        pathrules.check_path_entries(entries, session_writable)
-        if pathrules.writable_hop(exe_dir, session_writable) is not None:
-            raise LaunchValidationError(
-                "the claude-session executable directory is inside a session-writable path",
-                end_reason="unsafe_path",
-            )
+        pathrules.check_path_entries(entries, checked)
+        _check_exe_dir(exe_dir, checked)
         path = [os.path.realpath(entry) for entry in entries]
         for name in [n for n in env if n in LOADER_DROP or n.startswith(LOADER_DROP_PREFIX)]:
             del env[name]
+    elif guard is not None:
+        # Refused, not dropped: the injected hooks run the claude-session executable.
+        _check_exe_dir(exe_dir, guard)
+        path, warnings = _outside(":".join(path), guard)
     env["PATH"] = ":".join([exe_dir, *path])
     # 7. Git hardening (after step 5: it wins over env.set).
     if profile.reads_third_party:
@@ -368,7 +379,42 @@ def build(
         auth_names=auth_names,
         credential_names=credential_names,
         secret_names=secret_names,
+        warnings=tuple(warnings),
     )
+
+
+def _check_exe_dir(exe_dir: str, checked: Callable[[str], bool]) -> None:
+    """``exe_dir`` (resolved hop by hop: ``pathrules.writable_hop``) must lie outside
+    ``checked``; for a ``pathrules.Guard`` the message names who may write it. Raises
+    ``LaunchValidationError`` (``unsafe_path``)."""
+    hop = pathrules.writable_hop(exe_dir, checked)
+    if hop is None:
+        return
+    owner = checked.owner(hop) if isinstance(checked, pathrules.Guard) else None
+    raise LaunchValidationError(
+        f"the claude-session executable directory {exe_dir!r} is inside a session-writable"
+        " path" + ("" if owner is None else f" ({owner})"),
+        end_reason="unsafe_path",
+    )
+
+
+def _outside(value: str, guard: pathrules.Guard) -> tuple[list[str], list[str]]:
+    """A trusted run's ``PATH`` entries (``value``) without the absolute ones under
+    ``guard`` (resolved hop by hop: ``pathrules.writable_hop``), and a warning for each
+    entry dropped. Empty and relative entries are kept as they are."""
+    kept: list[str] = []
+    warnings: list[str] = []
+    for entry in value.split(":") if value else []:
+        hop = pathrules.writable_hop(entry, guard) if os.path.isabs(entry) else None
+        if hop is None:
+            kept.append(entry)
+            continue
+        owner = guard.owner(hop)
+        warnings.append(
+            f"PATH entry {entry!r} dropped: it is inside a session-writable path"
+            + ("" if owner is None else f" ({owner})")
+        )
+    return kept, warnings
 
 
 def secret_values(

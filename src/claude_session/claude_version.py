@@ -72,14 +72,18 @@ def probe_path(environ: Mapping[str, str], writable: Callable[[str], bool]) -> l
     ]
 
 
-def _unknown(claude: ResolvedTool, why: str) -> LaunchValidationError:
+def _unknown(claude: ResolvedTool, why: str, what: str) -> LaunchValidationError:
     return LaunchValidationError(
-        f"claude's #! line cannot be checked ({why}): {claude.path!r}", end_reason="unsafe_path"
+        f"{what}'s #! line cannot be checked ({why}): {claude.path!r}", end_reason="unsafe_path"
     )
 
 
 def check_interpreter(
-    claude: ResolvedTool, path_entries: Sequence[str], writable: Callable[[str], bool]
+    claude: ResolvedTool,
+    path_entries: Sequence[str],
+    writable: Callable[[str], bool],
+    *,
+    what: str = "claude",
 ) -> None:
     """A script ``claude``'s interpreter is not session-writable: the first line of the
     resolved realpath (at most ``SHEBANG_MAX`` bytes, as the kernel reads it) is read; when
@@ -91,30 +95,31 @@ def check_interpreter(
     more than one argument to ``env``, a relative interpreter, a line longer than
     ``SHEBANG_MAX`` or not UTF-8, a ``claude`` that cannot be read) cannot be checked and is
     refused (fail closed). An interpreter that is not found passes: running fails then.
-    Raises ``LaunchValidationError`` (``unsafe_path``)."""
+    The launch checks the notes command's program the same way (``what`` names it in the
+    messages). Raises ``LaunchValidationError`` (``unsafe_path``)."""
     try:
         with open(claude.path, "rb") as file:
             head = file.read(SHEBANG_MAX)
     except OSError as error:
-        raise _unknown(claude, f"cannot read it: {error.strerror or error}") from None
+        raise _unknown(claude, f"cannot read it: {error.strerror or error}", what) from None
     if not head.startswith(b"#!"):
         return
     line, newline, _ = head[2:].partition(b"\n")
     if not newline:
-        raise _unknown(claude, f"no end of line within {SHEBANG_MAX} bytes")
+        raise _unknown(claude, f"no end of line within {SHEBANG_MAX} bytes", what)
     try:
         text = line.decode("utf-8")
     except UnicodeDecodeError:
-        raise _unknown(claude, "not UTF-8") from None
+        raise _unknown(claude, "not UTF-8", what) from None
     # As the kernel splits it: the interpreter, then at most one argument (the rest).
     interpreter, _, rest = text.strip(" \t").replace("\t", " ").partition(" ")
     argument = rest.strip(" ")
     if not os.path.isabs(interpreter):
-        raise _unknown(claude, "not an absolute interpreter")
+        raise _unknown(claude, "not an absolute interpreter", what)
     hop = pathrules.writable_hop(interpreter, writable)
     if hop is not None:
         raise LaunchValidationError(
-            f"claude's #! interpreter is inside a session-writable path: {shown(interpreter)!r}"
+            f"{what}'s #! interpreter is inside a session-writable path: {shown(interpreter)!r}"
             + ("" if hop == interpreter else f" (through {shown(hop)!r})"),
             end_reason="unsafe_path",
         )
@@ -124,12 +129,12 @@ def check_interpreter(
     ):
         return
     if not argument or argument.startswith("-") or "=" in argument or " " in argument:
-        raise _unknown(claude, "env with options, assignments, or not exactly one name")
+        raise _unknown(claude, "env with options, assignments, or not exactly one name", what)
     try:
         pathrules.resolve_tool(argument, path_entries, writable)
     except LaunchValidationError as error:
         raise LaunchValidationError(
-            f"claude's #! interpreter {shown(argument)!r}: {error.message}",
+            f"{what}'s #! interpreter {shown(argument)!r}: {error.message}",
             end_reason="unsafe_path",
         ) from None
 

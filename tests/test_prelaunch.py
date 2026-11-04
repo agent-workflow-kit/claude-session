@@ -88,12 +88,13 @@ def run(
         secret_env=(),
         hook=toolhooks.PRE_LAUNCH,
         csession_id=SID,
+        guard=launch.NO_SANDBOX,
     )
     return toolhooks.run_pre_launch(
         gateway or SystemGateway(),
         entries,
         payload=lambda: payload,
-        sh=toolhooks.resolve_sh(env),
+        sh=toolhooks.resolve_sh(env, launch.NO_SANDBOX),
         env=env,
         cwd=str(root),
         kill_grace=kill_grace,
@@ -635,7 +636,11 @@ def test_each_entry_gets_a_fresh_payload(root: Path) -> None:
     gateway.on(["sh"])
     count = iter(range(100))
     env = toolhooks.hook_env(
-        dict(os.environ), secret_env=(), hook=toolhooks.PRE_LAUNCH, csession_id=SID
+        dict(os.environ),
+        secret_env=(),
+        hook=toolhooks.PRE_LAUNCH,
+        csession_id=SID,
+        guard=launch.NO_SANDBOX,
     )
     toolhooks.run_pre_launch(
         gateway,

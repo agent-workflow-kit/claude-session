@@ -795,13 +795,11 @@ def test_matching_carried_value_gives_no_warning(cfg_dir: Path) -> None:
     assert result.warnings == ()
 
 
-def test_kind_reads_third_party_lets_flags_set_the_profile(cfg_dir: Path) -> None:
-    # Without --reads-third-party there are no implications: the kind's values apply, and
-    # explicit flags (given now or carried) replace them as usual.
+def test_kind_reads_third_party_lets_a_flag_given_now_set_the_profile(cfg_dir: Path) -> None:
+    # A flag given now replaces the kind's value (audited `sandbox_lowered` at adoption); a
+    # carried one does not (test_carried_sandbox_off_never_beats_the_review_kind).
     now = resolve(load(cfg_dir), "review", flags={"sandbox": "off"})
     assert (now.profile.sandbox, now.origins["sandbox"]) == ("off", "flag")
-    carried = resolve(load(cfg_dir), "review", previous=kinds.Previous(None, {"sandbox": "off"}))
-    assert (carried.profile.sandbox, carried.origins["sandbox"]) == ("off", "previous_run")
 
 
 @pytest.mark.parametrize("value", [False, 0, "", "yes"])
@@ -1129,3 +1127,42 @@ def test_git_origin_url_runs_a_resolved_git_by_name() -> None:
     assert kinds.git_origin_url("/w", git="/opt/real/git", git_name="git", gw=gw)
     (call,) = gw.calls
     assert call.argv[0] == "git" and call.executable == "/opt/real/git"
+
+
+# reads_third_party from the kind profile: the same implications as the flag
+
+
+def test_carried_sandbox_off_never_beats_the_review_kind(cfg_dir: Path) -> None:
+    previous = kinds.Previous(
+        repo=None, flags={"sandbox": "off", "setting_sources": "user", "env_allowlist_only": []}
+    )
+    result = resolve(load(cfg_dir), "review", previous=previous)
+    assert result.profile.reads_third_party is True
+    assert result.origins["reads_third_party"] == "builtin"
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("required", "flag-implied")
+    assert (result.profile.setting_sources, result.origins["setting_sources"]) == (
+        [],
+        "flag-implied",
+    )
+    assert (result.profile.env.inherit, result.origins["env.inherit"]) == (False, "flag-implied")
+    assert any("--sandbox" in w and "reads_third_party" in w for w in result.warnings)
+
+
+def test_sandbox_given_now_still_beats_the_review_kind(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"sandbox": "off"})
+    result = resolve(load(cfg_dir), "review", previous=previous, flags={"sandbox": "preferred"})
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("preferred", "flag")
+
+
+def test_a_trusted_kind_still_carries_sandbox_off(cfg_dir: Path) -> None:
+    previous = kinds.Previous(repo=None, flags={"sandbox": "off"})
+    result = resolve(load(cfg_dir), "implement", previous=previous)
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("off", "previous_run")
+    assert result.warnings == ()
+
+
+def test_a_configured_third_party_kind_gets_the_same_rule(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "kinds:\n  triage:\n    reads_third_party: true\n    sandbox: preferred\n")
+    previous = kinds.Previous(repo=None, flags={"sandbox": "off"})
+    result = resolve(cfg, "triage", previous=previous)
+    assert (result.profile.sandbox, result.origins["sandbox"]) == ("required", "flag-implied")

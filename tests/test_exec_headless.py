@@ -45,10 +45,10 @@ sys.exit(main())
 """
 
 
-def claude_session_cmd() -> list[str]:
-    """The command that runs ``claude-session`` as the executable does, under the current
-    (test-private) ``pathrules.TMP_ROOT``."""
-    entry = ENTRY.format(tmp_root=pathrules.TMP_ROOT, exe=str(CLAUDE_SESSION))
+def claude_session_cmd(exe: Path = CLAUDE_SESSION) -> list[str]:
+    """The command that runs ``claude-session`` as the executable ``exe`` does, under the
+    current (test-private) ``pathrules.TMP_ROOT``."""
+    entry = ENTRY.format(tmp_root=pathrules.TMP_ROOT, exe=str(exe))
     return [sys.executable, "-c", entry]
 
 
@@ -131,13 +131,14 @@ def run_exec(
     scenario_extra: Mapping[str, Any] | None = None,
     timeout: float = 90,
     claude: Path | None = None,
+    exe: Path = CLAUDE_SESSION,
 ) -> Run:
     log = tmp_path / "fake.jsonl"
     scenario = write_json(tmp_path / "scenario.json", {"steps": steps, **(scenario_extra or {})})
     fake = claude or claude_bin(tmp_path / "fakebin", scenario, log)
     cfg = tmp_path / "config.yaml"
     cfg.write_text(f"claude_bin: {fake}\n{config}", encoding="utf-8")
-    argv = [*claude_session_cmd(), "exec", "--mode", "headless", "--json", "--config", str(cfg)]
+    argv = [*claude_session_cmd(exe), "exec", "--mode", "headless", "--json", "--config", str(cfg)]
     if prompt is not None:
         prompt_file = tmp_path / "prompt.md"
         prompt_file.write_text(prompt, encoding="utf-8")
@@ -965,6 +966,30 @@ def test_a_git_inside_a_write_dir_is_never_run(tmp_path: Path, state: Path, work
     )
     assert not marker.exists()
     assert (run.outcome["outcome"], run.outcome["end_reason"]) == ("not-started", "unsafe_path")
+
+
+def test_a_trusted_run_from_a_claude_session_in_another_kinds_write_dir_is_unsafe_path(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    # The claude-session executable lies in an isolated kind's write dir: its directory heads
+    # the session PATH and the injected hooks run it, so even a trusted run is refused.
+    exe_dir = tmp_path / "home" / "td" / "bin"
+    exe = script(exe_dir / "claude-session", CLAUDE_SESSION.read_text(encoding="utf-8"))
+    marker = tmp_path / "git-ran"
+    script(exe_dir / "git", f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, {"do": "bash", "command": "git status"}, STOP, result_step()],
+        args=["--kind", "implement", "--repo", "example.com/group/project"],
+        config=FAST + "kinds:\n  scribe:\n    write_dirs: ['~/td']\n",
+        env={"PATH": "/usr/bin:/bin"},
+        exe=exe,
+    )
+    assert not marker.exists()
+    assert (run.outcome["outcome"], run.outcome["end_reason"]) == ("not-started", "unsafe_path")
+    assert "kind 'scribe'" in run.outcome["message"]
 
 
 @pytest.mark.parametrize("where", ["write_dirs", "allowWrite"])

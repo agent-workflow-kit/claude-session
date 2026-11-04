@@ -47,12 +47,14 @@ part of ``checks`` (``effects.claude_version``), after ``claude_bin`` is resolve
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import os
 import re
+import sqlite3
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -373,9 +375,11 @@ def step2_git_writable(
     (``step2_writable``) plus the session-writable paths of the kind known without a
     session (``known_write_paths``: its ``write_dirs`` and permission profile write paths,
     with the placeholder session), for the kind as configured and as every per-repo
-    override of it makes it (the repo is not known yet), for trusted and isolated kinds
-    alike. None when any of them is not known (a ``${GIT_DIR}`` write entry, a profile
-    file that cannot be read, an entry that does not expand): no git may run."""
+    override of it makes it (the repo is not known yet), and the guard every tool of a
+    launch is checked against (``tool_guard``: every kind's paths and those recorded on
+    every isolated run), for trusted and isolated kinds alike. None when any of them is not
+    known (a ``${GIT_DIR}`` write entry of the kind, a profile file that cannot be read, an
+    entry that does not expand, a store that cannot be read): no git may run."""
     paths = list(step2_writable(process, probe_cwd).paths)
     mode: kinds.Mode = "headless" if req.mode == "headless" else "interactive"
     for repo in (None, *cfg.repos):
@@ -393,7 +397,11 @@ def step2_git_writable(
         if known is None:
             return None
         paths += known.paths
-    return pathrules.SessionWritable(paths)
+    try:
+        guard = tool_guard(cfg, process, git_cwd=probe_cwd)
+    except LaunchValidationError:
+        return None
+    return pathrules.SessionWritable([*paths, *guard.paths])
 
 
 def resolve_kind(req: Request, cfg: Config, process: Process) -> Resolved:
@@ -402,10 +410,10 @@ def resolve_kind(req: Request, cfg: Config, process: Process) -> Resolved:
     name from its realpath (looked up with the kind's configured ``env.path_prepend``: the
     repo, and so a per-repo override, is not known yet; step 5 resolves git again) and with
     the minimal git environment (``kinds.git_env``). A git under the probe cwd,
-    ``<state>/sessions``, the tmp root or the kind's write paths known without a session
-    (``step2_git_writable``, checked hop by hop) is never run, nor is any git when those
-    paths are not known: no repo is derived and the run gets a warning. A usage error
-    exits 2 before allocation."""
+    ``<state>/sessions``, the tmp root, the kind's write paths known without a session or
+    the launch's tool guard (``step2_git_writable``, checked hop by hop) is never run, nor
+    is any git when those paths are not known: no repo is derived and the run gets a
+    warning. A usage error exits 2 before allocation."""
     session_dir_cwd = req.cwd == "session-dir"
     configured = cfg.kinds.get(req.kind or cfg.default_kind)
     prepend = configured.env.path_prepend if configured is not None else []
@@ -418,9 +426,10 @@ def resolve_kind(req: Request, cfg: Config, process: Process) -> Resolved:
         writable = step2_git_writable(cfg, req, process, probe_cwd)
         if writable is None:
             warnings.append(
-                "the kind's session-writable paths are not known before the launch (a"
-                " ${GIT_DIR} write entry, a permission profile file that cannot be read or an"
-                " entry that does not expand); repo not derived from origin"
+                "the session-writable paths of the kind or of another kind are not known"
+                " before the launch (a ${GIT_DIR} write entry, a permission profile file that"
+                " cannot be read, an entry that does not expand or a store that cannot be"
+                " read); repo not derived from origin"
             )
             return None
         try:
@@ -710,6 +719,8 @@ class Checked:
     # An open descriptor of the private tmpdir this run created (``tmpdir.create_pinned``):
     # its removal is identity-checked against it; closed with the session directories.
     tmpdir_pin: int | None = None
+    # What no tool may lie under (``tool_guard``): the pre-launch hooks' sh and PATH too.
+    guard: pathrules.Guard | None = None
 
     def close_tmpdir_pin(self) -> None:
         if self.tmpdir_pin is not None:
@@ -899,6 +910,7 @@ def known_write_paths(
     caller_cwd: str | None,
     git_dirs: gitinfo.GitDirs | None = None,
     git_known: bool = False,
+    skip_git_dir: bool = False,
     alloc: Allocated | None = None,
 ) -> pathrules.SessionWritable | None:
     """The session-writable paths of a run of ``resolution`` known without a session
@@ -909,9 +921,12 @@ def known_write_paths(
     ``git_writable`` computes them; ``${GIT_DIR}`` is expanded with ``git_dirs`` when the
     git directory is known (``git_known``). None when they are not known: no ``profile``
     (a profile file that was not read), a ``${GIT_DIR}`` write entry while the git
-    directory is not known, or an entry that does not expand. ``alloc`` is the session's
-    (default: the placeholder session; the adoption dry run passes the pending run's)."""
-    if profile is None or (not git_known and uses_git_dir(resolution, profile)):
+    directory is not known, or an entry that does not expand. ``skip_git_dir`` leaves the
+    ``${GIT_DIR}`` entries out instead (the caller adds the candidate directories itself).
+    ``alloc`` is the session's (default: the placeholder session; the adoption dry run
+    passes the pending run's)."""
+    unknown_git = not git_known and not skip_git_dir
+    if profile is None or (unknown_git and uses_git_dir(resolution, profile)):
         return None
     home = os.path.realpath(process.environ.get("HOME", "/"))
     alloc = alloc or placeholder_alloc(process, resolution)
@@ -920,9 +935,12 @@ def known_write_paths(
     variables = profile_variables(alloc, cwd, home, git_dirs)
     content = profile.content if git_known else _without_git_dir(profile.content)
     try:
-        write = pathrules.resolve_dirs(
-            resolution.profile.write_dirs, variables, home=home, key="write_dirs"
-        )
+        entries = [
+            e
+            for e in resolution.profile.write_dirs
+            if git_known or not skip_git_dir or GIT_DIR_VARIABLE not in e
+        ]
+        write = pathrules.resolve_dirs(entries, variables, home=home, key="write_dirs")
         return pathrules.session_writable(
             session_dir=alloc.session_dir,
             cwd=cwd,
@@ -931,6 +949,120 @@ def known_write_paths(
             write_dirs=write,
             profile=permission_profiles.expand(content, variables),
         )
+    except LaunchValidationError:
+        return None
+
+
+def other_kinds_writable(cfg: Config, process: Process, *, git_cwd: str | None) -> pathrules.Guard:
+    """The union of the session-writable paths known without a session of every built-in
+    and configured kind, each as configured and as every per-repo override makes it (the
+    step-2 set, the placeholder session's paths, ``write_dirs`` and the permission
+    profile's write paths), trusted and isolated kinds alike: a tool a launch runs must lie
+    under none of them, whatever the launching run's own kind (an agent of one kind could
+    plant a binary where another kind's runs resolve it). The cwd of a ``caller``-cwd kind is
+    not part of it (it is the launching run's; the cwd of every isolated run that was
+    launched is in its recorded set, ``recorded_sources``). A ``${GIT_DIR}`` entry stands
+    for every directory git could take for the git directory of ``git_cwd``
+    (``gitinfo.candidate_dirs``; the git directories of other repositories are not known).
+    ``unsafe_path`` when the paths of any kind are not known (a permission profile that
+    cannot be read, an entry that does not expand): fail closed."""
+    sources: list[tuple[str, Sequence[str]]] = [
+        ("the session directories and the tmp root", step2_writable(process, None).paths)
+    ]
+    uses_git = False
+    for name in cfg.kinds:
+        for repo in (None, *cfg.repos):
+            resolution = kinds.resolve(cfg, name, mode="headless", repo=repo, cwd=None)
+            profile = kind_profile(cfg, resolution)
+            known = None
+            if profile is not None:
+                known = known_write_paths(
+                    resolution, profile, process, caller_cwd=None, skip_git_dir=True
+                )
+                uses_git = uses_git or uses_git_dir(resolution, profile)
+            if known is None:
+                raise LaunchValidationError(
+                    f"the session-writable paths of kind {name!r} are not known, so no tool can"
+                    " be checked against them (its permission profile or write_dirs cannot be"
+                    " read or expanded)",
+                    end_reason="unsafe_path",
+                )
+            label = f"a write path of kind {name!r}" + (
+                "" if repo is None else f" as repo {repo!r} overrides it"
+            )
+            sources.append((label, known.paths))
+    if uses_git and git_cwd is not None:
+        sources.append(("a ${GIT_DIR} write path", gitinfo.candidate_dirs(git_cwd)))
+    return pathrules.Guard(sources)
+
+
+def recorded_sources(process: Process) -> list[tuple[str, Sequence[str]]]:
+    """The session-writable paths recorded on every isolated run in the store
+    (``store.recorded_writable``), live and past: they hold what no kind config shows (the
+    caller cwd of a kind such as ``respond``, a per-call ``--permission-profile``).
+    ``unsafe_path`` when the store cannot be read (fail closed)."""
+    try:
+        found = store.recorded_writable(process.state_root)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        raise LaunchValidationError(
+            "the session-writable paths recorded in the store cannot be read, so no tool can"
+            f" be checked against them ({type(exc).__name__})",
+            end_reason="unsafe_path",
+        ) from None
+    return [(f"a write path of run {sid} #{run}", paths) for sid, run, paths in found]
+
+
+def tool_guard(
+    cfg: Config,
+    process: Process,
+    *,
+    git_cwd: str | None,
+    own: pathrules.SessionWritable | None = None,
+) -> pathrules.Guard:
+    """What no tool a launch runs, and no ``PATH`` entry a session or hook gets, may lie
+    under (interface.md, PATH rules): ``own`` (the run's own session-writable paths), every
+    kind's (``other_kinds_writable``) and those recorded on every isolated run in the store
+    (``recorded_sources``). ``unsafe_path`` when any of them is not known."""
+    sources = other_kinds_writable(cfg, process, git_cwd=git_cwd).sources
+    sources += recorded_sources(process)
+    if own is not None:
+        sources.insert(0, ("a write path of this run", own.paths))
+    return pathrules.Guard(sources)
+
+
+@contextlib.contextmanager
+def named(guard: pathrules.Guard) -> Iterator[None]:
+    """An ``unsafe_path`` refusal raised inside names the kind or recorded run whose write
+    path covers what was refused (the guard's last hit, when the message names it: a hit
+    that only dropped a probe ``PATH`` entry is not what an unrelated refusal is about)."""
+    guard.last = None
+    try:
+        yield
+    except LaunchValidationError as exc:
+        last = guard.last
+        owner = None if last is None or last not in exc.message else guard.owner(last)
+        if exc.end_reason != "unsafe_path" or owner is None:
+            raise
+        raise LaunchValidationError(
+            f"{exc.message}: under {owner}",
+            detail=exc.detail,
+            end_reason=exc.end_reason,
+            hint=exc.hint,
+        ) from None
+
+
+def kind_profile(
+    cfg: Config, resolution: kinds.Resolution, recorded: permission_profiles.Profile | None = None
+) -> permission_profiles.Profile | None:
+    """The permission profile a launch would use: ``recorded`` (the one its checks read),
+    else the kind's built-in or configured profile; None for a profile file that was not read
+    or a profile that cannot be selected."""
+    if recorded is not None:
+        return recorded
+    if resolution.permission_profile_file is not None:
+        return None
+    try:
+        return permission_profiles.select(cfg, resolution, session_writable=NO_SANDBOX)
     except LaunchValidationError:
         return None
 
@@ -1243,24 +1375,28 @@ def check_tools(
     process: Process,
     writable: Callable[[str], bool],
     git_before: pathrules.ResolvedTool | None,
+    *,
+    guard: Callable[[str], bool] | None = None,
 ) -> Tools:
     """``claude_bin``, ``git``, ``bwrap`` and ``socat`` resolved on the sanitized PATH, outside
     the session-writable paths (``unsafe_path``); each runs from its realpath with ``argv[0]``
-    its name. ``claude_not_found`` when there is no ``claude_bin``. With session-writable
-    paths (not ``NO_SANDBOX``) a script ``claude``'s ``#!`` interpreter is checked too
-    (``claude_version.check_interpreter``, on the version probe's ``PATH``). git must be the one the
-    git directory was resolved with (it was looked up before the full set was known)."""
+    its name. ``claude_not_found`` when there is no ``claude_bin``. A script ``claude``'s
+    ``#!`` interpreter is checked too, trusted runs included (``claude_version.check_interpreter``,
+    on the version probe's ``PATH``, against ``guard``). git must be the one the
+    git directory was resolved with (it was looked up before the full set was known).
+    ``guard`` (default ``writable``) is what the tools must lie outside of: ``writable`` and
+    the session-writable paths of every kind (``other_kinds_writable``)."""
+    guard = guard or writable
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
-    claude = pathrules.resolve_tool(cfg.claude_bin, entries, writable)
+    claude = pathrules.resolve_tool(cfg.claude_bin, entries, guard)
     if claude is None:
         raise LaunchValidationError(
             f"claude not found: {cfg.claude_bin!r}",
             end_reason="claude_not_found",
             hint=HINTS["claude_not_found"],
         )
-    if writable is not NO_SANDBOX:
-        claude_version.check_interpreter(claude, _probe_entries(entries, writable), writable)
-    git = pathrules.resolve_tool("git", entries, writable)
+    claude_version.check_interpreter(claude, _probe_entries(entries, guard), guard)
+    git = pathrules.resolve_tool("git", entries, guard)
     if git != git_before:
         raise LaunchValidationError(
             "git resolved differently once every session-writable path was known",
@@ -1268,9 +1404,14 @@ def check_tools(
         )
     bwrap = socat = None
     if resolution.profile.sandbox != "off":
-        bwrap = pathrules.resolve_tool("bwrap", entries, writable)
-        socat = pathrules.resolve_tool("socat", entries, writable)
+        bwrap = pathrules.resolve_tool("bwrap", entries, guard)
+        socat = pathrules.resolve_tool("socat", entries, guard)
     return Tools(claude=claude, git=git, bwrap=bwrap, socat=socat)
+
+
+def _either(first: Callable[[str], bool], second: Callable[[str], bool]) -> Callable[[str], bool]:
+    """A path is under either set."""
+    return lambda path: first(path) or second(path)
 
 
 def _probe_entries(entries: Sequence[str], writable: Callable[[str], bool]) -> list[str]:
@@ -1333,7 +1474,12 @@ def resolve_notes(
     name = cfg.notes_context_cmd[0]
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
     try:
-        tool = pathrules.resolve_tool(name, entries, writable)
+        with (
+            contextlib.nullcontext()
+            if not isinstance(writable, pathrules.Guard)
+            else named(writable)
+        ):
+            tool = pathrules.resolve_tool(name, entries, writable)
     except LaunchValidationError as exc:
         return None, f"notes command refused: {exc.message}"
     if tool is None:
@@ -1350,23 +1496,27 @@ def build_env(
     git_dirs: gitinfo.GitDirs | None,
     tmp: str | None,
     writable: pathrules.SessionWritable | None,
+    guard: pathrules.Guard | None = None,
 ) -> envbuild.SessionEnv:
-    """The session environment (its ``PATH`` checked for isolated runs: ``unsafe_path``). An
-    invalid ``env.set`` or ``path_prepend`` entry that reached here (config validation refuses
-    them) ends the run ``config_invalid``."""
+    """The session environment, its ``PATH`` checked against ``guard`` (``tool_guard``):
+    ``unsafe_path`` for an isolated run's entry under it, a trusted run's dropped with a
+    warning. An invalid ``env.set`` or ``path_prepend`` entry that reached here (config
+    validation refuses them) ends the run ``config_invalid``."""
     try:
-        return envbuild.build(
-            resolution,
-            cfg,
-            process.environ,
-            csession_id=alloc.csession_id,
-            csession_dir=alloc.session_dir,
-            cwd=cwd,
-            exe_dir=process.exe_dir,
-            git_dir=None if git_dirs is None else git_dirs.common_dir,
-            tmpdir=tmp,
-            session_writable=writable,
-        )
+        with contextlib.nullcontext() if guard is None else named(guard):
+            return envbuild.build(
+                resolution,
+                cfg,
+                process.environ,
+                csession_id=alloc.csession_id,
+                csession_dir=alloc.session_dir,
+                cwd=cwd,
+                exe_dir=process.exe_dir,
+                git_dir=None if git_dirs is None else git_dirs.common_dir,
+                tmpdir=tmp,
+                session_writable=writable,
+                guard=guard,
+            )
     except UsageError as exc:
         raise LaunchValidationError(
             exc.message, detail=exc.detail, end_reason="config_invalid"
@@ -1431,14 +1581,62 @@ def check_sandbox(
     )
 
 
-def check_hook_interpreter(process: Process, writable: pathrules.SessionWritable | None) -> None:
-    """Isolated runs: nothing the unsandboxed hook interpreter loads code from may be
-    session-writable, and the install has no hard-linked files (``unsafe_path``)."""
-    if writable is None:
+def check_hook_interpreter(
+    process: Process,
+    writable: pathrules.SessionWritable | None,
+    guard: pathrules.Guard | None = None,
+) -> None:
+    """Nothing the unsandboxed hook interpreter loads code from may lie under ``guard``
+    (``tool_guard``; default ``writable``), for trusted and isolated runs; isolated runs
+    also need an install without hard-linked files (``unsafe_path``)."""
+    checked = guard if guard is not None else writable
+    if checked is None:
         return
-    settings_builder.check_interpreter(
-        process.interpreter, session_writable=writable, writable_paths=writable.paths
-    )
+    with contextlib.nullcontext() if guard is None else named(guard):
+        settings_builder.check_interpreter(
+            process.interpreter,
+            session_writable=checked,
+            writable_paths=checked.paths,
+            link_dirs=None if writable is not None else [],
+        )
+
+
+def check_session_interpreter(
+    claude: pathrules.ResolvedTool,
+    session_env: envbuild.SessionEnv,
+    cwd: str,
+    guard: pathrules.Guard,
+) -> None:
+    """A script ``claude``'s ``#!`` interpreter as the session resolves it: on the exact
+    ``PATH`` it is exec'd with (an empty or relative entry against its cwd), against
+    ``guard``, for trusted and isolated runs (``unsafe_path``)."""
+    entries = [os.path.join(cwd, entry) for entry in session_env.env["PATH"].split(":")]
+    with named(guard):
+        claude_version.check_interpreter(claude, entries, guard)
+
+
+def check_notes_interpreter(
+    tool: pathrules.ResolvedTool, session_env: envbuild.SessionEnv, guard: pathrules.Guard
+) -> tuple[pathrules.ResolvedTool | None, str | None]:
+    """The notes command's ``#!`` interpreter, on the ``PATH`` it runs with (the session's,
+    sanitized: ``notes_conf``), against ``guard``; refused, the run gets no notes and the
+    second value says why (as ``resolve_notes``)."""
+    try:
+        with named(guard):
+            claude_version.check_interpreter(
+                tool,
+                sanitize_path(session_env.env.get("PATH", "")).split(":"),
+                guard,
+                what="the notes command",
+            )
+    except LaunchValidationError as exc:
+        return None, f"notes command refused: {exc.message}"
+    return tool, None
+
+
+def with_own(guard: pathrules.Guard, own: pathrules.SessionWritable) -> pathrules.Guard:
+    """``guard`` with the run's own session-writable paths first."""
+    return pathrules.Guard([("a write path of this run", own.paths), *guard.sources])
 
 
 class Effects:
@@ -1707,9 +1905,11 @@ def checks(
     if isolated:
         effects.known_writable(known_writable(resolution, alloc, cwd, home, profile.content))
     git_cwd = effects.git_cwd(cwd)
-    before_git = git_writable(resolution, alloc, cwd, home, tmp, profile, git_cwd)
+    others = tool_guard(cfg, process, git_cwd=git_cwd)
+    before_git = _either(git_writable(resolution, alloc, cwd, home, tmp, profile, git_cwd), others)
     entries = _path_entries(process.environ, resolution.profile.env.path_prepend)
-    git_tool = pathrules.resolve_tool("git", entries, before_git)
+    with named(others):
+        git_tool = pathrules.resolve_tool("git", entries, before_git)
     git_dirs, credential = check_git(resolution, git_cwd, git_tool, process)
     warnings = list(credential)
     effects.warn(credential)
@@ -1728,21 +1928,28 @@ def checks(
     effects.record_dirs(lambda: run_dirs(read, write.dirs, expanded, cwd, home))
     plugins = check_plugins(rules, req.plugin_dirs, writable, process.caller_cwd)
     effects.record_plugin_dirs(plugins)
-    check_hook_interpreter(process, writable)
+    guard = others if writable is None else with_own(others, writable)
+    check_hook_interpreter(process, writable, guard)
     check_tmpdir(resolution, alloc, tmp)
-    tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool)
-    notes_tool, notes_problem = resolve_notes(cfg, resolution, process, writable or NO_SANDBOX)
+    with named(guard):
+        tools = check_tools(cfg, resolution, process, writable or NO_SANDBOX, git_tool, guard=guard)
+    notes_tool, notes_problem = resolve_notes(cfg, resolution, process, guard)
     version_warnings = effects.claude_version(
         cfg,
         resolution,
         process,
         tools,
-        writable or NO_SANDBOX,
+        guard,
         lambda: dry_run_writable(resolution, profile, process, resolved.caller_cwd, git_dirs),
     )
     warnings += version_warnings
     effects.warn(version_warnings)
-    session_env = build_env(resolution, cfg, process, alloc, cwd, git_dirs, tmp, writable)
+    session_env = build_env(resolution, cfg, process, alloc, cwd, git_dirs, tmp, writable, guard)
+    warnings += session_env.warnings
+    effects.warn(session_env.warnings)
+    check_session_interpreter(tools.claude, session_env, cwd, guard)
+    if notes_tool is not None:
+        notes_tool, notes_problem = check_notes_interpreter(notes_tool, session_env, guard)
     generated = generated_entries(resolution, tools, git_dirs, process)
     if isolated:
         rules.check_generated(generated)
@@ -1789,6 +1996,7 @@ def checks(
         tmpdir_pin=check.tmpdir_pin,
         notes_tool=notes_tool,
         notes_problem=notes_problem,
+        guard=guard,
     )
 
 
@@ -2051,8 +2259,13 @@ def pre_launch(
     if entries:
         from .dryrun import printable  # dryrun imports this module
 
+        guard = v.guard if v.guard is not None else tool_guard(cfg, process, git_cwd=None)
         env = toolhooks.hook_env(
-            process.environ, secret_env=cfg.secret_env, hook=toolhooks.PRE_LAUNCH, csession_id=sid
+            process.environ,
+            secret_env=cfg.secret_env,
+            hook=toolhooks.PRE_LAUNCH,
+            csession_id=sid,
+            guard=guard,
         )
 
         def payload() -> str:
@@ -2066,7 +2279,7 @@ def pre_launch(
                 process.gateway,
                 entries,
                 payload=payload,
-                sh=toolhooks.resolve_sh(env),
+                sh=toolhooks.resolve_sh(env, guard),
                 env=env,
                 cwd=process.state_root,
                 kill_grace=cfg.kill_grace,

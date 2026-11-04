@@ -947,10 +947,14 @@ def test_sandbox_lowered_by_config(tmp_path: Path) -> None:
     assert resolution.sandbox_lowered()
 
 
-def test_sandbox_lowered_carried_from_the_previous_run(cfg: config.Config) -> None:
+def test_sandbox_lowered_is_not_carried_from_the_previous_run(cfg: config.Config) -> None:
+    # A carried `--sandbox off` never lowers a third-party-reading kind's sandbox (the kind's
+    # reads_third_party has the implications of `--reads-third-party`); one given now does.
     previous = kinds.Previous(repo=None, flags={"sandbox": "off"})
-    resolution = kinds.resolve(cfg, "review", mode="headless", previous=previous)
-    assert resolution.sandbox_lowered()
+    carried = kinds.resolve(cfg, "review", mode="headless", previous=previous)
+    assert not carried.sandbox_lowered()
+    now = kinds.resolve(cfg, "review", mode="headless", previous=previous, flags={"sandbox": "off"})
+    assert now.sandbox_lowered()
 
 
 def test_unsandboxed_third_party_run_warns(cfg: config.Config) -> None:

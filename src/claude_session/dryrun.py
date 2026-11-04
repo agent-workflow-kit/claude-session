@@ -61,7 +61,6 @@ from . import (
     kinds,
     launch,
     pathrules,
-    permission_profiles,
     selfcheck,
     sessiondir,
     settings_builder,
@@ -211,43 +210,25 @@ class Lookup:
 
 
 REFUSED = "not run (a launch refuses it: unsafe_path)"
-# A trusted kind's launch checks no session-writable path: it would use the tool, which a
-# dry run still never runs.
-NOT_PROBED = "not run (not probed by a dry run: under a session-writable path)"
 # The session-writable paths are not known (a profile file that was not read, a profile or
 # write_dirs entry that does not expand): nothing is run.
 UNKNOWN = "not run (not probed by a dry run: the permission profile or write_dirs are not known)"
 
 
-def _tool(
-    name: str,
-    entries: Sequence[str],
-    writable: Callable[[str], bool],
-    *,
-    launch_refuses: bool = True,
-) -> Lookup:
-    """``name`` resolved as a launch resolves it, against ``writable``; ``launch_refuses``
-    words a refusal as the launch's own (isolated kinds) or as a dry run's (trusted)."""
+def _tool(name: str, entries: Sequence[str], writable: Callable[[str], bool]) -> Lookup:
+    """``name`` resolved as a launch resolves it, against ``writable``: a tool under it is
+    refused by every kind's launch, trusted ones included (``launch.tool_guard``)."""
     try:
         return Lookup(pathrules.resolve_tool(name, entries, writable))
     except LaunchValidationError as error:
-        return Lookup(None, f"{error.message}: {REFUSED if launch_refuses else NOT_PROBED}")
+        return Lookup(None, f"{error.message}: {REFUSED}")
 
 
 def _kind_profile(
     cfg: Config, resolution: kinds.Resolution, recorded: Profile | None
 ) -> Profile | None:
-    """The permission profile a launch would use: the one its checks read (``recorded``),
-    else the kind's built-in or configured profile; None for a profile file that was not
-    read (a dry run never reads it outside the launch checks)."""
-    if recorded is not None:
-        return recorded
-    if resolution.permission_profile_file is not None:
-        return None
-    try:
-        return permission_profiles.select(cfg, resolution, session_writable=launch.NO_SANDBOX)
-    except LaunchValidationError:
-        return None
+    """The permission profile a launch would use (``launch.kind_profile``)."""
+    return launch.kind_profile(cfg, resolution, recorded)
 
 
 def unchecked_writable(
@@ -323,10 +304,7 @@ class Prerequisites:
         if writable is None:
             return not_probed(resolution)
         entries = _entries(process, resolution)
-        refuses = resolution.isolated()
-        found = [
-            _tool(name, entries, writable, launch_refuses=refuses) for name in ("bwrap", "socat")
-        ]
+        found = [_tool(name, entries, writable) for name in ("bwrap", "socat")]
         refused = tuple(item.refused for item in found if item.refused is not None)
         if refused:
             return Sandbox(available=False, problems=refused)
@@ -463,6 +441,12 @@ def kinds_report(
     profiles = []
     for resolution, writable in zip(resolutions, sets, strict=True):
         warnings += resolution.warnings
+        # bwrap, socat and the preview's git must lie under no kind's paths, not only the row's.
+        writable = (
+            None
+            if writable is None or every is None
+            else pathrules.SessionWritable([*writable.paths, *every.union.paths])
+        )
         sandbox = probes.check(process, resolution, writable)
         claude_path = None if claude is None else claude.path
         profiles.append(
@@ -515,6 +499,31 @@ def _writable_of(
     )
 
 
+def tool_writable(
+    cfg: Config,
+    process: launch.Process,
+    own: pathrules.SessionWritable | None,
+    cwd: str,
+) -> pathrules.SessionWritable | None:
+    """What ``bwrap``, ``socat`` and ``git`` must not be under when a dry run probes them:
+    ``own`` (the run's or row's paths) and the guard a launch checks its tools against
+    (``launch.tool_guard``: every kind's paths, a ``${GIT_DIR}`` entry standing for every
+    candidate git directory of ``cwd`` as in the launch, and those recorded on every
+    isolated run). None when any of them is not known: nothing is probed."""
+    if own is None:
+        return None
+    try:
+        guard = launch.tool_guard(cfg, process, git_cwd=launch.Effects().git_cwd(cwd))
+    except LaunchValidationError:
+        return None
+    return pathrules.SessionWritable([*own.paths, *guard.paths])
+
+
+def plan_cwd(found: Outcome, resolved: launch.Resolved, alloc: launch.Allocated) -> str:
+    """The run's cwd: the checks', else as a launch would take it."""
+    return found.checked.cwd if found.checked is not None else _cwd(resolved, alloc)
+
+
 def kind_writable(
     cfg: Config, process: launch.Process, name: str, repo: str | None
 ) -> pathrules.SessionWritable | None:
@@ -533,29 +542,32 @@ def kind_writable(
 
 @dataclass(frozen=True)
 class Every:
-    """The session-writable paths of every kind (``_every_kind``): ``union`` of all of them,
-    ``isolated`` of the isolated ones only."""
+    """The session-writable paths of every kind (``_every_kind``), and those recorded on
+    every isolated run in the store: ``union`` of all of them."""
 
     union: pathrules.SessionWritable
-    isolated: pathrules.SessionWritable
 
 
 def _every_kind(cfg: Config, process: launch.Process) -> Every | None:
     """The session-writable paths, known without a session, of every built-in and
     configured kind, each as configured and as every per-repo override makes it, whatever
-    ``--kind`` and ``--repo`` name: ``claude_bin`` is shared by all of them. None when any
-    of them is not known."""
+    ``--kind`` and ``--repo`` name (``claude_bin`` is shared by all of them), and those
+    recorded on every isolated run in the store (``launch.recorded_sources``). None when
+    any of them is not known (``kinds`` never knows the git directory: a ``${GIT_DIR}``
+    write entry is not known)."""
     union: list[str] = []
-    isolated: list[str] = []
     for name in cfg.kinds:
         for resolution in _variants(cfg, name, None):
             writable = _writable_of(cfg, process, resolution)
             if writable is None:
                 return None
             union += writable.paths
-            if resolution.isolated():
-                isolated += writable.paths
-    return Every(pathrules.SessionWritable(union), pathrules.SessionWritable(isolated))
+    try:
+        recorded = launch.recorded_sources(process)
+    except LaunchValidationError:
+        return None
+    union += [path for _, paths in recorded for path in paths]
+    return Every(pathrules.SessionWritable(union))
 
 
 def _claude_lookup(
@@ -563,16 +575,11 @@ def _claude_lookup(
 ) -> Lookup:
     """``claude_bin`` on the default kind's ``PATH``, checked against the step-2 set and the
     session-writable paths of every kind (``every``: ``claude_bin`` is shared by all of
-    them); never run when any kind's paths are not known. A refusal is the launch's own
-    when an isolated kind's paths hold it."""
+    them); never run when any kind's paths are not known. Under any of them, every kind's
+    launch refuses it."""
     if every is None:
         return Lookup(None, f"{cfg.claude_bin!r}: {UNKNOWN}")
-    entries = _entries(process, default)
-    found = _tool(cfg.claude_bin, entries, every.union, launch_refuses=False)
-    if found.refused is None:
-        return found
-    by_launch = _tool(cfg.claude_bin, entries, every.isolated)
-    return by_launch if by_launch.refused is not None else found
+    return _tool(cfg.claude_bin, _entries(process, default), every.union)
 
 
 def _sandbox_warnings(resolution: kinds.Resolution, sandbox: Sandbox | None) -> list[str]:
@@ -798,6 +805,7 @@ def new_session_plan(
         recorded=found.profile,
         git=found.git,
     )
+    writable = tool_writable(cfg, process, writable, plan_cwd(found, resolved, alloc))
     sandbox = plan_sandbox(process, resolution, found, writable, prerequisites)
     plan = plan_json(
         cfg,

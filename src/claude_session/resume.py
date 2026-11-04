@@ -857,6 +857,7 @@ def plan(
         git=found.git,
         alloc=None if planned.fork else alloc,
     )
+    writable = dryrun.tool_writable(cfg, process, writable, dryrun.plan_cwd(found, resolved, alloc))
     sandbox = dryrun.plan_sandbox(process, resolution, found, writable, prerequisites)
     cwd = (
         found.checked.cwd
