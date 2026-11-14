@@ -1264,6 +1264,7 @@
             "null"
           ],
           "minimum": 0,
+          "maximum": 9223372036854775807,
           "description": "Headless: the sum of num_turns over all result objects of the run (values that are not non-negative integers left out); null for interactive runs, launch-phase ends, and a headless run with no result object or no usable num_turns."
         },
         "message": {

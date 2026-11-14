@@ -1099,6 +1099,15 @@ def test_an_unusable_cost_is_null_and_the_run_still_ends(
     assert not (run.private_run / "secret-index").exists()
 
 
+def test_an_unbindable_turn_count_is_null_and_the_run_still_ends(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    run = run_exec(tmp_path, state, work, [START, STOP, result_step(num_turns=2**64)], config=FAST)
+    assert run.code == 0, run.proc.stderr
+    assert run.outcome["outcome"] == "done" and run.outcome["num_turns"] is None
+    assert not (run.private_run / "secret-index").exists()
+
+
 def test_credential_warnings_are_logged_as_config_warnings(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
