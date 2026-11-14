@@ -59,6 +59,16 @@ class Report:
     size: int
 
 
+@dataclass(frozen=True)
+class Planned:
+    """One plugin directory of a sandboxed run: the caller's ``source``, the ``effective``
+    directory the run uses (its copy) and the placeholders the copy adds."""
+
+    source: str
+    effective: str
+    added: tuple[str, ...]
+
+
 def effective_path(session_path: str, run: int, index: int, source: str) -> str:
     """Where run ``run`` copies the plugin directory ``source``, the ``index``-th of the
     run's: the directory name is kept, since Claude Code names a plugin without a manifest
