@@ -521,6 +521,7 @@ def _forget(args: argparse.Namespace) -> int:
 
     cfg = load_config(args)
     actor = launch.default_actor(args.actor, cfg)
+    reasons: dict[str, str] = {}
     common: dict[str, Any] = {
         "gateway": SystemGateway(),
         "environ": os.environ,
@@ -528,6 +529,7 @@ def _forget(args: argparse.Namespace) -> int:
         "decision_ids": args.decision_id or [],
         "dry_run": args.dry_run,
         "purge": args.purge,
+        "reasons": reasons,
     }
     with store.open_state() as st:
         if args.id is not None:
@@ -556,11 +558,11 @@ def _forget(args: argparse.Namespace) -> int:
         if not (result["forgotten"] or result["skipped"]):
             print("nothing to forget")
     if unpurged and not result["dry_run"]:
-        print(
-            f"forgotten but not purged: {', '.join(unpurged)} (events are left to deliver, or a "
-            "directory could not be removed); reconcile deletes them after retention_days",
-            file=sys.stderr,
-        )
+        for sid in unpurged:
+            print(
+                f"forgotten but not purged: {sid} ({reasons.get(sid, 'unknown')})", file=sys.stderr
+            )
+        print("reconcile deletes them after retention_days", file=sys.stderr)
         return 12
     return 0
 

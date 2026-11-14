@@ -964,3 +964,134 @@ def test_a_failed_purge_exits_12_audits_an_error_and_reconcile_finishes_it(
     age_forget(st, sid, 8)
     reconcile(capsys, cfg)
     assert not session.exists() and forgotten_at(st, sid) is None
+
+
+def undelivered(st: Store, sid: str) -> None:
+    st.conn.execute("UPDATE events SET delivered_at = NULL WHERE csession_id = ?", (sid,))
+
+
+def test_purge_delivers_an_undelivered_event_first_and_then_purges(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = make(st, root)
+    undelivered(st, sid)
+    session, private = stage_files(root, sid)
+    code, out, _ = forget(capsys, sid, "--purge")
+    assert code == 0 and out["forgotten"][0]["purged"] is True
+    assert not os.path.lexists(session) and not os.path.lexists(private)
+    assert not st.has_undelivered_events(sid)
+
+
+def test_purge_does_not_wait_for_a_delivery_lease_another_holder_has(
+    st: Store,
+    root: str,
+    capsys: pytest.CaptureFixture[str],
+    procs: Procs,  # noqa: F811
+) -> None:
+    import time
+
+    from claude_session import toolhooks
+
+    sid = make(st, root)
+    undelivered(st, sid)
+    session, _ = stage_files(root, sid)
+    holder = procs.live()
+    with Store.open(st.path, holder=store.Holder(*holder)) as other:
+        assert other.take_lease(toolhooks.lease_name(sid))
+        started = time.monotonic()
+        code, out, err = forget(capsys, sid, "--purge")
+        elapsed = time.monotonic() - started
+    assert code == 12 and out["forgotten"][0]["purged"] is False
+    assert elapsed < 20
+    assert (session / "prompt.md").is_file()
+
+
+def test_an_interrupted_purge_propagates_and_leaves_the_session_forgotten(
+    st: Store, root: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = make(st, root)
+    stage_files(root, sid)
+
+    def interrupted(*_a: Any, **_k: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sessiondir, "delete_session_dirs", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        main(["forget", sid, "--purge", "--json", "--actor", "auto:test"])
+    assert forgotten_at(st, sid) is not None
+    assert [r["result"] for r in audit_records(root)] == ["ok", "error"]
+
+
+def test_bulk_purge_goes_on_after_a_failed_purge_and_exits_12(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bad = make(st, root)
+    good = make(st, root)
+    kept = {sid: stage_files(root, sid) for sid in (bad, good)}
+    real = sessiondir.delete_session_dirs
+
+    def flaky(state_root: str, sid: str) -> None:
+        if sid == bad:
+            raise OSError("cannot remove")
+        real(state_root, sid)
+
+    monkeypatch.setattr(sessiondir, "delete_session_dirs", flaky)
+    code, out, err = forget(capsys, "--older-than", "1d", "--purge")
+    assert code == 12
+    validate(out, SCHEMA)
+    assert {e["csession_id"]: e["purged"] for e in out["forgotten"]} == {bad: False, good: True}
+    assert forgotten_at(st, bad) is not None and forgotten_at(st, good) is not None
+    assert kept[bad][0].is_dir() and not os.path.lexists(kept[good][0])
+    assert bad in err and good not in err
+
+
+def test_each_unpurged_session_is_named_with_its_own_reason(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_session import toolhooks
+
+    pending = make(st, root)
+    stuck = make(st, root)
+    undelivered(st, pending)
+    for sid in (pending, stuck):
+        stage_files(root, sid)
+    monkeypatch.setattr(toolhooks, "deliver_best_effort", lambda *a, **k: None)
+    real = sessiondir.delete_session_dirs
+
+    def flaky(state_root: str, sid: str) -> None:
+        if sid == stuck:
+            raise OSError("cannot remove")
+        real(state_root, sid)
+
+    monkeypatch.setattr(sessiondir, "delete_session_dirs", flaky)
+    code, _, err = forget(capsys, "--older-than", "1d", "--purge")
+    assert code == 12
+    lines = {sid: next(x for x in err.splitlines() if sid in x) for sid in (pending, stuck)}
+    assert "deliver" in lines[pending] and "removed" not in lines[pending]
+    assert "removed" in lines[stuck] and "deliver" not in lines[stuck]
+
+
+def test_a_bulk_audit_failure_names_the_sessions_already_forgotten_on_stderr(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_session import audit
+
+    first = make(st, root)
+    second = make(st, root)
+    for sid in (first, second):
+        stage_files(root, sid)
+    real = audit.append
+    calls: list[str] = []
+
+    def failing(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs["target"])
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(audit, "append", failing)
+    code, out, err = forget(capsys, "--older-than", "1d", "--purge")
+    assert code == 1 and "error" in out
+    done, failed = calls
+    assert done in err
+    assert forgotten_at(st, done) is not None and forgotten_at(st, failed) is None

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -59,6 +60,8 @@ if TYPE_CHECKING:
 CAUSE = "forget"
 AUDIT_NAME = "audit.jsonl"
 LIVE = "live"
+UNDELIVERED = "events are left to deliver"
+NOT_REMOVED = "a directory could not be removed"
 
 
 def delete_after(forgotten_at: str, retention_days: int) -> str:
@@ -78,8 +81,11 @@ class _Forgetter:
         decision_ids: Sequence[str],
         dry_run: bool,
         purge: bool = False,
+        reasons: dict[str, str] | None = None,
     ) -> None:
         self.purge = purge
+        # Why each session ``purged`` left unpurged (for the caller's stderr); not in the result.
+        self.reasons = reasons if reasons is not None else {}
         self.st = st
         self.cfg = cfg
         self.gateway = gateway
@@ -227,7 +233,8 @@ class _Forgetter:
         except BaseException:
             # The update failed or was interrupted (a signal) after the ``ok`` record. Before
             # the commit the transaction rolled back and nothing was forgotten: the ``error``
-            # record says so. After the commit the session is forgotten and ``ok`` stands.
+            # record says so. After the commit the session is forgotten and ``ok`` stands (with
+            # ``inputs.purge`` a later ``error`` record means: forgotten, purge incomplete).
             if audited and not self._forgotten(sid):
                 self._best_effort(sid, "error")
             raise
@@ -241,10 +248,10 @@ class _Forgetter:
 
     def purged(self, sid: str) -> bool:
         """Delete the directories of the session just forgotten (``--purge``). A dry run
-        deletes nothing and answers whether the real run would. False (the session stays
-        forgotten, ``reconcile`` deletes the directories at retention) when an event is
-        left to deliver (the hook reads the directories), or a directory cannot be removed
-        (an ``error`` record follows the ``ok`` one). The walk is
+        deletes nothing and estimates it before any delivery (no event left to deliver now).
+        False (the session stays forgotten, ``reconcile`` deletes the directories at
+        retention) when an event is left to deliver (the hook reads the directories), or a
+        directory cannot be removed (an ``error`` record follows the ``ok`` one). The walk is
         ``sessiondir.delete_session_dirs``: fd-based, never following a symlink."""
         if self.dry_run:
             return not self.st.has_undelivered_events(sid)
@@ -255,13 +262,16 @@ class _Forgetter:
             gateway=self.gateway,
             environ=self.environ,
             state_root=self.state_root,
+            patience=0.0,  # a busy lease means: not purged now, never a wait
         )
         if self.st.has_undelivered_events(sid):
+            self.reasons[sid] = UNDELIVERED
             self._best_effort(sid, "error")
             return False
         try:
             sessiondir.delete_session_dirs(self.state_root, sid)
         except (OSError, ValueError, sessiondir.SessionDirUnsafe):
+            self.reasons[sid] = NOT_REMOVED
             self._best_effort(sid, "error")
             return False
         except BaseException:
@@ -299,6 +309,7 @@ def forget_session(
     decision_ids: Sequence[str] = (),
     dry_run: bool = False,
     purge: bool = False,
+    reasons: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """``forget <id>`` (``csession_id`` already resolved): the ``forget --json`` object, or
     ``RefusedError`` (``live``, exit 20) when a run of the session is not final."""
@@ -311,6 +322,7 @@ def forget_session(
         decision_ids=decision_ids,
         dry_run=dry_run,
         purge=purge,
+        reasons=reasons,
     )
     worker.check([csession_id])
     if worker.live(csession_id):
@@ -343,6 +355,7 @@ def forget_older_than(
     labels: Sequence[tuple[str, str]] = (),
     dry_run: bool = False,
     purge: bool = False,
+    reasons: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """``forget --older-than`` (interface.md, forget): every session last updated more than
     ``seconds`` ago that matches the filters is forgotten, live ones (pending records
@@ -356,6 +369,7 @@ def forget_older_than(
         decision_ids=decision_ids,
         dry_run=dry_run,
         purge=purge,
+        reasons=reasons,
     )
     threshold = st.clock() - timedelta(seconds=seconds)
     selected = [sid for sid, _ in st.forget_candidates(threshold, kind=kind, labels=labels)]
@@ -369,7 +383,17 @@ def forget_older_than(
         if worker.live(sid):
             skipped.append({"csession_id": sid, "reason": LIVE})
             continue
-        forgotten_at = worker.forget_one(sid, after[1])
+        try:
+            forgotten_at = worker.forget_one(sid, after[1])
+        except InternalError:
+            # The error envelope names no one: say who was forgotten before the abort.
+            if forgotten:
+                done = ", ".join(
+                    f"{e['csession_id']}" + (" (purged)" if e.get("purged") else "")
+                    for e in forgotten
+                )
+                print(f"forgotten before the failure: {done}", file=sys.stderr)
+            raise
         if forgotten_at is not None:
             forgotten.append(worker.entry(forgotten_at, sid))
         elif st.has_open_run(sid):  # a run started since the check
