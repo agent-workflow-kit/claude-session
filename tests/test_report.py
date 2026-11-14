@@ -195,7 +195,11 @@ def outside_file(tmp_path: Path, text: str = "private notes") -> Path:
     return path
 
 
-def test_a_summary_file_outside_csession_dir_is_refused(run: Run, tmp_path: Path) -> None:
+# the `run` fixture starts no sandbox, and `report` is allowed by `Bash(claude-session report:*)`,
+# so the confinement must not rely on the sandbox being active
+def test_a_summary_file_outside_csession_dir_is_refused_even_when_sandbox_inactive(
+    run: Run, tmp_path: Path
+) -> None:
     usage(run, "outside .*CSESSION_DIR", summary_file=str(outside_file(tmp_path)))
 
 
@@ -282,12 +286,6 @@ def test_a_trailing_slash_or_dot_is_refused(run: Run, suffix: str) -> None:
 
 def test_a_final_dotdot_is_refused(run: Run) -> None:
     usage(run, "not a regular file", summary_file=str(run.artifacts) + "/..")
-
-
-# the criterion holds with the sandbox inactive: the `run` fixture starts no sandbox, and `report`
-# is allowed by `Bash(claude-session report:*)`, so the confinement must not rely on the sandbox
-def test_an_outside_file_is_refused_when_sandbox_inactive(run: Run, tmp_path: Path) -> None:
-    usage(run, "outside .*CSESSION_DIR", summary_file=str(outside_file(tmp_path)))
 
 
 def test_a_directory_swapped_for_a_symlink_after_the_check_is_not_followed(

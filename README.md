@@ -231,7 +231,7 @@ adopts ends `not-started` (`never_adopted`, exit 12) once it expires.
 
 Agents run `report` themselves; claude-session adds the instructions and the permission rules
 that pre-approve `claude-session report …` commands. You rarely run it by hand. For reference, the
-forms the agent is told to use (it writes a summary or reason file to `artifacts/` first; the files must be inside `$CSESSION_DIR`, stdin `-` otherwise):
+forms the agent is told to use (it writes a summary or reason file to `artifacts/` first; the files must be inside `$CSESSION_DIR`; otherwise pass the text on stdin with `-`):
 
 ```sh
 claude-session report done --summary-file "$CSESSION_DIR/artifacts/summary.md"
