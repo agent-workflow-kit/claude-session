@@ -863,7 +863,7 @@ All failures here end the launch `not-started` (exit 12) with the named end reas
 **Every run** (all kinds):
 
 - `--add-dir $CSESSION_DIR`; `--system-prompt-snapshot off`; `permissions.defaultMode` as described in [Permission profiles](#permission-profiles);
-- allow `Bash(claude-session report:*)` and `Bash(<absolute claude-session path> report:*)` (see [`report`](#report) for the forms that match), added whatever the permission profile lists: a profile file with only `Skill(<name>)` still lets `report` run (tested);
+- allow `Bash(claude-session report:*)` and `Bash(<absolute claude-session path> report:*)` (see [`report`](#report) for the forms that match), added whatever the profile's `allow` lists, so a profile file with only `Skill(<name>)` still lets `report` run (tested); a profile `deny` or `ask` rule that matches `claude-session report` still takes precedence;
 - allow `Read` of `//$CSESSION_DIR/**`; allow both `Edit` and `Write` of `//$CSESSION_DIR/artifacts/**`, `//$CSESSION_DIR/outbox/**` and, when it is the cwd, `//$CSESSION_DIR/work/**` (live test: a `Write(…)` allow rule alone does not permit the Write tool; `Edit(…)` does, so both are generated);
 - `Edit` and `Write` denies for the protected session files and the private directory;
 - the injected hooks, each with an explicit `timeout` (`PostToolUse` and `Stop` 60 s, the others 30 s), see [Internal commands](#internal-commands).
