@@ -41,7 +41,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from . import fsutil, ids
+from . import fsutil, ids, plugincopy
 from .errors import FailedError, LaunchValidationError, UsageError
 
 SESSIONS = "sessions"
@@ -1277,6 +1277,45 @@ class SessionDirs:
             _unlink_at(run_fd, name, os.path.join(self.private_path, RUNS, str(run), name))
         finally:
             os.close(run_fd)
+
+    def copy_plugins(self, run: int, sources: Sequence[str]) -> tuple[list[str], list[str]]:
+        """A sandboxed run's copies of its plugin directories (``sources``: resolved,
+        existing): ``plugins/<run>/<n>/<name>/`` in the session directory, each with the
+        placeholders Claude Code's sandbox masks (``plugincopy``). Whatever is at
+        ``plugins`` (earlier runs' copies, or an entry the agent planted, a symlink
+        included) is first moved into the private directory by rename, never followed, and
+        removed there once the new tree is in place; a removal that fails is a warning, and
+        the leftovers are swept again at the next call. Returns the copies' absolute paths,
+        in order, and the warnings. An unsafe source is ``LaunchValidationError``
+        (``unsafe_plugin_dir``); a write failure is ``SessionDirUnsafe``."""
+        _check_run(run)
+        warnings = self._sweep_trash()
+        trash = self._move_to_private(plugincopy.PLUGINS)
+        paths: list[str] = []
+        where = os.path.join(self.session_path, plugincopy.PLUGINS)
+        try:
+            plugins_fd = _ensure_dir(self._sfd, plugincopy.PLUGINS, where)
+            try:
+                run_fd = _ensure_dir(plugins_fd, str(run), os.path.join(where, str(run)))
+            finally:
+                os.close(plugins_fd)
+            try:
+                for index, source in enumerate(sources):
+                    target = plugincopy.effective_path(self.session_path, run, index, source)
+                    index_fd = _ensure_dir(run_fd, str(index), os.path.dirname(target))
+                    try:
+                        plugincopy.copy(source, index_fd, os.path.basename(target))
+                    except OSError as exc:
+                        raise _failed(target, exc) from exc
+                    finally:
+                        os.close(index_fd)
+                    paths.append(target)
+            finally:
+                os.close(run_fd)
+        finally:
+            if trash is not None:
+                warnings += self._remove_trash(trash)
+        return paths, warnings
 
     def open_run_dir(self, run: int) -> int:
         """A descriptor of the private ``runs/<run>/`` (verified ours, no-follow) that the
