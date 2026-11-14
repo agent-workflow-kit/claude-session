@@ -773,3 +773,194 @@ def test_a_builtin_credential_is_redacted_from_the_forget_audit(
     assert code == 0
     text = (Path(root) / "audit.jsonl").read_text()
     assert key not in text and "[redacted]" in text
+
+
+# forget --purge
+
+
+def stage_files(root: str, sid: str) -> tuple[Path, Path]:
+    """The session's directories with a prompt, an input, a result and an artifact in them."""
+    with sessiondir.SessionDirs.open(root, sid) as dirs:
+        dirs.write_instructions("x")
+    session = Path(sessiondir.session_dir(root, sid))
+    private = Path(sessiondir.private_dir(root, sid))
+    (session / "prompt.md").write_text("the prompt")
+    (session / "inputs" / "1").mkdir(parents=True)
+    (session / "inputs" / "1" / "notes.txt").write_text("an input")
+    (private / "runs" / "1" / "staged").mkdir(parents=True)
+    (private / "runs" / "1" / "staged" / "prompt.md").write_text("staged")
+    (private / "runs" / "1" / "result.json").write_text("{}")
+    (private / "runs" / "1" / "artifact" / "1").mkdir(parents=True)
+    (private / "runs" / "1" / "artifact" / "1" / "result.md").write_text("the result")
+    return session, private
+
+
+def test_purge_removes_the_directories_now_and_keeps_the_forgotten_row(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str], cfg: str
+) -> None:
+    sid = make(st, root)
+    session, private = stage_files(root, sid)
+    code, out, _ = forget(capsys, sid, "--purge", "--config", cfg)
+    assert code == 0
+    validate(out, SCHEMA)
+    assert [(e["csession_id"], e["purged"]) for e in out["forgotten"]] == [(sid, True)]
+    assert not os.path.lexists(session) and not os.path.lexists(private)
+    assert forgotten_at(st, sid) is not None  # the row waits for retention_days
+    (rec,) = audit_records(root)
+    assert (rec["action"], rec["result"], rec["inputs"]["purge"]) == ("forget", "ok", True)
+    # reconcile later only removes the row
+    age_forget(st, sid, 8)
+    out = reconcile(capsys, cfg)
+    assert [c["csession_id"] for c in out["changes"] if c["action"] == "deleted"] == [sid]
+
+
+def test_without_purge_the_directories_stay_and_the_output_has_no_purged_key(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = make(st, root)
+    session, private = stage_files(root, sid)
+    _, out, _ = forget(capsys, sid)
+    assert session.is_dir() and private.is_dir()
+    assert "purged" not in out["forgotten"][0]
+    (rec,) = audit_records(root)
+    assert "purge" not in (rec["inputs"] or {})
+
+
+def test_purge_never_follows_planted_symlinks(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside"
+    (outside / "sub").mkdir(parents=True)
+    (outside / "sub" / "precious").write_text("keep")
+    sid = make(st, root)
+    session, private = stage_files(root, sid)
+    os.symlink(outside, session / "link-to-dir")
+    os.symlink(outside / "sub" / "precious", session / "link-to-file")
+    os.symlink(outside, session / "inputs" / "1" / "evil")
+    os.symlink(outside, session / "inputs" / "2")
+    os.symlink(outside / "sub" / "precious", session / "prompts")
+    os.symlink(outside, private / "pl")
+    os.symlink(outside, private / "runs" / "1" / "artifact" / "2")
+    code, out, _ = forget(capsys, sid, "--purge")
+    assert code == 0 and out["forgotten"][0]["purged"] is True
+    assert not os.path.lexists(session) and not os.path.lexists(private)
+    assert (outside / "sub" / "precious").read_text() == "keep"
+    assert [p.name for p in outside.iterdir()] == ["sub"]
+
+
+def test_purge_unlinks_session_and_private_dirs_that_are_symlinks(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "precious").write_text("keep")
+    sid = make(st, root)
+    session = Path(sessiondir.session_dir(root, sid))
+    private = Path(sessiondir.private_dir(root, sid))
+    session.parent.mkdir(parents=True, exist_ok=True)
+    private.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(outside, session)
+    os.symlink(outside, private)
+    code, out, _ = forget(capsys, sid, "--purge")
+    assert code == 0 and out["forgotten"][0]["purged"] is True
+    assert not os.path.lexists(session) and not os.path.lexists(private)
+    assert (outside / "precious").read_text() == "keep"
+
+
+def test_purge_refuses_a_live_session_and_deletes_nothing(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = make(st, root, final=False)
+    session, private = stage_files(root, sid)
+    code, out, _ = forget(capsys, sid, "--purge")
+    assert code == 20 and out["error"]["reason"] == "live"
+    assert (session / "prompt.md").is_file() and private.is_dir()
+    assert forgotten_at(st, sid) is None
+    (rec,) = audit_records(root)
+    assert (rec["result"], rec["inputs"]["purge"]) == ("refused", True)
+
+
+def test_a_failing_audit_purges_nothing(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = make(st, root)
+    session, private = stage_files(root, sid)
+    (Path(root) / "audit.jsonl").mkdir()
+    code, _, _ = forget(capsys, sid, "--purge")
+    assert code == 1
+    assert (session / "prompt.md").is_file() and private.is_dir()
+    assert forgotten_at(st, sid) is None
+
+
+def test_bulk_purge_removes_only_the_forgotten_sessions_directories(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    old = make(st, root)
+    live = make(st, root, final=False)
+    fresh = make(st, root, old=False)
+    kept = {sid: stage_files(root, sid) for sid in (old, live, fresh)}
+    code, out, _ = forget(capsys, "--older-than", "1d", "--purge")
+    assert code == 0
+    validate(out, SCHEMA)
+    assert [(e["csession_id"], e["purged"]) for e in out["forgotten"]] == [(old, True)]
+    assert [s["csession_id"] for s in out["skipped"]] == [live]
+    assert not os.path.lexists(kept[old][0])
+    assert kept[live][0].is_dir() and kept[fresh][0].is_dir()
+    assert [r["inputs"]["purge"] for r in audit_records(root)] == [True]
+
+
+def test_purge_dry_run_deletes_and_audits_nothing(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = make(st, root)
+    session, private = stage_files(root, sid)
+    code, out, _ = forget(capsys, sid, "--purge", "--dry-run")
+    assert code == 0 and out["forgotten"][0]["purged"] is True
+    assert (session / "prompt.md").is_file() and private.is_dir()
+    assert forgotten_at(st, sid) is None and audit_records(root) == []
+
+
+def test_purge_waits_for_undelivered_events_and_exits_12(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from claude_session import toolhooks
+
+    sid = make(st, root)
+    st.conn.execute("UPDATE events SET delivered_at = NULL WHERE csession_id = ?", (sid,))
+    # delivery is attempted first; here it leaves the event undelivered
+    monkeypatch.setattr(toolhooks, "deliver_best_effort", lambda *a, **k: None)
+    session, private = stage_files(root, sid)
+    code, out, err = forget(capsys, sid, "--purge")
+    assert code == 12
+    validate(out, SCHEMA)
+    assert out["forgotten"][0]["purged"] is False
+    assert "events" in err and sid in err
+    assert (session / "prompt.md").is_file() and private.is_dir()
+    assert forgotten_at(st, sid) is not None  # still forgotten; reconcile deletes it later
+
+
+def test_a_failed_purge_exits_12_audits_an_error_and_reconcile_finishes_it(
+    st: Store, root: str, capsys: pytest.CaptureFixture[str], cfg: str
+) -> None:
+    from claude_session import fsutil
+
+    sid = make(st, root)
+    session, _ = stage_files(root, sid)
+    deep = session
+    for _ in range(40):
+        deep = deep / "d"
+        deep.mkdir()
+    original = fsutil.tree_depth_cap
+    fsutil.tree_depth_cap = lambda: 5  # type: ignore[assignment]
+    try:
+        code, out, err = forget(capsys, sid, "--purge", "--config", cfg)
+    finally:
+        fsutil.tree_depth_cap = original  # type: ignore[assignment]
+    assert code == 12
+    assert out["forgotten"][0]["purged"] is False
+    assert sid in err
+    assert forgotten_at(st, sid) is not None
+    assert [r["result"] for r in audit_records(root)] == ["ok", "error"]
+    age_forget(st, sid, 8)
+    reconcile(capsys, cfg)
+    assert not session.exists() and forgotten_at(st, sid) is None

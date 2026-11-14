@@ -78,6 +78,10 @@
               },
               "description": "Multiset of key=value pairs, verbatim."
             },
+            "purge": {
+              "type": "boolean",
+              "description": "forget --purge: the session and private directories were deleted at once."
+            },
             "tty": {
               "type": "boolean"
             },

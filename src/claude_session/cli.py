@@ -527,6 +527,7 @@ def _forget(args: argparse.Namespace) -> int:
         "actor": actor,
         "decision_ids": args.decision_id or [],
         "dry_run": args.dry_run,
+        "purge": args.purge,
     }
     with store.open_state() as st:
         if args.id is not None:
@@ -542,16 +543,25 @@ def _forget(args: argparse.Namespace) -> int:
                 labels=[ids.parse_label(text) for text in args.label or []],
                 **common,
             )
+    unpurged = [e["csession_id"] for e in result["forgotten"] if e.get("purged") is False]
     if args.json:
         print_json(result)
-        return 0
-    verb = "would forget" if result["dry_run"] else "forgot"
-    for item in result["forgotten"]:
-        print(f"{verb} {item['csession_id']} (deleted after {item['delete_after']})")
-    for item in result["skipped"]:
-        print(f"skipped {item['csession_id']}: {item['reason']}")
-    if not (result["forgotten"] or result["skipped"]):
-        print("nothing to forget")
+    else:
+        verb = "would forget" if result["dry_run"] else "forgot"
+        for item in result["forgotten"]:
+            purged = " and purged" if item.get("purged") else ""
+            print(f"{verb}{purged} {item['csession_id']} (deleted after {item['delete_after']})")
+        for item in result["skipped"]:
+            print(f"skipped {item['csession_id']}: {item['reason']}")
+        if not (result["forgotten"] or result["skipped"]):
+            print("nothing to forget")
+    if unpurged and not result["dry_run"]:
+        print(
+            f"forgotten but not purged: {', '.join(unpurged)} (events are left to deliver, or a "
+            "directory could not be removed); reconcile deletes them after retention_days",
+            file=sys.stderr,
+        )
+        return 12
     return 0
 
 
@@ -1110,6 +1120,7 @@ def build_parser() -> _Parser:
     p.add_argument("--state", action="append", choices=STATES)
     p.add_argument("--kind", metavar="KIND")
     p.add_argument("--label", action="append", metavar="KEY=VALUE")
+    p.add_argument("--purge", action="store_true")
     _add_audit_flags(p)
     _add_dry_run(p)
 

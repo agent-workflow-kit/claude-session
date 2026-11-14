@@ -49,7 +49,7 @@ from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from . import audit, envbuild, liveness, outcomefile, store, toolhooks
+from . import audit, envbuild, liveness, outcomefile, sessiondir, store, toolhooks
 from .errors import InternalError, NotFoundError, RefusedError
 
 if TYPE_CHECKING:
@@ -77,7 +77,9 @@ class _Forgetter:
         actor: str,
         decision_ids: Sequence[str],
         dry_run: bool,
+        purge: bool = False,
     ) -> None:
+        self.purge = purge
         self.st = st
         self.cfg = cfg
         self.gateway = gateway
@@ -150,7 +152,11 @@ class _Forgetter:
         row = self.st.conn.execute(
             "SELECT launch_kind, current_run FROM sessions WHERE csession_id = ?", (sid,)
         ).fetchone()
-        inputs = None if row is None else {"kind": row[0], "run": int(row[1])}
+        inputs: dict[str, Any] | None = (
+            None if row is None else {"kind": row[0], "run": int(row[1])}
+        )
+        if self.purge:
+            inputs = {**(inputs or {}), "purge": True}
         return audit.append(
             self.audit_path,
             actor=self.actor,
@@ -231,6 +237,44 @@ class _Forgetter:
             return None
         return self.st.forgotten_since(sid)
 
+    # Purging
+
+    def purged(self, sid: str) -> bool:
+        """Delete the directories of the session just forgotten (``--purge``). A dry run
+        deletes nothing and answers whether the real run would. False (the session stays
+        forgotten, ``reconcile`` deletes the directories at retention) when an event is
+        left to deliver (the hook reads the directories), or a directory cannot be removed
+        (an ``error`` record follows the ``ok`` one). The walk is
+        ``sessiondir.delete_session_dirs``: fd-based, never following a symlink."""
+        if self.dry_run:
+            return not self.st.has_undelivered_events(sid)
+        toolhooks.deliver_best_effort(
+            self.st,
+            self.cfg,
+            sid,
+            gateway=self.gateway,
+            environ=self.environ,
+            state_root=self.state_root,
+        )
+        if self.st.has_undelivered_events(sid):
+            self._best_effort(sid, "error")
+            return False
+        try:
+            sessiondir.delete_session_dirs(self.state_root, sid)
+        except (OSError, ValueError, sessiondir.SessionDirUnsafe):
+            self._best_effort(sid, "error")
+            return False
+        except BaseException:
+            self._best_effort(sid, "error")
+            raise
+        return True
+
+    def entry(self, forgotten_at: str, sid: str) -> dict[str, Any]:
+        entry: dict[str, Any] = _entry(forgotten_at, sid, self.cfg.retention_days)
+        if self.purge:
+            entry["purged"] = self.purged(sid)
+        return entry
+
 
 class _AuditFailed(Exception):
     pass
@@ -254,6 +298,7 @@ def forget_session(
     actor: str,
     decision_ids: Sequence[str] = (),
     dry_run: bool = False,
+    purge: bool = False,
 ) -> dict[str, Any]:
     """``forget <id>`` (``csession_id`` already resolved): the ``forget --json`` object, or
     ``RefusedError`` (``live``, exit 20) when a run of the session is not final."""
@@ -265,6 +310,7 @@ def forget_session(
         actor=actor,
         decision_ids=decision_ids,
         dry_run=dry_run,
+        purge=purge,
     )
     worker.check([csession_id])
     if worker.live(csession_id):
@@ -278,7 +324,7 @@ def forget_session(
         raise worker.refused(csession_id)
     return {
         "dry_run": dry_run,
-        "forgotten": [_entry(forgotten_at, csession_id, cfg.retention_days)],
+        "forgotten": [worker.entry(forgotten_at, csession_id)],
         "skipped": [],
     }
 
@@ -296,6 +342,7 @@ def forget_older_than(
     kind: str | None = None,
     labels: Sequence[tuple[str, str]] = (),
     dry_run: bool = False,
+    purge: bool = False,
 ) -> dict[str, Any]:
     """``forget --older-than`` (interface.md, forget): every session last updated more than
     ``seconds`` ago that matches the filters is forgotten, live ones (pending records
@@ -308,11 +355,12 @@ def forget_older_than(
         actor=actor,
         decision_ids=decision_ids,
         dry_run=dry_run,
+        purge=purge,
     )
     threshold = st.clock() - timedelta(seconds=seconds)
     selected = [sid for sid, _ in st.forget_candidates(threshold, kind=kind, labels=labels)]
     worker.check(selected)
-    forgotten: list[dict[str, str]] = []
+    forgotten: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
     for sid in selected:
         after = worker.state_after(sid)
@@ -323,7 +371,7 @@ def forget_older_than(
             continue
         forgotten_at = worker.forget_one(sid, after[1])
         if forgotten_at is not None:
-            forgotten.append(_entry(forgotten_at, sid, cfg.retention_days))
+            forgotten.append(worker.entry(forgotten_at, sid))
         elif st.has_open_run(sid):  # a run started since the check
             skipped.append({"csession_id": sid, "reason": LIVE})
     return {"dry_run": dry_run, "forgotten": forgotten, "skipped": skipped}
