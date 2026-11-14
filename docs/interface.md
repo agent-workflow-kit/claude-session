@@ -127,7 +127,7 @@ When a bootstrap prompt is sent as the first message:
 - skill only: `/<skill> Your claude-session directory is <abs>.`;
 - headless resume without a prompt: `Your claude-session directory is <abs>. Continue the task. When you are finished, file your status report.` (an interactive resume without a prompt gets no initial message).
 
-Independently, the injected `SessionStart` hook always adds the trusted context line `claude-session directory: <abs>; run <n>; inputs: inputs/<n>/<a>, inputs/<n>/<b>` (the run's input files, if any; every source: `startup`, `resume`, `fork`, `clear`, `compact`, `other`), so the path, the run and the inputs are known even when no first message is sent.
+Independently, the injected `SessionStart` hook always adds the trusted context line `claude-session directory: <abs>; run <n>; inputs: inputs/<n>/<a>, inputs/<n>/<b>` (the run's input files, if any; every source: `startup`, `resume`, `fork`, `clear`, `compact`, `other`), so the path, the run and the inputs are known even when no first message is sent. The prompt and the line name the session directory as an absolute path, not the artifacts directory: `artifacts/` is the fixed subdirectory `<abs>/artifacts` of it (the same as `$CSESSION_DIR/artifacts`, which the instructions use).
 
 The bootstrap prompt is the last argument of the `claude` argv, preceded by `--`, so no option given before it (for example a `claude_args` entry such as `--debug` or `--allowedTools`) can take it as a value; without a prompt there is no `--`.
 
@@ -863,7 +863,7 @@ All failures here end the launch `not-started` (exit 12) with the named end reas
 **Every run** (all kinds):
 
 - `--add-dir $CSESSION_DIR`; `--system-prompt-snapshot off`; `permissions.defaultMode` as described in [Permission profiles](#permission-profiles);
-- allow `Bash(claude-session report:*)` and `Bash(<absolute claude-session path> report:*)` (see [`report`](#report) for the forms that match);
+- allow `Bash(claude-session report:*)` and `Bash(<absolute claude-session path> report:*)` (see [`report`](#report) for the forms that match), added whatever the permission profile lists: a profile file with only `Skill(<name>)` still lets `report` run (tested);
 - allow `Read` of `//$CSESSION_DIR/**`; allow both `Edit` and `Write` of `//$CSESSION_DIR/artifacts/**`, `//$CSESSION_DIR/outbox/**` and, when it is the cwd, `//$CSESSION_DIR/work/**` (live test: a `Write(…)` allow rule alone does not permit the Write tool; `Edit(…)` does, so both are generated);
 - `Edit` and `Write` denies for the protected session files and the private directory;
 - the injected hooks, each with an explicit `timeout` (`PostToolUse` and `Stop` 60 s, the others 30 s), see [Internal commands](#internal-commands).
