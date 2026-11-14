@@ -303,6 +303,26 @@ def test_a_launch_validation_failure_at_start_is_launch_failed(env: Env) -> None
     assert env.rows("SELECT state FROM sessions") == [("not-started",)]
 
 
+def test_the_launch_failed_csession_id_is_a_real_session_a_caller_can_stop_and_forget(
+    env: Env,
+) -> None:
+    env.config.write_text(f"claude_bin: {env.tmp_path / 'missing'}\n", encoding="utf-8")
+    proc, out = env.start()
+    assert proc.returncode == 12
+    sid = out["error"]["csession_id"]
+    assert env.rows("SELECT csession_id FROM sessions") == [(sid,)]
+
+    stopped = env.cs(["stop", sid, "--json", "--config", str(env.config)])
+    assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+    assert json.loads(stopped.stdout)["already_final"] is True
+
+    forgotten = env.cs(["forget", sid, "--json", "--config", str(env.config)])
+    assert forgotten.returncode == 0, forgotten.stdout + forgotten.stderr
+    assert sid in forgotten.stdout
+    status = env.cs(["status", sid, "--json", "--config", str(env.config)])
+    assert status.returncode == 10  # forgotten: no longer addressable
+
+
 def test_a_usage_error_at_start_allocates_nothing(env: Env) -> None:
     proc, out = env.start(("--mode", "headless", "--cwd", str(env.tmp_path / "nope")))
     assert proc.returncode == 2 and out["error"]["code"] == "usage"
