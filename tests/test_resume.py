@@ -223,6 +223,44 @@ def test_implicit_done_is_carried_and_reset_returns_to_the_kind(env: Env) -> Non
     assert resolved["origins"]["implicit_done"] == "builtin"
 
 
+def test_a_carried_implicit_done_true_over_a_false_kind_survives_a_plain_resume(
+    env: Env,
+) -> None:
+    sid = exec_session(env, "--kind", "rank", "--implicit-done")["csession_id"]
+    assert spec(env, sid, 1) == {"implicit_done": True}
+    proc, _out = resume(env, sid)
+    assert proc.returncode == 0, proc.stderr
+    assert spec(env, sid, 2) == {"implicit_done": True}
+    resolved = json.loads(env.run_row(sid, 2)["resolved_json"])
+    assert resolved["profile"]["implicit_done"] is True  # the kind's own value is false
+    assert resolved["origins"]["implicit_done"] == "previous_run"
+
+
+def test_a_kind_change_drops_the_carried_implicit_done_and_honours_one_given_now(
+    env: Env,
+) -> None:
+    sid = exec_session(env, "--no-implicit-done")["csession_id"]
+    assert spec(env, sid, 1) == {"implicit_done": False}
+    proc, _out = resume(env, sid, "--kind", "draft-ticket")
+    assert proc.returncode == 0, proc.stderr
+    assert spec(env, sid, 2) == {}
+    resolved = json.loads(env.run_row(sid, 2)["resolved_json"])
+    assert resolved["profile"]["implicit_done"] is True  # draft-ticket's own value
+    assert resolved["origins"]["implicit_done"] == "builtin"
+    proc, _out = resume(env, sid, "--kind", "rank", "--implicit-done")
+    assert proc.returncode == 0, proc.stderr
+    assert spec(env, sid, 3) == {"implicit_done": True}
+    resolved = json.loads(env.run_row(sid, 3)["resolved_json"])
+    assert resolved["profile"]["implicit_done"] is True
+    assert resolved["origins"]["implicit_done"] == "flag"
+    proc, _out = resume(env, sid, "--kind", "draft-ticket", "--no-implicit-done")
+    assert proc.returncode == 0, proc.stderr
+    assert spec(env, sid, 4) == {"implicit_done": False}
+    resolved = json.loads(env.run_row(sid, 4)["resolved_json"])
+    assert resolved["profile"]["implicit_done"] is False
+    assert resolved["origins"]["implicit_done"] == "flag"
+
+
 def test_reset_with_the_flag_it_resets_exits_2_and_allocates_nothing(env: Env) -> None:
     sid = exec_session(env, "--model", "m1")["csession_id"]
     proc, out = resume(env, sid, "--reset", "model", "--model", "m2")
