@@ -869,6 +869,9 @@
               "cost_usd": {
                 "type": "null"
               },
+              "num_turns": {
+                "type": "null"
+              },
               "outcome": {
                 "enum": [
                   "not-started",
@@ -1255,6 +1258,14 @@
           ],
           "description": "Headless: the sum of total_cost_usd over all result objects of the run (values that are not finite non-negative numbers left out); null for interactive runs, launch-phase ends, and a headless run with no result object, no usable cost or a sum that is not finite."
         },
+        "num_turns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Headless: the sum of num_turns over all result objects of the run (values that are not non-negative integers left out); null for interactive runs, launch-phase ends, and a headless run with no result object or no usable num_turns."
+        },
         "message": {
           "type": [
             "string",
@@ -1313,6 +1324,7 @@
         "report",
         "session_started_at",
         "cost_usd",
+        "num_turns",
         "message",
         "warnings"
       ]
