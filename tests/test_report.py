@@ -264,10 +264,30 @@ def test_a_sibling_directory_sharing_the_name_prefix_is_outside(run: Run) -> Non
     usage(run, "outside .*CSESSION_DIR", summary_file=str(sibling / "s.md"))
 
 
-def test_a_hard_link_outside_is_not_a_bypass_of_the_path_check(run: Run, tmp_path: Path) -> None:
-    # a file the agent hard-linked into the session directory is inside; one it names outside is not
+def test_a_hard_link_to_an_outside_file_inside_csession_dir_is_refused(
+    run: Run, tmp_path: Path
+) -> None:
     outside = outside_file(tmp_path)
-    usage(run, "outside .*CSESSION_DIR", summary_file=str(outside))
+    os.link(outside, run.artifacts / "summary.md")
+    usage(run, "more than one hard link", summary_file=str(run.artifacts / "summary.md"))
+
+
+@pytest.mark.parametrize("suffix", ["/", "/.", "/.."])
+def test_a_trailing_slash_or_dot_is_refused(run: Run, suffix: str) -> None:
+    run.write_artifact("real.md", b"inside")
+    (run.artifacts / "ln2").symlink_to(run.artifacts / "real.md")
+    for name in ("ln2", "real.md"):
+        usage(run, "not a regular file", summary_file=str(run.artifacts / name) + suffix)
+
+
+def test_a_final_dotdot_is_refused(run: Run) -> None:
+    usage(run, "not a regular file", summary_file=str(run.artifacts) + "/..")
+
+
+# the criterion holds with the sandbox inactive: the `run` fixture starts no sandbox, and `report`
+# is allowed by `Bash(claude-session report:*)`, so the confinement must not rely on the sandbox
+def test_an_outside_file_is_refused_when_sandbox_inactive(run: Run, tmp_path: Path) -> None:
+    usage(run, "outside .*CSESSION_DIR", summary_file=str(outside_file(tmp_path)))
 
 
 def test_a_directory_swapped_for_a_symlink_after_the_check_is_not_followed(

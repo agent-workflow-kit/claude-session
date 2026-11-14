@@ -419,8 +419,8 @@ def _open_confined(path: str, flag: str, session_fd: int, real_dir: str) -> int:
     if "\0" in path:
         raise _usage(f"{flag}: the path contains a NUL character")
     parent, base = os.path.split(path)
-    if base in ("", ".", ".."):
-        parent, base = os.path.split(os.path.realpath(path))
+    if base in ("", ".", ".."):  # a trailing slash or dot would follow a final symlink
+        raise _usage(f"{flag} {path}: not a regular file")
     full = os.path.join(os.path.realpath(parent or "."), base)
     if full != real_dir and not full.startswith(real_dir + "/"):
         raise _usage(f"{flag} {path}: outside $CSESSION_DIR; write the text there first")
@@ -452,8 +452,8 @@ def _read_text_file(
     path: str, cap: int, flag: str, stdin: Readable, session_fd: int, real_dir: str
 ) -> str:
     """``--summary-file``/``--reason-file``: ``-`` (stdin) or a readable regular file inside
-    ``$CSESSION_DIR`` (``_open_confined``; a symlink, FIFO, device or directory is refused), at
-    most ``cap`` bytes, valid UTF-8."""
+    ``$CSESSION_DIR`` (``_open_confined``; a symlink, FIFO, device, directory or file with more
+    than one hard link is refused), at most ``cap`` bytes, valid UTF-8."""
     if path == "-":
         data = _read_stream(stdin, cap, flag)
     else:
@@ -462,6 +462,8 @@ def _read_text_file(
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
                 raise _usage(f"{flag} {path}: not a regular file")
+            if info.st_nlink != 1:
+                raise _usage(f"{flag} {path}: has more than one hard link")
             if info.st_size > cap:
                 raise _usage(f"{flag} {path}: larger than summary_max_bytes ({cap} bytes)")
             data = b""
