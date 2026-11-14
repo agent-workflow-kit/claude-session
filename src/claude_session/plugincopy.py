@@ -180,9 +180,7 @@ class _Walk:
                 try:
                     chunk = os.read(fd, _CHUNK)
                 except OSError as exc:
-                    raise _refuse(
-                        self.source, f"{rel!r} cannot be read ({exc.strerror})"
-                    ) from exc
+                    raise _refuse(self.source, f"{rel!r} cannot be read ({exc.strerror})") from exc
                 if not chunk:
                     break
                 read += len(chunk)

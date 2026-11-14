@@ -207,7 +207,12 @@ def test_dry_run_plan_golden(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ki
     shown = normalized_plan(plan, root)
     assert_golden(shown, f"exec-dry-run-{kind}")
     documented = json.loads((GOLDEN / f"settings-{kind}.json").read_text(encoding="utf-8"))
-    settings = json.loads(json.dumps(shown["settings"]).replace(dryrun.PLACEHOLDER_ID, SID))
+    text = json.dumps(shown["settings"]).replace(dryrun.PLACEHOLDER_ID, SID)
+    # The documented settings name the plugin directory itself; a sandboxed run names its
+    # per-run copy, which the plan lists as the directory's ``effective`` path.
+    (plugin,) = shown["plugin_dirs"]
+    text = text.replace(plugin["effective"].replace(dryrun.PLACEHOLDER_ID, SID), plugin["source"])
+    settings = json.loads(text)
     settings.pop("hooks")
     assert settings == documented
 

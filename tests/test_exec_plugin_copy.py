@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from .test_exec_headless import FAST, START, STOP, read_jsonl, result_step, run_exec
+from .test_exec_headless import FAST, START, STOP, Run, read_jsonl, result_step, run_exec
 
 PLACEHOLDERS = [".claude", ".mcp.json", "CLAUDE.md", "CLAUDE.local.md"]
 
@@ -40,7 +40,7 @@ def plugin_flags(log: Path) -> tuple[list[str], list[str]]:
     return ([plugins] if isinstance(plugins, str) else plugins), flags["--add-dir"]
 
 
-def launch(tmp_path: Path, state: Path, work: Path, plugin: Path, *args: str):  # type: ignore[no-untyped-def]
+def launch(tmp_path: Path, state: Path, work: Path, plugin: Path, *args: str) -> Run:
     return run_exec(
         tmp_path,
         state,

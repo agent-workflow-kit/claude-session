@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from claude_session import fsutil, plugincopy
+from claude_session import fsutil, plugincopy, sessiondir
 from claude_session.errors import LaunchValidationError
+from claude_session.sessiondir import SessionDirs
 
 PLACEHOLDERS = [".claude", ".mcp.json", "CLAUDE.md", "CLAUDE.local.md"]
 
@@ -228,16 +230,14 @@ SID = "cs-abcd2345"
 
 
 @pytest.fixture
-def dirs(tmp_path: Path):  # type: ignore[no-untyped-def]
-    from claude_session.sessiondir import SessionDirs
-
+def dirs(tmp_path: Path) -> Iterator[SessionDirs]:
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     with SessionDirs.open(str(state), SID) as d:
         yield d
 
 
-def test_copy_plugins_returns_the_effective_directories(plugin: Path, dirs) -> None:  # type: ignore[no-untyped-def]
+def test_copy_plugins_returns_the_effective_directories(plugin: Path, dirs: SessionDirs) -> None:
     second = plugin.parent / "other"
     second.mkdir()
     paths, warnings = dirs.copy_plugins(1, [str(plugin), str(second)])
@@ -250,7 +250,7 @@ def test_copy_plugins_returns_the_effective_directories(plugin: Path, dirs) -> N
     assert (Path(paths[1]) / "CLAUDE.local.md").is_file()
 
 
-def test_copy_plugins_replaces_earlier_copies(plugin: Path, dirs) -> None:  # type: ignore[no-untyped-def]
+def test_copy_plugins_replaces_earlier_copies(plugin: Path, dirs: SessionDirs) -> None:
     first, _ = dirs.copy_plugins(1, [str(plugin)])
     second, _ = dirs.copy_plugins(2, [str(plugin)])
     assert not Path(first[0]).exists()
@@ -260,7 +260,7 @@ def test_copy_plugins_replaces_earlier_copies(plugin: Path, dirs) -> None:  # ty
 
 
 def test_copy_plugins_never_writes_through_a_planted_symlink(
-    plugin: Path, dirs, tmp_path: Path  # type: ignore[no-untyped-def]
+    plugin: Path, dirs: SessionDirs, tmp_path: Path
 ) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -273,7 +273,7 @@ def test_copy_plugins_never_writes_through_a_planted_symlink(
 
 
 def test_copy_plugins_replaces_a_planted_run_directory_link(
-    plugin: Path, dirs, tmp_path: Path  # type: ignore[no-untyped-def]
+    plugin: Path, dirs: SessionDirs, tmp_path: Path
 ) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -284,16 +284,16 @@ def test_copy_plugins_replaces_a_planted_run_directory_link(
     assert list(outside.iterdir()) == []
 
 
-def test_copy_plugins_refuses_a_hostile_source(plugin: Path, dirs, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_copy_plugins_refuses_a_hostile_source(
+    plugin: Path, dirs: SessionDirs, tmp_path: Path
+) -> None:
     (plugin / "link").symlink_to(tmp_path)
     with pytest.raises(LaunchValidationError) as info:
         dirs.copy_plugins(1, [str(plugin)])
     assert info.value.end_reason == "unsafe_plugin_dir"
 
 
-def test_copy_plugins_is_removed_with_the_session(plugin: Path, dirs) -> None:  # type: ignore[no-untyped-def]
-    from claude_session import sessiondir
-
+def test_copy_plugins_is_removed_with_the_session(plugin: Path, dirs: SessionDirs) -> None:
     dirs.copy_plugins(1, [str(plugin)])
     state = dirs.state_root
     dirs.close()
