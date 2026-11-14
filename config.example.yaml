@@ -295,10 +295,10 @@ permission_profiles:
   readonly:
     permissions:
       allow:
-        - "Agent"
-        - "Task"
         - "Skill"
       deny:
+        - "Agent"
+        - "Task"
         - "WebFetch"
         - "WebSearch"
         - "mcp__*"
