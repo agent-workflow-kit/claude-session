@@ -206,6 +206,23 @@ def test_reset_drops_a_carried_setting(env: Env) -> None:
     assert spec(env, sid, 2) == {"max_turns": 5}
 
 
+def test_implicit_done_is_carried_and_reset_returns_to_the_kind(env: Env) -> None:
+    sid = exec_session(env, "--no-implicit-done")["csession_id"]
+    assert spec(env, sid, 1) == {"implicit_done": False}
+    proc, _out = resume(env, sid)
+    assert proc.returncode == 0, proc.stderr
+    assert spec(env, sid, 2) == {"implicit_done": False}
+    resolved = json.loads(env.run_row(sid, 2)["resolved_json"])
+    assert resolved["profile"]["implicit_done"] is False
+    assert resolved["origins"]["implicit_done"] == "previous_run"
+    proc, _out = resume(env, sid, "--reset", "implicit-done")
+    assert proc.returncode == 0, proc.stderr
+    assert spec(env, sid, 3) == {}
+    resolved = json.loads(env.run_row(sid, 3)["resolved_json"])
+    assert resolved["profile"]["implicit_done"] is True  # the implement kind's own value
+    assert resolved["origins"]["implicit_done"] == "builtin"
+
+
 def test_reset_with_the_flag_it_resets_exits_2_and_allocates_nothing(env: Env) -> None:
     sid = exec_session(env, "--model", "m1")["csession_id"]
     proc, out = resume(env, sid, "--reset", "model", "--model", "m2")

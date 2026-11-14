@@ -158,9 +158,10 @@ Shared by `exec`, `start` and `resume` (where each is accepted: [Flags at start 
 | `--setting-sources <list>` | kind's `setting_sources` | Comma list of `user`, `project`, `local`; `""` for none. Third-party-reading runs must load none: a non-empty list fails the launch (`unsafe_setting_sources`, see [Generated settings](#generated-settings)). |
 | `--reads-third-party` | kind's `reads_third_party` | Forces the run to be third-party-reading (there is no per-call way to force `false`; change the kind instead). Implies `sandbox: required`, `setting_sources: []` and `env.inherit: false` unless each is given explicitly in the same call, and `mcp: none` (which has no per-call flag); origin `flag-implied`. Carried flags (from the previous run) never override these implications, also when `--reads-third-party` itself is carried; an explicit flag that an implication overrides produces a warning. A kind whose `reads_third_party` is true (for example `review`) has the same implications for carried flags: a carried `--sandbox`, `--setting-sources` or `--env-allowlist-only` never beats them on a resume or fork (origin `flag-implied`, with a warning); one given now does, as with the flag. A carried value is replaced by the implied one (`sandbox: required`, `setting_sources: []`, `env.inherit: false`), whatever it was. With nothing carried, the kind's own values apply: a configured `sandbox: preferred` stays `preferred`. |
 | `--auto-exit` / `--no-auto-exit` | kind's `auto_exit` | Whether `claude` is ended `auto_exit_delay` after a `done` report and a qualifying `Stop` (no background tasks). A `done` report ingested by the qualifying Stop's own hook counts: the latest event is then that `report` event (`reported`, idle), right after the Stop. Immediately before SIGTERM, `exec` re-checks that the latest event is still that `Stop` (or that `report` event); otherwise it waits for the next one. |
+| `--implicit-done` / `--no-implicit-done` | kind's `implicit_done` | Whether a clean headless exit with a result and no report counts as `done` (implicit, `report.implicit: true`) or ends `exited-unreported` (`no_report`); see [Outcome mapping](#outcome-mapping). `--no-implicit-done` lets a caller that needs a skill-written report refuse the implicit success whatever the config says. The dry run's `implicit_done` and `origins.implicit_done` show the effective value. Interactive runs have no implicit done: the flag is accepted and has no effect there (it is still carried). |
 | `--env-allow VAR` | none | Repeatable; adds a name to the effective allowlist. Each name must match `^[A-Za-z_][A-Za-z0-9_]*$` (ASCII; no patterns), else exit 2. It cannot unlock `secret_env` variables (only the kind's config `env.allow` can). |
 | `--env-allowlist-only VAR` | none | Repeatable. The first use replaces the kind's `env.allow` with the given names and turns off env inheritance; `--env-allowlist-only ''` gives an empty list (`''` is ignored when names are also given); any other name must match `^[A-Za-z_][A-Za-z0-9_]*$`, else exit 2. `--env-allow` adds to the replaced list. Because the kind's `env.allow` is replaced, its unlock of `secret_env` variables is off too: while allowlist-only mode is in effect no `secret_env` variable is passed, even one the kind's config `env.allow` or this flag names. |
-| `--reset <setting>` | none | Resume (`resume`, `start --resume`) only. Repeatable; drops the stored value of `model`, `plugin-dir`, `env-allow`, `env-allowlist-only`, `setting-sources`, `sandbox`, `timeout`, `max-turns`, `permission-profile` or `auto-exit`. |
+| `--reset <setting>` | none | Resume (`resume`, `start --resume`) only. Repeatable; drops the stored value of `model`, `plugin-dir`, `env-allow`, `env-allowlist-only`, `setting-sources`, `sandbox`, `timeout`, `max-turns`, `permission-profile`, `auto-exit` or `implicit-done`. |
 | `--outcome-file <path>` | none | Also accepted by `wait`. See [Outcome file](#outcome-file). |
 | `--allow-tainted` | off | Resume (and fork) only. [Human-only](#flag-rules); audited (`resume_tainted`). |
 | `--override-escalation` | off | Resume only (not with `--fork`), after a run that ended `escalated`. [Human-only](#flag-rules); audited. See [Escalation override](#launch-order). |
@@ -233,6 +234,7 @@ Untrusted or agent-generated text is never accepted *only* as a flag value: prom
 | `--prompt-file`, `--input-file` | accepted | copies staged in `private/<id>/runs/<n>/staged/` | rejected |
 | `--hook`, `--hook-timeout` | accepted | yes (also used for late delivery) | rejected |
 | `--auto-exit`, `--no-auto-exit` | accepted | yes | rejected |
+| `--implicit-done`, `--no-implicit-done` | accepted | yes | rejected |
 | `--allow-tainted`, `--override-escalation` | with `--resume` only; the [human-only check](#flag-rules) runs here | yes, also `--override-escalation` in the run row; at adoption the spec must match the row and, for either flag, the frozen actor must still be `human:<non-blank>` (else `session_dir_unsafe`); audited at adoption | rejected |
 | `--actor`, `--decision-id` | accepted | yes | rejected |
 | `--outcome-file` | accepted | yes (absolute path) | accepted; overrides the stored path (checked again; rejected: exit 2, run stays pending) |
@@ -264,6 +266,7 @@ Each run stores the resolved values of its launch settings. Resolution order for
 | `--setting-sources` | carried | not carried | `--reset setting-sources`; on a third-party-reading run a carried value is replaced by the implied `[]`, as for `--sandbox` |
 | `--reads-third-party` | carried | not carried | cannot be reset |
 | `--auto-exit` / `--no-auto-exit` | carried | not carried | `--reset auto-exit` |
+| `--implicit-done` / `--no-implicit-done` | carried | not carried | `--reset implicit-done` |
 | `--label` | labels belong to the session | same | given now: added |
 | prompt, `--input-file` | only from a previous run that ended `not-started` | same | given now: replaces the carried prompt or input set; earlier inputs stay readable in `inputs/<n>/`; fork: see below |
 | `--skill` | never | never | the skill is re-invoked only if `--skill` is given |
@@ -637,10 +640,10 @@ When `claude` exits, `exec` first ingests the outbox (the last report may not ha
 | `pending_cause` set, or killed by a signal | per the cause table | per the cause table |
 | `subtype: error_max_turns` or `terminal_reason: max_turns` | `timeout` | `max_turns` |
 | `is_error: true` | `exited-unreported` | `api_error` |
-| clean exit with a result, kind `implicit_done: true` | `done`, implicit (state `exited`, `report.implicit: true`, `summary` null, the result text frozen as artifact `result.md` after the same ingestion checks) | `normal` |
+| clean exit with a result, effective `implicit_done: true` (the kind's, or `--implicit-done`) | `done`, implicit (state `exited`, `report.implicit: true`, `summary` null, the result text frozen as artifact `result.md` after the same ingestion checks) | `normal` |
 | ... while report requests of the run are still in the outbox or `claimed/` after the final drain (a report may wait unprocessed; the run gets a warning) | `exited-unreported` | `result_rejected` |
 | ... and `result.md` fails an ingestion check (size, `contains_secret`) | `exited-unreported` | `result_rejected` |
-| clean exit with a result, kind `implicit_done: false` | `exited-unreported` | `no_report` (with a report: `normal`) |
+| clean exit with a result, effective `implicit_done: false` (the kind's, or `--no-implicit-done`) | `exited-unreported` | `no_report` (with a report: `normal`) |
 | non-zero exit | `exited-unreported` | `exit_<code>` |
 | no complete result | `exited-unreported` | `no_session_start` if no `SessionStart` was seen, else `no_result` |
 
