@@ -213,7 +213,8 @@
           ]
         },
         "available": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "False for sandbox off, for missing prerequisites and for an install that would fail inside the sandbox (hard-linked code, an interpreter behind an unreadable alias directory); problems says why."
         },
         "problems": {
           "type": "array",

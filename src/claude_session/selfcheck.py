@@ -23,6 +23,11 @@ command that removes it.
 - A socket path that does not fit fails every sandboxed run (``socket_path_too_long``):
   with the sandbox enabled, its network bridge would break (spike: unix socket paths are
   limited to about 108 bytes).
+- An install that would fail inside the sandbox although the tools work (an interpreter of
+  ``claude-session`` behind an alias directory the sandbox does not list; interface.md,
+  Install requirements) counts as a missing prerequisite: ``launch.check_sandbox`` passes it
+  as ``install_problems``. Hard-linked code fails earlier (``check_hook_interpreter``), and
+  ``dryrun.Prerequisites`` adds both to ``kinds`` rows.
 - ``off``: nothing is checked or created.
 
 Prerequisite probes run through the #51 ``Gateway`` (a fake one in tests), by absolute path

@@ -103,7 +103,7 @@
             "boolean",
             "null"
           ],
-          "description": "null when sandbox is off."
+          "description": "null when sandbox is off. False also when the install would fail inside the sandbox (hard-linked code, an interpreter behind an unreadable alias directory); sandbox_problems says why."
         },
         "sandbox_problems": {
           "type": "array",
