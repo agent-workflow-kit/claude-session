@@ -409,23 +409,61 @@ def _read_stream(stream: Readable, cap: int, flag: str) -> bytes:
     return b"".join(chunks)
 
 
-def _read_text_file(path: str, cap: int, flag: str, stdin: Readable) -> str:
-    """``--summary-file``/``--reason-file``: ``-`` (stdin) or a readable regular file, opened
-    with ``O_NOFOLLOW`` (a symlink, FIFO, device or directory is refused), at most ``cap``
-    bytes, valid UTF-8."""
-    if path == "-":
-        data = _read_stream(stdin, cap, flag)
-    else:
+def _open_confined(path: str, flag: str, session_fd: int, real_dir: str) -> int:
+    """Open ``path`` for reading, confined to ``real_dir`` (the resolved ``$CSESSION_DIR``).
+
+    The directory part is resolved (symlinks and ``..`` included) and must lie inside
+    ``real_dir``; the file is then opened component by component from ``session_fd`` with
+    ``O_NOFOLLOW``, so a component swapped for a symlink after the check is refused instead of
+    followed, and the final component may not be a symlink at all (``UsageError``)."""
+    if "\0" in path:
+        raise _usage(f"{flag}: the path contains a NUL character")
+    parent, base = os.path.split(path)
+    if base in ("", ".", ".."):  # a trailing slash or dot would follow a final symlink
+        raise _usage(f"{flag} {path}: not a regular file")
+    full = os.path.join(os.path.realpath(parent or "."), base)
+    if full != real_dir and not full.startswith(real_dir + "/"):
+        raise _usage(f"{flag} {path}: outside $CSESSION_DIR; write the text there first")
+    parts = [part for part in full[len(real_dir) :].split("/") if part]
+    if not parts:
+        raise _usage(f"{flag} {path}: not a regular file")
+    dir_fd = os.dup(session_fd)
+    try:
+        for part in parts[:-1]:
+            try:
+                next_fd = os.open(part, _DIR_FLAGS, dir_fd=dir_fd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise _usage(f"{flag} {path}: outside $CSESSION_DIR or changed") from exc
+                raise _usage(f"{flag} {path}: {exc.strerror}") from exc
+            os.close(dir_fd)
+            dir_fd = next_fd
         try:
-            fd = os.open(path, _FILE_FLAGS)
+            return os.open(parts[-1], _FILE_FLAGS, dir_fd=dir_fd)
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 raise _usage(f"{flag} {path}: is a symbolic link; pass the file itself") from exc
             raise _usage(f"{flag} {path}: {exc.strerror}") from exc
+    finally:
+        os.close(dir_fd)
+
+
+def _read_text_file(
+    path: str, cap: int, flag: str, stdin: Readable, session_fd: int, real_dir: str
+) -> str:
+    """``--summary-file``/``--reason-file``: ``-`` (stdin) or a readable regular file inside
+    ``$CSESSION_DIR`` (``_open_confined``; a symlink, FIFO, device, directory or file with more
+    than one hard link is refused), at most ``cap`` bytes, valid UTF-8."""
+    if path == "-":
+        data = _read_stream(stdin, cap, flag)
+    else:
+        fd = _open_confined(path, flag, session_fd, real_dir)
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
                 raise _usage(f"{flag} {path}: not a regular file")
+            if info.st_nlink != 1:
+                raise _usage(f"{flag} {path}: has more than one hard link")
             if info.st_size > cap:
                 raise _usage(f"{flag} {path}: larger than summary_max_bytes ({cap} bytes)")
             data = b""
@@ -548,10 +586,14 @@ def file_report(
         cap = info.summary_max_bytes
         summary_text = summary
         if summary_file is not None:
-            summary_text = _read_text_file(summary_file, cap, "--summary-file", stdin)
+            summary_text = _read_text_file(
+                summary_file, cap, "--summary-file", stdin, session_fd, real_dir
+            )
         reason_text = None
         if reason_file is not None:
-            reason_text = _read_text_file(reason_file, cap, "--reason-file", stdin)
+            reason_text = _read_text_file(
+                reason_file, cap, "--reason-file", stdin, session_fd, real_dir
+            )
         if summary_text is not None:
             _check_text(summary_text, "summary", cap)
         if reason_text is not None:
