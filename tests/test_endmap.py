@@ -174,6 +174,20 @@ def test_a_cost_sum_that_overflows_is_unknown() -> None:
     assert parsed.complete and parsed.cost_usd is None
 
 
+def test_a_turn_count_beyond_sqlite_integers_is_not_counted() -> None:
+    parsed = parse(line(result(num_turns=2**63)), line(result(num_turns=2)))
+    assert parsed.complete and parsed.num_turns == 2
+    parsed = parse(line(result(num_turns=2**63 - 1)))
+    assert parsed.num_turns == 2**63 - 1
+
+
+def test_a_turn_sum_that_overflows_is_unknown() -> None:
+    parsed = parse(line(result(num_turns=2**63 - 1)), line(result(num_turns=1)))
+    assert parsed.complete and parsed.num_turns is None
+    parsed = parse(line(result(num_turns=2**63 - 1)), line(result(num_turns=1)), line(result()))
+    assert parsed.num_turns is None
+
+
 def test_a_long_single_line_parses_in_linear_time() -> None:
     import time
 
