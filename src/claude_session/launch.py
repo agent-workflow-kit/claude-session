@@ -1584,6 +1584,30 @@ def generated_entries(
     }
 
 
+def interpreter_holders(
+    process: Process,
+    rules: pathrules.PathRules,
+    writable: pathrules.SessionWritable,
+    readable: Sequence[str],
+) -> tuple[str, ...]:
+    """The read entries ``exec`` adds so the sandbox can follow the symlinks on the way to
+    the ``#!`` interpreter of ``claude-session`` (``settings_builder.interpreter_holders``;
+    callers apply it on Linux and WSL2 only, ``selfcheck.symlink_hops_apply``): the directories holding them,
+    read-only. A holder that fails the generated-entry rules (``read_entry_problem``), the
+    user-entry rules (``user_entry_problem``: session-writable, or reached through a symlink
+    in a session-writable directory) or contains a session-writable path is left out, and
+    the install probe then reports the sandbox unavailable."""
+
+    def accept(holder: str) -> bool:
+        return (
+            rules.read_entry_problem(holder, generated=True) is None
+            and rules.user_entry_problem(holder, writable) is None
+            and not writable.overlaps(holder)
+        )
+
+    return settings_builder.interpreter_holders(process.claude_session, readable, accept)
+
+
 def sandbox_readable(
     cwd: str,
     alloc: Allocated,
@@ -2037,6 +2061,16 @@ def checks(
     if isolated:
         rules.check_generated(generated)
     readable = sandbox_readable(cwd, alloc, generated, read, plugins, expanded, home)
+    if (
+        isolated
+        and writable is not None
+        and selfcheck.symlink_hops_apply(selfcheck.detect_platform())
+    ):
+        holders = interpreter_holders(process, rules, writable, readable)
+        generated["interpreter"] = holders
+        readable = [*readable, *holders]
+    else:
+        generated["interpreter"] = ()
     check = effects.sandbox(resolution, alloc, tools, process, tmp, readable=readable)
     warnings += check.warnings
     effects.warn(check.warnings)
@@ -2051,7 +2085,7 @@ def checks(
             write_dirs=write.dirs,
             system_dirs=generated["system"],
             tool_dirs=generated["tools"],
-            python_dirs=generated["python"],
+            python_dirs=(*generated["python"], *generated["interpreter"]),
             path_prepend=generated["path_prepend"],
         )
     isolation_warnings = settings_builder.isolation_warnings(resolution)

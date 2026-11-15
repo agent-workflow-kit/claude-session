@@ -432,6 +432,49 @@ def hard_link_problem(link_dirs: Sequence[str] | None = None) -> str | None:
     return None
 
 
+def _script_interpreter(executable: str) -> str | None:
+    """The absolute ``#!`` interpreter of the script ``executable`` (the kernel ends it at the
+    first space or tab), or None: not a script, an unreadable file, a relative interpreter or
+    ``env`` (resolved on the sandbox's ``PATH``)."""
+    try:
+        with open(executable, "rb") as handle:
+            line = handle.read(256).split(b"\n", 1)[0]
+        words = os.fsdecode(line[2:]).split() if line[:2] == b"#!" else []
+    except OSError:
+        return None
+    interpreter = words[0] if words else ""
+    if not os.path.isabs(interpreter) or os.path.basename(interpreter) == "env":
+        return None
+    return interpreter
+
+
+def interpreter_holders(
+    executable: str, readable_dirs: Sequence[str], accept: Callable[[str], bool]
+) -> tuple[str, ...]:
+    """The directories to add to the sandbox's ``allowRead`` so that the ``#!`` interpreter of
+    ``executable`` (``claude-session``) can be followed inside it: the exact directories
+    holding the symlinks on the way to its real file (``pathrules.symlink_holders``; for a
+    uv-managed Python the store directory holding the minor-version alias), not their
+    ancestors, minus those ``readable_dirs`` already cover and ``/``, which cannot be listed.
+    A holder ``accept`` refuses (the read-entry and path rules: ``$HOME`` or an ancestor,
+    credential paths, the state root, anything session-writable or containing a writable
+    path) is left out, so ``interpreter_problem`` reports the sandbox unavailable as before.
+    Nothing for a script without an absolute ``#!`` interpreter or a chain that does not
+    resolve. Callers apply it on Linux and WSL2 only (``selfcheck.symlink_hops_apply``)."""
+    interpreter = _script_interpreter(executable)
+    if interpreter is None:
+        return ()
+    holders = pathrules.symlink_holders(interpreter)
+    if holders is None:
+        return ()
+    roots = [os.path.normpath(d) for d in readable_dirs]
+    return tuple(
+        holder
+        for holder in holders
+        if holder != "/" and not any(_inside(holder, r) for r in roots) and accept(holder)
+    )
+
+
 def interpreter_problem(executable: str, readable_dirs: Sequence[str]) -> str | None:
     """Why a sandboxed run of the script ``executable`` (``claude-session``) could not start
     its interpreter, or None. The ``#!`` interpreter (the kernel ends it at the first space
@@ -442,14 +485,8 @@ def interpreter_problem(executable: str, readable_dirs: Sequence[str]) -> str | 
     file that is not a script with an absolute ``#!`` interpreter (``#!/usr/bin/env`` is
     resolved on the sandbox's ``PATH``) and one that cannot be read. Callers apply it on
     Linux and WSL2 only (``selfcheck.symlink_hops_apply``)."""
-    try:
-        with open(executable, "rb") as handle:
-            line = handle.read(256).split(b"\n", 1)[0]
-        words = os.fsdecode(line[2:]).split() if line[:2] == b"#!" else []
-    except OSError:
-        return None
-    interpreter = words[0] if words else ""
-    if not os.path.isabs(interpreter) or os.path.basename(interpreter) == "env":
+    interpreter = _script_interpreter(executable)
+    if interpreter is None:
         return None
     who = f"the interpreter of {_shown(executable)!r} ({_shown(interpreter)!r})"
     loop = (

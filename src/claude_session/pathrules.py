@@ -1255,6 +1255,17 @@ def unreadable_hop(path: str, readable: Callable[[str], bool]) -> str | None:
     return None if readable(real) else real
 
 
+def symlink_holders(path: str) -> list[str] | None:
+    """The directories holding the symlinks followed while resolving ``path``, in order (the
+    exact directories only, never their ancestors; ``/`` included when a symlink sits
+    directly under it), or None for more than ``MAX_SYMLINKS`` symlinks or a path that
+    cannot be resolved. What a sandbox must list for ``unreadable_hop`` to pass."""
+    steps = _resolution_steps(path)
+    if steps is None:
+        return None
+    return list(dict.fromkeys(step for step, link in steps if link is not None))
+
+
 def check_path_entries(entries: Sequence[str], writable: Callable[[str], bool]) -> None:
     """No ``PATH`` entry may be inside a session-writable path, resolved hop by hop
     (``writable_hop``): an isolated run never runs a binary from one. Raises
