@@ -4,11 +4,27 @@ sandbox uses the directories as given. End to end through the fake ``claude``.""
 
 from __future__ import annotations
 
+import errno
+import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from .test_exec_headless import FAST, START, STOP, Run, read_jsonl, result_step, run_exec
+from .test_exec_headless import (
+    FAST,
+    START,
+    STOP,
+    Run,
+    claude_bin,
+    claude_session_cmd,
+    private_home,
+    read_jsonl,
+    result_step,
+    run_exec,
+    write_json,
+)
 
 PLACEHOLDERS = [".claude", ".mcp.json", "CLAUDE.md", "CLAUDE.local.md"]
 
@@ -103,10 +119,21 @@ def test_a_run_without_a_sandbox_uses_the_directory_as_given(
     assert not (plugin / "CLAUDE.md").exists()
 
 
-def test_a_symlink_in_the_plugin_ends_the_run_not_started(
+def test_a_relative_symlink_inside_the_plugin_is_copied_as_a_link(
     tmp_path: Path, state: Path, work: Path, plugin: Path
 ) -> None:
-    (plugin / "out").symlink_to(tmp_path)
+    (plugin / "alias").symlink_to("skills/s")
+    run = launch(tmp_path, state, work, plugin, "--sandbox", "preferred")
+    assert run.code == 0, run.proc.stderr
+    copy = state / "sessions" / run.sid / "plugins" / "1" / "0" / "kit"
+    assert os.readlink(copy / "alias") == "skills/s"
+
+
+@pytest.mark.parametrize("target", ["ABSOLUTE", "../../x"])
+def test_an_absolute_or_escaping_symlink_ends_the_run_not_started(
+    tmp_path: Path, state: Path, work: Path, plugin: Path, target: str
+) -> None:
+    (plugin / "out").symlink_to(str(tmp_path) if target == "ABSOLUTE" else target)
     run = launch(tmp_path, state, work, plugin, "--sandbox", "preferred")
     assert run.code == 12
     assert (run.outcome["outcome"], run.outcome["end_reason"]) == (
@@ -115,3 +142,71 @@ def test_a_symlink_in_the_plugin_ends_the_run_not_started(
     )
     assert "out" in run.outcome["message"]
     assert not run.log.exists() or not read_jsonl(run.log)
+
+
+def test_a_resume_without_copies_removes_the_earlier_runs_copies(
+    tmp_path: Path, state: Path, work: Path, plugin: Path
+) -> None:
+    first = launch(tmp_path, state, work, plugin, "--sandbox", "preferred")
+    assert first.code == 0, first.proc.stderr
+    plugins = state / "sessions" / first.sid / "plugins"
+    assert (plugins / "1").is_dir()
+    prompt = tmp_path / "again.md"
+    prompt.write_text("Again.\n")
+    proc = subprocess.run(
+        [
+            *claude_session_cmd(),
+            "resume",
+            first.sid,
+            "--json",
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--sandbox",
+            "off",
+            "--prompt-file",
+            str(prompt),
+        ],
+        cwd=work,
+        env={**os.environ, **private_home(tmp_path), "PATH": "/usr/bin:/bin"},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not plugins.exists()
+
+
+def test_a_copy_that_fails_ends_not_started_and_leaves_no_run_directory(
+    tmp_path: Path,
+    state: Path,
+    work: Path,
+    plugin: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from claude_session import cli, plugincopy
+
+    def failing(*_args: object, **_kwargs: object) -> object:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(plugincopy, "copy", failing)
+    log = tmp_path / "fake.jsonl"
+    scenario = write_json(tmp_path / "scenario.json", {"steps": [START, STOP, result_step()]})
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"claude_bin: {claude_bin(tmp_path / 'fakebin', scenario, log)}\n{FAST}")
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Go.\n")
+    monkeypatch.chdir(work)
+    for key, value in {**private_home(tmp_path), "PATH": "/usr/bin:/bin"}.items():
+        monkeypatch.setenv(key, value)
+    capsys.readouterr()
+    code = cli.main(
+        ["exec", "--mode", "headless", "--json", "--config", str(cfg), "--prompt-file", str(prompt)]
+        + ["--plugin-dir", str(plugin), "--sandbox", "preferred"]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert code == 12 and out["outcome"] == "not-started"
+    assert not list((state / "sessions").glob("*/plugins/*"))
+    assert not log.exists() or not read_jsonl(log)

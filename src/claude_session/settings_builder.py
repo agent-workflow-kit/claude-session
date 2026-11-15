@@ -682,6 +682,23 @@ def _check_abs(label: str, path: str, *, rule: bool = False) -> None:
         )
 
 
+def rule_name_problem(name: str) -> str | None:
+    """Why ``name`` (one path component) cannot appear in a permission rule, or None: not
+    valid UTF-8, a control character, or one of the rule characters."""
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return "is not valid UTF-8"
+    if _CONTROL.search(name):
+        return "contains a control character"
+    if _RULE_UNSAFE.search(name):
+        return (
+            "contains a character that cannot appear in a permission rule "
+            "(one of * ? [ ] { } ( ) \\)"
+        )
+    return None
+
+
 # Isolated runs (interface.md, Generated settings: isolated and third-party-reading runs)
 
 

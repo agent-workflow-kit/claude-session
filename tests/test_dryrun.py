@@ -10,6 +10,7 @@ import json
 import os
 import stat
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -122,7 +123,15 @@ def executable_at(path: Path) -> Path:
     return path
 
 
-def real_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str) -> tuple[Any, Path]:
+def real_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    *,
+    setup: Callable[[Path], None] | None = None,
+    extra_args: tuple[str, ...] = (),
+    plugin_name: str | None = None,
+) -> tuple[Any, Path]:
     """The plan ``dryrun.new_session_plan`` gives for a headless run of ``kind`` on a host
     laid out under ``<root>`` as the settings goldens' fixed inputs (tests/golden_settings)
     are: ``<root>/home/user``, its state directory, the tools, the plugin directory, the
@@ -139,6 +148,12 @@ def real_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str) -> tup
     (root / "usr" / "local" / "bin" / "claude").symlink_to(real_claude)
     for directory in (*SYSTEM, *PYTHON_DIRS, PLUGIN, "/opt/toolchain", REPO, WT_GIT_DIR):
         (root / directory.lstrip("/")).mkdir(parents=True, exist_ok=True)
+    plugin_path = root / PLUGIN.lstrip("/")
+    if plugin_name is not None:
+        plugin_path = plugin_path.with_name(plugin_name)
+        plugin_path.mkdir()
+    if setup is not None:
+        setup(plugin_path)  # a test shapes the plugin directory
     prefixed = lambda paths: tuple(f"{root}{p}" for p in paths)  # noqa: E731
     monkeypatch.setattr(settings_builder, "system_read_dirs", lambda: prefixed(SYSTEM))
     monkeypatch.setattr(settings_builder, "python_read_dirs", lambda **_: prefixed(PYTHON_DIRS))
@@ -178,9 +193,10 @@ def real_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str) -> tup
         "--prompt-file",
         str(prompt),
         "--plugin-dir",
-        f"{root}{PLUGIN}",
+        str(plugin_path),
         "--actor",
         "auto:test",
+        *extra_args,
     )
     plan, _ = dryrun.new_session_plan(args, cfg, proc)
     return plan, root
@@ -209,12 +225,68 @@ def test_dry_run_plan_golden(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ki
     documented = json.loads((GOLDEN / f"settings-{kind}.json").read_text(encoding="utf-8"))
     text = json.dumps(shown["settings"]).replace(dryrun.PLACEHOLDER_ID, SID)
     # The documented settings name the plugin directory itself; a sandboxed run names its
-    # per-run copy, which the plan lists as the directory's ``effective`` path.
+    # per-run copy, which the plan lists as the directory's ``effective`` path: the settings
+    # hold the copy and never the source, and only then map back to the documented ones.
     (plugin,) = shown["plugin_dirs"]
-    text = text.replace(plugin["effective"].replace(dryrun.PLACEHOLDER_ID, SID), plugin["source"])
+    effective = plugin["effective"].replace(dryrun.PLACEHOLDER_ID, SID)
+    assert effective != plugin["source"] and effective in text
+    assert plugin["source"] not in text.replace(effective, "")
+    text = text.replace(effective, plugin["source"])
     settings = json.loads(text)
     settings.pop("hooks")
     assert settings == documented
+
+
+def test_a_plugin_lacking_the_placeholders_lists_all_four_as_added(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, root = real_plan(tmp_path, monkeypatch, "review")
+    (plugin,) = normalized_plan(plan, root)["plugin_dirs"]
+    assert plugin["source"] == PLUGIN
+    assert plugin["added"] == [".claude", ".mcp.json", "CLAUDE.md", "CLAUDE.local.md"]
+    assert plugin["effective"] != PLUGIN
+
+
+def test_a_plugin_with_an_escaping_symlink_would_fail_with_no_plugin_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, _ = real_plan(
+        tmp_path, monkeypatch, "review", setup=lambda p: (p / "out").symlink_to("../../x")
+    )
+    assert plan["would_fail"] == "unsafe_plugin_dir"
+    assert any("'out'" in w and "unsafe_plugin_dir" in w for w in plan["warnings"])
+    assert plan["plugin_dirs"] == []
+
+
+def test_a_plugin_with_an_inside_relative_symlink_is_planned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, _ = real_plan(
+        tmp_path, monkeypatch, "review", setup=lambda p: (p / "alias").symlink_to("skills")
+    )
+    assert plan["would_fail"] is None, plan["warnings"]
+
+
+@pytest.mark.parametrize("name", ["star*", "a(b)", "a\nb"])
+def test_a_plugin_dir_name_the_rules_cannot_hold_is_refused_naming_the_callers_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    plan, root = real_plan(tmp_path, monkeypatch, "review", plugin_name=name)
+    assert plan["would_fail"] == "unsafe_plugin_dir"
+    (warning,) = [w for w in plan["warnings"] if "unsafe_plugin_dir" in w]
+    assert "plugin directory name" in warning
+    assert repr(f"{root}/opt/plugins/{name}")[1:-1] in warning
+    assert "/plugins/1/" not in warning  # not the session's copy path
+    assert plan["plugin_dirs"] == []
+
+
+def test_with_the_sandbox_off_the_plugin_is_used_as_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, _ = real_plan(tmp_path, monkeypatch, "review", extra_args=("--sandbox", "off"))
+    (plugin,) = plan["plugin_dirs"]
+    assert plugin["effective"] == plugin["source"]
+    assert plugin["added"] == []
 
 
 def test_the_plan_never_holds_an_environment_value(

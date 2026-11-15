@@ -10,16 +10,20 @@ written. The copy is the directory the run passes as ``--plugin-dir`` and ``--ad
 makes read-only (sandbox ``denyWrite`` and ``Edit``/``Write`` denies).
 
 The source is read through directory descriptors opened without following symlinks. A
-symlink, a special file (FIFO, socket, device) or an unreadable entry is refused
-(``unsafe_plugin_dir``), as is a tree past the bounds below; nothing is followed out of the
-plugin directory. Directories are written 0700 and files 0600 (0700 when the source has an
-executable bit: plugin hooks are scripts), whatever the umask. ``scan`` makes the same
+symlink is copied as a symlink (never followed) when its target is relative, non-empty and,
+normalised lexically against the link's directory, stays inside the plugin directory
+(real plugins ship ``node_modules/.bin`` links); any other symlink, a special file (FIFO,
+socket, device) or an unreadable entry is refused (``unsafe_plugin_dir``), as is a tree past
+the bounds below; nothing is followed out of the plugin directory. Directories are written
+0700 and files 0600 (0700 when the source has an executable bit: plugin hooks are scripts),
+whatever the umask. ``scan`` makes the same
 checks reading only (the launch validations and the dry run); ``copy`` writes.
 """
 
 from __future__ import annotations
 
 import os
+import posixpath
 import stat
 from dataclasses import dataclass
 from typing import Final
@@ -126,13 +130,26 @@ class _Walk:
         except OSError as exc:
             raise _refuse(self.source, f"{rel!r} cannot be inspected ({exc.strerror})") from exc
         if stat.S_ISLNK(info.st_mode):
-            raise _refuse(self.source, f"{rel!r} is a symlink")
+            self.symlink(src_fd, dst_fd, name, rel)
+            return
         if stat.S_ISDIR(info.st_mode):
             self.subdirectory(src_fd, dst_fd, name, rel, depth, info)
         elif stat.S_ISREG(info.st_mode):
             self.file(src_fd, dst_fd, name, rel, info)
         else:
             raise _refuse(self.source, f"{rel!r} is not a regular file or directory")
+
+    def symlink(self, src_fd: int, dst_fd: int | None, name: str, rel: str) -> None:
+        try:
+            target = os.readlink(name, dir_fd=src_fd)
+        except OSError as exc:
+            raise _refuse(self.source, f"{rel!r} cannot be read ({exc.strerror})") from exc
+        if not _stays_inside(rel, target):
+            raise _refuse(
+                self.source, f"{rel!r} is a symlink that is absolute or leaves the plugin"
+            )
+        if dst_fd is not None:
+            os.symlink(target, name, dir_fd=dst_fd)
 
     def subdirectory(
         self, src_fd: int, dst_fd: int | None, name: str, rel: str, depth: int, info: os.stat_result
@@ -183,9 +200,10 @@ class _Walk:
                     raise _refuse(self.source, f"{rel!r} cannot be read ({exc.strerror})") from exc
                 if not chunk:
                     break
+                before = read
                 read += len(chunk)
-                if read > info.st_size:  # grew since it was counted
-                    self._count_bytes(rel, len(chunk))
+                if read > info.st_size:  # grew since it was counted: count only the excess
+                    self._count_bytes(rel, read - max(before, info.st_size))
                 view = memoryview(chunk)
                 while view:
                     view = view[os.write(out, view) :]
@@ -193,9 +211,26 @@ class _Walk:
             os.close(out)
 
 
+def _stays_inside(rel: str, target: str) -> bool:
+    """Whether the symlink at ``rel`` (relative to the plugin root) with this ``target`` is
+    relative, non-empty, has no NUL and, lexically, stays inside the plugin root."""
+    if not target or "\0" in target or target.startswith("/"):
+        return False
+    joined = posixpath.normpath(posixpath.join(posixpath.dirname(rel), target))
+    return joined != ".." and not joined.startswith("../")
+
+
 def _same(fd: int, info: os.stat_result) -> bool:
+    """Whether the opened ``fd`` is still the entry that was inspected: same device, inode
+    and type, and for a regular file the same size and modification time."""
     now = os.fstat(fd)
-    return (now.st_dev, now.st_ino) == (info.st_dev, info.st_ino)
+    if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
+        return False
+    if stat.S_IFMT(now.st_mode) != stat.S_IFMT(info.st_mode):
+        return False
+    if stat.S_ISREG(now.st_mode):
+        return (now.st_size, now.st_mtime_ns) == (info.st_size, info.st_mtime_ns)
+    return True
 
 
 def _open_source(source: str) -> int:

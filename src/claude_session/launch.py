@@ -1358,6 +1358,15 @@ def plan_plugin_copies(
     directories as they are."""
     if resolution.profile.sandbox == "off":
         return ()
+    for source in plugins:
+        # The copy keeps the directory's name and the run's rules name the copy: refuse a
+        # name they cannot hold now, naming the caller's directory, before anything is copied.
+        problem = settings_builder.rule_name_problem(os.path.basename(source))
+        if problem is not None:
+            shown = source.encode("utf-8", "backslashreplace").decode("utf-8")
+            raise LaunchValidationError(
+                f"plugin directory name {problem}: {shown!r}", end_reason="unsafe_plugin_dir"
+            )
     return tuple(
         plugincopy.Planned(
             source,
@@ -2649,11 +2658,11 @@ def prepare(
     if v.profile.is_file:
         # Adoption rewrites start's snapshot with the same bytes (read back with its label).
         snapshot = dirs.write_private_run_file(run, PROFILE_SNAPSHOT, v.profile.snapshot_bytes())
-    if v.plugin_copies:
-        copies, copy_warnings = dirs.copy_plugins(run, [c.source for c in v.plugin_copies])
-        if copies != [c.effective for c in v.plugin_copies]:
-            raise sessiondir.SessionDirUnsafe("the plugin copies are not where the run planned")
-        v.warnings.extend(copy_warnings)
+    # Every run replaces ``plugins/`` (earlier runs' copies go even when this run has none).
+    copies, copy_warnings = dirs.copy_plugins(run, [c.source for c in v.plugin_copies])
+    if copies != [c.effective for c in v.plugin_copies]:
+        raise sessiondir.SessionDirUnsafe("the plugin copies are not where the run planned")
+    v.warnings.extend(copy_warnings)
     generated = generate(req, resolution, alloc, v, process, prompt_path)
     dirs.write_settings(run, settings_builder.settings_json(generated.settings))
     fields: dict[str, Any] = {

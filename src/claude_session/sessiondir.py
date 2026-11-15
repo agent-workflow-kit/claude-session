@@ -1284,14 +1284,18 @@ class SessionDirs:
         placeholders Claude Code's sandbox masks (``plugincopy``). Whatever is at
         ``plugins`` (earlier runs' copies, or an entry the agent planted, a symlink
         included) is first moved into the private directory by rename, never followed, and
-        removed there once the new tree is in place; a removal that fails is a warning, and
-        the leftovers are swept again at the next call. Returns the copies' absolute paths,
-        in order, and the warnings. An unsafe source is ``LaunchValidationError``
-        (``unsafe_plugin_dir``); a write failure is ``SessionDirUnsafe``."""
+        removed there once the new tree is in place (a failed copy removes its partial tree);
+        a removal that fails is a warning, and the leftovers are swept again at the next
+        call. Returns the copies' absolute paths, in order, and the warnings. An unsafe
+        source is ``LaunchValidationError`` (``unsafe_plugin_dir``); a write failure is
+        ``SessionDirUnsafe``. With no
+        ``sources`` the old ``plugins`` is still removed and nothing is created."""
         _check_run(run)
         warnings = self._sweep_trash()
         trash = self._move_to_private(plugincopy.PLUGINS)
         paths: list[str] = []
+        if not sources:
+            return paths, warnings + ([] if trash is None else self._remove_trash(trash))
         where = os.path.join(self.session_path, plugincopy.PLUGINS)
         try:
             plugins_fd = _ensure_dir(self._sfd, plugincopy.PLUGINS, where)
@@ -1312,6 +1316,12 @@ class SessionDirs:
                     paths.append(target)
             finally:
                 os.close(run_fd)
+        except BaseException:
+            # A failed copy leaves no partial tree behind (best effort; swept next call).
+            partial = self._move_to_private(plugincopy.PLUGINS)
+            if partial is not None:
+                self._remove_trash(partial)
+            raise
         finally:
             if trash is not None:
                 warnings += self._remove_trash(trash)

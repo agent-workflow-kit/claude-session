@@ -8,6 +8,7 @@ import os
 import stat
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -107,24 +108,79 @@ def test_modes_are_private_and_the_exec_bit_is_kept(plugin: Path, dest: Path) ->
     assert stat.S_IMODE(os.lstat(out / "CLAUDE.md").st_mode) == 0o600
 
 
-def test_a_symlink_to_a_file_is_refused(plugin: Path, tmp_path: Path) -> None:
+def test_an_absolute_symlink_is_refused(plugin: Path, tmp_path: Path) -> None:
     secret = tmp_path / "secret"
     secret.write_text("s")
     (plugin / "link").symlink_to(secret)
     assert "link" in refused(plugin).message
 
 
-def test_a_symlink_to_a_directory_is_refused(plugin: Path, tmp_path: Path) -> None:
+def test_an_absolute_symlink_to_a_directory_is_refused(plugin: Path, tmp_path: Path) -> None:
     (plugin / "skills" / "out").symlink_to(tmp_path)
     assert "symlink" in refused(plugin).message
 
 
-def test_a_dangling_symlink_placeholder_is_refused_not_replaced(plugin: Path) -> None:
+def test_a_relative_symlink_inside_the_plugin_is_copied_as_a_link(plugin: Path, dest: Path) -> None:
+    (plugin / "bin").mkdir()
+    (plugin / "bin" / "tool").write_text("t")
+    (plugin / "node_modules" / ".bin").mkdir(parents=True)
+    (plugin / "node_modules" / ".bin" / "tool").symlink_to("../../bin/tool")
+    (plugin / "alias").symlink_to("skills/hello")
+    report = copy(plugin, dest)
+    out = dest / "myplug"
+    assert os.readlink(out / "node_modules" / ".bin" / "tool") == "../../bin/tool"
+    assert os.readlink(out / "alias") == "skills/hello"
+    assert (out / "alias" / "SKILL.md").read_text() == "hello\n"
+    assert report.entries == plugincopy.scan(str(plugin)).entries
+
+
+def test_a_dangling_symlink_inside_the_plugin_is_ok(plugin: Path, dest: Path) -> None:
+    (plugin / "later").symlink_to("not/there")
+    copy(plugin, dest)
+    assert os.readlink(dest / "myplug" / "later") == "not/there"
+
+
+def test_symlinks_count_toward_the_entry_bound_with_no_bytes(plugin: Path) -> None:
+    for i in range(3):
+        (plugin / f"l{i}").symlink_to("skills")
+    report = plugincopy.scan(str(plugin))
+    assert report.size == len("hello\n") + len("#!/bin/sh\n")
+    refused(plugin, max_entries=report.entries - 1)
+
+
+@pytest.mark.parametrize(
+    ("where", "target"),
+    [
+        ("link", "../x"),
+        ("link", ".."),
+        ("link", "a/../../x"),
+        ("skills/link", "../../x"),
+        ("skills/link", "../.."),
+        ("skills/link", "a/../../../x"),
+    ],
+)
+def test_a_symlink_escaping_the_plugin_is_refused(plugin: Path, where: str, target: str) -> None:
+    (plugin / where).symlink_to(target)
+    assert where in refused(plugin).message
+
+
+def test_a_symlink_that_stays_inside_through_dotdot_is_ok(plugin: Path) -> None:
+    (plugin / "skills" / "link").symlink_to("../hooks/../skills")
+    plugincopy.scan(str(plugin))
+
+
+def test_a_symlinked_plugin_root_is_refused(plugin: Path, tmp_path: Path) -> None:
+    root = tmp_path / "rootlink"
+    root.symlink_to(plugin)
+    refused(root)
+
+
+def test_an_absolute_dangling_symlink_placeholder_is_refused_not_replaced(plugin: Path) -> None:
     (plugin / "CLAUDE.md").symlink_to("/nonexistent/elsewhere")
     assert "CLAUDE.md" in refused(plugin).message
 
 
-def test_a_symlink_never_leaks_its_target_into_the_copy(
+def test_an_escaping_symlink_never_leaks_its_target_into_the_copy(
     plugin: Path, dest: Path, tmp_path: Path
 ) -> None:
     outside = tmp_path / "outside"
@@ -182,6 +238,48 @@ def test_the_copy_stops_when_the_bytes_grow_past_the_limit(plugin: Path, dest: P
             plugincopy.copy(str(plugin), fd, "myplug", max_bytes=4096)
     finally:
         os.close(fd)
+
+
+def test_growth_past_the_counted_size_counts_only_the_excess(tmp_path: Path) -> None:
+    grown = tmp_path / "grown"
+    grown.write_bytes(b"x" * 150)
+    walk = plugincopy._Walk("src", 10, 240, 5)
+    info = SimpleNamespace(st_size=100, st_mode=stat.S_IFREG | 0o644)
+    walk._count_bytes("grown", info.st_size)
+    src = os.open(grown, os.O_RDONLY)
+    dst_dir = tmp_path / "out"
+    dst_dir.mkdir()
+    dst = os.open(dst_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        walk.write(src, dst, "grown", "grown", info)  # type: ignore[arg-type]
+    finally:
+        os.close(src)
+        os.close(dst)
+    assert walk.size == 150
+
+
+def test_same_requires_the_same_type_and_for_files_size_and_mtime(tmp_path: Path) -> None:
+    path = tmp_path / "f"
+    path.write_text("abc")
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        real = os.fstat(fd)
+        assert plugincopy._same(fd, real)
+        as_fifo = SimpleNamespace(**{**_fields(real), "st_mode": stat.S_IFIFO | 0o600})
+        assert not plugincopy._same(fd, as_fifo)  # type: ignore[arg-type]
+        as_dir = SimpleNamespace(**{**_fields(real), "st_mode": stat.S_IFDIR | 0o700})
+        assert not plugincopy._same(fd, as_dir)  # type: ignore[arg-type]
+        resized = SimpleNamespace(**{**_fields(real), "st_size": real.st_size + 1})
+        assert not plugincopy._same(fd, resized)  # type: ignore[arg-type]
+        touched = SimpleNamespace(**{**_fields(real), "st_mtime_ns": real.st_mtime_ns + 1})
+        assert not plugincopy._same(fd, touched)  # type: ignore[arg-type]
+    finally:
+        os.close(fd)
+
+
+def _fields(info: os.stat_result) -> dict[str, int]:
+    names = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")
+    return {n: getattr(info, n) for n in names}
 
 
 def test_an_existing_destination_is_refused(plugin: Path, dest: Path) -> None:
@@ -282,6 +380,15 @@ def test_copy_plugins_replaces_a_planted_run_directory_link(
     os.symlink(outside, plugins / "1")
     dirs.copy_plugins(1, [str(plugin)])
     assert list(outside.iterdir()) == []
+
+
+def test_copy_plugins_with_no_sources_removes_earlier_copies_and_creates_nothing(
+    plugin: Path, dirs: SessionDirs
+) -> None:
+    dirs.copy_plugins(1, [str(plugin)])
+    paths, warnings = dirs.copy_plugins(2, [])
+    assert (paths, warnings) == ([], [])
+    assert not (Path(dirs.session_path) / "plugins").exists()
 
 
 def test_copy_plugins_refuses_a_hostile_source(
