@@ -55,6 +55,7 @@ FLAG_KEYS = (
     "implicit_done",
     "env_allowlist_only",
     "env_allow",
+    "tools",
 )
 _FLAG_NAMES = {key: "--" + key.replace("_", "-") for key in FLAG_KEYS}
 for _boolean in ("auto_exit", "implicit_done"):  # the flags with a --no- form
@@ -132,6 +133,9 @@ class Resolution:
     # (the kind's config env.allow) can (envbuild.build, step 3).
     env_allow: tuple[str, ...] = ()
     env_allowlist_only: tuple[str, ...] | None = None
+    # ``--tools``: Claude Code built-in tool names, deduplicated in the order given; None: not
+    # given (every tool the permissions allow). Isolated runs only (``resolve``).
+    tools: tuple[str, ...] | None = None
     permission_profile_file: str | None = None
     # A carried snapshot's recorded label (origin ``previous_run``): ``launch.select_profile``
     # passes it as ``expected_label``, so an edited snapshot fails the launch.
@@ -220,6 +224,13 @@ def resolve(
             )
         extra["permission_profile_label"] = previous.permission_profile_label
     _check_profile_name(cfg, profile, origins)
+    if "tools" in extra and not (profile.reads_third_party or profile.sandbox != "off"):
+        origin = origins["tools"]
+        raise UsageError(
+            "--tools needs an isolated run (a third-party-reading kind or a sandbox that is "
+            f"not off); kind {name!r} is not isolated",
+            detail="use --reset tools" if origin == "previous_run" else None,
+        )
     return Resolution(
         kind=name,
         builtin=name in BUILTIN_KINDS,
@@ -407,6 +418,8 @@ def _apply_flags(
             keep(key, tuple(_env_names(value, key, origin, allow_empty=only)), origin)
             if only:
                 put("env.inherit", False, origin)
+        elif key == "tools":
+            keep(key, _tool_names(value, origin), origin)
         elif key == "permission_profile" and ids.is_permission_profile_file(value):
             keep("permission_profile_file", value, origin)
         else:
@@ -485,6 +498,19 @@ def _setting_sources(value: Any) -> Any:
     if isinstance(value, str):
         return [] if value == "" else value.split(",")
     return value
+
+
+def _tool_names(value: Any, origin: Origin) -> tuple[str, ...]:
+    """``--tools`` names (given now or carried): a non-empty list of known built-in names."""
+    if (
+        not isinstance(value, (list, tuple))
+        or not value
+        or not all(isinstance(n, str) and ids.is_builtin_tool(n) for n in value)
+    ):
+        raise UsageError(
+            f"--tools: expected a list of built-in tool names ({_LAYER_NAMES[origin]})"
+        )
+    return tuple(dict.fromkeys(value))
 
 
 def _env_names(value: Any, key: str, origin: Origin, *, allow_empty: bool) -> list[str]:

@@ -146,6 +146,7 @@ RESOLUTION_KEYS = frozenset(
         "warnings",
         "env_allow",
         "env_allowlist_only",
+        "tools",
         "permission_profile_file",
         "permission_profile_label",
     }
@@ -214,6 +215,7 @@ def resolution_json(resolution: kinds.Resolution) -> dict[str, Any]:
         "env_allowlist_only": (
             None if resolution.env_allowlist_only is None else list(resolution.env_allowlist_only)
         ),
+        "tools": None if resolution.tools is None else list(resolution.tools),
         "permission_profile_file": resolution.permission_profile_file,
         "permission_profile_label": resolution.permission_profile_label,
     }
@@ -222,6 +224,7 @@ def resolution_json(resolution: kinds.Resolution) -> dict[str, Any]:
 def resolution_of(data: Mapping[str, Any]) -> kinds.Resolution:
     _keys(data, RESOLUTION_KEYS)
     allowlist_only = data["env_allowlist_only"]
+    tools = data["tools"]
     origins = {_text(k): _text(v) for k, v in _mapping(data["origins"]).items()}
     if not set(origins.values()) <= ORIGINS:
         raise ValueError("unknown origin")
@@ -235,6 +238,7 @@ def resolution_of(data: Mapping[str, Any]) -> kinds.Resolution:
         warnings=tuple(_texts(data["warnings"])),
         env_allow=tuple(_texts(data["env_allow"])),
         env_allowlist_only=None if allowlist_only is None else tuple(_texts(allowlist_only)),
+        tools=None if tools is None else tuple(_texts(tools)),
         permission_profile_file=_optional_text(data["permission_profile_file"]),
         permission_profile_label=_optional_text(data["permission_profile_label"]),
     )

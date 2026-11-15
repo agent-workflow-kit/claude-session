@@ -49,6 +49,7 @@ FAKE_VALUE_FLAGS = {
     "--session-id",
     "--output-format",
     "--max-turns",
+    "--tools",
 }
 FAKE_REPEATABLE = {"--plugin-dir"}
 FAKE_BOOL_FLAGS = {"-p", "--print", "--fork-session", "--strict-mcp-config", "--verbose"}

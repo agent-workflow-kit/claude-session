@@ -32,6 +32,7 @@ The adopting ``exec`` reruns the step-5 checks (``lifecycle``).
 from __future__ import annotations
 
 import copy
+import fnmatch
 import json
 import os
 import re
@@ -231,6 +232,7 @@ class Isolation:
 class Argv:
     argv: list[str]
     warnings: tuple[str, ...] = ()
+    tools: tuple[str, ...] | None = None  # the ``--tools`` list passed (None: none passed)
 
 
 @dataclass(frozen=True)
@@ -238,6 +240,7 @@ class Generated:
     settings: dict[str, Any]
     argv: list[str]
     warnings: tuple[str, ...] = field(default=())
+    tools: tuple[str, ...] | None = None  # the effective ``--tools`` list (None: none passed)
 
 
 def current_interpreter(executable: str | None = None) -> str:
@@ -497,8 +500,30 @@ def build(
         plugin_dirs=launch.plugin_dirs,
         isolation=isolation,
     )
-    built = build_argv(resolution, paths, tools, launch)
-    return Generated(settings=settings, argv=built.argv, warnings=built.warnings)
+    allowed, denied = _allowed_tools(resolution.tools, _content(permission_profile))
+    built = build_argv(resolution, paths, tools, launch, tools_override=allowed)
+    notes = tuple(
+        f"--tools {name}: denied by the permission profile; it stays unavailable (a deny wins)"
+        for name in denied
+    )
+    return Generated(
+        settings=settings, argv=built.argv, warnings=(*built.warnings, *notes), tools=built.tools
+    )
+
+
+def _allowed_tools(
+    requested: tuple[str, ...] | None, content: Mapping[str, Any]
+) -> tuple[tuple[str, ...] | None, list[str]]:
+    """``requested`` without the tools the permission profile denies by bare name or pattern
+    (``WebFetch``, ``mcp__*``): ``--tools`` only ever narrows, so it never lists a denied
+    tool. Returns the kept names and the dropped ones."""
+    if requested is None:
+        return None, []
+    section = content.get("permissions") or {}
+    deny = section.get("deny", []) if isinstance(section, Mapping) else []
+    patterns = [d for d in deny if isinstance(d, str) and "(" not in d]
+    kept = [t for t in requested if not any(fnmatch.fnmatchcase(t, p) for p in patterns)]
+    return tuple(kept), [t for t in requested if t not in kept]
 
 
 # Settings
@@ -1156,11 +1181,21 @@ def _existing_unique(paths: Iterable[str]) -> tuple[str, ...]:
 # argv
 
 
-def build_argv(resolution: Resolution, paths: Paths, tools: Tools, launch: Launch) -> Argv:
+def build_argv(
+    resolution: Resolution,
+    paths: Paths,
+    tools: Tools,
+    launch: Launch,
+    *,
+    tools_override: tuple[str, ...] | None = None,
+) -> Argv:
     """The ``claude`` argv (design.md, Generated settings: argv); the bootstrap prompt, if
     any, is the last argument, after ``--``. An interactive run ignores
-    an explicit ``--max-turns`` with a warning."""
+    an explicit ``--max-turns`` with a warning. ``--tools`` (the resolution's, or
+    ``tools_override`` when ``build`` dropped denied tools) is one comma-joined value placed
+    before ``--add-dir``: the option is variadic in Claude Code, so an option must follow it."""
     profile = resolution.profile
+    allowlist = resolution.tools if tools_override is None else tools_override
     _check_abs("claude", tools.claude)
     _check_conversation(launch)
     warnings: list[str] = []
@@ -1177,6 +1212,13 @@ def build_argv(resolution: Resolution, paths: Paths, tools: Tools, launch: Launc
         if profile.model.startswith("-"):
             raise ValueError(f"model must not start with '-': {profile.model!r}")
         argv += ["--model", profile.model]
+    if allowlist is not None:
+        argv += ["--tools", ",".join(allowlist)]
+        if "Bash" not in allowlist:
+            warnings.append(
+                "--tools without Bash: the run cannot call `claude-session report`; "
+                "it ends without a report"
+            )
     argv += ["--add-dir", paths.session_dir]
     for plugin_dir in launch.plugin_dirs:
         argv += ["--plugin-dir", plugin_dir]
@@ -1216,7 +1258,7 @@ def build_argv(resolution: Resolution, paths: Paths, tools: Tools, launch: Launc
         # "--" ends the options: a preceding variadic or optional-value option (from
         # claude_args, e.g. --allowedTools or --debug) would otherwise take the prompt.
         argv += ["--", message]
-    return Argv(argv=argv, warnings=tuple(warnings))
+    return Argv(argv=argv, warnings=tuple(warnings), tools=allowlist)
 
 
 def _check_conversation(launch: Launch) -> None:

@@ -525,6 +525,7 @@ def _resolved_record(resolution: kinds.Resolution) -> dict[str, Any]:
         "env_allowlist_only": (
             None if resolution.env_allowlist_only is None else list(resolution.env_allowlist_only)
         ),
+        "tools": None if resolution.tools is None else list(resolution.tools),
         "permission_profile_file": resolution.permission_profile_file,
     }
 

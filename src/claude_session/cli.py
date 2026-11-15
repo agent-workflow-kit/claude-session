@@ -89,6 +89,7 @@ RESETTABLE = {
     "permission-profile": "permission_profile",
     "auto-exit": "auto_exit",
     "implicit-done": "implicit_done",
+    "tools": "tools",
 }
 # Launch flags with a --no- form (argparse.BooleanOptionalAction); shown as `--[no-]<name>`.
 BOOLEAN_FLAGS = frozenset({"auto_exit", "implicit_done"})
@@ -1014,6 +1015,7 @@ def _add_launch_flags(parser: argparse.ArgumentParser, *, resumable: bool) -> No
     parser.add_argument("--reads-third-party", action="store_true", default=None)
     parser.add_argument("--auto-exit", action=argparse.BooleanOptionalAction)
     parser.add_argument("--implicit-done", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--tools", action="extend", nargs="+", metavar="NAME")
     parser.add_argument("--env-allow", action="append", metavar="VAR")
     parser.add_argument("--env-allowlist-only", action="append", metavar="VAR")
     parser.add_argument("--outcome-file", metavar="PATH")
@@ -1251,6 +1253,13 @@ def _check_launch_flags(args: argparse.Namespace) -> None:
                 raise UsageError(
                     f"{_flag(dest)}: invalid variable name {name!r} (^{ids.ENV_NAME.pattern}$)"
                 )
+    for name in args.tools or []:
+        if not isinstance(name, str) or not ids.is_builtin_tool(name):
+            shown = name if isinstance(name, str) and name.isprintable() else repr(name)
+            raise UsageError(
+                f"--tools: unknown tool {shown!r} (a Claude Code built-in tool name, one of "
+                f"{', '.join(sorted(ids.BUILTIN_TOOLS))})"
+            )
     if args.setting_sources:
         for source in args.setting_sources.split(","):
             if source not in SETTING_SOURCES:

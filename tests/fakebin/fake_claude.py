@@ -298,6 +298,7 @@ STRICT_FLAGS = {
     "--fork-session",
     "--strict-mcp-config",
     "--verbose",
+    "--tools",
 }
 REPEATABLE_FLAGS = {"--plugin-dir"}
 OUTPUT_FORMATS = {"text", "json", "stream-json"}

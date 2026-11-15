@@ -929,6 +929,12 @@ def plan_json(
         "has_prompt": req.prompt is not None,
         "input_files": [item.name for item in req.inputs],
         "implicit_done": profile.implicit_done,
+        # The effective --tools list (denied tools dropped); None: no allowlist.
+        "tools": (
+            None
+            if resolution.tools is None
+            else list(resolution.tools if generated is None else generated.tools or ())
+        ),
         "permission_profile": label,
         "timeout": resolution.timeout(mode),
         "max_turns": profile.max_turns,
