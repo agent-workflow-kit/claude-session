@@ -310,7 +310,7 @@ def _run_object(
         "exit_code": _int(run.get("exit_code")),
         "result_path": result_path,
         "cost_usd": None if phase == "launch" else _finite(run.get("cost_usd")),
-        "num_turns": _int(run.get("num_turns")),
+        "num_turns": None if phase == "launch" else _int(run.get("num_turns")),
         "is_error": None if is_error is None else _flag(is_error),
     }
 
