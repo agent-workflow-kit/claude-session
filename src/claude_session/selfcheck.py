@@ -47,6 +47,7 @@ import os
 import shlex
 import stat
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from . import tmpdir
@@ -195,6 +196,7 @@ def self_check(
     tmp_root: str | None = None,  # None: tmpdir.select_root(tmp_base), chosen here
     create: bool = True,
     sandbox_exec: str = SANDBOX_EXEC,
+    install_problems: Sequence[str] = (),
 ) -> SelfCheck:
     """Run the sandbox self-check for a run with sandbox ``mode``: sandbox prerequisites,
     socket path length, then the private tmpdir is created (a leftover moved aside and left
@@ -206,7 +208,11 @@ def self_check(
     does not touch the tmpdir at all; ``csession_id`` may then be None (a new session), and
     the socket path is checked for an id of the fixed length. Raises
     ``LaunchValidationError`` (``sandbox_unavailable``, ``socket_path_too_long``,
-    ``tmpdir_unsafe``) in that order of precedence."""
+    ``tmpdir_unsafe``) in that order of precedence.
+
+    ``install_problems`` (``settings_builder.interpreter_problem``): why a sandboxed
+    ``claude-session report`` could not start here although the prerequisites are present;
+    each makes the sandbox unavailable like a missing prerequisite."""
     if mode not in SANDBOX_MODES:
         raise ValueError(f"unknown sandbox mode: {mode!r}")
     if mode == "off":
@@ -219,18 +225,22 @@ def self_check(
         platform, bwrap=bwrap, socat=socat, gw=gw, sandbox_exec=sandbox_exec
     )
     warnings: list[str] = []
-    problems: tuple[str, ...] = ()
+    found: list[tuple[str, str | None]] = []  # (problem, hint)
     if not prerequisites.available:
-        problems = (f"{prerequisites.problem}; {prerequisites.hint}",)
+        found.append((str(prerequisites.problem), prerequisites.hint))
+    found += [(text, None) for text in install_problems]
+    problems = tuple(f"{p}; {h}" if h else p for p, h in found)
+    if found:
+        problem, hint = found[0]
         if mode == "required":
             raise LaunchValidationError(
-                f"sandbox unavailable: {prerequisites.problem}",
+                f"sandbox unavailable: {problem}",
                 end_reason="sandbox_unavailable",
-                hint=prerequisites.hint,
+                hint=hint,
             )
         warnings.append(
-            f"sandbox 'preferred' but unavailable ({prerequisites.problem}): the run is not"
-            f" sandboxed; {prerequisites.hint}"
+            f"sandbox 'preferred' but unavailable ({problem}): the run is not"
+            f" sandboxed{'; ' + hint if hint else ''}"
         )
     root = tmpdir.select_root(tmp_base) if tmp_root is None else tmp_root
     check_socket_path(os.path.join(root, csession_id or _PLACEHOLDER_ID), platform)
@@ -245,7 +255,7 @@ def self_check(
                 f" remove it: rm -rf {shlex.quote(stale)}"
             )
     return SelfCheck(
-        sandbox_active=prerequisites.available,
+        sandbox_active=not found,
         tmpdir=path,
         warnings=tuple(warnings),
         problems=problems,

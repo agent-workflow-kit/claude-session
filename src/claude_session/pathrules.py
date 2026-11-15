@@ -1221,6 +1221,24 @@ def writable_hop(path: str, writable: Callable[[str], bool]) -> str | None:
     return None
 
 
+def unreadable_hop(path: str, readable: Callable[[str], bool]) -> str | None:
+    """The first step of resolving ``path`` that a sandbox would not let a process follow, or
+    None: the directory holding each symlink followed (the sandbox mounts only the
+    directories it lists; a symlink in an unlisted directory, such as an alias for the real
+    interpreter directory, cannot be read) and the final realpath must satisfy ``readable``.
+    The literal prefixes are not checked (ancestors of a listed directory are traversable).
+    More than ``MAX_SYMLINKS`` symlinks, or a path that cannot be resolved, is returned as it
+    is (fail closed). The read-side twin of ``writable_hop``."""
+    steps = _resolution_steps(path)
+    if steps is None:
+        return path
+    for step, holds_link in steps:
+        if holds_link and not readable(step):
+            return step
+    real = os.path.realpath(path)
+    return None if readable(real) else real
+
+
 def check_path_entries(entries: Sequence[str], writable: Callable[[str], bool]) -> None:
     """No ``PATH`` entry may be inside a session-writable path, resolved hop by hop
     (``writable_hop``): an isolated run never runs a binary from one. Raises

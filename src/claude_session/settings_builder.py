@@ -338,8 +338,6 @@ def check_interpreter(
     ``exec`` calls this for isolated runs at launch (``launch.check_hook_interpreter``) with
     current_interpreter(), pathrules.session_writable(...) and its .paths, and the adopting
     exec again with its own interpreter."""
-    import site
-
     if prefixes is None:
         prefixes = (sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix)
     if stdlib_dirs is None:
@@ -351,10 +349,7 @@ def check_interpreter(
     if site_dirs is None:
         site_dirs = _site_dirs()
     if link_dirs is None:
-        link_dirs = [package_dir]
-        if sys.prefix != sys.base_prefix:
-            venv = os.path.realpath(sys.prefix)
-            link_dirs += [d for d in site.getsitepackages() if _inside(os.path.realpath(d), venv)]
+        link_dirs = default_link_dirs(package_dir)
     pth_entries, pth_files = _pth_entries(site_dirs)
     # (label, path, code-bearing directory: also checked for a writable path inside it)
     candidates = [
@@ -388,6 +383,20 @@ def check_interpreter(
     check_hard_links(link_dirs)
 
 
+def default_link_dirs(package_dir: str | None = None) -> list[str]:
+    """What must hold single-link files: the package directory and, in a virtual
+    environment (``sys.prefix != sys.base_prefix``), its own site-packages."""
+    import site
+
+    if package_dir is None:
+        package_dir = os.path.dirname(os.path.abspath(__file__))
+    dirs = [package_dir]
+    if sys.prefix != sys.base_prefix:
+        venv = os.path.realpath(sys.prefix)
+        dirs += [d for d in site.getsitepackages() if _inside(os.path.realpath(d), venv)]
+    return dirs
+
+
 def check_hard_links(dirs: Sequence[str]) -> None:
     """Every regular file below ``dirs`` (symlinks not followed) must have exactly one link.
     Raises ``LaunchValidationError`` (``unsafe_path``) naming the file and the fix."""
@@ -407,6 +416,44 @@ def check_hard_links(dirs: Sequence[str]) -> None:
                         "UV_LINK_MODE=copy)",
                         end_reason="unsafe_path",
                     )
+
+
+def hard_link_problem(link_dirs: Sequence[str] | None = None) -> str | None:
+    """Why hard-linked code makes every isolated launch fail (``check_hard_links``), or None.
+    Default ``link_dirs``: ``default_link_dirs()``. Part of the sandbox availability probe."""
+    try:
+        check_hard_links(default_link_dirs() if link_dirs is None else link_dirs)
+    except LaunchValidationError as exc:
+        return exc.message
+    return None
+
+
+def interpreter_problem(executable: str, readable_dirs: Sequence[str]) -> str | None:
+    """Why a sandboxed run of the script ``executable`` (``claude-session``) could not start
+    its interpreter, or None. The ``#!`` interpreter is followed hop by hop
+    (``pathrules.unreadable_hop``): a symlink in a directory outside ``readable_dirs`` (the
+    run's ``allowRead``) is invisible in the sandbox, so a venv python that links through an
+    alias directory fails there. Not checked (None): a file that is not a script with an
+    absolute ``#!`` interpreter (``#!/usr/bin/env`` is resolved on the sandbox's ``PATH``)
+    and one that cannot be read."""
+    try:
+        with open(executable, "rb") as handle:
+            line = handle.read(256).split(b"\n", 1)[0]
+        interpreter = os.fsdecode(line[2:]).strip().split(" ", 1)[0] if line[:2] == b"#!" else ""
+    except OSError:
+        return None
+    if not os.path.isabs(interpreter) or os.path.basename(interpreter) == "env":
+        return None
+    roots = [os.path.normpath(d) for d in readable_dirs]
+    hop = pathrules.unreadable_hop(interpreter, lambda p: any(_inside(p, r) for r in roots))
+    if hop is None:
+        return None
+    return (
+        f"the interpreter of {_shown(executable)!r} ({_shown(interpreter)!r}) is reached through"
+        f" {_shown(hop)!r}, outside the directories readable in the sandbox, so sandboxed"
+        " `claude-session report` cannot start; reinstall claude-session with an interpreter"
+        " that is not behind a symlinked alias directory, or list that directory in read_dirs"
+    )
 
 
 def _overlaps(candidate: str, writable_paths: Sequence[str]) -> bool:
