@@ -377,8 +377,9 @@ def _interpreter_holders(
 ) -> tuple[str, ...]:
     """The directories a launch would add for the symlinks of the interpreter chain
     (``launch.interpreter_holders``), checked against the placeholder session's rules;
-    none for a kind that is not isolated or whose rules cannot be built."""
-    if not resolution.isolated():
+    none for a kind whose sandbox is off (no probe runs, allowRead is inert) or whose rules
+    cannot be built."""
+    if resolution.profile.sandbox == "off":
         return ()
     session_dir = sessiondir.session_dir(process.state_root, PLACEHOLDER_ID)
     try:

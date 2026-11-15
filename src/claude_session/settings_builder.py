@@ -212,7 +212,8 @@ class Isolation:
     - ``read_dirs``, ``write_dirs``: the kind's (expanded, resolved; missing write_dirs
       already skipped).
     - ``system_dirs`` (``system_read_dirs()``), ``tool_dirs`` (``tool_dirs()`` of the resolved
-      bwrap, socat, git and claude), ``python_dirs`` (``python_read_dirs()``) and
+      bwrap, socat, git and claude), ``python_dirs`` (``python_read_dirs()`` plus the
+      directories holding the symlinks of the ``claude-session`` interpreter chain) and
       ``path_prepend`` (the kind's ``env.path_prepend``, resolved): the generated read
       entries.
     """
@@ -515,8 +516,8 @@ def interpreter_problem(executable: str, readable_dirs: Sequence[str]) -> str | 
         " claude-session so that the interpreter path has no symlink in an unlisted directory"
         " (for example a virtual environment created with --copies); claude-session lists"
         " the directories holding such symlinks itself, except `/`, the home directory and"
-        " its ancestors, credential and state paths and session-writable ones, which cannot"
-        " be listed"
+        " its ancestors, credential and state paths, session-writable ones, /proc, /sys, /dev and"
+        " world-writable ones, which cannot be listed"
     )
 
 
@@ -1052,7 +1053,7 @@ def _check_isolation_inputs(
         ("write_dirs entry", "invalid_permission_profile", iso.write_dirs),
         ("system read directory", "unsafe_read_dir", iso.system_dirs),
         ("tool directory", "unsafe_read_dir", iso.tool_dirs),
-        ("Python read directory", "unsafe_read_dir", iso.python_dirs),
+        ("Python read directory or interpreter symlink holder", "unsafe_read_dir", iso.python_dirs),
         ("env.path_prepend directory", "unsafe_read_dir", iso.path_prepend),
     ]
     for label, reason, values in sandbox_paths:
@@ -1076,7 +1077,7 @@ def _check_isolation_inputs(
         ("profile allowWrite entry", "invalid_permission_profile", profile_writes),
         ("system read directory", "unsafe_read_dir", iso.system_dirs),
         ("tool directory", "unsafe_read_dir", iso.tool_dirs),
-        ("Python read directory", "unsafe_read_dir", iso.python_dirs),
+        ("Python read directory or interpreter symlink holder", "unsafe_read_dir", iso.python_dirs),
         ("env.path_prepend directory", "unsafe_read_dir", iso.path_prepend),
         (
             "git directory",
@@ -1100,7 +1101,7 @@ def _check_isolation_inputs(
         ("profile allowRead entry", "invalid_permission_profile", profile_reads),
         ("system read directory", "unsafe_read_dir", iso.system_dirs),
         ("tool directory", "unsafe_read_dir", iso.tool_dirs),
-        ("Python read directory", "unsafe_read_dir", iso.python_dirs),
+        ("Python read directory or interpreter symlink holder", "unsafe_read_dir", iso.python_dirs),
         ("env.path_prepend directory", "unsafe_read_dir", iso.path_prepend),
     ]
     for label, reason, values in readable:
@@ -1136,7 +1137,7 @@ def _check_lexical(
         ("read_dirs entry", "invalid_permission_profile", iso.read_dirs),
         ("profile allowRead entry", "invalid_permission_profile", profile_reads),
         ("tool directory", "unsafe_read_dir", iso.tool_dirs),
-        ("Python read directory", "unsafe_read_dir", iso.python_dirs),
+        ("Python read directory or interpreter symlink holder", "unsafe_read_dir", iso.python_dirs),
         ("env.path_prepend directory", "unsafe_read_dir", iso.path_prepend),
         ("git directory", "unsafe_read_dir", git_dirs),
     ]

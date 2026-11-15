@@ -1584,6 +1584,23 @@ def generated_entries(
     }
 
 
+PSEUDO_FILESYSTEMS = ("/proc", "/sys", "/dev")
+
+
+def _pseudo_filesystem(path: str) -> bool:
+    """Whether ``path`` is /proc, /sys or /dev or inside one (never listed as a holder)."""
+    return any(path == p or path.startswith(p + "/") for p in PSEUDO_FILESYSTEMS)
+
+
+def _world_writable(path: str) -> bool:
+    """Whether another user could plant files in the directory (``mode & 0o002``); a path
+    that cannot be examined counts as writable (fails closed)."""
+    try:
+        return bool(os.stat(path).st_mode & 0o002)
+    except OSError:
+        return True
+
+
 def interpreter_holders(
     process: Process,
     rules: pathrules.PathRules,
@@ -1601,7 +1618,9 @@ def interpreter_holders(
 
     def accept(holder: str) -> bool:
         return (
-            rules.read_entry_problem(holder, generated=True) is None
+            not _pseudo_filesystem(holder)
+            and not _world_writable(holder)
+            and rules.read_entry_problem(holder, generated=True) is None
             and rules.user_entry_problem(holder, writable) is None
             and not writable.overlaps(holder)
         )
@@ -2064,10 +2083,12 @@ def checks(
     readable = sandbox_readable(cwd, alloc, generated, read, plugins, expanded, home)
     if (
         isolated
+        and resolution.profile.sandbox != "off"
         and writable is not None
         and selfcheck.symlink_hops_apply(selfcheck.detect_platform())
     ):
         holders = interpreter_holders(process, rules, writable, readable)
+        rules.check_generated({"interpreter": holders})
         generated["interpreter"] = holders
         readable = [*readable, *holders]
     else:

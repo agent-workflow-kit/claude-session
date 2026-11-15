@@ -180,10 +180,15 @@ def test_a_refused_holder_is_left_out_and_the_chain_stays_a_problem(layout: Layo
     assert problem is not None and str(layout.store) in problem
 
 
-def test_the_root_directory_is_never_a_holder(tmp_path: Path) -> None:
-    script = executable(tmp_path / "claude-session", "#!/bin/sh\n")  # /bin may link from /
+def test_the_root_directory_is_never_a_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlink directly under `/` makes `/` a holder of the chain; it is never listed.
+    Host independent: the chain is faked."""
+    script = executable(tmp_path / "claude-session", "#!/bin/sh\n")
+    monkeypatch.setattr(pathrules, "symlink_holders", lambda _p: ["/", str(tmp_path)])
     holders = settings_builder.interpreter_holders(script, [], lambda _p: True)
-    assert "/" not in holders
+    assert holders == (str(tmp_path),)
 
 
 @pytest.mark.parametrize(
@@ -805,3 +810,125 @@ def test_too_long_a_chain_has_its_own_message(tmp_path: Path) -> None:
     script = executable(tmp_path / "cs", f"#!{tmp_path}/l{pathrules.MAX_SYMLINKS + 1}\n")
     problem = settings_builder.interpreter_problem(script, [str(tmp_path)])
     assert problem is not None and "symlink loop or is behind more than" in problem
+
+
+# #124 review round 1
+
+
+def test_a_sandbox_off_kind_lists_no_holders_in_kinds(tmp_path: Path, layout: Layout) -> None:
+    """R1-1: with `sandbox: off` no probe runs and allowRead is inert."""
+    gw = FakeGateway()
+    proc = kinds_proc(tmp_path, layout, gw)
+    off = kinds_row(tmp_path, proc, gw, "implement", link_dirs=())
+    assert off["sandbox"] == "off"
+    assert str(layout.store) not in off["read_dirs"]
+    on = kinds_row(tmp_path, proc, gw, "review", link_dirs=())
+    assert str(layout.store) in on["read_dirs"]
+
+
+def test_a_sandbox_off_dry_run_lists_no_holders(
+    tmp_path: Path, layout: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(selfcheck, "detect_platform", lambda *a, **k: "linux")
+    plan, _ = real_plan(
+        tmp_path, monkeypatch, "implement", setup=lambda _p: script_for(tmp_path / "root", layout)
+    )
+    assert plan["sandbox"]["allow_read"] == []
+    assert str(layout.store) not in plan["profile"]["read_dirs"]
+
+
+def test_a_sandbox_off_third_party_kind_lists_no_holders(tmp_path: Path, layout: Layout) -> None:
+    gw = FakeGateway()
+    proc = kinds_proc(tmp_path, layout, gw)
+    resolution = kinds.resolve(
+        config.load(None, env={"XDG_CONFIG_HOME": str(tmp_path / "none")}),
+        "review",
+        mode="headless",
+    )
+    resolution = dataclasses.replace(
+        resolution, profile=resolution.profile.model_copy(update={"sandbox": "off"})
+    )
+    assert resolution.profile.sandbox == "off" and resolution.isolated()
+    assert (
+        dryrun._interpreter_holders(
+            proc, resolution, pathrules.SessionWritable([]), layout.readable()
+        )
+        == ()
+    )
+
+
+def test_macos_leaves_the_holder_out_of_kinds_and_the_plan(
+    tmp_path: Path, layout: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1-6: the holder listing is for Linux and WSL2 (selfcheck.symlink_hops_apply)."""
+    gw = FakeGateway()
+    proc = kinds_proc(tmp_path, layout, gw)
+    report = dryrun.kinds_report(
+        config.load(None, env={"XDG_CONFIG_HOME": str(tmp_path / "none")}),
+        proc,
+        kind="review",
+        repo=None,
+        prerequisites=dryrun.Prerequisites(gw, "macos", link_dirs=()),
+    )
+    (row,) = report["kinds"]
+    assert str(layout.store) not in row["read_dirs"]
+    monkeypatch.setattr(selfcheck, "detect_platform", lambda *a, **k: "macos")
+    plan, _ = real_plan(
+        tmp_path, monkeypatch, "review", setup=lambda _p: script_for(tmp_path / "root", layout)
+    )
+    assert str(layout.store) not in plan["sandbox"]["allow_read"]
+    assert str(layout.store) not in plan["profile"]["read_dirs"]
+
+
+def test_a_world_writable_holder_is_not_listed(tmp_path: Path, layout: Layout) -> None:
+    """R1-9: another user could plant files in it."""
+    layout.store.chmod(0o777)
+    assert holders_with(tmp_path, layout, []) == ()
+    layout.store.chmod(0o755)
+    assert holders_with(tmp_path, layout, []) == (str(layout.store),)
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self"), reason="needs /proc")
+def test_a_pseudo_filesystem_holder_is_not_listed(tmp_path: Path) -> None:
+    """R1-8: /proc/self/exe is a symlink held by /proc (and /proc/<pid>)."""
+    script = executable(tmp_path / "claude-session", "#!/proc/self/exe\n")
+    proc = dataclasses.replace(process(tmp_path, {}, FakeGateway()), claude_session=script)
+    holders = settings_builder.interpreter_holders(script, [], lambda _p: True)
+    assert "/proc" in holders  # the unfiltered chain does run through /proc
+    rules = holder_rules(tmp_path, tmp_path / "home")
+    assert launch.interpreter_holders(proc, rules, pathrules.SessionWritable([]), []) == ()
+
+
+def test_generated_holders_pass_the_generated_entry_rules(
+    tmp_path: Path, layout: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1-7: launch.checks runs rules.check_generated over the holders."""
+    seen: list[dict] = []
+    original = pathrules.PathRules.check_generated
+
+    def spy(self, entries):  # type: ignore[no-untyped-def]
+        seen.append({k: tuple(v) for k, v in entries.items()})
+        return original(self, entries)
+
+    monkeypatch.setattr(pathrules.PathRules, "check_generated", spy)
+    monkeypatch.setattr(selfcheck, "detect_platform", lambda *a, **k: "linux")
+    real_plan(
+        tmp_path, monkeypatch, "review", setup=lambda _p: script_for(tmp_path / "root", layout)
+    )
+    assert any(set(e) == {"interpreter"} and str(layout.store) in e["interpreter"] for e in seen)
+
+
+def test_chains_through_a_root_or_etc_link_list_nothing_dangerous(tmp_path: Path) -> None:
+    """R1-5: links whose targets are `/` or /etc: the holder is the directory holding the
+    link (never `/` or /etc), and what is listed passes the generated-entry rules."""
+    home = tmp_path / "home"
+    home.mkdir()
+    os.symlink("/", tmp_path / "to-root")
+    os.symlink("/etc", tmp_path / "to-etc")
+    rules = holder_rules(tmp_path, home)
+    for link, rest in (("to-root", "usr/bin/env"), ("to-etc", "hostname")):
+        script = executable(tmp_path / f"cs-{link}", f"#!{tmp_path}/{link}/{rest}\n")
+        proc = dataclasses.replace(process(tmp_path, {}, FakeGateway()), claude_session=script)
+        got = launch.interpreter_holders(proc, rules, pathrules.SessionWritable([]), [])
+        assert "/" not in got and "/etc" not in got
+        assert all(rules.read_entry_problem(h, generated=True) is None for h in got)
