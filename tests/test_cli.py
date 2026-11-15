@@ -43,6 +43,7 @@ FULL_INVOCATIONS: dict[str, list[str]] = {
         *("--max-turns", "5", "--model", "m", "--permission-profile", "review"),
         *("--sandbox", "required", "--setting-sources", "", "--reads-third-party"),
         *("--no-auto-exit", "--env-allow", "A", "--env-allowlist-only", "B"),
+        "--no-implicit-done",
         *("--outcome-file", "/tmp/o.json", "--actor", "auto:test"),
         *("--decision-id", "d1", "--decision-id", "d2", "--dry-run"),
         *("--json", "--config", "c.yaml", "--verbose"),
@@ -234,6 +235,7 @@ def test_launch_flags_are_parsed_into_fields() -> None:
     assert args.setting_sources == ""
     assert args.reads_third_party is True
     assert args.auto_exit is False
+    assert args.implicit_done is False
     assert args.env_allowlist_only == ["B"]
     assert args.decision_id == ["d1", "d2"]
     assert (args.dry_run, args.json, args.verbose, args.config) == (True, True, True, "c.yaml")
@@ -247,6 +249,13 @@ def test_unset_launch_flags_are_none() -> None:
         None,
         None,
     )
+    assert args.implicit_done is None
+
+
+def test_implicit_done_has_both_polarities() -> None:
+    assert parse(["start", "--json", "--implicit-done"]).implicit_done is True
+    assert parse(["start", "--json", "--no-implicit-done"]).implicit_done is False
+    assert parse(["resume", SID, "--no-implicit-done"]).implicit_done is False
 
 
 def test_resume_only_flags_are_parsed() -> None:

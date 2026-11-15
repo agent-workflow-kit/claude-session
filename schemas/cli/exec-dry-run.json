@@ -88,7 +88,8 @@
       "description": "Basenames the run would get in $CSESSION_DIR/inputs/<run>/."
     },
     "implicit_done": {
-      "type": "boolean"
+      "type": "boolean",
+      "description": "The effective value: the kind's, or the --implicit-done / --no-implicit-done flag given now or carried."
     },
     "permission_profile": {
       "type": [

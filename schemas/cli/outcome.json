@@ -321,7 +321,7 @@
         },
         "implicit": {
           "type": "boolean",
-          "description": "true for implicit done (headless clean exit without a report, kinds with implicit_done: true; the result text is the artifact result.md and summary is null). Callers that need an explicit report check it."
+          "description": "true for implicit done (headless clean exit without a report, for runs whose effective implicit_done is true: the kind's, or --implicit-done; the result text is the artifact result.md and summary is null). Callers that need an explicit report check it."
         },
         "summary": {
           "type": [

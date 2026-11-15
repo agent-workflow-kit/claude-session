@@ -22,6 +22,7 @@ STORED: dict[str, Any] = {
     "setting_sources": "user",
     "reads_third_party": True,
     "auto_exit": False,
+    "implicit_done": False,
     "env_allow": ["A_VAR"],
     "env_allowlist_only": ["B_VAR"],
     "plugin_dir": ["/plugins/p"],

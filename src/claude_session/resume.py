@@ -70,6 +70,7 @@ RESETS = {
     "max-turns": "max_turns",
     "permission-profile": "permission_profile",
     "auto-exit": "auto_exit",
+    "implicit-done": "implicit_done",
 }
 # The prefix of a human actor (interface.md, Flag rules: human-only flags).
 HUMAN_ACTOR = "human:"

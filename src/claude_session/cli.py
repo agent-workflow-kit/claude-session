@@ -88,7 +88,10 @@ RESETTABLE = {
     "max-turns": "max_turns",
     "permission-profile": "permission_profile",
     "auto-exit": "auto_exit",
+    "implicit-done": "implicit_done",
 }
+# Launch flags with a --no- form (argparse.BooleanOptionalAction); shown as `--[no-]<name>`.
+BOOLEAN_FLAGS = frozenset({"auto_exit", "implicit_done"})
 # The only flags `exec --session-id` accepts (interface.md, Exit codes, exit 2).
 ADOPTION_FLAGS = {"json", "dry_run", "outcome_file", "verbose", "quiet", "yes", "run"}
 OUTCOME_FILE_COMMANDS = ("exec", "start", "resume", "wait")
@@ -1022,6 +1025,7 @@ def _add_launch_flags(parser: argparse.ArgumentParser, *, resumable: bool) -> No
     parser.add_argument("--setting-sources", metavar="LIST")
     parser.add_argument("--reads-third-party", action="store_true", default=None)
     parser.add_argument("--auto-exit", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--implicit-done", action=argparse.BooleanOptionalAction)
     parser.add_argument("--env-allow", action="append", metavar="VAR")
     parser.add_argument("--env-allowlist-only", action="append", metavar="VAR")
     parser.add_argument("--outcome-file", metavar="PATH")
@@ -1172,8 +1176,8 @@ def parse(parser: _Parser, argv: Sequence[str]) -> argparse.Namespace:
 
 
 def _flag(dest: str) -> str:
-    if dest == "auto_exit":
-        return "--[no-]auto-exit"
+    if dest in BOOLEAN_FLAGS:
+        return "--[no-]" + dest.replace("_", "-")
     return "--" + dest.replace("_", "-")
 
 

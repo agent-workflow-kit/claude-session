@@ -123,7 +123,8 @@ another with `--kind`.
   `killed`, `timeout`, `lost`, `not-started`), mapped to the exit code of the waiting commands.
 - **Report**: the agent's own statement of how it finished (`report done|blocked|failed|needs-input`),
   authenticated with a per-run secret. Without a report, a clean headless exit of a kind with
-  `implicit_done` counts as `done`, with the final result as the artifact.
+  `implicit_done` counts as `done`, with the final result as the artifact; pass
+  `--no-implicit-done` to end such a run `exited-unreported` instead.
 
 ## Usage
 

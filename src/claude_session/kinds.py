@@ -52,11 +52,13 @@ FLAG_KEYS = (
     "setting_sources",
     "reads_third_party",
     "auto_exit",
+    "implicit_done",
     "env_allowlist_only",
     "env_allow",
 )
 _FLAG_NAMES = {key: "--" + key.replace("_", "-") for key in FLAG_KEYS}
-_FLAG_NAMES["auto_exit"] = "--[no-]auto-exit"
+for _boolean in ("auto_exit", "implicit_done"):  # the flags with a --no- form
+    _FLAG_NAMES[_boolean] = "--[no-]" + _boolean.replace("_", "-")
 _LAYER_NAMES: dict[str, str] = {"flag": "flags", "previous_run": "the previous run's flags"}
 # `--reads-third-party` implies these, each unless given explicitly (field, value, flag key).
 _IMPLIED: tuple[tuple[str, Any, str | None], ...] = (

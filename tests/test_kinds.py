@@ -444,6 +444,7 @@ def test_default_bounds_per_mode(cfg_dir: Path) -> None:
         ({"setting_sources": ","}, "--setting-sources"),
         ({"permission_profile": "-x"}, "--permission-profile"),
         ({"auto_exit": "yes"}, "--[no-]auto-exit"),
+        ({"implicit_done": "yes"}, "--[no-]implicit-done"),
     ],
 )
 def test_invalid_flag_values_are_usage_errors_naming_the_flag(
@@ -1179,3 +1180,14 @@ def test_a_configured_third_party_kind_gets_the_same_rule(cfg_dir: Path) -> None
     previous = kinds.Previous(repo=None, flags={"sandbox": "off"})
     result = resolve(cfg, "triage", previous=previous)
     assert (result.profile.sandbox, result.origins["sandbox"]) == ("required", "flag-implied")
+
+
+def test_implicit_done_flag_beats_a_carried_value_which_beats_the_kind(cfg_dir: Path) -> None:
+    cfg = load(cfg_dir, "kinds: {implement: {implicit_done: false}}\n")
+    carried = kinds.Previous(repo=None, flags={"implicit_done": True})
+    kept = resolve(cfg, "implement", previous=carried)
+    assert (kept.profile.implicit_done, kept.origins["implicit_done"]) == (True, "previous_run")
+    now = resolve(cfg, "implement", previous=carried, flags={"implicit_done": False})
+    assert (now.profile.implicit_done, now.origins["implicit_done"]) == (False, "flag")
+    plain = resolve(cfg, "implement")
+    assert (plain.profile.implicit_done, plain.origins["implicit_done"]) == (False, "config")

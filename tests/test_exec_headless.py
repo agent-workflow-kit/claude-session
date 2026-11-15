@@ -244,6 +244,38 @@ def test_an_unreported_clean_run_without_implicit_done_is_exited_unreported(
     assert run.outcome["report"] is None and run.outcome["state"] == "exited-unreported"
 
 
+def test_no_implicit_done_flag_ends_an_unreported_clean_run_exited_unreported(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """The kind says implicit done (the default); --no-implicit-done wins for this call."""
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, STOP, result_step()],
+        args=["--no-implicit-done"],
+        config=FAST,
+    )
+    assert run.code == 14
+    assert (run.outcome["outcome"], run.outcome["end_reason"]) == ("exited-unreported", "no_report")
+    assert run.outcome["report"] is None
+
+
+def test_implicit_done_flag_turns_it_on_over_a_kind_that_has_it_off(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, STOP, result_step("# Result\n\nfine\n")],
+        args=["--implicit-done"],
+        config=NO_IMPLICIT,
+    )
+    assert run.code == 0, run.proc.stderr
+    assert (run.outcome["outcome"], run.outcome["report"]["implicit"]) == ("done", True)
+
+
 def test_the_backstop_blocks_the_first_unreported_stop_once(
     tmp_path: Path, state: Path, work: Path
 ) -> None:
