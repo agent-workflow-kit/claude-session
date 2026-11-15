@@ -159,11 +159,166 @@ def test_reason_file_dash_reads_stdin(run: Run) -> None:
     assert queued_request(run, queued.request_id)["reason"] == "blocked on review"
 
 
-def test_summary_and_reason_files_may_live_anywhere(run: Run, tmp_path: Path) -> None:
-    elsewhere = tmp_path / "notes.md"
-    elsewhere.write_text("outside the session directory")
-    queued = run.report("done", summary_file=str(elsewhere))
-    assert queued_request(run, queued.request_id)["summary"] == "outside the session directory"
+def test_summary_and_reason_files_may_live_anywhere_inside_csession_dir(run: Run) -> None:
+    sub = run.artifacts / "sub"
+    sub.mkdir()
+    (sub / "notes.md").write_text("inside the session directory")
+    (Path(run.csession_dir) / "work.md").write_text("in the session root")
+    queued = run.report(
+        "blocked",
+        summary_file=str(sub / "notes.md"),
+        reason_file=str(Path(run.csession_dir) / "work.md"),
+    )
+    request = queued_request(run, queued.request_id)
+    assert (request["summary"], request["reason"]) == (
+        "inside the session directory",
+        "in the session root",
+    )
+
+
+def test_a_relative_path_inside_csession_dir_is_accepted(
+    run: Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run.write_artifact("summary.md", b"relative")
+    (run.artifacts / "sub").mkdir()
+    monkeypatch.chdir(run.artifacts)
+    queued = run.report("done", summary_file="./sub/../summary.md")
+    assert queued_request(run, queued.request_id)["summary"] == "relative"
+
+
+# Confinement of --summary-file/--reason-file to $CSESSION_DIR (the sandbox may be inactive)
+
+
+def outside_file(tmp_path: Path, text: str = "private notes") -> Path:
+    path = tmp_path / "outside.md"
+    path.write_text(text)
+    return path
+
+
+# the `run` fixture starts no sandbox, and `report` is allowed by `Bash(claude-session report:*)`,
+# so the confinement must not rely on the sandbox being active
+def test_a_summary_file_outside_csession_dir_is_refused_even_when_sandbox_inactive(
+    run: Run, tmp_path: Path
+) -> None:
+    usage(run, "outside .*CSESSION_DIR", summary_file=str(outside_file(tmp_path)))
+
+
+def test_a_reason_file_outside_csession_dir_is_refused(run: Run, tmp_path: Path) -> None:
+    usage(
+        run,
+        "--reason-file .*outside .*CSESSION_DIR",
+        status="blocked",
+        reason_file=str(outside_file(tmp_path)),
+    )
+
+
+def test_the_outside_text_never_reaches_the_error(run: Run, tmp_path: Path) -> None:
+    with pytest.raises(UsageError) as info:
+        run.report("done", summary_file=str(outside_file(tmp_path, "TOP-SECRET-TEXT")))
+    assert "TOP-SECRET-TEXT" not in str(info.value)
+
+
+@pytest.mark.parametrize("path", ["/etc/passwd", "/proc/self/environ", "/dev/null"])
+def test_well_known_outside_files_are_refused(run: Run, path: str) -> None:
+    usage(run, "outside .*CSESSION_DIR", summary_file=path)
+
+
+def test_dotdot_segments_cannot_leave_csession_dir(run: Run, tmp_path: Path) -> None:
+    target = outside_file(tmp_path)
+    depth = len(Path(run.csession_dir).parts) - 1
+    escape = run.csession_dir + "/artifacts/" + "../" * (depth + 1) + str(target).lstrip("/")
+    assert os.path.samefile(escape, target)
+    usage(run, "outside .*CSESSION_DIR", summary_file=escape)
+
+
+def test_a_symlinked_directory_inside_csession_dir_cannot_leave_it(
+    run: Run, tmp_path: Path
+) -> None:
+    outside_file(tmp_path)
+    (run.artifacts / "escape").symlink_to(tmp_path, target_is_directory=True)
+    usage(run, "outside .*CSESSION_DIR", summary_file=str(run.artifacts / "escape" / "outside.md"))
+
+
+def test_a_symlinked_final_component_to_an_outside_file_is_refused(
+    run: Run, tmp_path: Path
+) -> None:
+    (run.artifacts / "summary.md").symlink_to(outside_file(tmp_path))
+    usage(run, "symbolic link", summary_file=str(run.artifacts / "summary.md"))
+
+
+def test_a_symlink_to_an_inside_file_is_still_refused(run: Run) -> None:
+    run.write_artifact("real.md", b"inside")
+    (run.artifacts / "summary.md").symlink_to(run.artifacts / "real.md")
+    usage(run, "symbolic link", summary_file=str(run.artifacts / "summary.md"))
+
+
+def test_a_symlinked_csession_dir_path_to_an_outside_file_is_refused(
+    run: Run, tmp_path: Path
+) -> None:
+    link = tmp_path / "alias"
+    link.symlink_to(run.csession_dir, target_is_directory=True)
+    outside = outside_file(tmp_path)
+    usage(run, "outside .*CSESSION_DIR", summary_file=str(link / ".." / outside.name))
+
+
+def test_a_sibling_directory_sharing_the_name_prefix_is_outside(run: Run) -> None:
+    sibling = Path(run.csession_dir + "-evil")
+    sibling.mkdir()
+    (sibling / "s.md").write_text("x")
+    usage(run, "outside .*CSESSION_DIR", summary_file=str(sibling / "s.md"))
+
+
+def test_a_hard_link_to_an_outside_file_inside_csession_dir_is_refused(
+    run: Run, tmp_path: Path
+) -> None:
+    outside = outside_file(tmp_path)
+    os.link(outside, run.artifacts / "summary.md")
+    usage(run, "more than one hard link", summary_file=str(run.artifacts / "summary.md"))
+
+
+@pytest.mark.parametrize("suffix", ["/", "/.", "/.."])
+def test_a_trailing_slash_or_dot_is_refused(run: Run, suffix: str) -> None:
+    run.write_artifact("real.md", b"inside")
+    (run.artifacts / "ln2").symlink_to(run.artifacts / "real.md")
+    for name in ("ln2", "real.md"):
+        usage(run, "not a regular file", summary_file=str(run.artifacts / name) + suffix)
+
+
+def test_a_final_dotdot_is_refused(run: Run) -> None:
+    usage(run, "not a regular file", summary_file=str(run.artifacts) + "/..")
+
+
+def test_a_directory_swapped_for_a_symlink_after_the_check_is_not_followed(
+    run: Run, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TOCTOU: the path resolves inside, then a directory component becomes a symlink out."""
+    outside = tmp_path / "out"
+    outside.mkdir()
+    (outside / "summary.md").write_text("stolen")
+    sub = run.artifacts / "sub"
+    sub.mkdir()
+    (sub / "summary.md").write_text("inside")
+    real_realpath = os.path.realpath
+    swapped: list[bool] = []
+
+    def swap_after_resolve(path: str, *args: Any, **kwargs: Any) -> str:
+        resolved = real_realpath(path, *args, **kwargs)
+        if str(path).endswith("/sub") and not swapped:
+            swapped.append(True)
+            sub.rename(run.artifacts / "sub-moved")
+            (run.artifacts / "sub").symlink_to(outside, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(outbox.os.path, "realpath", swap_after_resolve)
+    with pytest.raises(UsageError):
+        run.report("done", summary_file=str(sub / "summary.md"))
+    assert swapped
+    assert listing(run.outbox) == []
+
+
+def test_stdin_is_not_subject_to_the_path_check(run: Run) -> None:
+    queued = run.report("done", summary_file="-", stdin=b"fine")
+    assert queued_request(run, queued.request_id)["summary"] == "fine"
 
 
 @pytest.mark.parametrize("form", ["name", "path", "real-path"])
@@ -297,7 +452,7 @@ def test_an_oversized_summary_file_is_refused(run: Run) -> None:
 
 
 def test_a_symlinked_summary_file_is_refused(run: Run, tmp_path: Path) -> None:
-    target = tmp_path / "secret-notes"
+    target = Path(run.csession_dir) / "secret-notes"
     target.write_text("private")
     link = run.artifacts / "summary.md"
     link.symlink_to(target)
@@ -310,12 +465,13 @@ def test_a_fifo_summary_file_is_refused_without_waiting(run: Run) -> None:
     usage(run, "not a regular file", summary_file=str(fifo))
 
 
-def test_a_directory_summary_file_is_refused(run: Run, tmp_path: Path) -> None:
-    usage(run, "not a regular file", summary_file=str(tmp_path))
+def test_a_directory_summary_file_is_refused(run: Run) -> None:
+    usage(run, "not a regular file", summary_file=str(run.artifacts))
+    usage(run, "not a regular file", summary_file=run.csession_dir)
 
 
-def test_a_missing_summary_file_is_refused(run: Run, tmp_path: Path) -> None:
-    usage(run, "No such file", summary_file=str(tmp_path / "missing"))
+def test_a_missing_summary_file_is_refused(run: Run) -> None:
+    usage(run, "No such file", summary_file=str(run.artifacts / "missing"))
 
 
 # The secret
