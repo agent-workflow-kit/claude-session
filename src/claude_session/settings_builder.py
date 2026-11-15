@@ -513,10 +513,10 @@ def interpreter_problem(executable: str, readable_dirs: Sequence[str]) -> str | 
         f"{who} is reached through {_shown(hop)!r}, outside the directories readable in the"
         " sandbox, so sandboxed `claude-session report` cannot start; reinstall"
         " claude-session so that the interpreter path has no symlink in an unlisted directory"
-        " (for example a virtual environment created with --copies), or list"
-        f" {_shown(hop)!r} itself in read_dirs, which grants read access to everything in it"
-        " (listing the symlink itself does nothing: entries are resolved; `/` and the home"
-        " directory cannot be listed)"
+        " (for example a virtual environment created with --copies); claude-session lists"
+        " the directories holding such symlinks itself, except `/`, the home directory and"
+        " its ancestors, credential and state paths and session-writable ones, which cannot"
+        " be listed"
     )
 
 

@@ -159,7 +159,10 @@ def test_holders_list_the_alias_store_but_not_what_is_readable(layout: Layout) -
         str(layout.script), layout.readable(), lambda _p: True
     )
     assert holders == (str(layout.store),)  # venv/bin is readable already
-    assert settings_builder.interpreter_problem(str(layout.script), [*layout.readable(), *holders]) is None
+    assert (
+        settings_builder.interpreter_problem(str(layout.script), [*layout.readable(), *holders])
+        is None
+    )
 
 
 def test_holders_never_include_the_ancestors_or_siblings_of_the_store(layout: Layout) -> None:
@@ -680,9 +683,7 @@ def test_a_holder_containing_a_session_writable_path_is_not_listed(
     assert holders_with(tmp_path, layout, [str(layout.real / "bin")]) == ()
 
 
-def test_the_home_directory_and_its_ancestors_are_not_listed(
-    tmp_path: Path, stuck: Layout
-) -> None:
+def test_the_home_directory_and_its_ancestors_are_not_listed(tmp_path: Path, stuck: Layout) -> None:
     assert holders_with(tmp_path, stuck, [], home=stuck.store) == ()
     assert holders_with(tmp_path, stuck, [], home=stuck.store / "user") == ()
 
@@ -707,12 +708,8 @@ def test_a_hostile_chain_through_the_root_or_home_lists_nothing_dangerous(tmp_pa
     os.symlink(home, tmp_path / "to-home")
     os.symlink("/etc", tmp_path / "to-etc")
     (home / "python").write_text("")
-    script = executable(
-        tmp_path / "claude-session", f"#!{tmp_path}/to-home/python\n"
-    )
-    proc = dataclasses.replace(
-        process(tmp_path, {}, FakeGateway()), claude_session=script
-    )
+    script = executable(tmp_path / "claude-session", f"#!{tmp_path}/to-home/python\n")
+    proc = dataclasses.replace(process(tmp_path, {}, FakeGateway()), claude_session=script)
     rules = holder_rules(tmp_path, home)
     got = launch.interpreter_holders(proc, rules, pathrules.SessionWritable([]), [])
     # the only holder is tmp_path, an ancestor of the home directory: refused
@@ -754,11 +751,11 @@ def test_dry_run_passes_read_dirs_into_the_probe(
 # R4, R7, R9, R10, and a symlinked ancestor
 
 
-def test_the_message_names_the_holder_and_what_listing_it_grants(layout: Layout) -> None:
+def test_the_message_names_the_holder_and_why_it_stays_unlisted(layout: Layout) -> None:
     problem = settings_builder.interpreter_problem(str(layout.script), layout.readable())
     assert problem is not None
-    assert f"list {str(layout.store)!r} itself in read_dirs" in problem
-    assert "everything in it" in problem and "--copies" in problem
+    assert repr(str(layout.store)) in problem
+    assert "cannot be listed" in problem and "--copies" in problem
 
 
 def test_a_symlinked_ancestor_in_an_unlisted_directory_is_a_problem(tmp_path: Path) -> None:

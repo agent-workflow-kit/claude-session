@@ -1592,11 +1592,12 @@ def interpreter_holders(
 ) -> tuple[str, ...]:
     """The read entries ``exec`` adds so the sandbox can follow the symlinks on the way to
     the ``#!`` interpreter of ``claude-session`` (``settings_builder.interpreter_holders``;
-    callers apply it on Linux and WSL2 only, ``selfcheck.symlink_hops_apply``): the directories holding them,
-    read-only. A holder that fails the generated-entry rules (``read_entry_problem``), the
-    user-entry rules (``user_entry_problem``: session-writable, or reached through a symlink
-    in a session-writable directory) or contains a session-writable path is left out, and
-    the install probe then reports the sandbox unavailable."""
+    callers apply it on Linux and WSL2 only, ``selfcheck.symlink_hops_apply``): the
+    directories holding them, read-only. A holder that fails the generated-entry rules
+    (``read_entry_problem``), the user-entry rules (``user_entry_problem``: session-writable,
+    or reached through a symlink in a session-writable directory) or contains a
+    session-writable path is left out, and the install probe then reports the sandbox
+    unavailable."""
 
     def accept(holder: str) -> bool:
         return (
