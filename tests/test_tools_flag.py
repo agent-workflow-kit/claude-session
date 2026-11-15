@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from claude_session import cli, config, ids, kinds, settings_builder
+from claude_session import cli, config, ids, kinds, resume as resume_mod, settings_builder
 from claude_session.cli import build_parser
 from claude_session.errors import UsageError
 from claude_session.settings_builder import Launch, Paths, Tools
@@ -278,9 +278,16 @@ def test_tools_reach_claude_are_carried_and_reset(env: Any) -> None:  # noqa: F8
     assert spec(env, sid, 4) == {}
 
 
-def test_a_kind_change_drops_the_carried_tools(env: Any) -> None:  # noqa: F811
-    sid = exec_session(env, "--kind", "rank", "--tools", "Read")["csession_id"]
-    proc, _ = resume(env, sid, "--kind", "review")
-    assert proc.returncode == 0, proc.stderr
-    assert spec(env, sid, 2) == {}
-    assert flag_value(starts(env)[-1], "--tools") is None
+def test_a_kind_change_drops_the_carried_tools_and_reset_drops_them_too() -> None:
+    from .test_carryover import source
+
+    src = source(spec={"tools": ["Read"], "model": "m"})
+    assert resume_mod.carry(src, kind="implement", mode="headless", resets=()).flags == {
+        "model": "m",
+        "tools": ["Read"],
+    }
+    assert resume_mod.carry(src, kind="review", mode="headless", resets=()).flags == {}
+    other = resume_mod.carry(src, kind="implement", mode="headless", resets=("tools",))
+    assert other.flags == {"model": "m"}
+    given = resume_mod.carry(src, kind="implement", mode="headless", resets=(), given={"tools"})
+    assert "tools" not in given.flags

@@ -44,6 +44,7 @@ FULL_INVOCATIONS: dict[str, list[str]] = {
         *("--sandbox", "required", "--setting-sources", "", "--reads-third-party"),
         *("--no-auto-exit", "--env-allow", "A", "--env-allowlist-only", "B"),
         "--no-implicit-done",
+        *("--tools", "Read", "Grep"),
         *("--outcome-file", "/tmp/o.json", "--actor", "auto:test"),
         *("--decision-id", "d1", "--decision-id", "d2", "--dry-run"),
         *("--json", "--config", "c.yaml", "--verbose"),
