@@ -17,8 +17,8 @@ from claude_session.cli import build_parser
 from claude_session.errors import UsageError
 from claude_session.settings_builder import Launch, Paths, Tools
 
+from .test_dryrun_cli import clean_exe, dry_run, tools, work  # noqa: F401  (fixtures)
 from .test_dryrun_cli import cli as run_cli
-from .test_dryrun_cli import dry_run, tools, work  # noqa: F401  (fixtures)
 from .test_resume import (  # noqa: F401  (fixtures)
     env,
     exec_session,
