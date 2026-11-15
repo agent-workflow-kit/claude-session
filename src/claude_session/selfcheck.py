@@ -25,9 +25,11 @@ command that removes it.
   limited to about 108 bytes).
 - An install that would fail inside the sandbox although the tools work (an interpreter of
   ``claude-session`` behind an alias directory the sandbox does not list; interface.md,
-  Install requirements) counts as a missing prerequisite: ``launch.check_sandbox`` passes it
-  as ``install_problems``. Hard-linked code fails earlier (``check_hook_interpreter``), and
-  ``dryrun.Prerequisites`` adds both to ``kinds`` rows.
+  Install requirements) is passed by ``launch.check_sandbox`` as ``install_problems``: a
+  ``required`` sandbox fails (``sandbox_unavailable``); a ``preferred`` one keeps running
+  and ``sandbox_active`` stays true (the sandbox is enabled), with a warning that the
+  sandboxed ``report`` will fail, and ``problems`` lists it. Hard-linked code fails earlier
+  (``check_hook_interpreter``), and ``dryrun.Prerequisites`` adds both to ``kinds`` rows.
 - ``off``: nothing is checked or created.
 
 Prerequisite probes run through the #51 ``Gateway`` (a fake one in tests), by absolute path
@@ -138,6 +140,13 @@ class SelfCheck:
     tmpdir_pin: int | None = None
 
 
+def symlink_hops_apply(platform: str) -> bool:
+    """Whether the symlink-hop probe of the install applies: it rests on how bubblewrap mounts
+    only the directories listed, so only Linux and WSL2 (macOS Seatbelt is unverified, see
+    macos-checklist.md: fail open)."""
+    return platform in ("linux", "wsl2")
+
+
 def detect_platform(sys_platform: str | None = None, release: str | None = None) -> str:
     """``linux``, ``wsl2``, ``wsl1``, ``macos`` or ``unsupported``. WSL is told by the kernel
     release: WSL2 kernels are ``*-microsoft-standard-WSL2``, WSL1 reports ``*-Microsoft``."""
@@ -217,7 +226,8 @@ def self_check(
 
     ``install_problems`` (``settings_builder.interpreter_problem``): why a sandboxed
     ``claude-session report`` could not start here although the prerequisites are present;
-    each makes the sandbox unavailable like a missing prerequisite."""
+    each fails a ``required`` sandbox like a missing prerequisite; for ``preferred`` it only
+    adds a warning and a ``problems`` entry (the sandbox itself still runs)."""
     if mode not in SANDBOX_MODES:
         raise ValueError(f"unknown sandbox mode: {mode!r}")
     if mode == "off":
@@ -235,18 +245,24 @@ def self_check(
         found.append((str(prerequisites.problem), prerequisites.hint))
     found += [(text, None) for text in install_problems]
     problems = tuple(f"{p}; {h}" if h else p for p, h in found)
-    if found:
+    if found and mode == "required":
         problem, hint = found[0]
-        if mode == "required":
-            raise LaunchValidationError(
-                f"sandbox unavailable: {problem}",
-                end_reason="sandbox_unavailable",
-                hint=hint,
-            )
-        warnings.append(
-            f"sandbox 'preferred' but unavailable ({problem}): the run is not"
-            f" sandboxed{'; ' + hint if hint else ''}"
+        raise LaunchValidationError(
+            f"sandbox unavailable: {problem}",
+            end_reason="sandbox_unavailable",
+            hint=hint,
         )
+    if not prerequisites.available:
+        warnings.append(
+            f"sandbox 'preferred' but unavailable ({prerequisites.problem}): the run is not"
+            f" sandboxed; {prerequisites.hint}"
+        )
+    else:
+        # The sandbox runs (sandbox_active stays true); only the sandboxed `report` fails.
+        warnings += [
+            f"the sandbox is active but the sandboxed `claude-session report` will fail: {text}"
+            for text in install_problems
+        ]
     root = tmpdir.select_root(tmp_base) if tmp_root is None else tmp_root
     check_socket_path(os.path.join(root, csession_id or _PLACEHOLDER_ID), platform)
     path = None if csession_id is None else os.path.join(root, csession_id)
@@ -260,7 +276,7 @@ def self_check(
                 f" remove it: rm -rf {shlex.quote(stale)}"
             )
     return SelfCheck(
-        sandbox_active=not found,
+        sandbox_active=prerequisites.available,
         tmpdir=path,
         warnings=tuple(warnings),
         problems=problems,

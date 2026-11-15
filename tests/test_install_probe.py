@@ -5,6 +5,7 @@ sandbox is needed."""
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import tempfile
@@ -17,7 +18,7 @@ from claude_session import config, dryrun, kinds, launch, pathrules, selfcheck, 
 from claude_session.errors import LaunchValidationError
 
 from .fake_gateway import FakeGateway
-from .test_dryrun import process, tool
+from .test_dryrun import process, real_plan, tool
 from .test_selfcheck import FakeRunner, executable
 
 
@@ -182,18 +183,22 @@ def test_install_problem_fails_a_required_sandbox(base: Path, tools: tuple[str, 
     assert "the interpreter is unreachable" in caught.value.message
 
 
-def test_install_problem_makes_a_preferred_sandbox_inactive(
+def test_install_problem_leaves_a_preferred_sandbox_active_with_an_accurate_warning(
     base: Path, tools: tuple[str, str]
 ) -> None:
     result = check("preferred", base, tools, ("the interpreter is unreachable",))
-    assert result.sandbox_active is False
+    assert result.sandbox_active is True
     assert result.problems == ("the interpreter is unreachable",)
-    assert any("unreachable" in w for w in result.warnings)
+    (warning,) = result.warnings
+    assert "sandbox is active" in warning and "report` will fail" in warning
+    assert "the interpreter is unreachable" in warning and "not sandboxed" not in warning
 
 
 def test_install_problem_is_added_to_a_missing_prerequisite(base: Path) -> None:
     result = check("preferred", base, ("", ""), ("extra problem",))  # type: ignore[arg-type]
     assert len(result.problems) == 2 and result.problems[1] == "extra problem"
+    assert result.sandbox_active is False
+    assert all("will fail" not in w for w in result.warnings)  # the run is unsandboxed anyway
 
 
 def test_no_install_problem_leaves_the_sandbox_active(base: Path, tools: tuple[str, str]) -> None:
@@ -224,8 +229,6 @@ def sandbox_inputs(tmp_path: Path, layout: Layout, kind: str = "review"):
     gw.on([str(bwrap)])
     gw.on([str(socat)])
     proc = process(tmp_path, {"PATH": str(bin_dir), "HOME": str(tmp_path)}, gw)
-    import dataclasses
-
     proc = dataclasses.replace(proc, claude_session=str(layout.script))
     alloc = launch.Allocated(
         csession_id="cs-abcd2345", run=1, session_dir="/s", private_dir="/p", warnings=()
@@ -238,9 +241,12 @@ def test_sandbox_check_reports_the_alias_interpreter_for_a_preferred_kind(
 ) -> None:
     monkeypatch.setattr(selfcheck, "detect_platform", lambda *a, **k: "linux")
     resolution, alloc, tools, proc = sandbox_inputs(tmp_path, layout, "rank")
-    result = launch.Effects().sandbox(resolution, alloc, tools, proc, None)
-    assert result.sandbox_active is False
+    result = launch.Effects().sandbox(
+        resolution, alloc, tools, proc, None, readable=layout.readable()
+    )
+    assert result.sandbox_active is True  # the sandbox runs; only `report` would fail
     assert any(str(layout.store) in p for p in result.problems)
+    assert any("will fail" in w and str(layout.store) in w for w in result.warnings)
 
 
 def test_sandbox_check_fails_a_required_kind_on_the_alias_interpreter(
@@ -249,7 +255,7 @@ def test_sandbox_check_fails_a_required_kind_on_the_alias_interpreter(
     monkeypatch.setattr(selfcheck, "detect_platform", lambda *a, **k: "linux")
     resolution, alloc, tools, proc = sandbox_inputs(tmp_path, layout, "review")
     with pytest.raises(LaunchValidationError) as caught:
-        launch.Effects().sandbox(resolution, alloc, tools, proc, None)
+        launch.Effects().sandbox(resolution, alloc, tools, proc, None, readable=layout.readable())
     assert caught.value.end_reason == "sandbox_unavailable"
 
 
@@ -260,7 +266,7 @@ def test_a_read_dir_listing_the_alias_directory_clears_it(
     resolution, alloc, tools, proc = sandbox_inputs(tmp_path, layout, "rank")
     # The real interpreter directory is not readable either: list the store as a whole.
     result = launch.Effects().sandbox(
-        resolution, alloc, tools, proc, None, read_dirs=[str(layout.store)]
+        resolution, alloc, tools, proc, None, readable=layout.readable(layout.store)
     )
     assert result.sandbox_active is True and result.problems == ()
 
@@ -269,8 +275,6 @@ def test_a_read_dir_listing_the_alias_directory_clears_it(
 
 
 def kinds_proc(tmp_path: Path, layout: Layout, gw: FakeGateway) -> launch.Process:
-    import dataclasses
-
     bin_dir = tmp_path / "tbin"
     tool(bin_dir, "bwrap")
     tool(bin_dir, "socat")
@@ -338,3 +342,196 @@ def test_the_hard_link_scan_runs_once_per_report(
         prerequisites=dryrun.Prerequisites(gw, "linux"),
     )
     assert len(report["kinds"]) > 1 and calls == [1]
+
+
+# R2: the symlink-hop probe is for Linux and WSL2 only
+
+
+def test_macos_skips_the_alias_probe(tmp_path: Path, layout: Layout) -> None:
+    gw = FakeGateway()
+    proc = kinds_proc(tmp_path, layout, gw)
+    resolution = kinds.resolve(
+        config.load(None, env={"XDG_CONFIG_HOME": str(tmp_path / "none")}),
+        "review",
+        mode="headless",
+    )
+    assert dryrun.Prerequisites(gw, "linux", link_dirs=()).install_problems(proc, resolution)
+    assert dryrun.Prerequisites(gw, "macos", link_dirs=()).install_problems(proc, resolution) == ()
+
+
+def test_macos_still_scans_for_hard_links(tmp_path: Path, layout: Layout) -> None:
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / "m.py").write_text("x = 1\n")
+    os.link(code / "m.py", tmp_path / "cache-m.py")
+    gw = FakeGateway()
+    proc = kinds_proc(tmp_path, layout, gw)
+    resolution = kinds.resolve(
+        config.load(None, env={"XDG_CONFIG_HOME": str(tmp_path / "none")}),
+        "review",
+        mode="headless",
+    )
+    (problem,) = dryrun.Prerequisites(gw, "macos", link_dirs=[str(code)]).install_problems(
+        proc, resolution
+    )
+    assert "hard links" in problem
+
+
+def test_exec_skips_the_alias_probe_on_macos(
+    tmp_path: Path, layout: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(selfcheck, "detect_platform", lambda *a, **k: "macos")
+    monkeypatch.setattr(selfcheck, "_macos", lambda *a, **k: selfcheck.Prerequisites(True))
+    resolution, alloc, tools, proc = sandbox_inputs(tmp_path, layout, "review")
+    result = launch.Effects().sandbox(resolution, alloc, tools, proc, None, readable=[])
+    assert result.sandbox_active is True and result.problems == ()
+
+
+# R3: the readable set has every source of the real allowRead
+
+
+def test_readable_set_has_every_allow_read_source(tmp_path: Path) -> None:
+    alloc = launch.Allocated(
+        csession_id="cs-abcd2345", run=1, session_dir="/s", private_dir="/p", warnings=()
+    )
+    expanded = {"sandbox": {"filesystem": {"allowRead": ["//opt/listed", "~/in-home"]}}}
+    got = launch.sandbox_readable(
+        "/c/cwd",
+        alloc,
+        {"system": ("/usr",), "git": ("/g/.git",)},
+        ["/r/read"],
+        ["/p/plugin"],
+        expanded,
+        "/home/u",
+    )
+    assert {"/c/cwd", "/s", "/usr", "/g/.git", "/r/read", "/p/plugin", "/opt/listed"} <= set(got)
+    assert "/home/u/in-home" in got
+
+
+def test_a_profile_allow_read_listing_the_holder_clears_the_problem(
+    tmp_path: Path, layout: Layout
+) -> None:
+    alloc = launch.Allocated(
+        csession_id="cs-abcd2345", run=1, session_dir="/s", private_dir="/p", warnings=()
+    )
+    expanded = {"sandbox": {"filesystem": {"allowRead": [str(layout.store)]}}}
+    readable = launch.sandbox_readable(
+        str(tmp_path), alloc, {"python": tuple(layout.readable())}, [], [], expanded, "/h"
+    )
+    assert settings_builder.interpreter_problem(str(layout.script), readable) is None
+
+
+def test_the_cwd_counts_as_readable(layout: Layout) -> None:
+    alloc = launch.Allocated(
+        csession_id="cs-abcd2345", run=1, session_dir="/s", private_dir="/p", warnings=()
+    )
+    readable = launch.sandbox_readable(
+        str(layout.store), alloc, {"python": tuple(layout.readable())}, [], [], {}, "/h"
+    )
+    assert settings_builder.interpreter_problem(str(layout.script), readable) is None
+
+
+# end to end: exec --dry-run through checks and plan_sandbox
+
+
+def script_for(root: Path, layout: Layout) -> None:
+    from .test_dryrun import CS_PATH
+
+    target = root / CS_PATH.lstrip("/")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    executable(target, f"#!{layout.bin}/python\n")
+
+
+def test_dry_run_reports_a_preferred_kind_unavailable_but_active(
+    tmp_path: Path, layout: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(selfcheck, "detect_platform", lambda *a, **k: "linux")
+    plan, _ = real_plan(
+        tmp_path, monkeypatch, "rank", setup=lambda _p: script_for(tmp_path / "root", layout)
+    )
+    assert plan["would_fail"] is None, plan["warnings"]
+    assert plan["sandbox"]["available"] is False
+    assert any(str(layout.bin) in p for p in plan["sandbox"]["problems"])
+    assert any("sandbox is active" in w for w in plan["warnings"])
+
+
+def test_dry_run_fails_a_required_kind(
+    tmp_path: Path, layout: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(selfcheck, "detect_platform", lambda *a, **k: "linux")
+    plan, _ = real_plan(
+        tmp_path, monkeypatch, "review", setup=lambda _p: script_for(tmp_path / "root", layout)
+    )
+    assert plan["would_fail"] == "sandbox_unavailable"
+
+
+def test_dry_run_passes_read_dirs_into_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kind's read_dirs (the fixture lists /opt/toolchain) hold the whole install."""
+    monkeypatch.setattr(selfcheck, "detect_platform", lambda *a, **k: "linux")
+    inside = Layout(tmp_path / "root" / "opt" / "toolchain" / "install")
+    plan, _ = real_plan(
+        tmp_path, monkeypatch, "review", setup=lambda _p: script_for(tmp_path / "root", inside)
+    )
+    assert plan["would_fail"] is None, plan["warnings"]
+    assert plan["sandbox"]["available"] is True and plan["sandbox"]["problems"] == []
+
+
+# R4, R7, R9, R10, and a symlinked ancestor
+
+
+def test_the_message_names_the_holder_and_what_listing_it_grants(layout: Layout) -> None:
+    problem = settings_builder.interpreter_problem(str(layout.script), layout.readable())
+    assert problem is not None
+    assert f"list {str(layout.store)!r} itself in read_dirs" in problem
+    assert "everything in it" in problem and "--copies" in problem
+
+
+def test_a_symlinked_ancestor_in_an_unlisted_directory_is_a_problem(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    (real / "bin").mkdir(parents=True)
+    executable(real / "bin" / "python")
+    os.symlink(real, tmp_path / "alias")
+    script = executable(tmp_path / "cs", f"#!{tmp_path}/alias/bin/python\n")
+    problem = settings_builder.interpreter_problem(script, [str(real)])
+    assert problem is not None and repr(os.path.realpath(tmp_path)) in problem
+
+
+@pytest.mark.skipif(not os.path.islink("/bin"), reason="needs a usr-merged system")
+def test_a_top_level_bin_symlink_is_readable_when_bin_is_listed(tmp_path: Path) -> None:
+    script = executable(tmp_path / "cs", "#!/bin/sh\n")
+    listed = [*settings_builder.system_read_dirs(), "/bin"]
+    assert settings_builder.interpreter_problem(script, listed) is None
+    assert settings_builder.interpreter_problem(script, ["/usr"]) is not None
+
+
+def test_a_tab_ends_the_shebang_interpreter(layout: Layout) -> None:
+    layout.script.write_text(f"#!{layout.bin}/python\t-I\n")
+    assert (
+        settings_builder.interpreter_problem(str(layout.script), layout.readable(layout.store))
+        is None
+    )
+
+
+def test_a_missing_interpreter_has_its_own_message(tmp_path: Path) -> None:
+    script = executable(tmp_path / "cs", f"#!{tmp_path}/gone/python\n")
+    problem = settings_builder.interpreter_problem(script, [str(tmp_path)])
+    assert problem is not None and "does not exist" in problem and "alias" not in problem
+
+
+def test_a_symlink_loop_has_its_own_message(tmp_path: Path) -> None:
+    os.symlink(tmp_path / "b", tmp_path / "a")
+    os.symlink(tmp_path / "a", tmp_path / "b")
+    script = executable(tmp_path / "cs", f"#!{tmp_path}/a\n")
+    problem = settings_builder.interpreter_problem(script, [str(tmp_path)])
+    assert problem is not None and "symlink loop or is behind more than" in problem
+
+
+def test_too_long_a_chain_has_its_own_message(tmp_path: Path) -> None:
+    executable(tmp_path / "l0")
+    for index in range(1, pathrules.MAX_SYMLINKS + 2):
+        os.symlink(tmp_path / f"l{index - 1}", tmp_path / f"l{index}")
+    script = executable(tmp_path / "cs", f"#!{tmp_path}/l{pathrules.MAX_SYMLINKS + 1}\n")
+    problem = settings_builder.interpreter_problem(script, [str(tmp_path)])
+    assert problem is not None and "symlink loop or is behind more than" in problem

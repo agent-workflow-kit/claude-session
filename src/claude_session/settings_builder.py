@@ -32,6 +32,7 @@ The adopting ``exec`` reruns the step-5 checks (``lifecycle``).
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import os
 import re
@@ -430,29 +431,52 @@ def hard_link_problem(link_dirs: Sequence[str] | None = None) -> str | None:
 
 def interpreter_problem(executable: str, readable_dirs: Sequence[str]) -> str | None:
     """Why a sandboxed run of the script ``executable`` (``claude-session``) could not start
-    its interpreter, or None. The ``#!`` interpreter is followed hop by hop
-    (``pathrules.unreadable_hop``): a symlink in a directory outside ``readable_dirs`` (the
-    run's ``allowRead``) is invisible in the sandbox, so a venv python that links through an
-    alias directory fails there. Not checked (None): a file that is not a script with an
-    absolute ``#!`` interpreter (``#!/usr/bin/env`` is resolved on the sandbox's ``PATH``)
-    and one that cannot be read."""
+    its interpreter, or None. The ``#!`` interpreter (the kernel ends it at the first space
+    or tab) is followed hop by hop (``pathrules.unreadable_hop``): a symlink in a directory
+    outside ``readable_dirs`` (the run's ``allowRead``) is invisible in the sandbox, so a
+    venv python that links through an alias directory fails there. A missing interpreter
+    and a symlink loop or too long a chain get their own messages. Not checked (None): a
+    file that is not a script with an absolute ``#!`` interpreter (``#!/usr/bin/env`` is
+    resolved on the sandbox's ``PATH``) and one that cannot be read. Callers apply it on
+    Linux and WSL2 only (``selfcheck.symlink_hops_apply``)."""
     try:
         with open(executable, "rb") as handle:
             line = handle.read(256).split(b"\n", 1)[0]
-        interpreter = os.fsdecode(line[2:]).strip().split(" ", 1)[0] if line[:2] == b"#!" else ""
+        words = os.fsdecode(line[2:]).split() if line[:2] == b"#!" else []
     except OSError:
         return None
+    interpreter = words[0] if words else ""
     if not os.path.isabs(interpreter) or os.path.basename(interpreter) == "env":
         return None
+    who = f"the interpreter of {_shown(executable)!r} ({_shown(interpreter)!r})"
+    loop = (
+        f"{who} is a symlink loop or is behind more than {pathrules.MAX_SYMLINKS} symlinks,"
+        " so `claude-session report` cannot start; reinstall claude-session"
+    )
+    try:
+        os.stat(interpreter)
+    except (FileNotFoundError, NotADirectoryError):
+        return (
+            f"{who} does not exist, so `claude-session report` cannot start; reinstall"
+            " claude-session"
+        )
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return loop
+    if not pathrules.symlink_chain_resolves(interpreter):
+        return loop
     roots = [os.path.normpath(d) for d in readable_dirs]
     hop = pathrules.unreadable_hop(interpreter, lambda p: any(_inside(p, r) for r in roots))
     if hop is None:
         return None
     return (
-        f"the interpreter of {_shown(executable)!r} ({_shown(interpreter)!r}) is reached through"
-        f" {_shown(hop)!r}, outside the directories readable in the sandbox, so sandboxed"
-        " `claude-session report` cannot start; reinstall claude-session with an interpreter"
-        " that is not behind a symlinked alias directory, or list that directory in read_dirs"
+        f"{who} is reached through {_shown(hop)!r}, outside the directories readable in the"
+        " sandbox, so sandboxed `claude-session report` cannot start; reinstall"
+        " claude-session so that the interpreter path has no symlink in an unlisted directory"
+        " (for example a virtual environment created with --copies), or list"
+        f" {_shown(hop)!r} itself in read_dirs, which grants read access to everything in it"
+        " (listing the symlink itself does nothing: entries are resolved; `/` and the home"
+        " directory cannot be listed)"
     )
 
 

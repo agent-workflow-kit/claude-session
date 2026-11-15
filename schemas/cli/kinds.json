@@ -103,7 +103,7 @@
             "boolean",
             "null"
           ],
-          "description": "null when sandbox is off. False also when the install would fail inside the sandbox (hard-linked code, an interpreter behind an unreadable alias directory); sandbox_problems says why."
+          "description": "null when sandbox is off. False also when the install would fail inside the sandbox (hard-linked code, an interpreter behind a symlink in an unlisted directory, an approximation: kinds knows only the generated entries and read_dirs); sandbox_problems says why."
         },
         "sandbox_problems": {
           "type": "array",

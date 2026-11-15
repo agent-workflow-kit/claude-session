@@ -275,7 +275,9 @@ claude-session treats the agent as untrusted wherever a kind says so. At a user 
   cwd, the session directory, system and tool directories, `read_dirs`) and gives them no network
   unless the profile allows domains (the built-in profiles allow none). A kind with sandbox `required` fails
   to launch (`sandbox_unavailable`) rather than run unsandboxed; `preferred` degrades to
-  unsandboxed. `status` shows whether the sandbox actually ran (`sandbox_active`). A
+  unsandboxed. `status` shows whether the sandbox actually ran (`sandbox_active`); an install
+  whose sandboxed `report` would fail (an interpreter behind a symlink the sandbox cannot see)
+  fails `required` kinds and gives a warning for `preferred` ones, which still run sandboxed. A
   third-party-reading run whose sandbox mode is below `required` is allowed, with a warning, and
   audited `sandbox_lowered`; when it runs without a sandbox (`off`, or `preferred` with none
   available) it relies on the permission rules alone, which a command can evade.

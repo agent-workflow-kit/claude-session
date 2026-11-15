@@ -339,6 +339,10 @@ class Prerequisites:
         if self._hard_links is None:
             problem = settings_builder.hard_link_problem(self._link_dirs)
             self._hard_links = () if problem is None else (problem,)
+        if not selfcheck.symlink_hops_apply(self.platform):
+            return self._hard_links
+        # An approximation (no cwd, git, plugin or tool directories, no profile allowRead):
+        # a holder inside one of those is reported although `exec` would pass.
         home = os.path.realpath(process.environ.get("HOME", "/"))
         readable = [
             *settings_builder.system_read_dirs(),
@@ -868,8 +872,11 @@ def plan_sandbox(
     if found.checked is not None:
         if resolution.profile.sandbox == "off":
             return None
+        # An install problem leaves the (preferred) sandbox active but its `report` failing:
+        # the plan reports it unavailable all the same.
         return Sandbox(
-            available=found.checked.sandbox_active, problems=found.checked.sandbox_problems
+            available=found.checked.sandbox_active and not found.checked.sandbox_problems,
+            problems=found.checked.sandbox_problems,
         )
     probes = prerequisites or Prerequisites(process.gateway)
     return probes.check(process, resolution, writable)
