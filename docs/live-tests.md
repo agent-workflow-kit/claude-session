@@ -108,6 +108,13 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 |---|---|
 | Glob, Grep and LS under the review profile | `test_open_items.py::test_search_tools_...` (LS is not a tool in the verified Claude Code; the `init` tool list is recorded) |
 | `--strict-mcp-config` drops a `--plugin-dir` plugin's MCP servers | `test_headless.py::test_strict_mcp_config_...` |
+| Claude Code accepts `--plugin-dir` under an already-added `$CSESSION_DIR` (issue 102) | Not yet verified |
+| The placeholder `.mcp.json` (`{"mcpServers": {}}`) loads cleanly and does not override inline `mcpServers` in `plugin.json` (issue 102) | Not yet verified |
+| An empty `.claude/` directory and empty `CLAUDE.md` and `CLAUDE.local.md` are harmless in a plugin dir (issue 102) | Not yet verified |
+| Sandboxed Bash works against a plugin copy with the four placeholders (and fails without them) (issue 102) | Not yet verified |
+| A wrong-type placeholder (`.claude` as a file, `CLAUDE.md` as a directory) in a plugin dir (issue 102) | Not yet verified |
+| `${CLAUDE_PLUGIN_ROOT}` resolves to the per-run copy (issue 102) | Not yet verified |
+| Plugin hook scripts run from the copy (executable bit kept, no `noexec`) (issue 102) | Not yet verified |
 | MCP elicitation (`elicitation_dialog`) | `test_interactive.py::test_an_mcp_elicitation_...` |
 | Background subagents: last `result` taken, cost and turns summed | Raw stream: `test_headless_signals.py::test_background_subagents_...`; the product's summing: #42 |
 | Report forms under `dontAsk` | `test_isolation.py::test_report_command_forms_under_dont_ask` |

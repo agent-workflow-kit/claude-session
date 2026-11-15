@@ -60,6 +60,7 @@ def test_full_record_validates(audit_path: Path) -> None:
         "sandbox_from": "required",
         "sandbox_to": "off",
         "grace": 10.0,
+        "purge": True,
     }
     now = datetime(2026, 10, 30, 1, 2, 3, tzinfo=UTC)
     write(
@@ -139,6 +140,7 @@ def test_enums_match_the_schema() -> None:
         {"inputs": {"run_kind": ""}},
         {"inputs": {"forked_from": "parent"}},
         {"inputs": {"tty": 1}},
+        {"inputs": {"purge": 1}},
         {"inputs": {"overridden_hooks": "h1"}},
         {"inputs": {"overridden_hooks": [1]}},
         {"inputs": {"grace": "10"}},

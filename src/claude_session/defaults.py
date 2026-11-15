@@ -103,7 +103,12 @@ BUILTIN_KINDS: dict[str, dict[str, Any]] = {
 BUILTIN_PERMISSION_PROFILES: dict[str, dict[str, Any]] = {
     "default": {},
     "readonly": {
-        "permissions": {"allow": _SUBAGENTS, "deny": _NO_NETWORK_TOOLS + _NO_EXTERNAL_TOOLS},
+        # Unlike review, no subagents (Agent, Task): a read-only run on untrusted input gets
+        # one agent, no delegation. Skill stays allowed.
+        "permissions": {
+            "allow": ["Skill"],
+            "deny": ["Agent", "Task", *_NO_NETWORK_TOOLS, *_NO_EXTERNAL_TOOLS],
+        },
     },
     "review": {
         "permissions": {"allow": _SUBAGENTS, "deny": _NO_NETWORK_TOOLS + _NO_EXTERNAL_TOOLS},

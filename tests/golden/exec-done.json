@@ -6,6 +6,7 @@
   "exit_code": 0,
   "forked_from": null,
   "message": null,
+  "num_turns": 1,
   "outcome": "done",
   "phase": "session",
   "report": {

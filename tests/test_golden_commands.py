@@ -136,3 +136,12 @@ def test_stop_dry_run_of_a_finished_session(
     code, out = run(capsys, "stop", sid, "--dry-run", "--config", str(config))
     assert code == 0, out
     assert_golden(out, "stop-already-final-dry-run", normalize=scrub)
+
+
+def test_forget_purge_dry_run_reports_what_would_be_deleted(
+    st: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = make(st, str(Path(st.path).parent))
+    code, out = run(capsys, "forget", sid, "--purge", "--dry-run", "--actor", "auto:golden")
+    assert code == 0
+    assert_golden(out, "forget-purge-dry-run", normalize=scrub)
