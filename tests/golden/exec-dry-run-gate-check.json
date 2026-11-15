@@ -498,6 +498,7 @@
   "skill": null,
   "taints": true,
   "timeout": 900.0,
+  "tools": null,
   "warnings": [],
   "would_fail": null,
   "would_refuse": null

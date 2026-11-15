@@ -1,3 +1,4 @@
+# ruff: noqa: F811
 """``--tools <name>...`` (interface.md, Launch flags; issue #108): a per-call allowlist of Claude
 Code built-in tools for isolated kinds, passed as ``claude --tools``. It only narrows the
 tools Claude Code offers; permissions (deny first) still apply on top of it."""
@@ -9,7 +10,8 @@ from typing import Any
 
 import pytest
 
-from claude_session import cli, config, ids, kinds, resume as resume_mod, settings_builder
+from claude_session import cli, config, ids, kinds, settings_builder
+from claude_session import resume as resume_mod
 from claude_session.cli import build_parser
 from claude_session.errors import UsageError
 from claude_session.settings_builder import Launch, Paths, Tools
@@ -196,7 +198,9 @@ def _isolation() -> settings_builder.Isolation:
 
 
 def test_a_dry_run_shows_the_effective_tools_and_argv(
-    tmp_path: Path, tools: Path, work: Path  # noqa: F811
+    tmp_path: Path,
+    tools: Path,
+    work: Path,  # noqa: F811
 ) -> None:
     proc, plan = dry_run(
         "review", "--tools", "Read", "Grep", cwd=work, tools=tools, tmp_path=tmp_path
@@ -209,7 +213,9 @@ def test_a_dry_run_shows_the_effective_tools_and_argv(
 
 
 def test_a_dry_run_without_the_flag_has_null_tools(
-    tmp_path: Path, tools: Path, work: Path  # noqa: F811
+    tmp_path: Path,
+    tools: Path,
+    work: Path,  # noqa: F811
 ) -> None:
     _, plan = dry_run("review", cwd=work, tools=tools, tmp_path=tmp_path)
     assert plan["tools"] is None
@@ -218,7 +224,9 @@ def test_a_dry_run_without_the_flag_has_null_tools(
 
 
 def test_a_dry_run_drops_a_denied_tool_from_the_plan(
-    tmp_path: Path, tools: Path, work: Path  # noqa: F811
+    tmp_path: Path,
+    tools: Path,
+    work: Path,  # noqa: F811
 ) -> None:
     _, plan = dry_run(
         "review", "--tools", "Read", "WebFetch", cwd=work, tools=tools, tmp_path=tmp_path
@@ -228,7 +236,9 @@ def test_a_dry_run_drops_a_denied_tool_from_the_plan(
 
 
 def test_a_dry_run_refuses_an_unknown_tool_with_exit_2(
-    tmp_path: Path, tools: Path, work: Path  # noqa: F811
+    tmp_path: Path,
+    tools: Path,
+    work: Path,  # noqa: F811
 ) -> None:
     proc = run_cli(
         [
@@ -244,7 +254,9 @@ def test_a_dry_run_refuses_an_unknown_tool_with_exit_2(
 
 
 def test_a_dry_run_refuses_tools_on_a_trusted_kind_with_exit_2(
-    tmp_path: Path, tools: Path, work: Path  # noqa: F811
+    tmp_path: Path,
+    tools: Path,
+    work: Path,  # noqa: F811
 ) -> None:
     proc = run_cli(
         [
