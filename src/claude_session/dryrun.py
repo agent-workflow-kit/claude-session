@@ -953,6 +953,7 @@ def plan_json(
             else [found.checked.claude.name, *generated.argv[1:]]
         ),
         "env_names": [] if checked is None else sorted(checked.session_env.env),
+        "plugin_dirs": [] if checked is None else plugin_dirs_json(checked),
         "sandbox": {
             "mode": profile.sandbox,
             "available": False if sandbox is None else sandbox.available,
@@ -964,6 +965,17 @@ def plan_json(
         "would_fail": found.would_fail,
         "warnings": list(dict.fromkeys(warnings)),
     }
+
+
+def plugin_dirs_json(checked: launch.Checked) -> list[dict[str, Any]]:
+    """The plan's ``plugin_dirs``: each plugin directory, the directory the run uses (its
+    copy, for a sandboxed run) and the placeholders the copy adds."""
+    if checked.plugin_copies:
+        return [
+            {"source": c.source, "effective": c.effective, "added": list(c.added)}
+            for c in checked.plugin_copies
+        ]
+    return [{"source": d, "effective": d, "added": []} for d in checked.plugin_dirs]
 
 
 def current_process(gw: Gateway) -> launch.Process:
