@@ -1346,3 +1346,48 @@ def test_a_launch_spec_missing_a_notes_value_fails_the_adoption(env: Env) -> Non
     spec.write_text(json.dumps(data))
     proc, out = env.adopt(sid)
     assert_not_started(proc, out, "session_dir_unsafe")
+
+
+# --tools through start and adoption (issue #108)
+
+
+def test_start_with_tools_reaches_claude_at_adoption(env: Env) -> None:
+    sid = env.started(
+        "--mode", "headless", "--reads-third-party", "--sandbox", "off", "--tools", "Read", "Grep"
+    )["csession_id"]
+    proc, _out = env.adopt(sid)
+    assert proc.returncode == 0, proc.stderr
+    record = next(r for r in read_jsonl(env.log) if r["event"] == "start")
+    assert record["flags"].get("--tools") == ["Read,Grep"]
+
+
+def test_a_frozen_spec_without_tools_fails_the_adoption(env: Env) -> None:
+    # A spec written before --tools existed has no `tools` key: the decided break (the same
+    # strictness as every other resolution key).
+    sid = env.started("--mode", "headless", "--reads-third-party", "--sandbox", "off")[
+        "csession_id"
+    ]
+    env.edit_spec(sid, lambda data: data["resolution"].pop("tools"))
+    proc, out = env.adopt(sid)
+    assert_not_started(proc, out, "session_dir_unsafe")
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [["default"], [], ["Frob"], ["mcp__s__t"], "Read", [1]],
+    ids=["default", "empty", "unknown", "mcp", "string", "number"],
+)
+def test_a_frozen_spec_with_bad_tools_fails_the_adoption(env: Env, tools: Any) -> None:
+    sid = env.started("--mode", "headless", "--reads-third-party", "--sandbox", "off")[
+        "csession_id"
+    ]
+    env.edit_spec(sid, lambda data: data["resolution"].update(tools=tools))
+    proc, out = env.adopt(sid)
+    assert_not_started(proc, out, "session_dir_unsafe")
+
+
+def test_a_frozen_spec_with_tools_on_a_trusted_kind_fails_the_adoption(env: Env) -> None:
+    sid = env.started("--mode", "headless", "--kind", "implement")["csession_id"]
+    env.edit_spec(sid, lambda data: data["resolution"].update(tools=["Read"]))
+    proc, out = env.adopt(sid)
+    assert_not_started(proc, out, "session_dir_unsafe")

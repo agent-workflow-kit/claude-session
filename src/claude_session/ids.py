@@ -31,6 +31,38 @@ ARTIFACT_NAME = re.compile(r"[A-Za-z0-9._-]{1,128}")
 LABEL_KEY = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 # Environment variable names (--env-allow, --env-allowlist-only); ASCII only.
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Claude Code built-in tools `--tools` accepts (bare names only). An unlisted name, including a
+# tool a newer Claude Code adds, is refused until it is listed here: the safe direction.
+BUILTIN_TOOLS = frozenset(
+    {
+        "Agent",
+        "AskUserQuestion",
+        "Bash",
+        "BashOutput",
+        "Edit",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "Glob",
+        "Grep",
+        "KillShell",
+        "LSP",
+        "Monitor",
+        "MultiEdit",
+        "NotebookEdit",
+        "NotebookRead",
+        "PowerShell",
+        "Read",
+        "Skill",
+        "Task",
+        "TaskOutput",
+        "TaskStop",
+        "TodoWrite",
+        "ToolSearch",
+        "WebFetch",
+        "WebSearch",
+        "Write",
+    }
+)
 LABEL_VALUE = re.compile(r"[A-Za-z0-9._:/#@+=,-]{0,256}")
 # Prefix input after `cs-`: what any id prefix of at least MIN_PREFIX_LENGTH can look like.
 ID_PREFIX_BODY = re.compile(r"[a-z2-7]{4,8}")
@@ -156,6 +188,10 @@ def is_permission_profile_file(value: object) -> bool:
 
 def is_env_name(name: str) -> bool:
     return ENV_NAME.fullmatch(name) is not None
+
+
+def is_builtin_tool(name: str) -> bool:
+    return name in BUILTIN_TOOLS
 
 
 def is_skill_name(name: str) -> bool:

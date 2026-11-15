@@ -9,6 +9,10 @@ exits, hangs, ignores signals or dies on cue. Standard library only.
 Behaviour marked *unverified* below is taken from Claude Code's documentation or chosen as the
 likely behaviour; the spike (design.md, Spike results) did not check it.
 
+``--tools`` is accepted and recorded in the ``start`` record's flags, but its semantics are
+*not modeled* and unverified live (issue #41): the fake neither restricts anything nor puts a
+tool list in an ``init`` message, and what Claude Code does with an empty value is unknown.
+
 **Finding the scenario.** ``$FAKE_CLAUDE_SCENARIO`` names a JSON scenario file;
 ``$FAKE_CLAUDE_LOG`` (or the scenario's ``log``) names a JSON-lines file the fake appends
 what it did to. ``--version`` needs no scenario (``$FAKE_CLAUDE_VERSION`` or the scenario's
@@ -298,6 +302,7 @@ STRICT_FLAGS = {
     "--fork-session",
     "--strict-mcp-config",
     "--verbose",
+    "--tools",
 }
 REPEATABLE_FLAGS = {"--plugin-dir"}
 OUTPUT_FORMATS = {"text", "json", "stream-json"}

@@ -818,8 +818,9 @@ def run_checks(
         found.warnings += found.generated.warnings
     except LaunchValidationError as error:
         if error.end_reason == "config_invalid":
-            # A launch ends config_invalid only for config that step 2 validates first; a
-            # dry run reports it as the invalid config it is (exit 2).
+            # A launch ends config_invalid for config that step 2 validated first (a dry run
+            # reports it as the invalid config it is, exit 2), or for a --tools list the
+            # profile denies in full (`start` does not read the profile; the adoption fails).
             raise UsageError("invalid config", detail=error.message) from error
         found.generated = None
         found.would_fail = error.end_reason
@@ -832,6 +833,24 @@ def run_checks(
     found.profile = effects.profile
     found.git = effects.git
     return found
+
+
+def _plan_tools(
+    resolution: kinds.Resolution,
+    generated: settings_builder.Generated | None,
+    recorded: Profile | None,
+) -> list[str] | None:
+    """The plan's ``tools``: the generated list, else the requested list filtered by the
+    profile that was read (also when a later check failed); None without an allowlist or
+    when the profile was never read."""
+    if resolution.tools is None:
+        return None
+    if generated is not None:
+        return list(generated.tools or ())
+    if recorded is None:
+        return None
+    allowed, _ = settings_builder.allowed_tools(resolution.tools, recorded.content)
+    return list(allowed or ())
 
 
 def new_session_plan(
@@ -986,6 +1005,9 @@ def plan_json(
         "has_prompt": req.prompt is not None,
         "input_files": [item.name for item in req.inputs],
         "implicit_done": profile.implicit_done,
+        # The effective --tools list (denied tools dropped); None: no allowlist, or a launch
+        # that failed before the permission profile was read.
+        "tools": _plan_tools(resolution, generated, recorded),
         "permission_profile": label,
         "timeout": resolution.timeout(mode),
         "max_turns": profile.max_turns,

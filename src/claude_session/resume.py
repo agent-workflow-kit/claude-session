@@ -71,6 +71,7 @@ RESETS = {
     "permission-profile": "permission_profile",
     "auto-exit": "auto_exit",
     "implicit-done": "implicit_done",
+    "tools": "tools",
 }
 # The prefix of a human actor (interface.md, Flag rules: human-only flags).
 HUMAN_ACTOR = "human:"

@@ -125,6 +125,8 @@ another with `--kind`.
   authenticated with a per-run secret. Without a report, a clean headless exit of a kind with
   `implicit_done` counts as `done`, with the final result as the artifact; pass
   `--no-implicit-done` to end such a run `exited-unreported` instead.
+- **Tool allowlist**: `--tools Read Grep` limits an isolated run to those Claude Code built-in tools
+  (permission denies still win); carried to later resumes, dropped with `--reset tools`.
 
 ## Usage
 

@@ -89,6 +89,7 @@ RESETTABLE = {
     "permission-profile": "permission_profile",
     "auto-exit": "auto_exit",
     "implicit-done": "implicit_done",
+    "tools": "tools",
 }
 # Launch flags with a --no- form (argparse.BooleanOptionalAction); shown as `--[no-]<name>`.
 BOOLEAN_FLAGS = frozenset({"auto_exit", "implicit_done"})
@@ -115,6 +116,10 @@ VERIFY_SECRET_USAGE = (
 NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
 
 
+# `--tools` takes every following name, so a session id given after it is read as a name.
+TOOLS_ORDER_HINT = "give the id first: resume <id> --tools ..."
+
+
 class _Parser(argparse.ArgumentParser):
     """An ArgumentParser that raises ``UsageError`` instead of exiting, so ``--json`` works."""
 
@@ -124,9 +129,22 @@ class _Parser(argparse.ArgumentParser):
     # echoed (verify-secret: a secret given there by mistake).
     fixed_error: str | None = None
 
+    def parse_known_args(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, args: Any = None, namespace: Any = None
+    ) -> Any:
+        self.given = list(sys.argv[1:] if args is None else args)
+        return super().parse_known_args(args, namespace)
+
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
-        raise UsageError(self.fixed_error or message)
+        hint = (
+            TOOLS_ORDER_HINT
+            if self.prog.endswith("resume")
+            and "--tools" in getattr(self, "given", ())
+            and "required" in message
+            else None
+        )
+        raise UsageError(self.fixed_error or message, detail=None if self.fixed_error else hint)
 
 
 class _VersionAction(argparse.Action):
@@ -1026,6 +1044,7 @@ def _add_launch_flags(parser: argparse.ArgumentParser, *, resumable: bool) -> No
     parser.add_argument("--reads-third-party", action="store_true", default=None)
     parser.add_argument("--auto-exit", action=argparse.BooleanOptionalAction)
     parser.add_argument("--implicit-done", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--tools", action="extend", nargs="+", metavar="NAME")
     parser.add_argument("--env-allow", action="append", metavar="VAR")
     parser.add_argument("--env-allowlist-only", action="append", metavar="VAR")
     parser.add_argument("--outcome-file", metavar="PATH")
@@ -1264,6 +1283,16 @@ def _check_launch_flags(args: argparse.Namespace) -> None:
                 raise UsageError(
                     f"{_flag(dest)}: invalid variable name {name!r} (^{ids.ENV_NAME.pattern}$)"
                 )
+    for name in args.tools or []:
+        if not isinstance(name, str) or not ids.is_builtin_tool(name):
+            shown = name if isinstance(name, str) and name.isprintable() else repr(name)
+            raise UsageError(
+                f"--tools: unknown tool {shown!r} (a Claude Code built-in tool name, one of "
+                f"{', '.join(sorted(ids.BUILTIN_TOOLS))})",
+                detail=TOOLS_ORDER_HINT
+                if isinstance(name, str) and ids.is_session_id(name)
+                else None,
+            )
     if args.setting_sources:
         for source in args.setting_sources.split(","):
             if source not in SETTING_SOURCES:

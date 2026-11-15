@@ -91,6 +91,16 @@
       "type": "boolean",
       "description": "The effective value: the kind's, or the --implicit-done / --no-implicit-done flag given now or carried."
     },
+    "tools": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      },
+      "description": "The effective --tools allowlist passed to claude (given now or carried), without tools the permission profile denies; null when no allowlist is passed (every tool the permissions allow) or when the launch would fail before the permission profile was read."
+    },
     "permission_profile": {
       "type": [
         "string",
@@ -350,6 +360,7 @@
     "has_prompt",
     "input_files",
     "implicit_done",
+    "tools",
     "permission_profile",
     "timeout",
     "max_turns",
