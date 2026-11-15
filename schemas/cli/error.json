@@ -50,7 +50,7 @@
             "null"
           ],
           "pattern": "^cs-[a-z2-7]{8}$",
-          "description": "For launch_failed: the session whose run ended not-started (never null then)."
+          "description": "For launch_failed: the session `start` allocated, whose run ended not-started (never null then); it is a real session a caller can pass to status, stop or forget."
         },
         "run": {
           "type": "integer",

@@ -88,7 +88,10 @@ RESETTABLE = {
     "max-turns": "max_turns",
     "permission-profile": "permission_profile",
     "auto-exit": "auto_exit",
+    "implicit-done": "implicit_done",
 }
+# Launch flags with a --no- form (argparse.BooleanOptionalAction); shown as `--[no-]<name>`.
+BOOLEAN_FLAGS = frozenset({"auto_exit", "implicit_done"})
 # The only flags `exec --session-id` accepts (interface.md, Exit codes, exit 2).
 ADOPTION_FLAGS = {"json", "dry_run", "outcome_file", "verbose", "quiet", "yes", "run"}
 OUTCOME_FILE_COMMANDS = ("exec", "start", "resume", "wait")
@@ -521,12 +524,15 @@ def _forget(args: argparse.Namespace) -> int:
 
     cfg = load_config(args)
     actor = launch.default_actor(args.actor, cfg)
+    reasons: dict[str, str] = {}
     common: dict[str, Any] = {
         "gateway": SystemGateway(),
         "environ": os.environ,
         "actor": actor,
         "decision_ids": args.decision_id or [],
         "dry_run": args.dry_run,
+        "purge": args.purge,
+        "reasons": reasons,
     }
     with store.open_state() as st:
         if args.id is not None:
@@ -542,16 +548,25 @@ def _forget(args: argparse.Namespace) -> int:
                 labels=[ids.parse_label(text) for text in args.label or []],
                 **common,
             )
+    unpurged = [e["csession_id"] for e in result["forgotten"] if e.get("purged") is False]
     if args.json:
         print_json(result)
-        return 0
-    verb = "would forget" if result["dry_run"] else "forgot"
-    for item in result["forgotten"]:
-        print(f"{verb} {item['csession_id']} (deleted after {item['delete_after']})")
-    for item in result["skipped"]:
-        print(f"skipped {item['csession_id']}: {item['reason']}")
-    if not (result["forgotten"] or result["skipped"]):
-        print("nothing to forget")
+    else:
+        verb = "would forget" if result["dry_run"] else "forgot"
+        for item in result["forgotten"]:
+            purged = " and purged" if item.get("purged") else ""
+            print(f"{verb}{purged} {item['csession_id']} (deleted after {item['delete_after']})")
+        for item in result["skipped"]:
+            print(f"skipped {item['csession_id']}: {item['reason']}")
+        if not (result["forgotten"] or result["skipped"]):
+            print("nothing to forget")
+    if unpurged and not result["dry_run"]:
+        for sid in unpurged:
+            print(
+                f"forgotten but not purged: {sid} ({reasons.get(sid, 'unknown')})", file=sys.stderr
+            )
+        print("reconcile deletes them after retention_days", file=sys.stderr)
+        return 12
     return 0
 
 
@@ -1010,6 +1025,7 @@ def _add_launch_flags(parser: argparse.ArgumentParser, *, resumable: bool) -> No
     parser.add_argument("--setting-sources", metavar="LIST")
     parser.add_argument("--reads-third-party", action="store_true", default=None)
     parser.add_argument("--auto-exit", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--implicit-done", action=argparse.BooleanOptionalAction)
     parser.add_argument("--env-allow", action="append", metavar="VAR")
     parser.add_argument("--env-allowlist-only", action="append", metavar="VAR")
     parser.add_argument("--outcome-file", metavar="PATH")
@@ -1110,6 +1126,7 @@ def build_parser() -> _Parser:
     p.add_argument("--state", action="append", choices=STATES)
     p.add_argument("--kind", metavar="KIND")
     p.add_argument("--label", action="append", metavar="KEY=VALUE")
+    p.add_argument("--purge", action="store_true")
     _add_audit_flags(p)
     _add_dry_run(p)
 
@@ -1159,8 +1176,8 @@ def parse(parser: _Parser, argv: Sequence[str]) -> argparse.Namespace:
 
 
 def _flag(dest: str) -> str:
-    if dest == "auto_exit":
-        return "--[no-]auto-exit"
+    if dest in BOOLEAN_FLAGS:
+        return "--[no-]" + dest.replace("_", "-")
     return "--" + dest.replace("_", "-")
 
 

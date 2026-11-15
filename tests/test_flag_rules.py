@@ -32,6 +32,10 @@ VIOLATIONS: list[tuple[list[str], str]] = [
         ["exec", "--session-id", SID, "--no-auto-exit"],
         "--[no-]auto-exit cannot be used with --session-id",
     ),
+    (
+        ["exec", "--session-id", SID, "--no-implicit-done"],
+        "--[no-]implicit-done cannot be used with --session-id",
+    ),
     (["exec", "--session-id", SID, "--label", "a=b"], "--label cannot be used with"),
     (["exec", "--run", "2"], "--run requires --session-id"),
     (["exec", "--mode", "headless", "--skill", "s", "--run", "1"], "--run requires --session-id"),
@@ -47,6 +51,10 @@ VIOLATIONS: list[tuple[list[str], str]] = [
     (
         ["resume", SID, "--reset", "auto-exit", "--auto-exit"],
         "--reset auto-exit cannot be combined with --[no-]auto-exit",
+    ),
+    (
+        ["resume", SID, "--reset", "implicit-done", "--no-implicit-done"],
+        "--reset implicit-done cannot be combined with --[no-]implicit-done",
     ),
     (["resume", SID, "--reset", "plugin-dir", "--plugin-dir", "/p"], "--reset plugin-dir"),
     (

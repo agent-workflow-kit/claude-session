@@ -1023,7 +1023,7 @@ def test_config_flags_are_allowlisted(cfg_dir: Path, key: str) -> None:
         load(cfg_dir).with_flags(**{key: []})
 
 
-@pytest.mark.parametrize("key", ["claude_args", "write_dirs", "implicit_done", "backstop", "cwd"])
+@pytest.mark.parametrize("key", ["claude_args", "write_dirs", "backstop", "cwd"])
 def test_kind_flags_are_allowlisted(cfg_dir: Path, key: str) -> None:
     with pytest.raises(TypeError):
         config.with_flags(load(cfg_dir).kinds["implement"], **{key: None})
@@ -1044,7 +1044,9 @@ def test_kind_flag_keys_are_settable(cfg_dir: Path) -> None:
         mcp="none",
         env={"inherit": False, "allow": ["A"], "set": {}, "path_prepend": []},
         auto_exit=False,
+        implicit_done=False,
     )
+    assert flagged.implicit_done is False
     assert flagged.sandbox == "required"
     assert flagged.env.allow == ["A"]
 

@@ -464,6 +464,23 @@ def test_salvage_of_an_implicit_done_without_a_verified_secret_is_rejected(
     assert (change.outcome, change.end_reason) == ("exited-unreported", "result_rejected")
 
 
+@pytest.mark.parametrize(
+    "resolved",
+    [{"profile": {"implicit_done": False}}, {"profile": {}}],
+    ids=["implicit_done_false", "implicit_done_missing"],
+)
+def test_salvage_without_a_true_implicit_done_is_exited_unreported(
+    st: Store, root: str, procs: Procs, tmp_path: Path, resolved: dict[str, Any]
+) -> None:
+    """A clean success result with no report is only an implicit done when the run's frozen
+    profile says ``implicit_done: true``; false or absent fails closed."""
+    sid = salvaged(st, root, procs, resolved_json=json.dumps(resolved))
+    result = {"type": "result", "subtype": "success", "is_error": False, "result": "ok"}
+    write_private(root, sid, 1, "result.json", (json.dumps(result) + "\n").encode())
+    (change,) = liveness.check_session(st, cfg_of(tmp_path), sid).changes
+    assert (change.outcome, change.end_reason) == ("exited-unreported", "no_report")
+
+
 def test_salvage_deletes_the_secret_index_and_writes_the_outcome_file(
     st: Store, root: str, procs: Procs, tmp_path: Path
 ) -> None:

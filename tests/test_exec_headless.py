@@ -197,6 +197,7 @@ def test_a_headless_run_that_reports_done_exits_0_with_a_frozen_artifact(
     assert frozen.read_bytes() == b"artifact body"
     assert frozen.is_relative_to(run.private_run / "artifact")
     assert outcome["cost_usd"] == 0.5
+    assert outcome["num_turns"] == 3
     assert outcome["claude_session_id"] is not None
     assert outcome["session_started_at"] is not None
     assert outcome["phase"] == "session"
@@ -241,6 +242,38 @@ def test_an_unreported_clean_run_without_implicit_done_is_exited_unreported(
     assert run.code == 14
     assert (run.outcome["outcome"], run.outcome["end_reason"]) == ("exited-unreported", "no_report")
     assert run.outcome["report"] is None and run.outcome["state"] == "exited-unreported"
+
+
+def test_no_implicit_done_flag_ends_an_unreported_clean_run_exited_unreported(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    """The kind says implicit done (the default); --no-implicit-done wins for this call."""
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, STOP, result_step()],
+        args=["--no-implicit-done"],
+        config=FAST,
+    )
+    assert run.code == 14
+    assert (run.outcome["outcome"], run.outcome["end_reason"]) == ("exited-unreported", "no_report")
+    assert run.outcome["report"] is None
+
+
+def test_implicit_done_flag_turns_it_on_over_a_kind_that_has_it_off(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    run = run_exec(
+        tmp_path,
+        state,
+        work,
+        [START, STOP, result_step("# Result\n\nfine\n")],
+        args=["--implicit-done"],
+        config=NO_IMPLICIT,
+    )
+    assert run.code == 0, run.proc.stderr
+    assert (run.outcome["outcome"], run.outcome["report"]["implicit"]) == ("done", True)
 
 
 def test_the_backstop_blocks_the_first_unreported_stop_once(
@@ -336,6 +369,7 @@ def test_cost_and_turns_are_summed_over_every_result_object(
         config=FAST,
     )
     assert run.outcome["cost_usd"] == pytest.approx(0.75)
+    assert run.outcome["num_turns"] == 5
     assert run.run_row()["num_turns"] == 5
     assert Path(run.outcome["report"]["artifact"]["path"]).read_text() == "two"
 
@@ -429,6 +463,7 @@ def test_claude_not_found_ends_the_run_not_started(tmp_path: Path, state: Path, 
         "claude_not_found",
     )
     assert outcome["state"] == "not-started" and outcome["cost_usd"] is None
+    assert outcome["num_turns"] is None
     assert outcome["message"] and "claude_bin" in outcome["message"]
 
 
@@ -1092,6 +1127,16 @@ def test_an_unusable_cost_is_null_and_the_run_still_ends(
     )
     assert run.code == 0, run.proc.stderr
     assert run.outcome["outcome"] == "done" and run.outcome["cost_usd"] is None
+    assert run.outcome["num_turns"] == 1  # the turn count is independent of the cost
+    assert not (run.private_run / "secret-index").exists()
+
+
+def test_an_unbindable_turn_count_is_null_and_the_run_still_ends(
+    tmp_path: Path, state: Path, work: Path
+) -> None:
+    run = run_exec(tmp_path, state, work, [START, STOP, result_step(num_turns=2**64)], config=FAST)
+    assert run.code == 0, run.proc.stderr
+    assert run.outcome["outcome"] == "done" and run.outcome["num_turns"] is None
     assert not (run.private_run / "secret-index").exists()
 
 

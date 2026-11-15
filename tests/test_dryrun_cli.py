@@ -240,6 +240,28 @@ def test_start_dry_run_is_the_same_plan(tmp_path: Path, tools: Path, work: Path)
     assert start_plan == exec_plan
 
 
+@pytest.mark.parametrize(
+    ("kind", "flag", "expected"),
+    [
+        ("implement", "--no-implicit-done", False),
+        ("implement", "--implicit-done", True),
+        ("gate-check", "--implicit-done", True),
+        ("gate-check", "--no-implicit-done", False),
+        ("implement", None, True),
+        ("gate-check", None, False),
+    ],
+)
+def test_a_dry_run_shows_the_effective_implicit_done(
+    kind: str, flag: str | None, expected: bool, tmp_path: Path, tools: Path, work: Path
+) -> None:
+    extra = [flag] if flag else []
+    proc, plan = dry_run(kind, *extra, cwd=work, tools=tools, tmp_path=tmp_path)
+    assert proc.returncode == 0, plan["warnings"]
+    assert plan["implicit_done"] is expected
+    assert plan["profile"]["implicit_done"] is expected
+    assert plan["origins"]["implicit_done"] == ("flag" if flag else "builtin")
+
+
 def test_an_interactive_dry_run_uses_the_interactive_timeout(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:

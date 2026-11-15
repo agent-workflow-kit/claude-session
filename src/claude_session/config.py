@@ -429,6 +429,7 @@ KIND_FLAG_KEYS = frozenset(
         "mcp",  # implied by --reads-third-party
         "env",  # --env-allow, --env-allowlist-only; inherit implied by --reads-third-party
         "auto_exit",
+        "implicit_done",
     }
 )
 FLAG_KEYS: dict[type[BaseModel], frozenset[str]] = {

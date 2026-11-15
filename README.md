@@ -123,7 +123,8 @@ another with `--kind`.
   `killed`, `timeout`, `lost`, `not-started`), mapped to the exit code of the waiting commands.
 - **Report**: the agent's own statement of how it finished (`report done|blocked|failed|needs-input`),
   authenticated with a per-run secret. Without a report, a clean headless exit of a kind with
-  `implicit_done` counts as `done`, with the final result as the artifact.
+  `implicit_done` counts as `done`, with the final result as the artifact; pass
+  `--no-implicit-done` to end such a run `exited-unreported` instead.
 
 ## Usage
 
@@ -231,7 +232,7 @@ adopts ends `not-started` (`never_adopted`, exit 12) once it expires.
 
 Agents run `report` themselves; claude-session adds the instructions and the permission rules
 that pre-approve `claude-session report …` commands. You rarely run it by hand. For reference, the
-forms the agent is told to use (it writes a summary or reason file to `artifacts/` first):
+forms the agent is told to use (it writes a summary or reason file to `artifacts/` first; the files must be inside `$CSESSION_DIR`; otherwise pass the text on stdin with `-`):
 
 ```sh
 claude-session report done --summary-file "$CSESSION_DIR/artifacts/summary.md"
