@@ -324,6 +324,7 @@ def test_an_interactive_run_goes_to_permission_and_reported_then_auto_exits(
     )
     assert outcome["report"]["summary"] == "finished"
     assert outcome["cost_usd"] is None  # interactive
+    assert outcome["num_turns"] is None
     row = run_row_of(state)
     assert row["mode"] == "interactive" and row["pending_cause"] == "auto_exit"
     changes = events(state)

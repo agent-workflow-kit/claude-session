@@ -388,7 +388,9 @@
             "integer",
             "null"
           ],
-          "description": "Headless: the sum of num_turns over all result objects."
+          "minimum": 0,
+          "maximum": 9223372036854775807,
+          "description": "Headless: the sum of num_turns over all result objects (values that are not non-negative integers up to 9223372036854775807 left out; a sum beyond that is null); null for interactive runs, launch-phase ends and a headless run with no usable count."
         },
         "is_error": {
           "type": [

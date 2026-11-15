@@ -71,6 +71,7 @@ from . import (
     outcomefile,
     pathrules,
     permission_profiles,
+    plugincopy,
     secretindex,
     selfcheck,
     sessiondir,
@@ -721,6 +722,16 @@ class Checked:
     tmpdir_pin: int | None = None
     # What no tool may lie under (``tool_guard``): the pre-launch hooks' sh and PATH too.
     guard: pathrules.Guard | None = None
+    # A sandboxed run's plugin directories are copied with the sandbox's mask placeholders
+    # (``plugincopy``): the checked sources, where the copies go and what they add. Empty
+    # when the sandbox is off (the run uses ``plugin_dirs`` as they are).
+    plugin_copies: tuple[plugincopy.Planned, ...] = ()
+
+    @property
+    def effective_plugin_dirs(self) -> tuple[str, ...]:
+        """The plugin directories the run passes to ``claude``: the copies, else the
+        resolved ``plugin_dirs``."""
+        return tuple(c.effective for c in self.plugin_copies) or self.plugin_dirs
 
     def close_tmpdir_pin(self) -> None:
         if self.tmpdir_pin is not None:
@@ -1339,6 +1350,33 @@ def check_paths(
     rules.check_profile(expanded, isolated=True, writable=writable)
 
 
+def plan_plugin_copies(
+    resolution: kinds.Resolution, alloc: Allocated, plugins: Sequence[str]
+) -> tuple[plugincopy.Planned, ...]:
+    """A sandboxed run copies each plugin directory (``prepare``): check the trees now
+    (reading only, ``unsafe_plugin_dir``) and plan where the copies go. Other runs use the
+    directories as they are."""
+    if resolution.profile.sandbox == "off":
+        return ()
+    for source in plugins:
+        # The copy keeps the directory's name and the run's rules name the copy: refuse a
+        # name they cannot hold now, naming the caller's directory, before anything is copied.
+        problem = settings_builder.rule_name_problem(os.path.basename(source))
+        if problem is not None:
+            shown = source.encode("utf-8", "backslashreplace").decode("utf-8")
+            raise LaunchValidationError(
+                f"plugin directory name {problem}: {shown!r}", end_reason="unsafe_plugin_dir"
+            )
+    return tuple(
+        plugincopy.Planned(
+            source,
+            plugincopy.effective_path(alloc.session_dir, alloc.run, index, source),
+            plugincopy.scan(source).added,
+        )
+        for index, source in enumerate(plugins)
+    )
+
+
 def check_plugins(
     rules: pathrules.PathRules,
     plugin_dirs: Sequence[str],
@@ -1928,6 +1966,7 @@ def checks(
     effects.record_dirs(lambda: run_dirs(read, write.dirs, expanded, cwd, home))
     plugins = check_plugins(rules, req.plugin_dirs, writable, process.caller_cwd)
     effects.record_plugin_dirs(plugins)
+    plugin_copies = plan_plugin_copies(resolution, alloc, plugins)
     guard = others if writable is None else with_own(others, writable)
     check_hook_interpreter(process, writable, guard)
     check_tmpdir(resolution, alloc, tmp)
@@ -1981,6 +2020,7 @@ def checks(
         read_dirs=tuple(read),
         write_dirs=write.dirs,
         plugin_dirs=plugins,
+        plugin_copies=plugin_copies,
         claude=tools.claude,
         git=tools.git,
         bwrap=tools.bwrap,
@@ -2551,7 +2591,7 @@ def generate(
         resume_from=conversation.resume_from,
         fork=conversation.fork,
         session_id=conversation.session_id,
-        plugin_dirs=v.plugin_dirs,
+        plugin_dirs=v.effective_plugin_dirs,
     )
     return settings_builder.build(
         resolution, v.expanded, paths, tools, launch, isolation=v.isolation
@@ -2618,6 +2658,11 @@ def prepare(
     if v.profile.is_file:
         # Adoption rewrites start's snapshot with the same bytes (read back with its label).
         snapshot = dirs.write_private_run_file(run, PROFILE_SNAPSHOT, v.profile.snapshot_bytes())
+    # Every run replaces ``plugins/`` (earlier runs' copies go even when this run has none).
+    copies, copy_warnings = dirs.copy_plugins(run, [c.source for c in v.plugin_copies])
+    if copies != [c.effective for c in v.plugin_copies]:
+        raise sessiondir.SessionDirUnsafe("the plugin copies are not where the run planned")
+    v.warnings.extend(copy_warnings)
     generated = generate(req, resolution, alloc, v, process, prompt_path)
     dirs.write_settings(run, settings_builder.settings_json(generated.settings))
     fields: dict[str, Any] = {

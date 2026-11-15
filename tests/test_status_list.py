@@ -183,6 +183,8 @@ NOT_STARTED = Final(
     state="not-started",
     cause="exit",
     message="claude not found on PATH",
+    cost_usd=0.5,
+    num_turns=7,
 )
 
 
@@ -307,6 +309,7 @@ def test_status_of_a_launch_failure_has_no_cost_and_a_message(
     assert (run["phase"], run["state"], run["outcome"]) == ("launch", "not-started", "not-started")
     assert run["message"] == "claude not found on PATH"
     assert run["cost_usd"] is None and run["result_path"] is None  # interactive
+    assert run["num_turns"] is None
 
 
 def test_status_of_a_pending_run(seeded: Store, capsys: pytest.CaptureFixture[str]) -> None:
