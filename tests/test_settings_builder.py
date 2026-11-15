@@ -397,6 +397,14 @@ def test_report_allow_rules_bare_and_absolute(cfg: config.Config) -> None:
     assert f"Bash({CS_PATH} report:*)" in allow
 
 
+def test_report_allow_rules_are_added_to_a_skill_only_profile(cfg: config.Config) -> None:
+    # A profile file that lists only Skill(<name>) still lets `claude-session report` run.
+    allow = settings(resolve(cfg), profile(allow=["Skill(my-skill)"]))["permissions"]["allow"]
+    assert allow[0] == "Skill(my-skill)"
+    assert "Bash(claude-session report:*)" in allow
+    assert f"Bash({CS_PATH} report:*)" in allow
+
+
 def test_read_allow_for_the_session_directory(cfg: config.Config) -> None:
     assert f"Read(/{CSDIR}/**)" in settings(resolve(cfg))["permissions"]["allow"]
 
