@@ -121,6 +121,19 @@ def test_builtin_permission_profiles_set_no_default_mode() -> None:
         assert "defaultMode" not in permissions
 
 
+def test_readonly_profile_denies_subagents_but_review_allows_them() -> None:
+    # The readonly profile backs the rank kind, which reads untrusted input without a sandbox
+    # requirement: a subagent would run outside the profile's tool intent (#112).
+    readonly = defaults.BUILTIN_PERMISSION_PROFILES["readonly"]["permissions"]
+    for tool in ("Agent", "Task"):
+        assert tool in readonly["deny"]
+        assert tool not in readonly["allow"]
+    assert "Skill" in readonly["allow"]
+    review = defaults.BUILTIN_PERMISSION_PROFILES["review"]["permissions"]
+    assert {"Agent", "Task", "Skill"} <= set(review["allow"])
+    assert not {"Agent", "Task"} & set(review["deny"])
+
+
 def test_default_kind_is_used_without_a_kind(cfg_dir: Path) -> None:
     result = resolve(load(cfg_dir))
     assert result.kind == "implement"
