@@ -139,7 +139,9 @@ class _Parser(argparse.ArgumentParser):
         self.print_usage(sys.stderr)
         hint = (
             TOOLS_ORDER_HINT
-            if "--tools" in getattr(self, "given", ()) and ("required" in message)
+            if self.prog.endswith("resume")
+            and "--tools" in getattr(self, "given", ())
+            and "required" in message
             else None
         )
         raise UsageError(self.fixed_error or message, detail=None if self.fixed_error else hint)

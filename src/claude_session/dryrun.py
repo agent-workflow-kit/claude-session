@@ -765,8 +765,9 @@ def run_checks(
         found.warnings += found.generated.warnings
     except LaunchValidationError as error:
         if error.end_reason == "config_invalid":
-            # A launch ends config_invalid only for config that step 2 validates first; a
-            # dry run reports it as the invalid config it is (exit 2).
+            # A launch ends config_invalid for config that step 2 validated first (a dry run
+            # reports it as the invalid config it is, exit 2), or for a --tools list the
+            # profile denies in full (`start` does not read the profile; the adoption fails).
             raise UsageError("invalid config", detail=error.message) from error
         found.generated = None
         found.would_fail = error.end_reason

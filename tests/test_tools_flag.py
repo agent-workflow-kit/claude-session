@@ -28,6 +28,8 @@ from .test_resume import (  # noqa: F401  (fixtures)
     spec,
     starts,
 )
+from .test_start_adopt import env as start_env  # noqa: F401  (fixture)
+from .test_start_adopt import state  # noqa: F401  (fixture)
 
 SID = "cs-abcd2345"
 PATHS = Paths(state_root="/state", csession_id=SID, run=1)
@@ -410,6 +412,24 @@ def test_an_exec_whose_tools_are_all_denied_does_not_start_claude(env: Any) -> N
     assert proc.returncode == 12, proc.stdout + proc.stderr
     assert out["end_reason"] == "config_invalid"
     assert starts(env) == []
+
+
+def test_start_accepts_all_denied_tools_and_the_adoption_ends_config_invalid(
+    start_env: Any,  # noqa: F811
+) -> None:
+    # start does not read the permission profile: it freezes the spec; the adoption refuses.
+    out = start_env.started(
+        "--mode", "headless", "--kind", "rank", "--tools", "WebFetch", "WebSearch"
+    )  # fmt: skip
+    proc, ended = start_env.adopt(out["csession_id"])
+    assert proc.returncode == 12, proc.stdout + proc.stderr
+    assert ended["end_reason"] == "config_invalid"
+
+
+def test_status_with_tools_does_not_get_the_resume_order_hint() -> None:
+    with pytest.raises(UsageError) as info:
+        parse("status", "--tools")
+    assert info.value.detail is None
 
 
 def test_a_dry_run_plan_filters_tools_even_when_the_launch_would_fail(
