@@ -969,6 +969,7 @@ def outcome_of_row(row: dict[str, Any], extra: tuple[str, ...] = ()) -> dict[str
         "report": report,
         "session_started_at": row["session_started_at"],
         "cost_usd": None if row["phase"] == "launch" else row["cost_usd"],
+        "num_turns": None if row["phase"] == "launch" else row["num_turns"],
         "message": row["message"],
         "warnings": list(dict.fromkeys([*warnings, *extra])),
     }

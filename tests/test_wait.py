@@ -490,6 +490,15 @@ def test_every_outcome_validates_against_the_wait_schema(
     )
 
 
+def test_a_finished_headless_run_carries_its_turn_count(st: Store, clock: Clock) -> None:
+    sid = session(st)
+    report(st, sid, "done")
+    final = Final("session", "done", "normal", 0, "exited", "exit", cost_usd=0.5, num_turns=7)
+    assert st.finalize_run(sid, 1, final)
+    waited = wait(st, clock, sid)
+    assert (waited.output["cost_usd"], waited.output["num_turns"]) == (0.5, 7)
+
+
 def test_a_not_started_run_exits_12(st: Store, clock: Clock) -> None:
     sid = st.allocate(new_run(), new_id=ids.new_session_id)
     final = Final("launch", "not-started", "never_adopted", 12, "not-started", "liveness")
@@ -500,6 +509,7 @@ def test_a_not_started_run_exits_12(st: Store, clock: Clock) -> None:
         "launch",
         None,
     )
+    assert waited.output["num_turns"] is None
 
 
 # claude-session wait (the entry point)

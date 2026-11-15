@@ -100,8 +100,11 @@ def _cost(value: object) -> float | None:
     return number if math.isfinite(number) and number >= 0 else None
 
 
+MAX_TURNS = 2**63 - 1  # the largest integer SQLite stores
+
+
 def _turns(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_TURNS:
         return None
     return value
 
@@ -125,6 +128,7 @@ class _Parser:
         self.count = 0
         self.cost: float | None = None
         self.turns: int | None = None
+        self.turns_overflowed = False  # a sum beyond MAX_TURNS stays unknown, like a cost sum
 
     def line(self, raw: bytes) -> None:
         obj = _object(raw.rstrip(b"\r"))
@@ -140,13 +144,17 @@ class _Parser:
             self.cost = (self.cost or 0.0) + cost
         turns = _turns(obj.get("num_turns"))
         if turns is not None:
-            self.turns = (self.turns or 0) + turns
+            total = (self.turns or 0) + turns
+            if total > MAX_TURNS:
+                self.turns_overflowed = True
+            self.turns = total
 
 
 def parse_stream_json(chunks: Iterable[bytes]) -> HeadlessResult:
     """Parse ``stream-json`` output given in chunks of any size (see the module docs). Only
     each new chunk is split; the partial line is kept in parts, so a long line costs linear
-    time. A summed cost that is not finite is unknown (None)."""
+    time. A summed cost that is not finite, or a summed turn count beyond 2**63-1, is unknown
+    (None)."""
     parser = _Parser()
     partial: list[bytes] = []
     for chunk in chunks:
@@ -169,7 +177,7 @@ def parse_stream_json(chunks: Iterable[bytes]) -> HeadlessResult:
         final=parser.final,
         result_count=parser.count,
         cost_usd=cost if cost is None or math.isfinite(cost) else None,
-        num_turns=parser.turns,
+        num_turns=None if parser.turns_overflowed else parser.turns,
     )
 
 

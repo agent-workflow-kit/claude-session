@@ -297,8 +297,6 @@
     },
     "permissions": {
       "allow": [
-        "Agent",
-        "Task",
         "Skill",
         "Bash(claude-session report:*)",
         "Bash(/opt/claude-session/bin/claude-session report:*)",
@@ -314,6 +312,8 @@
       "blockReadsOutsideWorkingDirectories": true,
       "defaultMode": "dontAsk",
       "deny": [
+        "Agent",
+        "Task",
         "WebFetch",
         "WebSearch",
         "mcp__*",
