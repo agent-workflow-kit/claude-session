@@ -419,7 +419,7 @@ def _apply_flags(
             if only:
                 put("env.inherit", False, origin)
         elif key == "tools":
-            keep(key, _tool_names(value, origin), origin)
+            keep(key, tool_names(value, origin), origin)
         elif key == "permission_profile" and ids.is_permission_profile_file(value):
             keep("permission_profile_file", value, origin)
         else:
@@ -500,7 +500,7 @@ def _setting_sources(value: Any) -> Any:
     return value
 
 
-def _tool_names(value: Any, origin: Origin) -> tuple[str, ...]:
+def tool_names(value: Any, origin: Origin) -> tuple[str, ...]:
     """``--tools`` names (given now or carried): a non-empty list of known built-in names."""
     if (
         not isinstance(value, (list, tuple))

@@ -116,6 +116,10 @@ VERIFY_SECRET_USAGE = (
 NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
 
 
+# `--tools` takes every following name, so a session id given after it is read as a name.
+TOOLS_ORDER_HINT = "give the id first: resume <id> --tools ..."
+
+
 class _Parser(argparse.ArgumentParser):
     """An ArgumentParser that raises ``UsageError`` instead of exiting, so ``--json`` works."""
 
@@ -125,9 +129,20 @@ class _Parser(argparse.ArgumentParser):
     # echoed (verify-secret: a secret given there by mistake).
     fixed_error: str | None = None
 
+    def parse_known_args(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, args: Any = None, namespace: Any = None
+    ) -> Any:
+        self.given = list(sys.argv[1:] if args is None else args)
+        return super().parse_known_args(args, namespace)
+
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
-        raise UsageError(self.fixed_error or message)
+        hint = (
+            TOOLS_ORDER_HINT
+            if "--tools" in getattr(self, "given", ()) and ("required" in message)
+            else None
+        )
+        raise UsageError(self.fixed_error or message, detail=None if self.fixed_error else hint)
 
 
 class _VersionAction(argparse.Action):
@@ -1258,7 +1273,10 @@ def _check_launch_flags(args: argparse.Namespace) -> None:
             shown = name if isinstance(name, str) and name.isprintable() else repr(name)
             raise UsageError(
                 f"--tools: unknown tool {shown!r} (a Claude Code built-in tool name, one of "
-                f"{', '.join(sorted(ids.BUILTIN_TOOLS))})"
+                f"{', '.join(sorted(ids.BUILTIN_TOOLS))})",
+                detail=TOOLS_ORDER_HINT
+                if isinstance(name, str) and ids.is_session_id(name)
+                else None,
             )
     if args.setting_sources:
         for source in args.setting_sources.split(","):

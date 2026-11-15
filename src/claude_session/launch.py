@@ -2554,9 +2554,16 @@ def generate(
         session_id=conversation.session_id,
         plugin_dirs=v.plugin_dirs,
     )
-    return settings_builder.build(
-        resolution, v.expanded, paths, tools, launch, isolation=v.isolation
-    )
+    try:
+        return settings_builder.build(
+            resolution, v.expanded, paths, tools, launch, isolation=v.isolation
+        )
+    except UsageError as exc:
+        # --tools whose every tool the permission profile denies: known only once the
+        # profile is read, so a launch ends config_invalid and a dry run exits 2.
+        raise LaunchValidationError(
+            exc.message, detail=exc.detail, end_reason="config_invalid"
+        ) from exc
 
 
 def prepare(

@@ -781,6 +781,24 @@ def run_checks(
     return found
 
 
+def _plan_tools(
+    resolution: kinds.Resolution,
+    generated: settings_builder.Generated | None,
+    recorded: Profile | None,
+) -> list[str] | None:
+    """The plan's ``tools``: the generated list, else the requested list filtered by the
+    profile that was read (also when a later check failed); None without an allowlist or
+    when the profile was never read."""
+    if resolution.tools is None:
+        return None
+    if generated is not None:
+        return list(generated.tools or ())
+    if recorded is None:
+        return None
+    allowed, _ = settings_builder.allowed_tools(resolution.tools, recorded.content)
+    return list(allowed or ())
+
+
 def new_session_plan(
     args: argparse.Namespace,
     cfg: Config,
@@ -929,12 +947,9 @@ def plan_json(
         "has_prompt": req.prompt is not None,
         "input_files": [item.name for item in req.inputs],
         "implicit_done": profile.implicit_done,
-        # The effective --tools list (denied tools dropped); None: no allowlist.
-        "tools": (
-            None
-            if resolution.tools is None
-            else list(resolution.tools if generated is None else generated.tools or ())
-        ),
+        # The effective --tools list (denied tools dropped); None: no allowlist, or a launch
+        # that failed before the permission profile was read.
+        "tools": _plan_tools(resolution, generated, recorded),
         "permission_profile": label,
         "timeout": resolution.timeout(mode),
         "max_turns": profile.max_turns,

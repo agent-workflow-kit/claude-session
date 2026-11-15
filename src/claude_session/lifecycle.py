@@ -228,7 +228,11 @@ def resolution_of(data: Mapping[str, Any]) -> kinds.Resolution:
     origins = {_text(k): _text(v) for k, v in _mapping(data["origins"]).items()}
     if not set(origins.values()) <= ORIGINS:
         raise ValueError("unknown origin")
-    return kinds.Resolution(
+    try:
+        stored_tools = None if tools is None else kinds.tool_names(_texts(tools), "previous_run")
+    except UsageError as exc:
+        raise ValueError("invalid stored tools") from exc
+    resolution = kinds.Resolution(
         kind=_text(data["kind"]),
         builtin=_bool(data["builtin"]),
         fallback=_bool(data["fallback"]),
@@ -238,10 +242,13 @@ def resolution_of(data: Mapping[str, Any]) -> kinds.Resolution:
         warnings=tuple(_texts(data["warnings"])),
         env_allow=tuple(_texts(data["env_allow"])),
         env_allowlist_only=None if allowlist_only is None else tuple(_texts(allowlist_only)),
-        tools=None if tools is None else tuple(_texts(tools)),
+        tools=stored_tools,
         permission_profile_file=_optional_text(data["permission_profile_file"]),
         permission_profile_label=_optional_text(data["permission_profile_label"]),
     )
+    if resolution.tools is not None and not resolution.isolated():
+        raise ValueError("tools on a run that is not isolated")
+    return resolution
 
 
 def spec_json(

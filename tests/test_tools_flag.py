@@ -5,6 +5,7 @@ tools Claude Code offers; permissions (deny first) still apply on top of it."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from .test_resume import (  # noqa: F401  (fixtures)
     exec_session,
     flag_value,
     resume,
+    run_cs,
     spec,
     starts,
 )
@@ -43,7 +45,7 @@ def resolve(kind: str = "review", **flags: Any) -> kinds.Resolution:
     return kinds.resolve(cfg, kind, mode="headless", flags=flags or None, origin_url=lambda _: None)
 
 
-def argv_of(resolution: kinds.Resolution, perm: dict[str, Any] | None = None) -> Any:
+def argv_of(resolution: kinds.Resolution) -> Any:
     return settings_builder.build_argv(
         resolution,
         PATHS,
@@ -85,15 +87,44 @@ def test_an_unknown_tool_name_is_refused(name: str) -> None:
     assert "--tools" in info.value.message
 
 
+def test_a_session_id_given_as_a_tool_name_gets_the_order_hint() -> None:
+    args = parse("start", "--json", "--kind", "review", "--tools", "Read", "cs-abcd2345")
+    with pytest.raises(UsageError) as info:
+        cli.check_flag_rules(args)
+    assert "resume <id> --tools" in (info.value.detail or "")
+
+
+def test_resume_without_an_id_but_with_tools_gets_the_order_hint() -> None:
+    with pytest.raises(UsageError) as info:
+        parse("resume", "--tools", "Read")
+    assert "resume <id> --tools" in (info.value.detail or "")
+    with pytest.raises(UsageError) as plain:
+        parse("resume", "--json")
+    assert plain.value.detail is None
+
+
 def test_known_names_pass_the_flag_rules() -> None:
     args = parse("start", "--json", "--kind", "review", "--tools", "Read", "Grep", "Glob")
     cli.check_flag_rules(args)
 
 
 def test_the_name_list_is_ascii_identifiers_only() -> None:
+    assert all(re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", n) for n in ids.BUILTIN_TOOLS)
     assert all(ids.is_builtin_tool(n) for n in ("Read", "Grep", "Bash", "WebFetch"))
     assert not ids.is_builtin_tool("Read ")
     assert not ids.is_builtin_tool("ＲＥＡＤ")
+
+
+def test_the_name_list_matches_the_installed_tool_set_and_the_interface_doc() -> None:
+    # R2: names found in Claude Code 2.1.325; SlashCommand is not one of them.
+    for name in ("TaskOutput", "TaskStop", "EnterPlanMode", "ToolSearch", "LSP", "Monitor"):
+        assert name in ids.BUILTIN_TOOLS
+    assert "SlashCommand" not in ids.BUILTIN_TOOLS
+    doc = (Path(__file__).parent.parent / "docs" / "interface.md").read_text(encoding="utf-8")
+    row = next(line for line in doc.splitlines() if line.startswith("| `--tools <name>...`"))
+    listed = re.search(r"list kept in the source \(([^)]*)\)", row)
+    assert listed is not None
+    assert set(re.findall(r"`(\w+)`", listed.group(1))) == set(ids.BUILTIN_TOOLS)
 
 
 def test_reset_tools_cannot_be_combined_with_tools() -> None:
@@ -170,6 +201,14 @@ def test_a_run_without_bash_is_warned_that_it_cannot_report() -> None:
     assert not any("report" in w for w in argv_of(resolve("review", tools=["Bash"])).warnings)
 
 
+def test_the_no_bash_warning_follows_implicit_done() -> None:
+    # review: a clean exit counts as done; gate-check: it does not.
+    implicit = " ".join(argv_of(resolve("review", tools=["Read"])).warnings)
+    assert "implicit" in implicit and "without a report" not in implicit
+    explicit = " ".join(argv_of(resolve("gate-check", tools=["Read"])).warnings)
+    assert "ends without a report" in explicit and "implicit" not in explicit
+
+
 def test_a_tool_the_profile_denies_is_dropped_with_a_warning() -> None:
     # review denies WebFetch/WebSearch: deny wins, and --tools never lists a denied tool.
     resolution = resolve("review", tools=["Read", "WebFetch"])
@@ -186,6 +225,43 @@ def test_a_tool_the_profile_denies_is_dropped_with_a_warning() -> None:
     assert argv[argv.index("--tools") + 1] == "Read"
     assert built.tools == ("Read",)
     assert any("WebFetch" in w and "denied" in w for w in built.warnings)
+
+
+def _build(resolution: kinds.Resolution, deny: list[str]) -> settings_builder.Generated:
+    perm = config.PermissionProfile(permissions={"deny": deny, "allow": []})
+    return settings_builder.build(
+        resolution,
+        perm,
+        PATHS,
+        TOOLS,
+        Launch(mode="headless", cwd="/w", prompt_path="/state/sessions/cs-abcd2345/prompt.md"),
+        isolation=_isolation(),
+    )
+
+
+def test_a_deny_of_edit_covers_every_file_edit_tool() -> None:
+    names = ["Read", "Edit", "MultiEdit", "Write", "NotebookEdit"]
+    built = _build(resolve("review", tools=names), ["Edit"])
+    assert built.tools == ("Read",)
+    for name in names[2:]:
+        assert any(name in w and "denied" in w for w in built.warnings)
+
+
+@pytest.mark.parametrize(("denied", "dropped"), [("Task", "Agent"), ("Agent", "Task")])
+def test_task_and_agent_are_aliases_for_a_deny(denied: str, dropped: str) -> None:
+    built = _build(resolve("review", tools=["Read", dropped]), [denied])
+    assert built.tools == ("Read",)
+
+
+def test_a_deny_with_a_specifier_does_not_drop_a_tool() -> None:
+    built = _build(resolve("review", tools=["Read", "Bash"]), ["Bash(rm:*)"])
+    assert built.tools == ("Read", "Bash")
+
+
+def test_every_tool_denied_is_a_usage_error_naming_them() -> None:
+    with pytest.raises(UsageError) as info:
+        _build(resolve("review", tools=["WebFetch", "WebSearch"]), ["WebFetch", "WebSearch"])
+    assert "WebFetch" in info.value.message and "WebSearch" in info.value.message
 
 
 def _isolation() -> settings_builder.Isolation:
@@ -303,3 +379,47 @@ def test_a_kind_change_drops_the_carried_tools_and_reset_drops_them_too() -> Non
     assert other.flags == {"model": "m"}
     given = resume_mod.carry(src, kind="implement", mode="headless", resets=(), given={"tools"})
     assert "tools" not in given.flags
+
+
+def test_a_dry_run_whose_tools_are_all_denied_exits_2(
+    tmp_path: Path,
+    tools: Path,
+    work: Path,  # noqa: F811
+) -> None:
+    proc = run_cli(
+        [
+            "exec", "--dry-run", "--json", "--kind", "review", "--mode", "headless",
+            "--prompt-file", "prompt.md", "--tools", "WebFetch", "WebSearch",
+        ],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+    )  # fmt: skip
+    assert proc.returncode == 2, proc.stderr
+    assert "WebFetch" in proc.stdout + proc.stderr
+
+
+def test_an_exec_whose_tools_are_all_denied_does_not_start_claude(env: Any) -> None:  # noqa: F811
+    prompt = env.tmp_path / "prompt.md"
+    prompt.write_text("go\n", encoding="utf-8")
+    proc, out = run_cs(
+        env,
+        ["exec", "--json", "--mode", "headless", "--kind", "rank", "--prompt-file",
+         str(prompt), "--tools", "WebFetch", "WebSearch"],
+    )  # fmt: skip
+    assert proc.returncode == 12, proc.stdout + proc.stderr
+    assert out["end_reason"] == "config_invalid"
+    assert starts(env) == []
+
+
+def test_a_dry_run_plan_filters_tools_even_when_the_launch_would_fail(
+    tmp_path: Path,
+    tools: Path,
+    work: Path,  # noqa: F811
+) -> None:
+    # respond outside git would fail (no_git_cwd): no generated argv, yet the filtered list.
+    proc, plan = dry_run(
+        "respond", "--tools", "Read", "WebFetch", cwd=work, tools=tools, tmp_path=tmp_path
+    )
+    assert plan["would_fail"] == "no_git_cwd", proc.stdout
+    assert plan["tools"] == ["Read"]

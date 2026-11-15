@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import config, ids, pathrules, permission_profiles, sessiondir
-from .errors import FailedError, LaunchValidationError
+from .errors import FailedError, LaunchValidationError, UsageError
 from .kinds import Mode, Resolution
 
 # Injected hooks: (event, matchers, timeout in seconds). ``None``: no matcher (everything).
@@ -500,7 +500,12 @@ def build(
         plugin_dirs=launch.plugin_dirs,
         isolation=isolation,
     )
-    allowed, denied = _allowed_tools(resolution.tools, _content(permission_profile))
+    allowed, denied = allowed_tools(resolution.tools, _content(permission_profile))
+    if allowed is not None and not allowed:
+        raise UsageError(
+            "--tools: every requested tool is denied by the permission profile "
+            f"({', '.join(denied)}); no tool would be left (a deny wins)"
+        )
     built = build_argv(resolution, paths, tools, launch, tools_override=allowed)
     notes = tuple(
         f"--tools {name}: denied by the permission profile; it stays unavailable (a deny wins)"
@@ -511,17 +516,28 @@ def build(
     )
 
 
-def _allowed_tools(
+# A deny of one name also covers its aliases: Claude Code applies the rules of ``Edit`` to every
+# file-edit tool and treats ``Task`` and ``Agent`` as one tool.
+_DENY_ALIASES: dict[str, tuple[str, ...]] = {
+    "Edit": ("Edit", "MultiEdit", "Write", "NotebookEdit"),
+    "Task": ("Task", "Agent"),
+    "Agent": ("Agent", "Task"),
+}
+
+
+def allowed_tools(
     requested: tuple[str, ...] | None, content: Mapping[str, Any]
 ) -> tuple[tuple[str, ...] | None, list[str]]:
     """``requested`` without the tools the permission profile denies by bare name or pattern
-    (``WebFetch``, ``mcp__*``): ``--tools`` only ever narrows, so it never lists a denied
-    tool. Returns the kept names and the dropped ones."""
+    (``WebFetch``, ``mcp__*``, and the aliases in ``_DENY_ALIASES``): ``--tools`` only ever
+    narrows, so it never lists a denied tool. Returns the kept names and the dropped ones."""
     if requested is None:
         return None, []
     section = content.get("permissions") or {}
     deny = section.get("deny", []) if isinstance(section, Mapping) else []
     patterns = [d for d in deny if isinstance(d, str) and "(" not in d]
+    covered = [name for p in patterns for name in _DENY_ALIASES.get(p, ())]
+    patterns += covered
     kept = [t for t in requested if not any(fnmatch.fnmatchcase(t, p) for p in patterns)]
     return tuple(kept), [t for t in requested if t not in kept]
 
@@ -1215,9 +1231,13 @@ def build_argv(
     if allowlist is not None:
         argv += ["--tools", ",".join(allowlist)]
         if "Bash" not in allowlist:
+            outcome = (
+                "a clean exit counts as done (implicit done)"
+                if profile.implicit_done
+                else "it ends without a report"
+            )
             warnings.append(
-                "--tools without Bash: the run cannot call `claude-session report`; "
-                "it ends without a report"
+                f"--tools without Bash: the run cannot call `claude-session report`; {outcome}"
             )
     argv += ["--add-dir", paths.session_dir]
     for plugin_dir in launch.plugin_dirs:
