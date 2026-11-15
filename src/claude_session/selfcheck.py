@@ -23,6 +23,13 @@ command that removes it.
 - A socket path that does not fit fails every sandboxed run (``socket_path_too_long``):
   with the sandbox enabled, its network bridge would break (spike: unix socket paths are
   limited to about 108 bytes).
+- An install that would fail inside the sandbox although the tools work (an interpreter of
+  ``claude-session`` behind an alias directory the sandbox does not list; interface.md,
+  Install requirements) is passed by ``launch.check_sandbox`` as ``install_problems``: a
+  ``required`` sandbox fails (``sandbox_unavailable``); a ``preferred`` one keeps running
+  and ``sandbox_active`` stays true (the sandbox is enabled), with a warning that the
+  sandboxed ``report`` will fail, and ``problems`` lists it. Hard-linked code fails earlier
+  (``check_hook_interpreter``), and ``dryrun.Prerequisites`` adds both to ``kinds`` rows.
 - ``off``: nothing is checked or created.
 
 Prerequisite probes run through the #51 ``Gateway`` (a fake one in tests), by absolute path
@@ -47,6 +54,7 @@ import os
 import shlex
 import stat
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from . import tmpdir
@@ -132,6 +140,13 @@ class SelfCheck:
     tmpdir_pin: int | None = None
 
 
+def symlink_hops_apply(platform: str) -> bool:
+    """Whether the symlink-hop probe of the install applies: it rests on how bubblewrap mounts
+    only the directories listed, so only Linux and WSL2 (macOS Seatbelt is unverified, see
+    macos-checklist.md: fail open)."""
+    return platform in ("linux", "wsl2")
+
+
 def detect_platform(sys_platform: str | None = None, release: str | None = None) -> str:
     """``linux``, ``wsl2``, ``wsl1``, ``macos`` or ``unsupported``. WSL is told by the kernel
     release: WSL2 kernels are ``*-microsoft-standard-WSL2``, WSL1 reports ``*-Microsoft``."""
@@ -195,6 +210,7 @@ def self_check(
     tmp_root: str | None = None,  # None: tmpdir.select_root(tmp_base), chosen here
     create: bool = True,
     sandbox_exec: str = SANDBOX_EXEC,
+    install_problems: Sequence[str] = (),
 ) -> SelfCheck:
     """Run the sandbox self-check for a run with sandbox ``mode``: sandbox prerequisites,
     socket path length, then the private tmpdir is created (a leftover moved aside and left
@@ -206,7 +222,12 @@ def self_check(
     does not touch the tmpdir at all; ``csession_id`` may then be None (a new session), and
     the socket path is checked for an id of the fixed length. Raises
     ``LaunchValidationError`` (``sandbox_unavailable``, ``socket_path_too_long``,
-    ``tmpdir_unsafe``) in that order of precedence."""
+    ``tmpdir_unsafe``) in that order of precedence.
+
+    ``install_problems`` (``settings_builder.interpreter_problem``): why a sandboxed
+    ``claude-session report`` could not start here although the prerequisites are present;
+    each fails a ``required`` sandbox like a missing prerequisite; for ``preferred`` it only
+    adds a warning and a ``problems`` entry (the sandbox itself still runs)."""
     if mode not in SANDBOX_MODES:
         raise ValueError(f"unknown sandbox mode: {mode!r}")
     if mode == "off":
@@ -219,19 +240,29 @@ def self_check(
         platform, bwrap=bwrap, socat=socat, gw=gw, sandbox_exec=sandbox_exec
     )
     warnings: list[str] = []
-    problems: tuple[str, ...] = ()
+    found: list[tuple[str, str | None]] = []  # (problem, hint)
     if not prerequisites.available:
-        problems = (f"{prerequisites.problem}; {prerequisites.hint}",)
-        if mode == "required":
-            raise LaunchValidationError(
-                f"sandbox unavailable: {prerequisites.problem}",
-                end_reason="sandbox_unavailable",
-                hint=prerequisites.hint,
-            )
+        found.append((str(prerequisites.problem), prerequisites.hint))
+    found += [(text, None) for text in install_problems]
+    problems = tuple(f"{p}; {h}" if h else p for p, h in found)
+    if found and mode == "required":
+        problem, hint = found[0]
+        raise LaunchValidationError(
+            f"sandbox unavailable: {problem}",
+            end_reason="sandbox_unavailable",
+            hint=hint,
+        )
+    if not prerequisites.available:
         warnings.append(
             f"sandbox 'preferred' but unavailable ({prerequisites.problem}): the run is not"
             f" sandboxed; {prerequisites.hint}"
         )
+    else:
+        # The sandbox runs (sandbox_active stays true); only the sandboxed `report` fails.
+        warnings += [
+            f"the sandbox is active but the sandboxed `claude-session report` will fail: {text}"
+            for text in install_problems
+        ]
     root = tmpdir.select_root(tmp_base) if tmp_root is None else tmp_root
     check_socket_path(os.path.join(root, csession_id or _PLACEHOLDER_ID), platform)
     path = None if csession_id is None else os.path.join(root, csession_id)

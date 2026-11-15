@@ -1584,6 +1584,33 @@ def generated_entries(
     }
 
 
+def sandbox_readable(
+    cwd: str,
+    alloc: Allocated,
+    generated: Mapping[str, Sequence[str]],
+    read: Sequence[str],
+    plugins: Sequence[str],
+    expanded: Mapping[str, Any],
+    home: str,
+) -> list[str]:
+    """What the sandbox's ``allowRead`` lists, from the sources ``settings_builder.build``
+    merges into it: the cwd, ``$CSESSION_DIR``, the generated entries (system, tool, Python,
+    ``path_prepend`` and git directories), the resolved ``read_dirs``, the plugin directories
+    and the profile's own ``sandbox.filesystem.allowRead`` entries (resolved; a relative one
+    is refused elsewhere). The sandbox mounts real paths, so each is a realpath."""
+    profile = [
+        pathrules.sandbox_path(entry, home=home)
+        for entry in pathrules.profile_read_entries(expanded)
+    ]
+    return [
+        *(os.path.realpath(p) for p in (cwd, alloc.session_dir)),
+        *(d for group in generated.values() for d in group),
+        *read,
+        *plugins,
+        *(os.path.realpath(p) for p in profile if os.path.isabs(p)),
+    ]
+
+
 def check_tmpdir(resolution: kinds.Resolution, alloc: Allocated, tmp: str | None) -> None:
     """The temporary-directory check of a sandboxed run (``tmpdir_unsafe``) for the root
     chosen once at step 5 (the parent of ``tmp``, from ``tmpdir.run_path``); nothing is
@@ -1600,15 +1627,26 @@ def check_sandbox(
     tmp: str | None,
     *,
     create: bool = True,
+    readable: Sequence[str] = (),
 ) -> selfcheck.SelfCheck:
     """``claude_args`` and setting sources, then the sandbox self-check, which creates the
     private tmpdir ``tmp`` (in the root chosen once at step 5; ``tmpdir_unsafe`` when that
     root can no longer be established): the last action of step 5 (``unsafe_claude_args``,
     ``unsafe_setting_sources``, ``sandbox_unavailable``, ``socket_path_too_long``). A dry run
-    passes ``create=False``: the same checks, nothing created."""
+    passes ``create=False``: the same checks, nothing created.
+
+    ``readable`` (``sandbox_readable``: what the sandbox's ``allowRead`` lists) is what a
+    process can read: the interpreter of ``claude-session`` must be reachable through it
+    (``settings_builder.interpreter_problem``, on Linux and WSL2 only; hard-linked code
+    already failed ``check_hook_interpreter``)."""
     profile = resolution.profile
     pathrules.check_claude_args(profile.claude_args, isolated=resolution.isolated())
     settings_builder.check_setting_sources(resolution)
+    install: list[str] = []
+    if profile.sandbox != "off" and selfcheck.symlink_hops_apply(selfcheck.detect_platform()):
+        problem = settings_builder.interpreter_problem(process.claude_session, readable)
+        if problem is not None:
+            install.append(problem)
     return selfcheck.self_check(
         profile.sandbox,
         alloc.csession_id,
@@ -1617,6 +1655,7 @@ def check_sandbox(
         gw=process.gateway,
         tmp_root=None if tmp is None else os.path.dirname(tmp),
         create=create,
+        install_problems=install,
     )
 
 
@@ -1748,8 +1787,11 @@ class Effects:
         tools: Tools,
         process: Process,
         tmp: str | None,
+        readable: Sequence[str] = (),
     ) -> selfcheck.SelfCheck:
-        return check_sandbox(resolution, alloc, tools, process, tmp, create=False)
+        return check_sandbox(
+            resolution, alloc, tools, process, tmp, create=False, readable=readable
+        )
 
     def claude_version(
         self,
@@ -1851,13 +1893,14 @@ class Recording(Effects):
         tools: Tools,
         process: Process,
         tmp: str | None,
+        readable: Sequence[str] = (),
     ) -> selfcheck.SelfCheck:
         """The self-check, then the created tmpdir recorded on the session. The created path
         must be ``tmp``, the one planned at step 5 (path rules, ``TMPDIR``): otherwise it is
         removed and the launch refused (``tmpdir_unsafe``). When recording fails, the tmpdir
         is removed (with its pin) and the pin closed before the error is re-raised: the run's
         ``Validated`` never exists, so ``_cleanup`` cannot."""
-        check = check_sandbox(resolution, alloc, tools, process, tmp)
+        check = check_sandbox(resolution, alloc, tools, process, tmp, readable=readable)
         if check.tmpdir is not None and check.tmpdir != tmp:
             _discard_tmpdir(alloc.csession_id, check.tmpdir_pin)
             raise tmpdir.TmpdirUnsafe(
@@ -1993,7 +2036,8 @@ def checks(
     generated = generated_entries(resolution, tools, git_dirs, process)
     if isolated:
         rules.check_generated(generated)
-    check = effects.sandbox(resolution, alloc, tools, process, tmp)
+    readable = sandbox_readable(cwd, alloc, generated, read, plugins, expanded, home)
+    check = effects.sandbox(resolution, alloc, tools, process, tmp, readable=readable)
     warnings += check.warnings
     effects.warn(check.warnings)
     isolation = None

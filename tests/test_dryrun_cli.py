@@ -11,7 +11,8 @@ import json
 import os
 import sqlite3
 import subprocess
-from collections.abc import Mapping, Sequence
+import sys
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ import pytest
 from .fakeclaude import claude_bin, write_json
 from .schemas import validate
 from .test_exec_headless import claude_session_cmd
+from .test_install_probe import Layout
 
 DRY_RUN = "claude-session/cli/exec-dry-run.json"
 KINDS = "claude-session/cli/kinds.json"
@@ -27,6 +29,25 @@ ERROR = "claude-session/cli/error.json"
 SECRET = "sk-test-secret-value-0123456789abcdef"
 SET_VALUE = "set-value-never-printed-42"
 ISOLATED = ["review", "gate-check", "respond", "rank"]
+
+
+_CLEAN_EXE: Path | None = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def clean_exe(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """A ``claude-session`` whose ``#!`` is the real interpreter (``realpath``), not a venv
+    alias. A dry run only reads that line, so the install probe sees no alias directory and
+    the generic plan tests do not depend on how the host Python is installed (uv on CI links
+    the venv through a minor-version alias directory the sandbox does not list)."""
+    global _CLEAN_EXE
+    exe = tmp_path_factory.mktemp("clean-exe") / "bin" / "claude-session"
+    exe.parent.mkdir()
+    exe.write_text(f"#!{os.path.realpath(sys.executable)}\n", encoding="utf-8")
+    exe.chmod(0o755)
+    _CLEAN_EXE = exe
+    yield exe
+    _CLEAN_EXE = None
 
 
 @pytest.fixture
@@ -72,13 +93,20 @@ def cli(
     config: str = "",
     env: Mapping[str, str] | None = None,
     with_config: bool = True,
+    exe: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Runs ``claude-session`` as ``exe`` (default: the clean executable of ``clean_exe``)."""
+    assert exe is not None or _CLEAN_EXE is not None
     cfg = tmp_path / "config.yaml"
     default = "" if "claude_bin:" in config else "claude_bin: claude\n"
     cfg.write_text(default + config, encoding="utf-8")
     environ = {**os.environ, "PATH": f"{tools}:/usr/bin:/bin", **(env or {})}
     return subprocess.run(
-        [*claude_session_cmd(), *args, *(["--config", str(cfg)] if with_config else [])],
+        [
+            *claude_session_cmd(exe or _CLEAN_EXE),  # type: ignore[arg-type]
+            *args,
+            *(["--config", str(cfg)] if with_config else []),
+        ],
         cwd=cwd,
         env=environ,
         stdin=subprocess.DEVNULL,
@@ -342,6 +370,37 @@ def test_a_required_sandbox_without_prerequisites_would_fail(tmp_path: Path, wor
     assert proc.returncode == 12
     assert plan["would_fail"] == "sandbox_unavailable"
     assert plan["sandbox"]["available"] is False and plan["sandbox"]["problems"]
+
+
+def test_a_dry_run_through_an_unlisted_alias_interpreter_fails_a_required_sandbox(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """The venv-style install of test_install_probe.Layout: the ``#!`` python links through an
+    alias directory no ``allowRead`` lists, so the CLI-level probe reports the sandbox
+    unavailable for a required kind and exits 12."""
+    layout = Layout(tmp_path / "install")
+    proc = cli(
+        [
+            "exec",
+            "--dry-run",
+            "--json",
+            "--kind",
+            "review",
+            "--mode",
+            "headless",
+            "--prompt-file",
+            "prompt.md",
+        ],
+        cwd=work,
+        tools=tools,
+        tmp_path=tmp_path,
+        exe=layout.script,
+    )
+    plan = json.loads(proc.stdout)
+    validate(plan, DRY_RUN)
+    assert proc.returncode == 12, proc.stderr
+    assert plan["would_fail"] == "sandbox_unavailable"
+    assert any(str(layout.bin) in p for p in plan["sandbox"]["problems"])
 
 
 def test_a_missing_claude_would_fail(tmp_path: Path, tools: Path, work: Path) -> None:

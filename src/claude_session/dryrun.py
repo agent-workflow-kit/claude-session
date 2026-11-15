@@ -96,11 +96,20 @@ _SESSION_VARIABLES = ("${CSESSION_DIR}", "${CWD}", "${GIT_DIR}")
 class Sandbox:
     """The sandbox prerequisites as a run of a kind would find them. ``probed`` False: the
     dry run could not tell which tools a launch would accept and probed nothing
-    (``available`` False, the reason in ``problems``)."""
+    (``available`` False, the reason in ``problems``). ``prerequisites`` is whether the tools
+    and user namespaces are present, apart from install problems: ``available`` is False for
+    either, but a preferred sandbox with only install problems still runs (its sandboxed
+    ``report`` fails)."""
 
     available: bool
     problems: tuple[str, ...] = ()
     probed: bool = True
+    prerequisites: bool | None = None  # None: the same as ``available``
+
+    @property
+    def runs(self) -> bool:
+        """Whether a launch would run sandboxed (the prerequisites are present)."""
+        return self.available if self.prerequisites is None else self.prerequisites
 
 
 @dataclass(frozen=True)
@@ -285,10 +294,18 @@ def not_probed(resolution: kinds.Resolution) -> Sandbox | None:
 class Prerequisites:
     """The sandbox prerequisite probes, run once per ``bwrap``/``socat`` pair."""
 
-    def __init__(self, gw: Gateway, platform: str | None = None) -> None:
+    def __init__(
+        self,
+        gw: Gateway,
+        platform: str | None = None,
+        *,
+        link_dirs: Sequence[str] | None = None,  # None: settings_builder.default_link_dirs()
+    ) -> None:
         self.gw = gw
         self.platform = selfcheck.detect_platform() if platform is None else platform
         self._seen: dict[tuple[str | None, str | None], Sandbox] = {}
+        self._link_dirs = link_dirs
+        self._hard_links: tuple[str, ...] | None = None  # scanned at most once
 
     def check(
         self,
@@ -316,7 +333,36 @@ class Prerequisites:
             )
             problems = () if found.available else (f"{found.problem}; {found.hint}",)
             self._seen[key] = Sandbox(available=found.available, problems=problems)
-        return self._seen[key]
+        base = self._seen[key]
+        install = self.install_problems(process, resolution)
+        if not install:
+            return base
+        return Sandbox(
+            available=False, problems=(*base.problems, *install), prerequisites=base.runs
+        )
+
+    def install_problems(
+        self, process: launch.Process, resolution: kinds.Resolution
+    ) -> tuple[str, ...]:
+        """What would make a launch fail at run time although the tools are present: hard-linked
+        code (the launch's ``check_hook_interpreter``; scanned once) and an interpreter of
+        ``claude-session`` that the sandbox cannot reach (``settings_builder``)."""
+        if self._hard_links is None:
+            problem = settings_builder.hard_link_problem(self._link_dirs)
+            self._hard_links = () if problem is None else (problem,)
+        if not selfcheck.symlink_hops_apply(self.platform):
+            return self._hard_links
+        # An approximation (no cwd, git, plugin or tool directories, no profile allowRead):
+        # a holder inside one of those is reported although `exec` would pass.
+        home = os.path.realpath(process.environ.get("HOME", "/"))
+        readable = [
+            *settings_builder.system_read_dirs(),
+            *settings_builder.python_read_dirs(executable_dir=process.exe_dir),
+            *(os.path.realpath(p) for p in resolution.profile.env.path_prepend),
+            *_expanded_dirs(resolution.profile.read_dirs, home, "read_dirs"),
+        ]
+        interpreter = settings_builder.interpreter_problem(process.claude_session, readable)
+        return (*self._hard_links, *(() if interpreter is None else (interpreter,)))
 
 
 def _expanded_dirs(entries: Sequence[str], home: str, key: str) -> list[str]:
@@ -587,7 +633,14 @@ def _sandbox_warnings(resolution: kinds.Resolution, sandbox: Sandbox | None) -> 
     if sandbox is not None and not sandbox.probed:
         return warnings
     if sandbox is not None and not sandbox.available:
-        if resolution.profile.sandbox == "required":
+        if sandbox.runs and resolution.profile.sandbox != "required":
+            # Only install problems: the sandbox still runs, its `report` fails.
+            warnings += [
+                "the sandbox is active but the sandboxed `claude-session report` will fail: "
+                + problem
+                for problem in sandbox.problems
+            ]
+        elif resolution.profile.sandbox == "required":
             warnings.append("sandbox 'required' but unavailable here: a launch fails")
         elif resolution.profile.reads_third_party:
             warnings.append(
@@ -856,8 +909,12 @@ def plan_sandbox(
     if found.checked is not None:
         if resolution.profile.sandbox == "off":
             return None
+        # An install problem leaves the (preferred) sandbox active but its `report` failing:
+        # the plan reports it unavailable all the same.
         return Sandbox(
-            available=found.checked.sandbox_active, problems=found.checked.sandbox_problems
+            available=found.checked.sandbox_active and not found.checked.sandbox_problems,
+            problems=found.checked.sandbox_problems,
+            prerequisites=found.checked.sandbox_active,
         )
     probes = prerequisites or Prerequisites(process.gateway)
     return probes.check(process, resolution, writable)
