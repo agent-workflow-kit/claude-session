@@ -21,6 +21,10 @@
             "type": "string",
             "format": "date-time"
           },
+          "purged": {
+            "type": "boolean",
+            "description": "Only with --purge: whether the session and private directories were deleted now (false: an event is left to deliver or a directory could not be removed; the command exits 12 and reconcile deletes them at delete_after). In a dry run: a pre-delivery estimate (false while an event is left to deliver, even if the real run would deliver it and purge)."
+          },
           "delete_after": {
             "type": "string",
             "format": "date-time"

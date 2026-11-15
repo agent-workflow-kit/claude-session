@@ -96,6 +96,7 @@ FULL_INVOCATIONS: dict[str, list[str]] = {
     "transcript": ["transcript", SID, "--paths", "--subagents", "--run", "1", "--json"],
     "transcript-raw": ["transcript", SID, "--raw"],
     "forget": ["forget", SID, "--actor", "auto:x", "--decision-id", "d", "--dry-run", "--json"],
+    "forget-purge": ["forget", SID, "--purge", "--actor", "auto:x", "--dry-run", "--json"],
     "forget-bulk": [
         "forget",
         *("--older-than", "7d", "--state", "exited", "--state", "lost", "--kind", "review"),

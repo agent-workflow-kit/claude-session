@@ -464,16 +464,18 @@ All transcript content is untrusted. claude-session never copies transcripts; fi
 ### `forget`
 
 ```text
-claude-session forget <id> [--actor <actor>] [--decision-id <id>]... [--dry-run] [--json]
+claude-session forget <id> [--purge] [--actor <actor>] [--decision-id <id>]... [--dry-run] [--json]
 claude-session forget --older-than <duration> [--state <state>]... [--kind <kind>] [--label key=value]...
-    [--actor <actor>] [--decision-id <id>]... [--dry-run] [--json]
+    [--purge] [--actor <actor>] [--decision-id <id>]... [--dry-run] [--json]
 ```
 
 Hides sessions: later commands report them as not found (exit 10; adopting a forgotten session also exits 10). Audited: one record per forgotten session, also in bulk mode; `forget <id>` also records a refusal (`result: refused`), while bulk `skipped` entries get no record. The record, session directory and private directory are deleted by `reconcile` `retention_days` after `forget`. Prints `{"dry_run", "forgotten": [...], "skipped": [...]}` ([schemas/cli/forget.json](../schemas/cli/forget.json)). `reconcile` deletes a session's directories first (fd-based, never following a symlink), then its rows (the id is kept), and keeps a session that still has an event to deliver. A session whose directories cannot be removed (a tree deeper than the depth limit, an entry owned by another user) is kept, with a warning on every pass; such sessions never hold up the deletion of others.
 
 - `forget` runs the inline [liveness check](#liveness) first (changes have `cause: forget`).
+- **What `forget` keeps, and for how long.** Plain `forget` deletes nothing. For `retention_days` (default 30) the session row, its runs, events, labels and report text (summaries, reasons) stay in the state database, and the session directory (`sessions/<id>/`: the prompt as delivered, `prompts/`, `inputs/`, `artifacts/`, `work/`) and private directory (`private/<id>/`: the staged prompt and inputs, the headless `result.json` and `stderr.log`, frozen artifacts including `result.md`) stay on disk, readable by the user. Then `reconcile` deletes both directories and the rows. The conversation transcript is Claude Code's own file under its projects directory (`$CLAUDE_CONFIG_DIR/projects` or `$HOME/.claude/projects`): claude-session never deletes it, `forget` and retention leave it in place, and it is removed only by Claude Code's own cleanup or by the user. A private temporary directory is removed by the next `reconcile`.
+- `--purge` (single and bulk mode) also deletes the session directory and the private directory of each session it forgets, at once, in the same command: the staged input, the prompt and the result included. The rows stay until `retention_days` (so the session is still reported as not found and the id is kept), and Claude Code's transcript is untouched. The deletion is the one `reconcile` uses (fd-based from the state root, never following a symlink: a symlink planted anywhere in either tree, or in place of either directory, is unlinked and never followed), and it runs after the session is forgotten, so a live session is refused as without `--purge` (exit 20, `live`) and nothing is deleted. The audit record (`result: ok`, `inputs.purge: true`) is written before anything changes and fails closed as for `forget`; the deletion then runs, and when it cannot finish a best-effort `result: error` record follows; for a `forget` record with `inputs.purge: true`, a later `error` record for the same session therefore means "forgotten, purge incomplete" (also after an interruption, which propagates). A session with an event left to deliver is not purged (its hook reads the directories; delivery is tried first, without waiting for a delivery lease another process holds). In both cases the entry has `purged: false`, the session stays forgotten, `reconcile` deletes the directories at `delete_after`, and the command names each such session and its reason (events left to deliver, or a directory that could not be removed) on stderr and exits 12 after the normal output (bulk mode goes on with the other sessions). Without `--purge` the entries have no `purged` key; with it `purged` says whether the directories are gone (in a dry run: a pre-delivery estimate, with nothing deleted and no delivery attempted: false while an event is left to deliver, even if the real run would deliver it and purge).
 - `forget <id>` refuses a live session (exit 20, `live`), including any session whose current run is pending (a pending resume or a pending new-session record): cancel it with [`stop`](#stop) first. Bulk-only flags with an id exit 2; `forget` requires an id or `--older-than` (exit 2 otherwise, also when only filters are given).
-- Bulk mode (`--older-than`, matching `updated_at`, with optional `--state`, `--kind` (the launch kind) and `--label` filters) forgets every match and skips live sessions, pending ones included (`reason: live`); exit 0. The age, `--kind` and `--label` select the sessions before the liveness check, which runs only on those; `--state` matches the state after it (in a dry run, the state it would leave), so `--dry-run` reports what the real run forgets.
+- Bulk mode (`--older-than`, matching `updated_at`, with optional `--state`, `--kind` (the launch kind) and `--label` filters) forgets every match and skips live sessions, pending ones included (`reason: live`); exit 0 (12 with `--purge` when some session was not purged, see above). When an audit record cannot be written the run stops with exit 1 and the error envelope on stdout; stderr names the sessions already forgotten. The age, `--kind` and `--label` select the sessions before the liveness check, which runs only on those; `--state` matches the state after it (in a dry run, the state it would leave), so `--dry-run` reports what the real run forgets.
 
 Callers such as gatectl and ticket-queue should forget their headless sessions after collecting the results.
 
@@ -726,6 +728,7 @@ With `--json` (and in `--outcome-file`):
 | 0, 12, 20 | `exec`, `start`, `resume` with `--dry-run` | [dry-run plan](#dry-run) (the error envelope only for `schema_newer` and `failed`) |
 | 12 | `start` | error envelope, `code: launch_failed`, with `end_reason`, `hint`, `csession_id`, `run` (the run's outcome file gets the outcome object) |
 | 12 | any command | error envelope, `code: schema_newer` or `failed` |
+| 12 | `forget --purge` | the normal `forget` output object (not an envelope), with `purged: false` for each session left unpurged; each is named with its reason on stderr |
 | 0, 12 | `stop` | the stop object (`ended: false` for 12; `--dry-run` always exits 0) |
 | 0 | other commands | the command's schema |
 | 11 | `verify-secret` | `{"match": false}` |
@@ -814,7 +817,7 @@ Precedence: top-level scalars: built-in → config → environment → flags. Ki
 | `summary_max_bytes` | `65536` | cap for summary and reason (UTF-8 bytes each) |
 | `artifact_max_bytes` | `10485760` | cap for a reported artifact |
 | `input_max_bytes` | `10485760` | cap for each `--prompt-file` and `--input-file` (larger exits 2) |
-| `retention_days` | `30` | after `forget`, before deletion |
+| `retention_days` | `30` | after `forget`, before deletion (`forget --purge` deletes the directories at once) |
 | `lost_grace` | `10m` | a pending run not adopted within it ends `not-started` (`never_adopted`) |
 | `auto_exit_delay` | `2s` | |
 | `kill_grace` | `10s` | SIGTERM → SIGKILL; default `stop --grace`; hook timeout kill |
@@ -972,7 +975,7 @@ A caller that launches a session with a skill expecting an artifact reads `statu
 
 On the user's confirmation, the caller reads only the listed `changed_files` from the run's cwd (normalized relative paths with no `.git` component, every component opened without following symlinks, regular files with one link, size-capped; a missing file is an error and deletions come only from `deleted_files`), applies them in a checkout of its own, commits with the user's identity using hardened git outside the sandbox, pushes fast-forward, and posts the replies; nothing trusted runs inside the agent-touched directory. All of it is untrusted agent text.
 
-Retention: session and private directories of sessions that are not forgotten are kept (they back parked agents); `retention_days` applies only after `forget`. Callers that keep artifacts copy them before `forget` plus the retention period.
+Retention: session and private directories of sessions that are not forgotten are kept (they back parked agents); `retention_days` applies only after `forget`, unless `forget --purge` deletes the directories at once; Claude Code's own transcript is never deleted by claude-session (see [`forget`](#forget)). Callers that keep artifacts copy them before `forget` (or `forget --purge`), or before the retention period ends.
 
 ## Residual risks
 

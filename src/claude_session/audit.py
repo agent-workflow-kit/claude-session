@@ -51,6 +51,7 @@ INPUT_KEYS = frozenset(
         "sandbox_from",
         "sandbox_to",
         "grace",
+        "purge",
     }
 )
 # interface.md, Identifiers (and schemas/audit.json inputs.labels).
@@ -93,6 +94,8 @@ def _check_inputs(inputs: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
         if not all(LABEL.fullmatch(label) for label in labels):
             raise ValueError("audit input labels: malformed label")
         checked["labels"] = list(labels)
+    if "purge" in checked and not isinstance(checked["purge"], bool):
+        raise ValueError("audit input purge must be a boolean")
     if "tty" in checked and not isinstance(checked["tty"], bool):
         raise ValueError("audit input tty must be a boolean")
     if "overridden_hooks" in checked:
