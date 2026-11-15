@@ -286,11 +286,11 @@ def kinds_proc(tmp_path: Path, layout: Layout, gw: FakeGateway) -> launch.Proces
     return dataclasses.replace(proc, claude_session=str(layout.script))
 
 
-def kinds_row(tmp_path: Path, proc: launch.Process, gw: FakeGateway, **kw):
+def kinds_row(tmp_path: Path, proc: launch.Process, gw: FakeGateway, kind: str = "review", **kw):
     report = dryrun.kinds_report(
         config.load(None, env={"XDG_CONFIG_HOME": str(tmp_path / "none")}),
         proc,
-        kind="review",
+        kind=kind,
         repo=None,
         prerequisites=dryrun.Prerequisites(gw, "linux", **kw),
     )
@@ -304,6 +304,41 @@ def test_kinds_reports_the_alias_interpreter_as_unavailable(tmp_path: Path, layo
     assert row["sandbox_available"] is False
     assert any(str(layout.store) in p for p in row["sandbox_problems"])
     assert any("a launch fails" in w for w in row["warnings"])
+
+
+def test_kinds_preferred_kind_warns_only_that_report_fails(tmp_path: Path, layout: Layout) -> None:
+    gw = FakeGateway()
+    row = kinds_row(tmp_path, kinds_proc(tmp_path, layout, gw), gw, "rank", link_dirs=())
+    assert row["sandbox_available"] is False
+    assert_only_report_fails(row["warnings"])
+
+
+def test_kinds_preferred_third_party_kind_warns_only_that_report_fails(
+    tmp_path: Path, layout: Layout
+) -> None:
+    gw = FakeGateway()
+    proc = kinds_proc(tmp_path, layout, gw)
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.yaml").write_text("kinds: {review: {sandbox: preferred}}\n")
+    report = dryrun.kinds_report(
+        config.load(cfg_dir / "config.yaml"),
+        proc,
+        kind="review",
+        repo=None,
+        prerequisites=dryrun.Prerequisites(gw, "linux", link_dirs=()),
+    )
+    (row,) = report["kinds"]
+    assert row["sandbox_available"] is False
+    assert_only_report_fails(row["warnings"])
+
+
+def test_kinds_missing_tools_still_warn_unsandboxed(tmp_path: Path, layout: Layout) -> None:
+    gw = FakeGateway()
+    proc = kinds_proc(tmp_path, layout, gw)
+    proc = dataclasses.replace(proc, environ={**proc.environ, "PATH": str(tmp_path / "empty")})
+    row = kinds_row(tmp_path, proc, gw, "rank", link_dirs=())
+    assert any("not sandboxed" in w for w in row["warnings"]), row["warnings"]
 
 
 def test_kinds_reports_hard_linked_code_as_unavailable(tmp_path: Path, layout: Layout) -> None:
@@ -453,6 +488,38 @@ def test_dry_run_reports_a_preferred_kind_unavailable_but_active(
     assert plan["sandbox"]["available"] is False
     assert any(str(layout.bin) in p for p in plan["sandbox"]["problems"])
     assert any("sandbox is active" in w for w in plan["warnings"])
+
+
+def test_dry_run_preferred_third_party_kind_warns_only_that_report_fails(
+    tmp_path: Path, layout: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(selfcheck, "detect_platform", lambda *a, **k: "linux")
+    plan, _ = real_plan(
+        tmp_path,
+        monkeypatch,
+        "review",
+        setup=lambda _p: script_for(tmp_path / "root", layout),
+        extra_args=("--sandbox", "preferred"),
+    )
+    assert plan["would_fail"] is None, plan["warnings"]
+    assert_only_report_fails(plan["warnings"])
+    assert_only_report_fails(plan["profile"]["warnings"])
+
+
+def assert_only_report_fails(warnings: list[str]) -> None:
+    assert any("sandbox is active" in w and "report` will fail" in w for w in warnings), warnings
+    assert not any("not sandboxed" in w or "unsandboxed" in w for w in warnings), warnings
+
+
+def test_dry_run_preferred_kind_profile_warns_only_that_report_fails(
+    tmp_path: Path, layout: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(selfcheck, "detect_platform", lambda *a, **k: "linux")
+    plan, _ = real_plan(
+        tmp_path, monkeypatch, "rank", setup=lambda _p: script_for(tmp_path / "root", layout)
+    )
+    assert_only_report_fails(plan["profile"]["warnings"])
+    assert_only_report_fails(plan["warnings"])
 
 
 def test_dry_run_fails_a_required_kind(
