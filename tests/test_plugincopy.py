@@ -164,9 +164,27 @@ def test_a_symlink_escaping_the_plugin_is_refused(plugin: Path, where: str, targ
     assert where in refused(plugin).message
 
 
-def test_a_symlink_that_stays_inside_through_dotdot_is_ok(plugin: Path) -> None:
-    (plugin / "skills" / "link").symlink_to("../hooks/../skills")
-    plugincopy.scan(str(plugin))
+@pytest.mark.parametrize("target", ["a/../b", "../hooks/../skills", "./a/../b"])
+def test_a_symlink_with_dotdot_after_a_named_component_is_refused(
+    plugin: Path, target: str
+) -> None:
+    (plugin / "x").symlink_to(target)
+    assert "x" in refused(plugin).message
+
+
+def test_a_symlink_chain_that_climbs_out_through_another_link_is_refused(plugin: Path) -> None:
+    (plugin / "d" / "e").mkdir(parents=True)
+    (plugin / "d" / "e" / "s").symlink_to("../..")
+    (plugin / "t").symlink_to("d/e/s/../x")
+    assert "'t'" in refused(plugin).message
+
+
+def test_a_leading_dotdot_run_that_stays_inside_is_ok(plugin: Path, dest: Path) -> None:
+    (plugin / "a").mkdir()
+    (plugin / "c").mkdir()
+    (plugin / "a" / "b").symlink_to("../c")
+    copy(plugin, dest)
+    assert os.readlink(dest / "myplug" / "a" / "b") == "../c"
 
 
 def test_a_symlinked_plugin_root_is_refused(plugin: Path, tmp_path: Path) -> None:

@@ -213,9 +213,19 @@ class _Walk:
 
 def _stays_inside(rel: str, target: str) -> bool:
     """Whether the symlink at ``rel`` (relative to the plugin root) with this ``target`` is
-    relative, non-empty, has no NUL and, lexically, stays inside the plugin root."""
+    relative, non-empty, has no NUL and, lexically, stays inside the plugin root. A ``..``
+    after a named component is refused: the component may be a symlink itself, which would make
+    the lexical result differ from where the link really points."""
     if not target or "\0" in target or target.startswith("/"):
         return False
+    named = False
+    for part in target.split("/"):
+        if part in ("", "."):
+            continue
+        if part != "..":
+            named = True
+        elif named:
+            return False
     joined = posixpath.normpath(posixpath.join(posixpath.dirname(rel), target))
     return joined != ".." and not joined.startswith("../")
 
