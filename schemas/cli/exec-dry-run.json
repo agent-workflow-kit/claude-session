@@ -172,6 +172,36 @@
       },
       "description": "Names of variables the session would receive. Values are never printed."
     },
+    "plugin_dirs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "The --plugin-dir as the launch resolved it."
+          },
+          "effective": {
+            "type": "string",
+            "description": "The directory the run passes to claude: a per-run copy of source in the session directory for a sandboxed run, else source."
+          },
+          "added": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The sandbox placeholders (.claude, .mcp.json, CLAUDE.md, CLAUDE.local.md) the copy adds because source lacks them; empty without a copy."
+          }
+        },
+        "required": [
+          "source",
+          "effective",
+          "added"
+        ],
+        "additionalProperties": false
+      },
+      "description": "The run's plugin directories. Empty when a launch would fail."
+    },
     "sandbox": {
       "type": "object",
       "properties": {
@@ -332,6 +362,7 @@
     "settings",
     "claude_argv",
     "env_names",
+    "plugin_dirs",
     "sandbox",
     "hooks",
     "would_refuse",

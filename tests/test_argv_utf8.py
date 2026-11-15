@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -386,6 +387,7 @@ def test_a_cwd_that_is_not_utf8_is_not_an_argv_refusal(sandbox: Sandbox) -> None
     assert proc.returncode == 12, proc.stderr
     error = json.loads(proc.stdout)["error"]
     assert (error["code"], error["end_reason"]) == ("launch_failed", "unsafe_cwd")
+    assert re.fullmatch(r"cs-[a-z2-7]{8}", error["csession_id"])
     assert not error["message"].startswith("argument")
     assert list(sandbox.started.iterdir()) == []
 

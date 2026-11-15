@@ -201,6 +201,17 @@ def test_permission_mode_is_dont_ask(cfg: config.Config, kind: str) -> None:
     assert settings(cfg, kind)["permissions"]["defaultMode"] == "dontAsk"
 
 
+@pytest.mark.parametrize("kind", ISOLATED_KINDS)
+def test_report_rules_are_added_to_a_skill_only_profile(cfg: config.Config, kind: str) -> None:
+    # A profile file that lists only Skill(<name>) still lets `claude-session report` run:
+    # the report rules are generated for every run, not read from the profile.
+    perm = {"permissions": {"allow": ["Skill(my-skill)"]}}
+    allow = settings(cfg, kind, perm=perm)["permissions"]["allow"]
+    assert allow[0] == "Skill(my-skill)"
+    assert "Bash(claude-session report:*)" in allow
+    assert f"Bash({TOOLS.claude_session} report:*)" in allow
+
+
 @pytest.mark.parametrize("mode", ["bypassPermissions", "acceptEdits", "default", "auto", "plan"])
 def test_profile_mode_is_ignored_for_isolated_runs(cfg: config.Config, mode: str) -> None:
     data = settings(cfg, perm={"permissions": {"defaultMode": mode}})

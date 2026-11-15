@@ -6,6 +6,7 @@
   "exit_code": 22,
   "forked_from": null,
   "message": null,
+  "num_turns": null,
   "outcome": null,
   "pending": false,
   "phase": "session",
