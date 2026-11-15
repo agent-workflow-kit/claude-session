@@ -214,7 +214,8 @@
           ]
         },
         "available": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "False for sandbox off, for missing prerequisites and for an install that would fail inside the sandbox (hard-linked code, an interpreter behind a symlink in an unlisted directory); problems says why. For a preferred sandbox the sandbox itself still runs; only the sandboxed report would fail."
         },
         "problems": {
           "type": "array",

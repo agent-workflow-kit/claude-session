@@ -219,7 +219,7 @@
         },
         "sandbox_active": {
           "type": "boolean",
-          "description": "Sandbox mode is not off AND its prerequisites were present at launch (Linux/WSL2: bwrap and socat resolved and user namespaces usable; macOS: sandbox-exec present) AND the socket path fits. false for a pending run."
+          "description": "Sandbox mode is not off AND its prerequisites were present at launch (Linux/WSL2: bwrap and socat resolved and user namespaces usable; macOS: sandbox-exec present) AND the socket path fits. An install whose sandboxed report would fail (interface.md, Install requirements) does not change it. false for a pending run."
         },
         "permission_profile": {
           "type": [

@@ -4,7 +4,7 @@ Run this once on a Mac before 1.0 (issue #43; [design.md, Testing](design.md#tes
 
 **Status: not run on macOS.** Nothing below was observed on a Mac. Every expected result is derived from the code (the file or function is named in each step) and from [interface.md, Platform notes](interface.md#platform-notes). Items marked **to be observed** state the invariant that must hold and leave the actual value to the person running the step: record it, do not pre-fill it. The acceptance criterion "run once on macOS with results recorded" stays open until the [results record](#results-record) is filled in and committed.
 
-M1 to M6 are free and need no real `claude` (the dry runs use the fake one from `tests/fakebin`), except the optional live steps M4.10 to M4.15, which are billed `make live` runs or `claude -p` runs by hand. The live suite ([live-tests.md](live-tests.md)) is the optional M7: it needs credentials and costs API usage, and it is the only way to see Claude Code's own Seatbelt profile enforce the generated settings. Every billed step says so.
+M1 to M6 are free and need no real `claude` (the dry runs use the fake one from `tests/fakebin`), except the optional live steps M4.10 to M4.16, which are billed `make live` runs or `claude -p` runs by hand. The live suite ([live-tests.md](live-tests.md)) is the optional M7: it needs credentials and costs API usage, and it is the only way to see Claude Code's own Seatbelt profile enforce the generated settings. Every billed step says so.
 
 ## How to run it
 
@@ -28,7 +28,7 @@ export PATH="$PWD/tests/fakebin:$PATH"
 
 Expected: `echo "$CS_MAC"` prints `/tmp/csm.` and six characters. `/tmp` is a symlink on macOS (M3 checks that). With the private `HOME`, `uv` downloads its dependencies (and a Python, if none is on `PATH`) into the private cache the first time.
 
-The dry runs (M3.7, M4.4 to M4.9, M6.2, M6.4) need a `claude` on `PATH`: without one they report `would_fail` `claude_not_found` and empty sandbox lists. `exec --dry-run` only resolves `claude` on `PATH` and checks the file; it never runs it (no `claude --version`, no API call). The fake `claude` in `tests/fakebin` stands in for it, so `which claude` prints `<checkout>/tests/fakebin/claude`. The live steps (M4.10 to M4.15, M7) need the real `claude`: run `export PATH="$CS_PATH0"` first.
+The dry runs (M3.7, M4.4 to M4.9, M6.2, M6.4) need a `claude` on `PATH`: without one they report `would_fail` `claude_not_found` and empty sandbox lists. `exec --dry-run` only resolves `claude` on `PATH` and checks the file; it never runs it (no `claude --version`, no API call). The fake `claude` in `tests/fakebin` stands in for it, so `which claude` prints `<checkout>/tests/fakebin/claude`. The live steps (M4.10 to M4.16, M7) need the real `claude`: run `export PATH="$CS_PATH0"` first.
 
 A small git repository and a prompt file are used by M3 to M6:
 
@@ -208,7 +208,7 @@ uv run claude-session exec --dry-run --json --kind respond --cwd "$CS_MAC/repo" 
 uv run python -c "import json,os; d = json.load(open(os.environ['CS_MAC'] + '/dry-plugin.json')); a = d['claude_argv']; print(d['would_fail']); print([a[i + 1] for i, x in enumerate(a) if x in ('--plugin-dir', '--add-dir')])"
 ```
 
-The lists are text until Claude Code's Seatbelt profile enforces them. Enforcement needs a real `claude`, credentials and API budget (billed), so M4.10 to M4.15 are optional. Before them: `export PATH="$CS_PATH0"` (the real `claude`, not the fake), and `export ANTHROPIC_API_KEY=...` or `export CLAUDE_CODE_OAUTH_TOKEN=...` (from `claude setup-token`), the variables [live-tests.md](live-tests.md) names. `CSESSION_LIVE_COPY_LOGIN=1` does not work from this shell: it copies the login file from `HOME`, which is the private one here; on macOS Claude Code may also keep its login in the Keychain rather than in a file (**to be observed**). `CSESSION_LIVE_MAX_USD` caps the cost of a `make live` run (default 3). These are the live tests of M7 (`make live PYTEST_ARGS='-k "sandbox or e2e or isolation"'`), which skip where no sandbox is present (`harness.sandbox_available` assumes Seatbelt is always there on macOS). Their hand-built settings use `/usr`, `/bin`, `/sbin`, `/etc` (and realpaths), the cwd and the TMPDIR in `allowWrite`. What to read from them on a Mac:
+The lists are text until Claude Code's Seatbelt profile enforces them. Enforcement needs a real `claude`, credentials and API budget (billed), so M4.10 to M4.16 are optional. Before them: `export PATH="$CS_PATH0"` (the real `claude`, not the fake), and `export ANTHROPIC_API_KEY=...` or `export CLAUDE_CODE_OAUTH_TOKEN=...` (from `claude setup-token`), the variables [live-tests.md](live-tests.md) names. `CSESSION_LIVE_COPY_LOGIN=1` does not work from this shell: it copies the login file from `HOME`, which is the private one here; on macOS Claude Code may also keep its login in the Keychain rather than in a file (**to be observed**). `CSESSION_LIVE_MAX_USD` caps the cost of a `make live` run (default 3). These are the live tests of M7 (`make live PYTEST_ARGS='-k "sandbox or e2e or isolation"'`), which skip where no sandbox is present (`harness.sandbox_available` assumes Seatbelt is always there on macOS). Their hand-built settings use `/usr`, `/bin`, `/sbin`, `/etc` (and realpaths), the cwd and the TMPDIR in `allowWrite`. What to read from them on a Mac:
 
 | ID | Item (live test) | Expected / to be observed |
 |---|---|---|
@@ -218,6 +218,7 @@ The lists are text until Claude Code's Seatbelt profile enforces them. Enforceme
 | M4.13 | Missing-path and nested denies (`test_sandbox.py::test_a_deny_write_of_a_missing_path_...` (C1), `test_a_nested_deny_inside_an_allowed_parent_...` (C3); or by hand, billed: the commands below the table) | The tests: the control file is written; the denied paths are not created (an empty placeholder is tolerated), and the nested protected file keeps its content. The by-hand step uses the deny-root shape of `sandbox_settings` in `tests/live/test_sandbox.py`, with a `denyWrite` entry for `<work>/CLAUDE.md`, which does not exist yet (as M4.7 generates for `.claude` and `CLAUDE.md`); the prompt asks Bash to create `ok.txt` (the positive control: it shows the command ran) and then `CLAUDE.md`. Expected: `denied` (design.md: Claude Code's sandbox blocks these on Linux). `INCONCLUSIVE-OR-FAIL` means either `ok.txt` is missing (nothing ran: not a pass, rerun or record why) or `CLAUDE.md` exists (a finding; an empty one is a placeholder: record it). **To be observed** on Seatbelt; also record what `claude` printed. |
 | M4.14 | Plugin dir via `--add-dir` (`test_isolation.py::test_a_plugin_dir_is_readable_...`) | Readable by the Read tool, not writable. The suite's root is under `/tmp`, a symlinked ancestor: note whether the realpath form is what Seatbelt matched. |
 | M4.15 | `autoAllowBashIfSandboxed` (`test_sandbox.py::test_auto_allow_bash_...`) | With `false`, `echo hi > out.txt` is denied; with the default, it is written. As on Linux. |
+| M4.16 | Symlink holders under Seatbelt | The Linux and WSL2 probe fails an install whose `#!` interpreter sits behind a symlink in a directory the sandbox does not list (bubblewrap mounts only real paths). It is skipped on macOS. With a sandboxed `claude-session report` from a uv tool install (a venv `python` that links through a versioned symlink to the interpreter store, e.g. Homebrew `opt/` links), **to be observed**: whether Seatbelt follows a symlink in an unlisted directory; if it does, the probe stays skipped, if it does not, enable it for macOS (`selfcheck.symlink_hops_apply`). |
 
 M4.13, by hand (one `claude -p` run with the small model, capped at 0.25 USD; needs the real `claude` and a credential, see above):
 
@@ -270,11 +271,11 @@ The code and tests run fixed paths (`/bin/ps`, `/usr/bin/git`, `/usr/bin/true`, 
 
 ## M7. Optional: the live suite on macOS
 
-Requires credentials and API budget (billed; `CSESSION_LIVE_MAX_USD` caps a run, default 3); read [live-tests.md](live-tests.md) first. As for M4.10 to M4.15: `export PATH="$CS_PATH0"` and export `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`; `CSESSION_LIVE_COPY_LOGIN=1` finds no login under the private `HOME`, and without a credential every test that needs a login skips. The suite's private root is directly under `/tmp` (`tempfile.mkdtemp(prefix="cs-live-", dir="/tmp")` in `tests/live/harness.py`, so `/private/tmp/cs-live-.../` after resolution), its `TMPDIR` is `<root>/tmp`, and a socket name inside it has to fit M3's limit.
+Requires credentials and API budget (billed; `CSESSION_LIVE_MAX_USD` caps a run, default 3); read [live-tests.md](live-tests.md) first. As for M4.10 to M4.16: `export PATH="$CS_PATH0"` and export `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`; `CSESSION_LIVE_COPY_LOGIN=1` finds no login under the private `HOME`, and without a credential every test that needs a login skips. The suite's private root is directly under `/tmp` (`tempfile.mkdtemp(prefix="cs-live-", dir="/tmp")` in `tests/live/harness.py`, so `/private/tmp/cs-live-.../` after resolution), its `TMPDIR` is `<root>/tmp`, and a socket name inside it has to fit M3's limit.
 
 | ID | Step | Expected |
 |---|---|---|
-| M7.1 | `make live PYTEST_ARGS='-k sandbox'` | Passes, or fails for a reason you record under M4.10 to M4.15. |
+| M7.1 | `make live PYTEST_ARGS='-k sandbox'` | Passes, or fails for a reason you record under M4.10 to M4.16. |
 | M7.2 | `make live PYTEST_ARGS='-k interactive'` (needs `tmux`) | Passes; `test_interactive.py::test_signals_end_interactive_claude_cleanly` skips (Linux-only: it checks the pane process through `/proc/<pid>/exe` and `cmdline`). |
 | M7.3 | `make live` | Everything else as on Linux. Compare the recorded observations with [live-tests.md](live-tests.md#observations). |
 | M7.4 | While M7.1 runs, in a second shell: `lsof -U -a -c claude 2>/dev/null \| grep -o '/[^ ]*\.sock' \| sort -u; ls -la /private/tmp/cs-live-*/tmp; find /private/var/folders -name 'claude-*.sock' 2>/dev/null` | **To be observed**: where Claude Code creates its `claude-*.sock` files. Expected from the code: under the run's `TMPDIR` (`/private/tmp/cs-live-.../tmp` here; `/private/tmp/csession-<uid>/cs-xxxxxxxx` for a `claude-session` run), none under `/var/folders`. Record the socket names and their length in bytes against the 40 bytes `selfcheck` reserves (`SOCKET_NAME_RESERVE`). |
@@ -305,7 +306,7 @@ Fill this in after the run and commit it with the macOS version. Leave `not run`
 | M2.1 to M2.6 | not run | |
 | M3.1 to M3.7 | not run | |
 | M4.1 to M4.9 | not run | |
-| M4.10 to M4.15 | not run | |
+| M4.10 to M4.16 | not run | |
 | M5.1 to M5.6 | not run | |
 | M6.1 to M6.4 | not run | |
 | M7.1 to M7.4 | not run | |

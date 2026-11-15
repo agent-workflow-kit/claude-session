@@ -401,6 +401,11 @@ def profile_write_entries(profile: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def profile_read_entries(profile: Mapping[str, Any]) -> list[str]:
+    """The strings of a profile's sandbox ``allowRead`` entries (before ``sandbox_path``)."""
+    return _strings(profile, "sandbox", "filesystem", "allowRead")
+
+
 def profile_write_paths(profile: Mapping[str, Any], *, cwd: str, home: str) -> list[str]:
     """The paths the expanded ``profile`` makes writable: its sandbox ``allowWrite`` entries
     and ``Edit``/``Write`` (and ``MultiEdit``/``NotebookEdit``) allow-rule targets. Raises
@@ -1156,20 +1161,20 @@ def sanitize_path(value: str) -> list[str]:
     return [entry for entry in value.split(":") if entry and os.path.isabs(entry)]
 
 
-def _resolution_steps(path: str) -> list[tuple[str, bool]] | None:
-    """The steps of resolving ``path``, in order, each paired with whether it is the
-    directory holding a symlink followed: every literal normalized prefix of ``path``, every
-    path visited while following its symlinks one component at a time (``lstat``), the
-    directory holding each symlink followed, and the final realpath. The walk takes the
-    raw components of ``path`` as the kernel does: a ``..`` applies to the directory
-    reached so far, after the symlinks before it are followed (``normpath`` would drop
-    ``lnk/..`` without visiting ``lnk``). None for more than ``MAX_SYMLINKS`` symlinks or
+def _resolution_steps(path: str) -> list[tuple[str, str | None]] | None:
+    """The steps of resolving ``path``, in order, each paired with the symlink it holds when
+    it is the directory holding a symlink followed (else None): every literal normalized
+    prefix of ``path``, every path visited while following its symlinks one component at a
+    time (``lstat``), the directory holding each symlink followed, and the final realpath.
+    The walk takes the raw components of ``path`` as the kernel does: a ``..`` applies to
+    the directory reached so far, after the symlinks before it are followed (``normpath``
+    would drop ``lnk/..`` without visiting ``lnk``). None for more than ``MAX_SYMLINKS`` symlinks or
     a path that cannot be resolved (callers fail closed)."""
     try:
         literal = os.path.normpath(path)
-        steps = [(literal, False)]
+        steps: list[tuple[str, str | None]] = [(literal, None)]
         prefixes = [part for part in literal.split("/") if part]
-        steps += [("/" + "/".join(prefixes[:end]), False) for end in range(1, len(prefixes))]
+        steps += [("/" + "/".join(prefixes[:end]), None) for end in range(1, len(prefixes))]
         parts = [part for part in path.split("/") if part]
         current = "/"
         links = 0
@@ -1181,7 +1186,7 @@ def _resolution_steps(path: str) -> list[tuple[str, bool]] | None:
                 current = os.path.dirname(current)
                 continue
             candidate = os.path.join(current, name)
-            steps.append((candidate, False))
+            steps.append((candidate, None))
             try:
                 info = os.lstat(candidate)
             except OSError:
@@ -1193,12 +1198,12 @@ def _resolution_steps(path: str) -> list[tuple[str, bool]] | None:
             links += 1
             if links > MAX_SYMLINKS:
                 return None
-            steps.append((current, True))  # the directory holding the link
+            steps.append((current, candidate))  # the directory holding the link
             target = os.readlink(candidate)
             if target.startswith("/"):
                 current = "/"
             parts = [part for part in target.split("/") if part] + parts
-        steps.append((os.path.realpath(path), False))
+        steps.append((os.path.realpath(path), None))
     except (OSError, ValueError):
         return None
     return list(dict.fromkeys(steps))
@@ -1215,10 +1220,39 @@ def writable_hop(path: str, writable: Callable[[str], bool]) -> str | None:
     steps = _resolution_steps(path)
     if steps is None:
         return path
-    for step, _holds_link in steps:
+    for step, _link in steps:
         if writable(step):
             return step
     return None
+
+
+def symlink_chain_resolves(path: str) -> bool:
+    """Whether ``path`` resolves within ``MAX_SYMLINKS`` symlinks (a loop or a longer chain
+    does not): the case ``unreadable_hop`` and ``writable_hop`` fail closed on."""
+    return _resolution_steps(path) is not None
+
+
+def unreadable_hop(path: str, readable: Callable[[str], bool]) -> str | None:
+    """The first step of resolving ``path`` that a sandbox would not let a process follow, or
+    None: the directory holding each symlink followed (the sandbox mounts only the
+    directories it lists; a symlink in an unlisted directory, such as an alias for the real
+    interpreter directory, cannot be read) and the final realpath must satisfy ``readable``.
+    A symlink directly under ``/`` whose own path is readable (``/bin`` -> ``usr/bin`` on a
+    usr-merged system, with ``/bin`` listed) is followable although ``/`` is not listed.
+    The literal prefixes are not checked (ancestors of a listed directory are traversable).
+    More than ``MAX_SYMLINKS`` symlinks, or a path that cannot be resolved, is returned as it
+    is (fail closed). The read-side twin of ``writable_hop``."""
+    steps = _resolution_steps(path)
+    if steps is None:
+        return path
+    for step, link in steps:
+        if link is None or readable(step):
+            continue
+        if step == "/" and readable(link):
+            continue
+        return step
+    real = os.path.realpath(path)
+    return None if readable(real) else real
 
 
 def check_path_entries(entries: Sequence[str], writable: Callable[[str], bool]) -> None:
