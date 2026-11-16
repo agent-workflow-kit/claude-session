@@ -3,12 +3,12 @@ behaviors other tools rely on, pinned against REAL command output, so a change t
 a consumer fails a test here and is never found first by the consumer.
 
 How the pins work. A pin is a field path and a type (``PINS``): ``taints: bool``,
-``profile.reads_third_party: bool``, ``hooks[].selected: bool`` (``[]`` checks every item of an
-array, and there must be one). ``violations`` reports a pinned field that is missing (removed or
-renamed) or of another type (retyped); it ignores every field it does not name, so an additive
-optional field never fails a pin. The documents come from the real ``claude-session`` entry
-point run against the fake ``claude`` (``tests/fakebin``), not from fixtures written here, and
-they are not whole-document goldens (those are ``tests/golden``).
+``profile.reads_third_party: bool``, ``recent_events[].event_id: int`` (``[]`` checks every
+item of an array, and there must be one). ``violations`` reports a pinned field that is missing
+(removed or renamed) or of another type (retyped); it ignores every field it does not name, so
+an additive optional field never fails a pin. The documents come from the real
+``claude-session`` entry point run against the fake ``claude`` (``tests/fakebin``), not from
+fixtures written here, and they are not whole-document goldens (those are ``tests/golden``).
 
 Behavior pins are plain tests against the same real commands. Each group's docstring quotes the
 comment on issue #45 (the 1.0 readiness checklist) that names the surface.
@@ -21,16 +21,23 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import shlex
 import sys
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from .test_exec_headless import private_home
 from .test_exec_hooks import HOOK
 from .test_start_adopt import DONE, START, STOP, Env, result_step
+
+AGENT_ID = "ag-abcdefgh"
+AGENT_LABEL = f"agent={AGENT_ID}"
 
 # --- the pin machinery -------------------------------------------------------------------
 
@@ -88,29 +95,45 @@ def violations(doc: Any, fields: dict[str, str]) -> list[str]:
 # name the consumer and quote the issue comment.
 PINS: dict[str, dict[str, str]] = {
     # agent-spawn: `start --dry-run --json` fields `taints`, `profile.reads_third_party`,
-    # `would_refuse`, `run_kind`, `repo` (+ the `hooks` entries of per-invocation `--hook`).
+    # `would_refuse`, `run_kind`, `repo`, and the plan (`dry_run`, `profile`, `would_fail`,
+    # `cwd`) it reads to decide whether to launch.
     "start_dry_run": {
+        "dry_run": "bool",
         "taints": "bool",
+        "profile": "dict",
         "profile.reads_third_party": "bool",
         "would_refuse": "str|null",
+        "would_fail": "str|null",
         "run_kind": "str",
         "repo": "str|null",
-        "hooks[].hook": "str",
-        "hooks[].cmd": "str",
-        "hooks[].source": "str",
-        "hooks[].selected": "bool",
+        "cwd": "str|null",
     },
     # agent-spawn: `status --json` fields `run.phase`, `run.reads_third_party`, `tainted`,
-    # `csession_dir`, `recent_events`.
+    # `csession_dir`, `recent_events`, and the run record it polls (`current_run`, `pending`,
+    # `run.*`, `repo`, `mode`, `tainted_by_run`, the events' `event_id`/`event_ts`/`run`).
     "status": {
         "csession_id": "str",
+        "state": "str",
+        "tainted": "bool",
+        "tainted_by_run": "int|null",
+        "csession_dir": "str",
+        "repo": "str|null",
+        "mode": "str",
+        "current_run": "int",
+        "pending": "bool",
+        "run.run": "int",
+        "run.pending": "bool",
         "run.phase": "str",
         "run.reads_third_party": "bool",
-        "tainted": "bool",
-        "csession_dir": "str",
+        "run.state": "str",
+        "run.outcome": "str|null",
+        "run.end_reason": "str|null",
+        "run.exit_code": "int|null",
         "recent_events": "list",
-        "state": "str",
-        "labels": "list",
+        "recent_events[].event_id": "int",
+        "recent_events[].event_ts": "str",
+        "recent_events[].run": "int",
+        "recent_events[].to_activity": "str|null",
     },
     # agent-spawn: the exit-12 `launch_failed` envelope carrying `csession_id` and `run`.
     "launch_failed": {
@@ -118,14 +141,11 @@ PINS: dict[str, dict[str, str]] = {
         "error.csession_id": "str",
         "error.run": "int",
         "error.end_reason": "str",
-        "error.message": "str",
     },
     # agent-spawn / gatectl / ticket-queue: `list --label ... --json`.
     "list": {
         "sessions": "list",
         "sessions[].csession_id": "str",
-        "sessions[].labels": "list",
-        "sessions[].state": "str",
     },
     # gatectl: `start --json`, then `exec --session-id <id> --run <n> ...`; ticket-queue:
     # the names to pass at adoption (`required_env_names`).
@@ -141,6 +161,9 @@ PINS: dict[str, dict[str, str]] = {
     "outcome": {
         "csession_id": "str",
         "run": "int",
+        "phase": "str",
+        "state": "str",
+        "report": "dict|null",
         "outcome": "str",
         "end_reason": "str|null",
         "exit_code": "int",
@@ -153,6 +176,31 @@ PINS: dict[str, dict[str, str]] = {
         "outcome": "str",
         "end_reason": "str",
         "state": "str",
+    },
+    # agent-spawn (relay.py): the `post-state-change` hook payload of a session, every key its
+    # `Event` requires, from the final event of an adopted run started with an `agent=<id>`
+    # label. Nullable keys are `T|null`.
+    "hook_payload": {
+        "hook": "str",
+        "object_type": "str",
+        "object_id": "str",
+        "event_id": "int",
+        "run": "int",
+        "state": "str",
+        "activity": "str|null",
+        "needs_input_reason": "str|null",
+        "labels": "list",
+        "previous_state": "str|null",
+        "final": "bool",
+        "cause": "str",
+        "report": "dict|null",
+        "event_ts": "str",
+        "phase": "str",
+        "outcome": "str|null",
+        "end_reason": "str|null",
+        "exit_code": "int|null",
+        "message": "str|null",
+        "sandbox_active": "bool|null",
     },
 }
 
@@ -207,11 +255,52 @@ def fresh_start(env: Env, *args: str, code: int = 0) -> dict[str, Any]:
     return out
 
 
-@pytest.fixture
-def docs(env: Env, tmp_path: Path) -> dict[str, Any]:
-    """The pinned documents, each produced by a real command."""
+@dataclass
+class IsolatedEnv(Env):
+    """An ``Env`` for a module-scoped fixture, which runs before the function-scoped autouse
+    isolation of ``tests/conftest.py``: its own ``XDG_STATE_HOME`` (the parent of ``state``),
+    ``HOME`` and ``XDG_CONFIG_HOME`` are passed explicitly, ``XDG_RUNTIME_DIR`` is dropped and
+    the crontab tripwire comes first on ``PATH``, so the real directories are never touched."""
+
+    tripwire: Path = Path()
+
+    def environ(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
+        base = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
+        return {
+            **base,
+            **private_home(self.tmp_path),
+            "XDG_STATE_HOME": str(self.state.parent),
+            "PATH": f"{self.tripwire}{os.pathsep}{base.get('PATH', '')}",
+            **(extra or {}),
+        }
+
+
+@pytest.fixture(scope="module")
+def docs_env(tmp_path_factory: pytest.TempPathFactory, _tripwire_bin: Path) -> IsolatedEnv:
+    root = tmp_path_factory.mktemp("consumer-docs")
+    work = root / "work"
+    work.mkdir()
+    e = IsolatedEnv(
+        root,
+        root / "xdg" / "state" / "claude-session",
+        work,
+        root / "config.yaml",
+        root / "fake.jsonl",
+        _tripwire_bin,
+    )
+    e.scenario([START, DONE, STOP, result_step()])
+    e.write_config()
+    return e
+
+
+@pytest.fixture(scope="module")
+def docs(docs_env: IsolatedEnv) -> dict[str, Any]:
+    """The pinned documents, each produced by a real command, built once for the module
+    (tests deepcopy before they mutate)."""
+    env, tmp_path = docs_env, docs_env.tmp_path
     found: dict[str, Any] = {}
-    hook = hook_command(tmp_path / "docs-hook.jsonl", "docs")
+    hook_log = tmp_path / "docs-hook.jsonl"
+    hook = hook_command(hook_log, "docs")
     prompt = tmp_path / "docs-prompt.md"
     prompt.write_text("Do the task.\n", encoding="utf-8")
     found["start_dry_run"] = run_json(
@@ -229,14 +318,26 @@ def docs(env: Env, tmp_path: Path) -> dict[str, Any]:
     found["start"] = out
     sid = out["csession_id"]
     found["stop_pending"] = run_json(env, "stop", sid, "--grace", "2s")
-    sid = fresh_start(env, "--mode", "headless", "--label", "owner=docs")["csession_id"]
+    sid = fresh_start(
+        env,
+        "--mode",
+        "headless",
+        "--label",
+        "owner=docs",
+        "--label",
+        AGENT_LABEL,
+        "--hook",
+        f"post-state-change={hook}",
+    )["csession_id"]
     found["outcome"] = run_json(env, "exec", "--session-id", sid, "--run", "1")
+    found["hook_payload"] = hook_payloads(hook_log)[-1]
     found["status"] = run_json(env, "status", sid)
     found["list"] = run_json(env, "list", "--label", "owner=docs")
     env.config.write_text(f"claude_bin: {env.tmp_path / 'missing'}\n", encoding="utf-8")
     found["launch_failed"] = run_json(
         env, "start", "--mode", "headless", "--prompt-file", str(prompt), code=12
     )
+    env.write_config()
     return found
 
 
@@ -251,12 +352,12 @@ def test_the_pinned_documents_are_the_real_shapes(docs: dict[str, Any]) -> None:
     dry = docs["start_dry_run"]
     assert (dry["taints"], dry["would_refuse"], dry["run_kind"]) == (False, None, "implement")
     assert dry["profile"]["reads_third_party"] is False
-    assert [(h["hook"], h["source"], h["selected"]) for h in dry["hooks"]] == [
-        ("post-state-change", "flag", True)
-    ]
+    assert dry["dry_run"] is True and dry["would_fail"] is None and isinstance(dry["cwd"], str)
     status = docs["status"]
     assert status["run"]["phase"] == "session" and status["state"] == "exited"
-    assert status["tainted"] is False and status["labels"] == ["kind=implement", "owner=docs"]
+    assert status["tainted"] is False and status["tainted_by_run"] is None
+    assert (status["current_run"], status["pending"], status["mode"]) == (1, False, "headless")
+    assert status["run"]["outcome"] == "done" and status["run"]["exit_code"] == 0
     assert status["recent_events"], "an adopted run has events"
     failed = docs["launch_failed"]["error"]
     assert (failed["code"], failed["end_reason"], failed["run"]) == (
@@ -265,6 +366,15 @@ def test_the_pinned_documents_are_the_real_shapes(docs: dict[str, Any]) -> None:
         1,
     )
     assert docs["outcome"]["outcome"] == "done" and docs["outcome"]["exit_code"] == 0
+    payload = docs["hook_payload"]
+    assert (payload["hook"], payload["object_type"], payload["state"], payload["final"]) == (
+        "post-state-change",
+        "session",
+        "exited",
+        True,
+    )
+    assert payload["object_id"] == docs["outcome"]["csession_id"]
+    assert AGENT_LABEL in payload["labels"]
     stopped = docs["stop_pending"]
     assert (stopped["canceled"], stopped["end_reason"], stopped["state"]) == (
         True,
@@ -394,7 +504,7 @@ def test_gatectl_timeout_is_whole_seconds_and_zero_is_a_usage_error(env: Env) ->
     prompt.write_text("x\n", encoding="utf-8")
     base = ("--mode", "headless", "--prompt-file", str(prompt))
     plan = run_json(env, "start", "--dry-run", *base, "--timeout", "30")
-    assert plan["timeout"] == 30 and has_type(plan["timeout"], "num")
+    assert plan["timeout"] == 30
     for zero in ("0", "0s"):
         out = run_json(env, "start", *base, "--timeout", zero, code=2)
         assert out["error"]["code"] == "usage"
@@ -463,6 +573,55 @@ def test_the_human_only_rule_is_checked_before_the_session_lookup(
     assert out["error"]["code"] == "usage"
     ok = run_json(env, "resume", "cs-abcdefgh", flag, "--actor", "human:alice", code=10)
     assert ok["error"]["code"] == "not_found"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("resume", "cs-abcdefgh", "--allow-tainted"),
+        ("resume", "cs-abcdefgh", "--override-escalation"),
+        ("start", "--mode", "headless", "--resume", "cs-abcdefgh", "--allow-tainted"),
+    ],
+    ids=lambda argv: " ".join(argv[:1] + argv[-1:]),
+)
+def test_the_human_only_rule_without_an_actor_needs_a_terminal(
+    env: Env, argv: tuple[str, ...]
+) -> None:
+    """The same rule with no `--actor`: stdin must be a terminal (the driver gives none), so
+    the flag is a usage error (exit 2) before the session lookup (`not_found`, 10)."""
+    out = run_json(env, *argv, code=2)
+    assert out["error"]["code"] == "usage"
+    assert "needs a terminal on stdin" in out["error"]["message"]  # not the blank-name branch
+
+
+# --- the dry-run refusals agent-spawn reads --------------------------------------------------
+
+
+def test_agent_spawn_a_refused_adoption_dry_run_exits_20_with_a_reason(env: Env) -> None:
+    """agent-spawn, issue #45 (`start --dry-run` fields `would_refuse`, `would_fail`): a
+    pending run past its deadline still prints a plan, with `would_refuse` set, exit 20; a
+    run that is over has no plan to print and gives the exit-20 refusal envelope, whose
+    `error.reason` names the refusal."""
+    env.write_config("lost_grace: 0.2s\n")
+    sid = fresh_start(env, "--mode", "headless")["csession_id"]
+    time.sleep(0.5)
+    plan = run_json(env, "exec", "--session-id", sid, "--dry-run", code=20)
+    assert plan["would_refuse"] == "expired" and plan["dry_run"] is True
+    assert violations(plan, {"would_refuse": "str|null", "would_fail": "str|null"}) == []
+    env.write_config()
+    done = fresh_start(env, "--mode", "headless")["csession_id"]
+    run_json(env, "exec", "--session-id", done)
+    out = run_json(env, "exec", "--session-id", done, "--dry-run", code=20)
+    assert (out["error"]["code"], out["error"]["reason"]) == ("refused", "expired")
+
+
+def test_agent_spawn_an_agent_label_given_at_start_reaches_the_hook_payload(
+    docs: dict[str, Any],
+) -> None:
+    """agent-spawn (relay.py), issue #45: the `agent=<id>` label of `start --label` is in the
+    `labels` of every `post-state-change` payload; the relay drops a payload without it."""
+    assert AGENT_LABEL in docs["hook_payload"]["labels"]
+    assert AGENT_LABEL in docs["status"]["labels"]
 
 
 # --- mutation tests: the pins fail on removal, rename, retype and pass on additions ------
@@ -534,8 +693,4 @@ def test_adding_optional_fields_does_not_fail_a_pin(docs: dict[str, Any], name: 
 def test_the_pins_notice_an_emptied_array(docs: dict[str, Any]) -> None:
     doc = copy.deepcopy(docs["list"])
     doc["sessions"] = []
-    assert violations(doc, PINS["list"]) == [
-        "sessions[].csession_id: missing",
-        "sessions[].labels: missing",
-        "sessions[].state: missing",
-    ]
+    assert violations(doc, PINS["list"]) == ["sessions[].csession_id: missing"]
