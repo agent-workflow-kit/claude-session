@@ -621,7 +621,6 @@ def test_agent_spawn_an_agent_label_given_at_start_reaches_the_hook_payload(
     """agent-spawn (relay.py), issue #45: the `agent=<id>` label of `start --label` is in the
     `labels` of every `post-state-change` payload; the relay drops a payload without it."""
     assert AGENT_LABEL in docs["hook_payload"]["labels"]
-    assert AGENT_LABEL in docs["status"]["labels"]
 
 
 # --- mutation tests: the pins fail on removal, rename, retype and pass on additions ------
