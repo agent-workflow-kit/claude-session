@@ -254,3 +254,13 @@ def test_the_readme_start_sample_has_the_schema_keys() -> None:
     ]
     required = json.loads((ROOT / "schemas" / "cli" / "start.json").read_text())["required"]
     assert list(json.loads(sample)) == required
+
+
+def test_the_readme_has_no_stale_coming_notes() -> None:
+    """Every command ships, so no row of the Commands table (or any other sentence) may say a
+    feature is coming or accepted without effect."""
+    rows = [line for line in section("## Commands").splitlines() if line.startswith("| `")]
+    assert len(rows) >= 16
+    assert all(line.rstrip().endswith("| available |") for line in rows), rows
+    stale = re.findall(r"[^.\n]*\b(?:coming|accepted but no effect|not yet implemented)\b[^.\n]*", README)
+    assert stale == []
