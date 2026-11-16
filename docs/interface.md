@@ -995,6 +995,19 @@ On the user's confirmation, the caller reads only the listed `changed_files` fro
 
 Retention: session and private directories of sessions that are not forgotten are kept (they back parked agents); `retention_days` applies only after `forget`, unless `forget --purge` deletes the directories at once; Claude Code's own transcript is never deleted by claude-session (see [`forget`](#forget)). Callers that keep artifacts copy them before `forget` (or `forget --purge`), or before the retention period ends.
 
+## Stability for consumers
+
+The surfaces below are relied on by other tools. [tests/test_consumer_contract.py](../tests/test_consumer_contract.py) pins each one against real command output (field names and types, and the behaviors), so removing, renaming or retyping one fails a test here. Adding an optional field to an output does not. From 1.0 on these pins are what a 1.x release promises: none of them changes within 1.x.
+
+| Consumer | Pinned |
+| --- | --- |
+| agent-spawn | `start --dry-run --json`: `taints`, `profile.reads_third_party`, `would_refuse`, `run_kind`, `repo`, and the `hooks[]` entries (`hook`, `cmd`, `source`, `selected`) of per-invocation `--hook`. `status --json`: `run.phase`, `run.reads_third_party`, `tainted`, `csession_dir`, `recent_events`, `labels`, `state`. The exit-12 `launch_failed` envelope: `error.csession_id` (a real session), `error.run`, `error.end_reason`. Per-invocation `--hook post-state-change=...`, stored with the run and delivered by the adopting `exec` and, late, by `stop`. `list --label`. The human-only rule for `--allow-tainted` and `--override-escalation`, checked before the session lookup. |
+| gatectl | `--outcome-file` at adoption; `stop` canceling a pending run; `list --label` repeated (ANDed); `--timeout` in whole seconds, with `0` a usage error. |
+| ticket-queue | `start --json`: `required_env_names` and `env_inherit`; `list --kind <kind> --label <k>=<v>`. |
+| ticketctl | `secret_env` names are stripped from a session unless the kind's `env.allow` names them exactly. |
+
+**Additive required output keys.** Before 1.0, a new required key in an output schema (as `num_turns`, `plugin_dirs` and `tools` were) is not a breaking change for the pins, but a consumer that validates strictly against the schemas breaks on it. Such a key is therefore still reported in the consumer-changes list of the release, even though no pin fails.
+
 ## Residual risks
 
 - **Symlink holder directories** (Linux and WSL2): to make a default `uv`-managed Python work, `exec` lists the directories that hold the symlinks on the way from the `claude-session` `#!` interpreter to its real file (for example `~/.local/share/uv/python`, holding the minor-version alias) as readable in the sandbox. That grants the session read access to everything in those directories (every other Python installed in the same store, for instance), not only the interpreter. Only the exact holder directories are added, never their ancestors or siblings, never as writable, and not when they are `/`, `$HOME` or an ancestor, a credential path, the state root, session-writable, a pseudo filesystem (`/proc`, `/sys`, `/dev`) or world-writable; they are shown in the dry-run plan and in `kinds`, for sandboxed runs only. An install without symlinks in the interpreter path (`--copies`, or a `#!` line with the real path) adds nothing.

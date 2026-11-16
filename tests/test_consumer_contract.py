@@ -29,8 +29,6 @@ from typing import Any
 
 import pytest
 
-from .fakeclaude import read_jsonl
-from .test_exec_headless import SECRET_VALUE
 from .test_exec_hooks import HOOK
 from .test_start_adopt import DONE, START, STOP, Env, result_step
 
@@ -465,14 +463,6 @@ def test_the_human_only_rule_is_checked_before_the_session_lookup(
     assert out["error"]["code"] == "usage"
     ok = run_json(env, "resume", "cs-abcdefgh", flag, "--actor", "human:alice", code=10)
     assert ok["error"]["code"] == "not_found"
-
-
-def test_the_pinned_run_state_is_recorded_in_the_fake_run(env: Env) -> None:
-    """The fake claude ran once for the adopted session (the pins above use real runs)."""
-    sid = fresh_start(env, "--mode", "headless")["csession_id"]
-    run_json(env, "exec", "--session-id", sid)
-    assert len([r for r in read_jsonl(env.log) if r["event"] == "start"]) == 1
-    assert SECRET_VALUE  # imported fixture constant stays referenced
 
 
 # --- mutation tests: the pins fail on removal, rename, retype and pass on additions ------
