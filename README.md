@@ -289,6 +289,8 @@ claude-session treats the agent as untrusted wherever a kind says so. At a user 
   Isolated runs may only add to the narrow set of `sandbox` keys the interface allows; settings
   that would weaken the sandbox are refused (`invalid_permission_profile`). A profile file is read
   once and snapshotted, so later runs use the snapshot.
+  A permission rule for a tool that holds your credentials (`forgectl`, `ticketctl`) is not a narrow
+  profile: see [Permission profiles](docs/interface.md#permission-profiles).
 - **Taint**: a session that has run a third-party-reading kind (one that reads content written by
   other people, such as a pull request) is *tainted*, permanently. `status --json` shows it and
   `list --tainted` filters on it. Resuming or forking a tainted session into a kind that is not
@@ -333,6 +335,10 @@ The guarantees, their limits and the residual risks are in
 [docs/interface.md](docs/interface.md) for their rules.
 
 Full reference: [docs/interface.md](docs/interface.md).
+
+Calling claude-session from another tool: [Calling from another tool](docs/interface.md#calling-from-another-tool),
+[Stability for consumers](docs/interface.md#stability-for-consumers) and
+[Changes for consumers since 0.1.0-design](docs/interface.md#changes-for-consumers-since-010-design).
 
 ## Reference
 
