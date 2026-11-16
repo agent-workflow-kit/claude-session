@@ -372,35 +372,74 @@ def test_a_required_sandbox_without_prerequisites_would_fail(tmp_path: Path, wor
     assert plan["sandbox"]["available"] is False and plan["sandbox"]["problems"]
 
 
-def test_a_dry_run_through_an_unlisted_alias_interpreter_fails_a_required_sandbox(
+ALIAS_ARGS = [
+    "exec",
+    "--dry-run",
+    "--json",
+    "--kind",
+    "review",
+    "--mode",
+    "headless",
+    "--prompt-file",
+    "prompt.md",
+]
+
+
+def test_a_dry_run_through_an_alias_interpreter_lists_the_holder_and_passes(
     tmp_path: Path, tools: Path, work: Path
 ) -> None:
-    """The venv-style install of test_install_probe.Layout: the ``#!`` python links through an
-    alias directory no ``allowRead`` lists, so the CLI-level probe reports the sandbox
-    unavailable for a required kind and exits 12."""
+    """The venv-style install of test_install_probe.Layout (uv: the venv ``python`` links
+    through a minor-version alias directory): a required kind passes with no ``read_dirs``,
+    and the plan shows the store directory holding the alias as readable, never writable."""
     layout = Layout(tmp_path / "install")
+    proc = cli(ALIAS_ARGS, cwd=work, tools=tools, tmp_path=tmp_path, exe=layout.script)
+    plan = json.loads(proc.stdout)
+    validate(plan, DRY_RUN)
+    assert proc.returncode == 0, proc.stderr
+    assert plan["would_fail"] is None
+    assert plan["sandbox"]["available"] is True and plan["sandbox"]["problems"] == []
+    assert str(layout.store) in plan["sandbox"]["allow_read"]
+    assert str(layout.store) not in plan["sandbox"]["allow_write"]
+    assert str(layout.store) in plan["profile"]["read_dirs"]
+
+
+def test_a_dry_run_through_the_real_venv_interpreter_needs_no_read_dirs(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """The product handles however this host's Python is installed (uv on CI links the venv
+    through an alias directory): no ``clean_exe`` workaround."""
+    exe = tmp_path / "bin" / "claude-session"
+    exe.parent.mkdir()
+    exe.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+    exe.chmod(0o755)
+    proc = cli(ALIAS_ARGS, cwd=work, tools=tools, tmp_path=tmp_path, exe=exe)
+    plan = json.loads(proc.stdout)
+    validate(plan, DRY_RUN)
+    assert proc.returncode == 0, (proc.stderr, plan["sandbox"]["problems"])
+    assert plan["sandbox"]["available"] is True
+
+
+def test_a_dry_run_whose_alias_directory_is_the_home_directory_fails_a_required_sandbox(
+    tmp_path: Path, tools: Path, work: Path
+) -> None:
+    """The alias sits directly in ``$HOME``: listing its holder would list the home
+    directory, so the CLI-level probe reports the sandbox unavailable and exits 12."""
+    home = tmp_path / "home"
+    layout = Layout(tmp_path / "install", store=home)
     proc = cli(
-        [
-            "exec",
-            "--dry-run",
-            "--json",
-            "--kind",
-            "review",
-            "--mode",
-            "headless",
-            "--prompt-file",
-            "prompt.md",
-        ],
+        ALIAS_ARGS,
         cwd=work,
         tools=tools,
         tmp_path=tmp_path,
         exe=layout.script,
+        env={"HOME": str(home)},
     )
     plan = json.loads(proc.stdout)
     validate(plan, DRY_RUN)
     assert proc.returncode == 12, proc.stderr
     assert plan["would_fail"] == "sandbox_unavailable"
-    assert any(str(layout.bin) in p for p in plan["sandbox"]["problems"])
+    assert any(str(home) in p for p in plan["sandbox"]["problems"])
+    assert str(home) not in plan["sandbox"]["allow_read"]
 
 
 def test_a_missing_claude_would_fail(tmp_path: Path, tools: Path, work: Path) -> None:

@@ -334,7 +334,7 @@ class Prerequisites:
             problems = () if found.available else (f"{found.problem}; {found.hint}",)
             self._seen[key] = Sandbox(available=found.available, problems=problems)
         base = self._seen[key]
-        install = self.install_problems(process, resolution)
+        install = self.install_problems(process, resolution, writable)
         if not install:
             return base
         return Sandbox(
@@ -342,7 +342,10 @@ class Prerequisites:
         )
 
     def install_problems(
-        self, process: launch.Process, resolution: kinds.Resolution
+        self,
+        process: launch.Process,
+        resolution: kinds.Resolution,
+        writable: pathrules.SessionWritable,
     ) -> tuple[str, ...]:
         """What would make a launch fail at run time although the tools are present: hard-linked
         code (the launch's ``check_hook_interpreter``; scanned once) and an interpreter of
@@ -361,8 +364,40 @@ class Prerequisites:
             *(os.path.realpath(p) for p in resolution.profile.env.path_prepend),
             *_expanded_dirs(resolution.profile.read_dirs, home, "read_dirs"),
         ]
+        readable += _interpreter_holders(process, resolution, writable, readable)
         interpreter = settings_builder.interpreter_problem(process.claude_session, readable)
         return (*self._hard_links, *(() if interpreter is None else (interpreter,)))
+
+
+def _interpreter_holders(
+    process: launch.Process,
+    resolution: kinds.Resolution,
+    writable: pathrules.SessionWritable,
+    readable: Sequence[str],
+) -> tuple[str, ...]:
+    """The directories a launch would add for the symlinks of the interpreter chain
+    (``launch.interpreter_holders``), checked against the placeholder session's rules;
+    none for a kind whose sandbox is off (no probe runs, allowRead is inert) or whose rules
+    cannot be built."""
+    if resolution.profile.sandbox == "off":
+        return ()
+    session_dir = sessiondir.session_dir(process.state_root, PLACEHOLDER_ID)
+    try:
+        rules = pathrules.PathRules(
+            pathrules.Host.from_environ(
+                process.environ,
+                state_root=process.state_root,
+                path_prepend=resolution.profile.env.path_prepend,
+            ),
+            session_dir=session_dir,
+            cwd=process.caller_cwd,
+            caller_cwd=process.caller_cwd,
+            tmpdir=tmpdir.run_path(PLACEHOLDER_ID),
+            planned=True,
+        )
+    except (ValueError, OSError):
+        return ()
+    return launch.interpreter_holders(process, rules, writable, readable)
 
 
 def _expanded_dirs(entries: Sequence[str], home: str, key: str) -> list[str]:
@@ -392,11 +427,13 @@ def preview(
     process: launch.Process,
     claude: str | None,
     writable: pathrules.SessionWritable | None,
+    platform: str,
 ) -> Preview:
     """A kind's ``PATH``, directories and required names without a session: the
     environment is built with the placeholder session and no session-writable check; the
     read directories of an isolated kind include the generated entries (system, tool,
-    Python and ``env.path_prepend`` directories)."""
+    Python and ``env.path_prepend`` directories, then the directories holding the symlinks of
+    the ``claude-session`` interpreter chain, on Linux and WSL2)."""
     profile = resolution.profile
     session_dir = sessiondir.session_dir(process.state_root, PLACEHOLDER_ID)
     cwd = (
@@ -431,6 +468,8 @@ def preview(
             *(os.path.realpath(p) for p in profile.env.path_prepend),
             *read,
         ]
+        if writable is not None and selfcheck.symlink_hops_apply(platform):
+            read += _interpreter_holders(process, resolution, writable, read)
     return Preview(
         path=session_env.env["PATH"],
         read_dirs=tuple(dict.fromkeys(read)),
@@ -500,7 +539,7 @@ def kinds_report(
                 resolution,
                 permission_profile=resolution.profile.permission_profile,
                 sandbox=sandbox,
-                preview=preview(cfg, resolution, process, claude_path, writable),
+                preview=preview(cfg, resolution, process, claude_path, writable, probes.platform),
                 warnings=[*resolution.warnings, *_sandbox_warnings(resolution, sandbox)],
             )
         )
@@ -931,7 +970,7 @@ def plan_preview(
     they passed, else as ``kinds`` computes them."""
     checked = found.checked
     if checked is None:
-        return preview(cfg, resolution, process, None, writable)
+        return preview(cfg, resolution, process, None, writable, selfcheck.detect_platform())
     read: list[str] = list(checked.read_dirs)
     if checked.isolation is not None:
         iso = checked.isolation

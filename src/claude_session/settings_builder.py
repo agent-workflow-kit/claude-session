@@ -212,7 +212,8 @@ class Isolation:
     - ``read_dirs``, ``write_dirs``: the kind's (expanded, resolved; missing write_dirs
       already skipped).
     - ``system_dirs`` (``system_read_dirs()``), ``tool_dirs`` (``tool_dirs()`` of the resolved
-      bwrap, socat, git and claude), ``python_dirs`` (``python_read_dirs()``) and
+      bwrap, socat, git and claude), ``python_dirs`` (``python_read_dirs()`` plus the
+      directories holding the symlinks of the ``claude-session`` interpreter chain) and
       ``path_prepend`` (the kind's ``env.path_prepend``, resolved): the generated read
       entries.
     """
@@ -432,6 +433,49 @@ def hard_link_problem(link_dirs: Sequence[str] | None = None) -> str | None:
     return None
 
 
+def _script_interpreter(executable: str) -> str | None:
+    """The absolute ``#!`` interpreter of the script ``executable`` (the kernel ends it at the
+    first space or tab), or None: not a script, an unreadable file, a relative interpreter or
+    ``env`` (resolved on the sandbox's ``PATH``)."""
+    try:
+        with open(executable, "rb") as handle:
+            line = handle.read(256).split(b"\n", 1)[0]
+        words = os.fsdecode(line[2:]).split() if line[:2] == b"#!" else []
+    except OSError:
+        return None
+    interpreter = words[0] if words else ""
+    if not os.path.isabs(interpreter) or os.path.basename(interpreter) == "env":
+        return None
+    return interpreter
+
+
+def interpreter_holders(
+    executable: str, readable_dirs: Sequence[str], accept: Callable[[str], bool]
+) -> tuple[str, ...]:
+    """The directories to add to the sandbox's ``allowRead`` so that the ``#!`` interpreter of
+    ``executable`` (``claude-session``) can be followed inside it: the exact directories
+    holding the symlinks on the way to its real file (``pathrules.symlink_holders``; for a
+    uv-managed Python the store directory holding the minor-version alias), not their
+    ancestors, minus those ``readable_dirs`` already cover and ``/``, which cannot be listed.
+    A holder ``accept`` refuses (the read-entry and path rules: ``$HOME`` or an ancestor,
+    credential paths, the state root, anything session-writable or containing a writable
+    path) is left out, so ``interpreter_problem`` reports the sandbox unavailable as before.
+    Nothing for a script without an absolute ``#!`` interpreter or a chain that does not
+    resolve. Callers apply it on Linux and WSL2 only (``selfcheck.symlink_hops_apply``)."""
+    interpreter = _script_interpreter(executable)
+    if interpreter is None:
+        return ()
+    holders = pathrules.symlink_holders(interpreter)
+    if holders is None:
+        return ()
+    roots = [os.path.normpath(d) for d in readable_dirs]
+    return tuple(
+        holder
+        for holder in holders
+        if holder != "/" and not any(_inside(holder, r) for r in roots) and accept(holder)
+    )
+
+
 def interpreter_problem(executable: str, readable_dirs: Sequence[str]) -> str | None:
     """Why a sandboxed run of the script ``executable`` (``claude-session``) could not start
     its interpreter, or None. The ``#!`` interpreter (the kernel ends it at the first space
@@ -442,14 +486,8 @@ def interpreter_problem(executable: str, readable_dirs: Sequence[str]) -> str | 
     file that is not a script with an absolute ``#!`` interpreter (``#!/usr/bin/env`` is
     resolved on the sandbox's ``PATH``) and one that cannot be read. Callers apply it on
     Linux and WSL2 only (``selfcheck.symlink_hops_apply``)."""
-    try:
-        with open(executable, "rb") as handle:
-            line = handle.read(256).split(b"\n", 1)[0]
-        words = os.fsdecode(line[2:]).split() if line[:2] == b"#!" else []
-    except OSError:
-        return None
-    interpreter = words[0] if words else ""
-    if not os.path.isabs(interpreter) or os.path.basename(interpreter) == "env":
+    interpreter = _script_interpreter(executable)
+    if interpreter is None:
         return None
     who = f"the interpreter of {_shown(executable)!r} ({_shown(interpreter)!r})"
     loop = (
@@ -476,10 +514,10 @@ def interpreter_problem(executable: str, readable_dirs: Sequence[str]) -> str | 
         f"{who} is reached through {_shown(hop)!r}, outside the directories readable in the"
         " sandbox, so sandboxed `claude-session report` cannot start; reinstall"
         " claude-session so that the interpreter path has no symlink in an unlisted directory"
-        " (for example a virtual environment created with --copies), or list"
-        f" {_shown(hop)!r} itself in read_dirs, which grants read access to everything in it"
-        " (listing the symlink itself does nothing: entries are resolved; `/` and the home"
-        " directory cannot be listed)"
+        " (for example a virtual environment created with --copies); claude-session lists"
+        " the directories holding such symlinks itself, except `/`, the home directory and"
+        " its ancestors, credential and state paths, session-writable ones, /proc, /sys, /dev and"
+        " world-writable ones, which cannot be listed"
     )
 
 
@@ -1015,7 +1053,7 @@ def _check_isolation_inputs(
         ("write_dirs entry", "invalid_permission_profile", iso.write_dirs),
         ("system read directory", "unsafe_read_dir", iso.system_dirs),
         ("tool directory", "unsafe_read_dir", iso.tool_dirs),
-        ("Python read directory", "unsafe_read_dir", iso.python_dirs),
+        ("Python read directory or interpreter symlink holder", "unsafe_read_dir", iso.python_dirs),
         ("env.path_prepend directory", "unsafe_read_dir", iso.path_prepend),
     ]
     for label, reason, values in sandbox_paths:
@@ -1039,7 +1077,7 @@ def _check_isolation_inputs(
         ("profile allowWrite entry", "invalid_permission_profile", profile_writes),
         ("system read directory", "unsafe_read_dir", iso.system_dirs),
         ("tool directory", "unsafe_read_dir", iso.tool_dirs),
-        ("Python read directory", "unsafe_read_dir", iso.python_dirs),
+        ("Python read directory or interpreter symlink holder", "unsafe_read_dir", iso.python_dirs),
         ("env.path_prepend directory", "unsafe_read_dir", iso.path_prepend),
         (
             "git directory",
@@ -1063,7 +1101,7 @@ def _check_isolation_inputs(
         ("profile allowRead entry", "invalid_permission_profile", profile_reads),
         ("system read directory", "unsafe_read_dir", iso.system_dirs),
         ("tool directory", "unsafe_read_dir", iso.tool_dirs),
-        ("Python read directory", "unsafe_read_dir", iso.python_dirs),
+        ("Python read directory or interpreter symlink holder", "unsafe_read_dir", iso.python_dirs),
         ("env.path_prepend directory", "unsafe_read_dir", iso.path_prepend),
     ]
     for label, reason, values in readable:
@@ -1099,7 +1137,7 @@ def _check_lexical(
         ("read_dirs entry", "invalid_permission_profile", iso.read_dirs),
         ("profile allowRead entry", "invalid_permission_profile", profile_reads),
         ("tool directory", "unsafe_read_dir", iso.tool_dirs),
-        ("Python read directory", "unsafe_read_dir", iso.python_dirs),
+        ("Python read directory or interpreter symlink holder", "unsafe_read_dir", iso.python_dirs),
         ("env.path_prepend directory", "unsafe_read_dir", iso.path_prepend),
         ("git directory", "unsafe_read_dir", git_dirs),
     ]
