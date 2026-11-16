@@ -56,7 +56,7 @@ The plan splits eight modules out of design.md's module list to keep files focus
 - cli: `--json` error envelope shape for usage (2), not found (10), ambiguous (21); `--yes` accepted as a no-op.
 - schema harness: every file under `schemas/` passes `check_schema`; `config.example.yaml` validates.
 
-**Status**: Not Started
+**Status**: Complete (shipped by v0.45.2)
 
 ## Stage 1: Headless core (0.1)
 
@@ -74,7 +74,7 @@ The plan splits eight modules out of design.md's module list to keep files focus
 - endmap (headless): every row of the headless precedence, `is_error`, `error_max_turns`, complete-result detection, cost and turns summed over result objects.
 - supervisor (headless): spawn with stdout to `result.json`, own process group, `/dev/null` stdin, `PR_SET_PDEATHSIG` on Linux; final drain before mapping; exit codes.
 
-**Status**: Not Started
+**Status**: Complete (shipped by v0.45.2)
 
 ## Stage 2: Interactive mode and supervision (0.2)
 
@@ -91,7 +91,7 @@ The plan splits eight modules out of design.md's module list to keep files focus
 - toolhooks: `post-state-change` selectors (kinds, exclude_kinds, labels at event time, states); background worker order; delivery lease; at-least-once with `event_id`/`event_ts`; hook process group SIGTERM → SIGKILL on timeout; hook cwd is the state root.
 - outcome file: written by the finalizer right after the finalization CAS; backfill; write failure is a warning; never written to a rejected path; mode 0600; no-follow.
 
-**Status**: Not Started
+**Status**: Complete (shipped by v0.45.2)
 
 ## Stage 3: Isolation (0.3)
 
@@ -107,7 +107,7 @@ The plan splits eight modules out of design.md's module list to keep files focus
 - `--reads-third-party` implications; `sandbox_lowered` audit and warning.
 - `kinds --json` and `exec --dry-run --json` golden files.
 
-**Status**: Not Started
+**Status**: Complete (shipped by v0.45.2)
 
 ## Stage 4: Session lifecycle (0.4)
 
@@ -125,7 +125,7 @@ The plan splits eight modules out of design.md's module list to keep files focus
 - reconcile: lease; outbox salvage for the finalized run; retention deletion (fd-based) incl. tmpdirs; `orphans` array; delivers undelivered events.
 - cron install/uninstall: managed block, env-file checks, idempotence.
 
-**Status**: Not Started
+**Status**: Complete (shipped by v0.45.2)
 
 ## Stage 5: Transcripts, notes, audit, labels, upgrades (0.5)
 
@@ -140,7 +140,7 @@ The plan splits eight modules out of design.md's module list to keep files focus
 - verify-secret: full id only; adopted and live run only; whitespace stripping; constant-time compare; exit 0/11.
 - min Claude version check (`claude_too_old`); hook interpreter path missing → warning; `schema_newer`.
 
-**Status**: Not Started
+**Status**: Complete (shipped by v0.45.2)
 
 ## Stage 6: Live verification and 1.0 readiness
 
@@ -159,5 +159,5 @@ The plan splits eight modules out of design.md's module list to keep files focus
 Issues are tied only to major milestones (`0.x`, `1.x`, `2.x`); minor and patch releases follow from Conventional Commit titles.
 
 - **0.x**: stages 0–6. Minor versions arrive as features merge; the stage numbers above are an ordering, not version promises. State at v0.45.2: stages 0 to 5 shipped (every command exists); stage 6 is open: the live run ([#41](https://github.com/agent-workflow-kit/claude-session/issues/41), [#42](https://github.com/agent-workflow-kit/claude-session/issues/42)), the macOS checklist ([#43](https://github.com/agent-workflow-kit/claude-session/issues/43)) and consumer integration ([#45](https://github.com/agent-workflow-kit/claude-session/issues/45)) are pending, and the 1.0 cut ([#45](https://github.com/agent-workflow-kit/claude-session/issues/45)) follows them.
-- **1.0** when: every command, flag, state, outcome and schema in interface.md is implemented and golden-tested; `make live` passes on Linux and WSL2 against the current Claude Code; the macOS checklist has been run once; agent-spawn and review-run have integrated against the interface without interface changes for one release cycle (what counts as an interface change: [the stability clock](interface.md#stability-for-consumers); it has not started, because the interface still changed through v0.45.0). Reaching 1.0 is a deliberate breaking-change commit.
+- **1.0** when: every command, flag, state, outcome and schema in interface.md is implemented and golden-tested; `make live` passes on Linux and WSL2 against the current Claude Code; the macOS checklist has been run once; agent-spawn and review-run have integrated against the interface without interface changes for one release cycle (what counts as an interface change: [the stability clock](interface.md#stability-for-consumers); it has not started, because the interface still changed through v0.45.2, which widened the sandbox read grant). Reaching 1.0 is a deliberate breaking-change commit.
 - **2.0**: reserved for a breaking change to session ids, the state or outcome model, the report protocol, or any public schema. None is planned.
