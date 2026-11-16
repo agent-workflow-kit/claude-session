@@ -802,6 +802,24 @@ def test_cli_report_json_matches_the_schema(
     assert_golden(out, "report-artifact", normalize=lambda o: {**o, "request_id": "<uuid>"})
 
 
+@pytest.mark.parametrize("status", ["blocked", "failed", "needs-input"])
+def test_cli_report_json_of_each_other_status_matches_the_golden(
+    status: str,
+    run: Run,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for key, value in run.environ().items():
+        monkeypatch.setenv(key, value)
+    reason = Path(run.csession_dir) / "reason.md"
+    reason.write_text("needs a decision\n", encoding="utf-8")
+    argv = ["report", status, "--reason-file", str(reason), "--json"]
+    assert cli.main(argv) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert (out["status"], out["artifact"]) == (status, None)
+    assert_golden(out, f"report-{status}", normalize=lambda o: {**o, "request_id": "<uuid>"})
+
+
 def test_cli_report_usage_error_envelope(
     run: Run, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

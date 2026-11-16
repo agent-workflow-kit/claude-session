@@ -378,3 +378,199 @@ def test_documented_error_codes_are_the_schema_error_codes() -> None:
 @pytest.mark.parametrize("name", sorted(p.name for p in (SCHEMAS / "cli").glob("*.json")))
 def test_every_cli_schema_is_named_in_interface_md(name: str) -> None:
     assert f"schemas/cli/{name}" in INTERFACE
+
+
+# Per-outcome goldens (issue #127): every documented run state, needs-input reason, outcome,
+# end reason and report status appears in at least one schema-validated golden of the command
+# that can show it. Coverage is read from the golden files' contents, not their names.
+
+OUTCOME_COMMANDS = {"exec", "resume", "status", "wait"}  # outcome and end reason (status: .run)
+
+
+def documented_outcomes(text: str = INTERFACE) -> set[str]:
+    """The outcomes of the ``Outcome -> exit code`` table."""
+    match = re.search(r"^\*\*Outcome → exit code\*\*.*?(?=^## )", text, re.DOTALL | re.MULTILINE)
+    assert match, "no Outcome -> exit code table in interface.md"
+    return set(re.findall(r"^\| `([a-z-]+)`", match.group(0), flags=re.MULTILINE))
+
+
+def documented_end_reasons(text: str = INTERFACE) -> set[str]:
+    """The end reasons the End reasons table and the launch validation row of the Launch
+    phase table name; ``signal_<name>`` and ``exit_<code>`` are families."""
+    table = re.search(r"^\*\*End reasons\*\*.*?(?=^Per outcome)", text, re.DOTALL | re.MULTILINE)
+    row = re.search(r"^\| launch validation failed \|.*$", text, re.MULTILINE)
+    assert table and row, "no End reasons table or launch validation row in interface.md"
+    return set(re.findall(r"`([a-z_<>]+)`", table.group(0) + row.group(0)))
+
+
+def documented_states(text: str = INTERFACE) -> set[str]:
+    body = section("States", text=text).split(NEEDS_INPUT_MARKER)[0]
+    return set(re.findall(r"`([a-z-]+)`", body)) - {"state"}
+
+
+NEEDS_INPUT_MARKER = "`needs-input` carries"
+
+
+def documented_needs_input_reasons(text: str = INTERFACE) -> set[str]:
+    states = section("States", text=text)
+    assert NEEDS_INPUT_MARKER in states, (
+        f"interface.md, States: no paragraph starting {NEEDS_INPUT_MARKER!r}; "
+        "tests/test_interface_audit.py reads the needs-input reasons from it"
+    )
+    body = states.split(NEEDS_INPUT_MARKER)[1].split("Pressing Esc")[0]
+    return set(re.findall(r"`([a-z]+)` \(", body))
+
+
+def golden_documents(root: Path = GOLDEN_ROOT) -> list[tuple[str, Any]]:
+    """``(command, output)`` of every command golden (the hook payloads are not command
+    outputs)."""
+    return [
+        (schema_id_for(golden_name(path, root)).rsplit("/", 1)[1].removesuffix(".json"), output)
+        for path in sorted(root.glob("*.json"))
+        for output in [json.loads(path.read_text(encoding="utf-8"))]
+    ]
+
+
+def run_of(command: str, output: Any) -> dict[str, Any] | None:
+    """The object that carries the run's outcome and end reason: the output itself for the
+    outcome object (``exec``, ``resume``, ``wait``), ``run`` for ``status``."""
+    if not isinstance(output, dict):
+        return None
+    run = output.get("run") if command == "status" else output
+    return run if command in OUTCOME_COMMANDS and isinstance(run, dict) else None
+
+
+def covered_by_goldens(documents: list[tuple[str, Any]]) -> dict[str, set[Any]]:
+    seen: dict[str, set[Any]] = {
+        key: set() for key in ("state", "reason", "outcome", "end_reason", "report")
+    }
+    for command, output in documents:
+        run = run_of(command, output)
+        if command == "status":
+            seen["state"] |= {output["state"], *([run["state"]] if run else [])}
+            seen["reason"] |= {output["needs_input_reason"]}
+        if run is not None:
+            seen["outcome"] |= {run["outcome"]}
+            seen["end_reason"] |= {run["end_reason"]}
+        if command == "report":
+            seen["report"] |= {output["status"]}
+    return seen
+
+
+def goldens_missing(
+    text: str = INTERFACE, documents: list[tuple[str, Any]] | None = None
+) -> list[str]:
+    """What interface.md (``text``) documents that no golden shows, as ``kind value``."""
+    seen = covered_by_goldens(golden_documents() if documents is None else documents)
+    missing = [f"state {s}" for s in sorted(documented_states(text) - seen["state"])]
+    missing += [
+        f"needs_input_reason {r}"
+        for r in sorted(documented_needs_input_reasons(text) - seen["reason"])
+    ]
+    missing += [f"outcome {o}" for o in sorted(documented_outcomes(text) - seen["outcome"])]
+    for reason in sorted(documented_end_reasons(text)):
+        # A family such as `exit_<code>` is covered by any value of it.
+        family = re.sub(r"<[a-z]+>", ".+", reason)
+        if not any(re.fullmatch(family, s) for s in seen["end_reason"] if s is not None):
+            missing.append(f"end_reason {reason}")
+    statuses = set(schema("cli/report.json")["properties"]["status"]["enum"])
+    missing += [f"report status {s}" for s in sorted(statuses - seen["report"])]
+    return missing
+
+
+def test_every_documented_state_outcome_and_end_reason_has_a_golden() -> None:
+    assert goldens_missing() == []
+
+
+def test_the_documented_vocabularies_are_the_schema_ones() -> None:
+    defs = schema("cli/outcome.json")["$defs"]
+    assert documented_needs_input_reasons() == set(defs["needs_input_reason"]["enum"]) - {None}
+    assert documented_outcomes() == set(defs["outcome_value"]["enum"]) - {None}
+    assert documented_end_reasons() - {"signal_<name>", "exit_<code>"} == end_reasons(defs)
+    assert {"signal_<name>", "exit_<code>"} <= documented_end_reasons()  # the two families
+
+
+def without(
+    keep: Any,
+) -> list[tuple[str, Any]]:
+    """The command goldens for which ``keep(command, output)`` holds."""
+    assert goldens_missing() == []  # a mutation is only a proof from a complete start
+    return [(c, o) for c, o in golden_documents() if keep(c, o)]
+
+
+def test_the_golden_audit_detects_a_state_with_no_golden() -> None:
+    documents = without(lambda c, o: not (c == "status" and o["state"] == "idle"))
+    assert "state idle" in goldens_missing(documents=documents)
+
+
+def test_the_golden_audit_detects_an_end_reason_with_no_golden() -> None:
+    def keep(command: str, output: Any) -> bool:
+        run = run_of(command, output)
+        return run is None or run["end_reason"] != "api_error"
+
+    assert "end_reason api_error" in goldens_missing(documents=without(keep))
+
+
+def test_the_golden_audit_detects_a_family_with_no_golden() -> None:
+    def keep(command: str, output: Any) -> bool:
+        run = run_of(command, output)
+        return run is None or not str(run["end_reason"]).startswith("signal_")
+
+    assert "end_reason signal_<name>" in goldens_missing(documents=without(keep))
+
+
+def test_the_golden_audit_detects_a_report_status_with_no_golden() -> None:
+    documents = without(lambda c, o: not (c == "report" and o["status"] == "failed"))
+    assert "report status failed" in goldens_missing(documents=documents)
+
+
+def test_the_golden_audit_detects_a_documented_state_that_is_new() -> None:
+    text = INTERFACE.replace("`lost`, `not-started`.", "`lost`, `not-started`, `paused`.", 1)
+    assert text != INTERFACE
+    assert goldens_missing() == []
+    assert "state paused" in goldens_missing(text)
+
+
+def test_the_golden_audit_detects_a_documented_end_reason_that_is_new() -> None:
+    text = INTERFACE.replace("| session | `normal`,", "| session | `normal`, `disk_full`,", 1)
+    assert text != INTERFACE
+    assert goldens_missing() == []
+    assert "end_reason disk_full" in goldens_missing(text)
+
+
+def test_the_golden_audit_detects_a_needs_input_reason_with_no_golden() -> None:
+    documents = without(
+        lambda c, o: not (c == "status" and o["needs_input_reason"] == "elicitation")
+    )
+    assert "needs_input_reason elicitation" in goldens_missing(documents=documents)
+
+
+def test_the_golden_audit_detects_an_outcome_with_no_golden() -> None:
+    def keep(command: str, output: Any) -> bool:
+        run = run_of(command, output)
+        return run is None or run["outcome"] != "vetoed"
+
+    assert "outcome vetoed" in goldens_missing(documents=without(keep))
+
+
+def test_the_golden_audit_detects_a_documented_needs_input_reason_that_is_new() -> None:
+    text = INTERFACE.replace(
+        "or `escalation` (the run", "`paused` (a pause) or `escalation` (the run", 1
+    )
+    assert text != INTERFACE
+    assert goldens_missing() == []
+    assert "needs_input_reason paused" in goldens_missing(text)
+
+
+def test_the_golden_audit_detects_a_documented_outcome_that_is_new() -> None:
+    row = "| `needs-input` | 13 | `exited` |"
+    text = INTERFACE.replace(row, f"{row}\n| `paused` | 19 | `exited` |", 1)
+    assert "paused" in documented_outcomes(text)
+    assert goldens_missing() == []
+    assert "outcome paused" in goldens_missing(text)
+
+
+def test_the_audit_names_a_missing_needs_input_paragraph() -> None:
+    text = INTERFACE.replace(NEEDS_INPUT_MARKER, "`needs-input` has", 1)
+    with pytest.raises(AssertionError, match="no paragraph starting"):
+        documented_needs_input_reasons(text)
