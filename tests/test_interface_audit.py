@@ -404,12 +404,20 @@ def documented_end_reasons(text: str = INTERFACE) -> set[str]:
 
 
 def documented_states(text: str = INTERFACE) -> set[str]:
-    body = section("States", text=text).split("`needs-input` carries")[0]
+    body = section("States", text=text).split(NEEDS_INPUT_MARKER)[0]
     return set(re.findall(r"`([a-z-]+)`", body)) - {"state"}
 
 
+NEEDS_INPUT_MARKER = "`needs-input` carries"
+
+
 def documented_needs_input_reasons(text: str = INTERFACE) -> set[str]:
-    body = section("States", text=text).split("`needs-input` carries")[1].split("Pressing Esc")[0]
+    states = section("States", text=text)
+    assert NEEDS_INPUT_MARKER in states, (
+        f"interface.md, States: no paragraph starting {NEEDS_INPUT_MARKER!r}; "
+        "tests/test_interface_audit.py reads the needs-input reasons from it"
+    )
+    body = states.split(NEEDS_INPUT_MARKER)[1].split("Pressing Esc")[0]
     return set(re.findall(r"`([a-z]+)` \(", body))
 
 
@@ -479,6 +487,7 @@ def test_the_documented_vocabularies_are_the_schema_ones() -> None:
     assert documented_needs_input_reasons() == set(defs["needs_input_reason"]["enum"]) - {None}
     assert documented_outcomes() == set(defs["outcome_value"]["enum"]) - {None}
     assert documented_end_reasons() - {"signal_<name>", "exit_<code>"} == end_reasons(defs)
+    assert {"signal_<name>", "exit_<code>"} <= documented_end_reasons()  # the two families
 
 
 def without(
@@ -527,3 +536,41 @@ def test_the_golden_audit_detects_a_documented_end_reason_that_is_new() -> None:
     assert text != INTERFACE
     assert goldens_missing() == []
     assert "end_reason disk_full" in goldens_missing(text)
+
+
+def test_the_golden_audit_detects_a_needs_input_reason_with_no_golden() -> None:
+    documents = without(
+        lambda c, o: not (c == "status" and o["needs_input_reason"] == "elicitation")
+    )
+    assert "needs_input_reason elicitation" in goldens_missing(documents=documents)
+
+
+def test_the_golden_audit_detects_an_outcome_with_no_golden() -> None:
+    def keep(command: str, output: Any) -> bool:
+        run = run_of(command, output)
+        return run is None or run["outcome"] != "vetoed"
+
+    assert "outcome vetoed" in goldens_missing(documents=without(keep))
+
+
+def test_the_golden_audit_detects_a_documented_needs_input_reason_that_is_new() -> None:
+    text = INTERFACE.replace(
+        "or `escalation` (the run", "`paused` (a pause) or `escalation` (the run", 1
+    )
+    assert text != INTERFACE
+    assert goldens_missing() == []
+    assert "needs_input_reason paused" in goldens_missing(text)
+
+
+def test_the_golden_audit_detects_a_documented_outcome_that_is_new() -> None:
+    row = "| `needs-input` | 13 | `exited` |"
+    text = INTERFACE.replace(row, f"{row}\n| `paused` | 19 | `exited` |", 1)
+    assert "paused" in documented_outcomes(text)
+    assert goldens_missing() == []
+    assert "outcome paused" in goldens_missing(text)
+
+
+def test_the_audit_names_a_missing_needs_input_paragraph() -> None:
+    text = INTERFACE.replace(NEEDS_INPUT_MARKER, "`needs-input` has", 1)
+    with pytest.raises(AssertionError, match="no paragraph starting"):
+        documented_needs_input_reasons(text)

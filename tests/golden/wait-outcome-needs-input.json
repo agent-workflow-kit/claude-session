@@ -1,5 +1,5 @@
 {
-  "claude_session_id": null,
+  "claude_session_id": "c0ffee00-0000-4000-8000-000000000001",
   "cost_usd": null,
   "csession_id": "cs-aaaaaaaa",
   "end_reason": "normal",
@@ -20,7 +20,7 @@
   },
   "run": 1,
   "run_exit_code": 13,
-  "session_started_at": null,
+  "session_started_at": "2026-10-30T12:00:00.000000Z",
   "state": "exited",
   "timed_out": false,
   "warnings": []

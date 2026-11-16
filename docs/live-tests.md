@@ -149,6 +149,12 @@ Some checks are open questions (an exit code, a payload shape, a message text). 
 | Glob and Grep through the generated review settings end to end | #41 | The product enables them with `--tools Glob Grep` (issue #108; `claude_args` still refuses `--tools`); the live half, through the generated settings, is owned by #41. `test_open_items.py` builds the same permission keys by hand. |
 | Managed settings (#56 (b), #59 item 13) | #42 | Needs a root-owned managed settings file (procedure below). |
 | macOS Seatbelt checks | #43 | Manual checklist (macOS only). |
+| `terminal_reason: max_turns` (the live test asserts only that the field is present; the mapping also reads it) -> `max_turns` | #41 | Mapping input of `max_turns`; only `subtype: error_max_turns` with exit 1 is observed. |
+| A result with `is_error: true` -> `api_error` | #41 | Needs a real API failure; the `api_error` golden is built from a hand-made result object. |
+| No result object at all (a `claude` that exits without one) -> `no_result` | #41 | Mapping input of `no_result`. |
+| A non-zero exit with a complete result -> `exit_<code>` | #41 | Mapping input of `exit_<code>` in headless runs. |
+| `no_session_start`, `result_rejected` and `no_report` through `exec` with real Claude Code | #41 | Their goldens and unit tests use the mapping and the store, not a real run. |
+| `wrapper_lost` (the wrapper killed while `claude` runs) | #42 | Needs killing the wrapper of a real run. |
 
 ### Comments on issue #41
 

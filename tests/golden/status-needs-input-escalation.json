@@ -56,7 +56,7 @@
       "cause": "report",
       "delivered": false,
       "event_id": 3,
-      "event_ts": "2026-10-30T12:00:04.000000Z",
+      "event_ts": "2026-10-30T12:00:05.000000Z",
       "final": false,
       "from_activity": "working",
       "from_state": "working",
@@ -94,7 +94,14 @@
     "phase": "session",
     "reads_third_party": false,
     "repo": "example.org/group/project",
-    "report": null,
+    "report": {
+      "artifact": null,
+      "implicit": false,
+      "reason": "Which branch?",
+      "reported_at": "2026-10-30T12:00:04.000000Z",
+      "status": "needs-input",
+      "summary": null
+    },
     "result_path": "/state/private/cs-aaaaaaaa/runs/1/result.json",
     "run": 1,
     "run_kind": "implement",
@@ -105,7 +112,7 @@
     "skill": null,
     "started_at": "2026-10-30T12:00:02.000000Z",
     "state": "needs-input",
-    "state_since": "2026-10-30T12:00:04.000000Z",
+    "state_since": "2026-10-30T12:00:05.000000Z",
     "stop_requested_at": null,
     "warnings": [],
     "wrapper_alive": true,
@@ -117,6 +124,6 @@
   "tainted": false,
   "tainted_at": null,
   "tainted_by_run": null,
-  "updated_at": "2026-10-30T12:00:04.000000Z",
+  "updated_at": "2026-10-30T12:00:05.000000Z",
   "warnings": []
 }

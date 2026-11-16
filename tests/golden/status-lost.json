@@ -69,7 +69,7 @@
   "repo": "example.org/group/project",
   "run": {
     "backstop_used": false,
-    "child_alive": true,
+    "child_alive": false,
     "child_pid": 5151,
     "cost_usd": null,
     "cwd": "/work/project",
@@ -108,7 +108,7 @@
     "state_since": "2026-10-30T12:00:04.000000Z",
     "stop_requested_at": null,
     "warnings": [],
-    "wrapper_alive": true,
+    "wrapper_alive": false,
     "wrapper_pid": 4242
   },
   "run_kind": "implement",
