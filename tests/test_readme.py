@@ -272,7 +272,9 @@ def test_the_calling_from_another_tool_example_passes_the_parser() -> None:
     text = (ROOT / "docs" / "interface.md").read_text(encoding="utf-8")
     start = text.index("\n## Calling from another tool\n")
     body = text[start + 1 :]
-    body = body[: re.search(r"^## (?!Calling)", body[3:], re.M).start() + 3]
+    following = re.search(r"^## ", body[3:], re.M)
+    assert following is not None
+    body = body[: following.start() + 3]
     commands = [argv for block in shell_blocks(body) for argv in commands_in(block)]
     assert [c[0] for c in commands] == [
         "start",
