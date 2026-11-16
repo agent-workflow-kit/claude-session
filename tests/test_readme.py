@@ -262,5 +262,26 @@ def test_the_readme_has_no_stale_coming_notes() -> None:
     rows = [line for line in section("## Commands").splitlines() if line.startswith("| `")]
     assert len(rows) >= 16
     assert all(line.rstrip().endswith("| available |") for line in rows), rows
-    stale = re.findall(r"[^.\n]*\b(?:coming|accepted but no effect|not yet implemented)\b[^.\n]*", README)
+    words = r"coming|accepted but no effect|not yet implemented"
+    stale = re.findall(rf"[^.\n]*\b(?:{words})\b[^.\n]*", README)
     assert stale == []
+
+
+def test_the_calling_from_another_tool_example_passes_the_parser() -> None:
+    """The commands of interface.md's wrapper example are real: parser and flag rules."""
+    text = (ROOT / "docs" / "interface.md").read_text(encoding="utf-8")
+    start = text.index("\n## Calling from another tool\n")
+    body = text[start + 1 :]
+    body = body[: re.search(r"^## (?!Calling)", body[3:], re.M).start() + 3]
+    commands = [argv for block in shell_blocks(body) for argv in commands_in(block)]
+    assert [c[0] for c in commands] == [
+        "start",
+        "exec",
+        "wait",
+        "status",
+        "stop",
+        "forget",
+        "list",
+    ]
+    for argv in commands:
+        check_command(argv)
