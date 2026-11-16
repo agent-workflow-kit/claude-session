@@ -1,0 +1,20 @@
+{
+  "claude_session_id": null,
+  "cost_usd": null,
+  "csession_id": "cs-aaaaaaaa",
+  "end_reason": "git_dir_changed",
+  "exit_code": 12,
+  "forked_from": null,
+  "message": "the launch ended: git_dir_changed",
+  "num_turns": null,
+  "outcome": "not-started",
+  "pending": false,
+  "phase": "launch",
+  "report": null,
+  "run": 1,
+  "run_exit_code": 12,
+  "session_started_at": null,
+  "state": "not-started",
+  "timed_out": false,
+  "warnings": []
+}

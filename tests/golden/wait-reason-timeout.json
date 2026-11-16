@@ -1,0 +1,20 @@
+{
+  "claude_session_id": null,
+  "cost_usd": null,
+  "csession_id": "cs-aaaaaaaa",
+  "end_reason": "timeout",
+  "exit_code": 16,
+  "forked_from": null,
+  "message": null,
+  "num_turns": null,
+  "outcome": "timeout",
+  "pending": false,
+  "phase": "session",
+  "report": null,
+  "run": 1,
+  "run_exit_code": 16,
+  "session_started_at": null,
+  "state": "timeout",
+  "timed_out": false,
+  "warnings": []
+}

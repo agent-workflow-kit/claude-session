@@ -1,0 +1,27 @@
+{
+  "claude_session_id": null,
+  "cost_usd": null,
+  "csession_id": "cs-aaaaaaaa",
+  "end_reason": "normal",
+  "exit_code": 18,
+  "forked_from": null,
+  "message": null,
+  "num_turns": null,
+  "outcome": "failed",
+  "pending": false,
+  "phase": "session",
+  "report": {
+    "artifact": null,
+    "implicit": false,
+    "reason": "why",
+    "reported_at": "2026-01-01T00:00:00Z",
+    "status": "failed",
+    "summary": "ok"
+  },
+  "run": 1,
+  "run_exit_code": 18,
+  "session_started_at": null,
+  "state": "exited",
+  "timed_out": false,
+  "warnings": []
+}
