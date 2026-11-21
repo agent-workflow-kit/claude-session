@@ -185,7 +185,7 @@
             "string",
             "null"
           ],
-          "description": "Resolved cwd of the run; a resume always reuses it; a fork reuses it unless given --cwd. null until the working directory is resolved (pending runs, and runs that ended during launch)."
+          "description": "Resolved cwd of the run; a resume reuses it (a session with no recorded cwd resolves it as a new session would); a fork reuses it unless given --cwd. null until the working directory is resolved (pending runs, and runs that ended during launch)."
         },
         "repo": {
           "type": [
