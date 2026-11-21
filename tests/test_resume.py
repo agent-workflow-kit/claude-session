@@ -1317,3 +1317,45 @@ def test_the_repo_is_carried_across_a_kind_change_and_into_a_fork(env: Env) -> N
     proc, out = resume(env, sid, "--fork")
     assert proc.returncode == 0, proc.stderr
     assert env.run_row(out["csession_id"])["repo"] == repo
+
+
+# cwd of a session in which no run recorded one (interface.md, Resume and fork carry-over)
+
+
+def expired_unadopted_session(env: Env) -> str:
+    """A session whose only run ended ``never_adopted`` before the launch resolved a cwd."""
+    import time
+
+    env.write_config("lost_grace: 0.2s\n")
+    sid = env.started("--mode", "headless")["csession_id"]
+    time.sleep(0.5)
+    env.write_config()
+    return sid
+
+
+def test_resume_without_a_recorded_cwd_accepts_cwd_like_a_new_session(env: Env) -> None:
+    sid = expired_unadopted_session(env)
+    other = env.tmp_path / "other"
+    other.mkdir()
+    proc, _out = resume(env, sid, "--cwd", str(other))
+    assert proc.returncode == 0, proc.stderr
+    assert env.run_row(sid, 1)["cwd"] is None
+    assert starts(env)[-1]["cwd"] == str(other.resolve())
+    assert env.run_row(sid, 2)["cwd"] == str(other.resolve())
+    # The cwd is recorded now: a later resume is bound to it (the usual rule).
+    proc, out = resume(env, sid, "--cwd", str(env.tmp_path))
+    assert proc.returncode == 2 and "previous run's cwd" in out["error"]["message"]
+
+
+def test_resume_without_a_recorded_cwd_checks_the_cwd_path(env: Env) -> None:
+    sid = expired_unadopted_session(env)
+    proc, out = resume(env, sid, "--cwd", str(env.tmp_path / "missing"))
+    assert proc.returncode == 2 and "not an existing directory" in out["error"]["message"]
+    assert env.rows("SELECT COUNT(*) FROM runs") == [(1,)]
+
+
+def test_resume_without_a_recorded_cwd_or_cwd_resolves_it_as_a_new_session(env: Env) -> None:
+    sid = expired_unadopted_session(env)
+    proc, _out = resume(env, sid)
+    assert proc.returncode == 0, proc.stderr
+    assert env.run_row(sid, 2)["cwd"] == str(env.work.resolve())
