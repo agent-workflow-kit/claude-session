@@ -1317,3 +1317,77 @@ def test_the_repo_is_carried_across_a_kind_change_and_into_a_fork(env: Env) -> N
     proc, out = resume(env, sid, "--fork")
     assert proc.returncode == 0, proc.stderr
     assert env.run_row(out["csession_id"])["repo"] == repo
+
+
+# cwd of a session in which no run recorded one (interface.md, Resume and fork carry-over)
+
+
+def expired_unadopted_session(env: Env, *args: str) -> str:
+    """A session whose only run was never adopted: its pending run is expired, so the next
+    command ends it ``never_adopted`` before the launch resolved a cwd."""
+    sid = env.started("--mode", "headless", *args)["csession_id"]
+    env.write_db(
+        "UPDATE runs SET expires_at = '2000-01-01T00:00:00.000Z' WHERE csession_id = ?", (sid,)
+    )
+    return sid
+
+
+def assert_run_1_unrecorded(env: Env, sid: str) -> None:
+    """Run 1 ended ``never_adopted`` without recording a cwd (checked after the resume,
+    which is what ends it)."""
+    row = env.run_row(sid, 1)
+    assert row["cwd"] is None and row["end_reason"] == "never_adopted"
+
+
+def test_resume_without_a_recorded_cwd_accepts_cwd_like_a_new_session(env: Env) -> None:
+    sid = expired_unadopted_session(env)
+    other = env.tmp_path / "other"
+    other.mkdir()
+    proc, _out = resume(env, sid, "--cwd", str(other))
+    assert proc.returncode == 0, proc.stderr
+    assert_run_1_unrecorded(env, sid)
+    assert starts(env)[-1]["cwd"] == str(other.resolve())
+    assert env.run_row(sid, 2)["cwd"] == str(other.resolve())
+    # The cwd is recorded now: a later resume is bound to it (the usual rule).
+    proc, out = resume(env, sid, "--cwd", str(env.tmp_path))
+    assert proc.returncode == 2 and "previous run's cwd" in out["error"]["message"]
+
+
+def test_resume_without_a_recorded_cwd_checks_the_cwd_path(env: Env) -> None:
+    sid = expired_unadopted_session(env)
+    proc, out = resume(env, sid, "--cwd", str(env.tmp_path / "missing"))
+    assert proc.returncode == 2 and "not an existing directory" in out["error"]["message"]
+    assert env.rows("SELECT COUNT(*) FROM runs") == [(1,)]
+
+
+def test_resume_without_a_recorded_cwd_uses_the_callers_cwd_for_a_caller_kind(env: Env) -> None:
+    """The default kind (``implement``) has ``cwd: caller``: the cwd of the resume command,
+    which here is not ``env.work`` (where ``start`` ran)."""
+    sid = expired_unadopted_session(env)
+    caller = env.tmp_path / "caller"
+    caller.mkdir()
+    proc, _out = resume(env, sid, cwd=caller)
+    assert proc.returncode == 0, proc.stderr
+    assert_run_1_unrecorded(env, sid)
+    assert env.run_row(sid, 2)["cwd"] == str(caller.resolve())
+
+
+def test_resume_without_a_recorded_cwd_uses_the_session_dir_for_a_session_dir_kind(
+    env: Env,
+) -> None:
+    sid = expired_unadopted_session(env, "--kind", "rank")
+    proc, _out = resume(env, sid)
+    assert proc.returncode == 0, proc.stderr
+    assert_run_1_unrecorded(env, sid)
+    work = (env.state / "sessions" / sid / "work").resolve()
+    assert env.run_row(sid, 2)["cwd"] == str(work)
+
+
+def test_resume_without_a_recorded_cwd_takes_cwd_session_dir_as_the_work_dir(env: Env) -> None:
+    sid = expired_unadopted_session(env)
+    proc, _out = resume(env, sid, "--cwd", "session-dir")
+    assert proc.returncode == 0, proc.stderr
+    assert_run_1_unrecorded(env, sid)
+    work = (env.state / "sessions" / sid / "work").resolve()
+    cwd = env.run_row(sid, 2)["cwd"]
+    assert cwd == str(work) and Path(cwd).name == "work"

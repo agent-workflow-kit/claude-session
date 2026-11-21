@@ -16,7 +16,8 @@ Resume and fork).
   with origin ``previous_run``, so a carried flag never beats a ``--reads-third-party``
   implication; the prompt and inputs of a previous run that ended ``not-started`` are carried
   unless given now (``sessiondir.read_undelivered``);
-- the **cwd**: a resume always runs in the previous run's resolved cwd (a different
+- the **cwd**: a resume runs in the previous run's resolved cwd (or, when no run of the
+  session recorded one, resolves it as a new session would) (a different
   ``--cwd`` exits 2; a trusted run in the session's own ``work/`` after an isolated run
   exits 2); a fork in ``--cwd`` when given, else in the source's cwd, except a session
   ``work/`` directory (any session's), which fails the launch ``fork_cwd_unsupported``;
