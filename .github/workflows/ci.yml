@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   ci:
-    uses: agent-workflow-kit/awkit-ci/.github/workflows/python-ci.yml@v0.1.0
+    uses: agent-workflow-kit/awkit-ci/.github/workflows/python-ci.yml@v0.2.0
 
   release:
     needs: ci
@@ -25,7 +25,7 @@ jobs:
     # The release pushes with the release GitHub App token, so GITHUB_TOKEN stays read-only.
     permissions:
       contents: read
-    uses: agent-workflow-kit/awkit-ci/.github/workflows/release.yml@v0.1.0
+    uses: agent-workflow-kit/awkit-ci/.github/workflows/release.yml@v0.2.0
     secrets:
       app-id: ${{ secrets.RELEASE_APP_ID }}
       app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}

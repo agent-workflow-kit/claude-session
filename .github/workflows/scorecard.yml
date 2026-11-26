@@ -18,4 +18,4 @@ jobs:
       actions: read # read workflow runs (Scorecard checks)
       security-events: write # upload SARIF to code scanning
       id-token: write # sign results published to the Scorecard API
-    uses: agent-workflow-kit/awkit-ci/.github/workflows/scorecard.yml@v0.1.0
+    uses: agent-workflow-kit/awkit-ci/.github/workflows/scorecard.yml@v0.2.0
